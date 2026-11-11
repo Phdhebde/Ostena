@@ -3,10 +3,10 @@
 //! Only the data lives here, so that the whole configuration file is parsed
 //! in one strict pass; `ostena-scope` validates and compiles it.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Policy of one gateway group, as written in the configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySpec {
     /// Gateway group this policy applies to (for audit). In an agent
@@ -39,7 +39,7 @@ pub struct PolicySpec {
 }
 
 /// Allowed networks with their ports.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowRuleSpec {
     /// Name shown in audit events.
@@ -52,7 +52,7 @@ pub struct AllowRuleSpec {
 }
 
 /// Denied networks.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DenyRuleSpec {
     /// Name shown in audit events.
@@ -63,7 +63,7 @@ pub struct DenyRuleSpec {
 }
 
 /// Role of an Ostena component.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[expect(missing_docs, reason = "component names")]
 pub enum InfrastructureRole {
@@ -86,7 +86,7 @@ impl InfrastructureRole {
 }
 
 /// Addresses of an Ostena component.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InfrastructureSpec {
     /// Component.
@@ -96,7 +96,7 @@ pub struct InfrastructureSpec {
 }
 
 /// Development-only lifting of the floor.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FloorExceptionSpec {
     /// Network where the floor does not apply.
