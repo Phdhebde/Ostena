@@ -110,7 +110,7 @@ pub fn service_manager() -> Result<&'static dyn ServiceManager, PlatformError> {
     }
 }
 
-/// The hardened systemd unit (systemd 247, Debian 11, and later).
+/// The hardened systemd unit (systemd 252, Debian 12, and later).
 pub fn systemd_unit(executable: &Path, config: &Path) -> String {
     format!(
         "\
@@ -161,6 +161,10 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RemoveIPC=yes
+PrivateIPC=yes
+PrivateMounts=yes
+# Not PrivateUsers=yes: a capability held in a private user namespace does
+# not apply to the host network namespace (future CAP_NET_BIND_SERVICE).
 KeyringMode=private
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
@@ -206,6 +210,8 @@ mod tests {
             "CapabilityBoundingSet=",
             "AmbientCapabilities=",
             "MemoryDenyWriteExecute=yes",
+            "PrivateIPC=yes",
+            "PrivateMounts=yes",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
             "UMask=0077",
         ] {
@@ -216,7 +222,7 @@ mod tests {
     }
 
     /// Writes the unit for `systemd-analyze verify` on the oldest supported
-    /// systemd (Debian 11): `OSTENA_UNIT_OUT=<file> cargo test -p
+    /// systemd (Debian 12): `OSTENA_UNIT_OUT=<file> cargo test -p
     /// ostena-platform -- --ignored write_unit`.
     #[test]
     #[ignore = "writes a file; run by the CI unit verification"]

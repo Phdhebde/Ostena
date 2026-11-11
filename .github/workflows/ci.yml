@@ -187,7 +187,7 @@ jobs:
 
   # Agent service lifecycle under systemd (install, status, permissions,
   # hardening score, clean stop, bounded restarts, uninstall), the unit on
-  # systemd 247 (Debian 11), and the idle footprint.
+  # systemd 252 (Debian 12), and the idle footprint.
   agent-linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

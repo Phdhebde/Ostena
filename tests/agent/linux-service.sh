@@ -88,14 +88,18 @@ code=$?
 set -e
 [ "$code" = "4" ] || fail "status after uninstall: exit $code, expected 4"
 
-if [ -n "${SKIP_DEBIAN11:-}" ]; then echo "OK (Debian 11 check skipped)"; exit 0; fi
-echo "=== unit on systemd 247 (Debian 11)"
-docker run --rm -v "${RUNNER_TEMP:-/tmp}/$UNIT:/etc/systemd/system/$UNIT:ro" debian:11 bash -c '
-    printf "deb http://archive.debian.org/debian bullseye main\ndeb http://archive.debian.org/debian-security bullseye-security main\n" > /etc/apt/sources.list
-    apt-get -o Acquire::Check-Valid-Until=false update -qq >/dev/null
-    apt-get install -y -qq --no-install-recommends systemd >/dev/null
+if [ -n "${SKIP_DEBIAN12:-}" ]; then echo "OK (Debian 12 check skipped)"; exit 0; fi
+echo "=== unit on systemd 252 (Debian 12, oldest supported)"
+# Any message from verify (unknown directive, wrong value) fails the test.
+docker run --rm -v "${RUNNER_TEMP:-/tmp}/$UNIT:/tmp/$UNIT:ro" debian:12 bash -c '
+    set -e
+    install -m 0644 /tmp/ostena-agent.service /etc/systemd/system/ostena-agent.service
+    apt-get update -qq >/dev/null
+    apt-get install -y -qq --no-install-recommends systemd >/dev/null 2>&1
     install -m 0755 /dev/null /usr/local/bin/ostena
     useradd --system --user-group --no-create-home --shell /usr/sbin/nologin ostena
     systemctl --version | head -1
-    systemd-analyze verify /etc/systemd/system/ostena-agent.service'
+    out=$(systemd-analyze verify /etc/systemd/system/ostena-agent.service 2>&1)
+    if [ -n "$out" ]; then echo "$out"; exit 1; fi
+    systemd-analyze security --offline=yes /etc/systemd/system/ostena-agent.service | tail -1'
 echo "OK"
