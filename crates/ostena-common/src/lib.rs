@@ -2,10 +2,12 @@
 //!
 //! - [`secret`]: `Secret<T>`, values that cannot be printed or logged.
 //! - [`config`]: strict TOML configuration and its validation.
+//! - [`logging`]: structured JSON logs with redaction of sensitive fields.
 
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod logging;
 pub mod secret;
 
 /// Product version, taken from the workspace manifest.
