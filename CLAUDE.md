@@ -19,7 +19,7 @@ Exigences qui priment sur tout le reste :
 
 - **ostena-core** (Linux) : identités multi-sources, inventaire, politiques d'accès, workflows, API (axum REST + OpenAPI, tonic gRPC interne en mTLS), base **PostgreSQL 16+** propre au produit (sqlx, requêtes vérifiées à la compilation, migrations embarquées).
 - **Agent passerelle** (Windows Server 2016+ et Debian 12+) : **un agent par groupe de cibles**, en passerelle de rebond. Il ouvre les sessions vers les cibles et joue l'authentification (Kerberos, CredSSP, clés SSH). Aucun agent sur les cibles. Aucune base de données sur l'agent. Il se connecte au core par un tunnel *dial-back* mTLS multiplexé (QUIC, repli HTTP/2).
-- **Grant de session** : le core autorise et signe un jeton court (EdDSA Ed25519, `kid`, TTL 60 s, usage unique, anti-rejeu persistant). Le jeton porte l'autorisation, **jamais le secret**.
+- **Grant de session** : le core autorise et signe un jeton court (ECDSA P-256 / SHA-256, `kid`, TTL 60 s, usage unique, anti-rejeu persistant). Le jeton porte l'autorisation, **jamais le secret**.
 - **Audit** : chaîne HMAC, horodatage RFC 3161, stockage WORM, export syslog/OCSF, outil `ostena-verify`.
 - **Coffre-fort** : module séparé, installable plus tard sur une autre machine, cryptographie hybride post-quantique (X25519 + ML-KEM-768, Ed25519 + ML-DSA-65). Il ne vit jamais sur le bastion.
 - Un **binaire unique** `ostena` dont les rôles sont activés à l'installation.
@@ -32,7 +32,7 @@ Monorepo, *workspace* Cargo. Ne créer une crate que lorsqu'un lot en a besoin.
 crates/
   ostena-common/      configuration TOML stricte, erreurs, journaux structurés, métriques, types Secret
   ostena-crypto/      SEULE crate autorisée à appeler la cryptographie (rustls / aws-lc-rs)
-  ostena-grant/       grants EdDSA, jeu de clés par kid, anti-rejeu persistant
+  ostena-grant/       grants ECDSA P-256, jeu de clés par kid, anti-rejeu persistant
   ostena-frame/       framing binaire versionné gateway <-> navigateur
   ostena-scope/       CIDR autorisés/interdits, épinglage de l'IP résolue, anti-SSRF
   ostena-session/     gestionnaire de sessions, quotas, trait Driver
@@ -60,7 +60,7 @@ packaging/  lab/  tests/  docs/  xtask/
 - Les crates protocolaires (`ssh`, `rdp`, `tsgu`, `rfb`, `frame`) ne dépendent ni de la base ni de l'API : testables et *fuzzables* seules.
 - Toute la cryptographie passe par `ostena-crypto`. Pas de crypto maison, pas d'OpenSSL. Algorithmes figés selon les guides ANSSI (PG-083, PA-035), pas négociables par un client ou un jeton.
 - Secrets dans des types `Secret<…>` (`secrecy` + `zeroize`) : jamais `Debug`/`Display`, jamais convertis en `String`, jamais journalisés.
-- Sécurité par défaut : le comportement par défaut est le plus sûr. Toute option qui l'affaiblit est journalisée et **refusée en mode production** (validation au démarrage). Exemples de refus : vérification de clé hôte SSH non stricte, certificat RDP de la cible non épinglé sans PKI, repli NTLM quand un mot de passe est délégué, grant signé avec un autre algorithme qu'EdDSA.
+- Sécurité par défaut : le comportement par défaut est le plus sûr. Toute option qui l'affaiblit est journalisée et **refusée en mode production** (validation au démarrage). Exemples de refus : vérification de clé hôte SSH non stricte, certificat RDP de la cible non épinglé sans PKI, repli NTLM quand un mot de passe est délégué, grant signé avec un autre algorithme qu'ECDSA P-256 / SHA-256.
 - Contrôle de périmètre (CIDR + épinglage de l'IP résolue + blocage des adresses de métadonnées cloud et locales) appliqué à **tous** les drivers.
 - Pas de `unwrap()`/`expect()` hors tests et hors invariants documentés. Erreurs typées (`thiserror`), `anyhow` seulement dans les binaires et `xtask`.
 - Dépendances : licences MIT, Apache 2.0, BSD, ISC, Zlib, MPL 2.0 uniquement, contrôlées par `cargo-deny`. Préférer peu de dépendances, bien maintenues. Toute nouvelle dépendance se justifie dans la PR.

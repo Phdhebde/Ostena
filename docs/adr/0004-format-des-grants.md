@@ -2,13 +2,14 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-11-11
+- **Révision** : 2026-11-11, signature ECDSA P-256 / SHA-256 (algorithme 2) au lieu d'Ed25519, absent des guides ANSSI (ADR-0009)
 
 ## Contexte
 
 Le core autorise une session et remet à l'utilisateur un *grant* : un jeton court que la passerelle (agent) vérifie avant d'ouvrir la session vers la cible. Le grant porte l'autorisation, jamais un secret. Contraintes :
 
 - il doit souvent transiter par un client natif, dans un champ prévu pour un identifiant ou un mot de passe : il doit être **compact** ;
-- l'algorithme est figé (Ed25519) et **ne doit pas être négociable** par le jeton ;
+- l'algorithme est figé (ECDSA P-256 / SHA-256, ADR-0009) et **ne doit pas être négociable** par le jeton ;
 - le décodeur reçoit des données hostiles : il doit être **simple, strict et fuzzable** ;
 - un grant ne sert **qu'une fois**, même après un redémarrage de l'agent.
 
@@ -21,7 +22,7 @@ Alternatives étudiées :
 | Option | Taille | Raison du rejet |
 |---|---|---|
 | CWT / COSE_Sign1 (CBOR) | ~180–220 o | parseur CBOR (dépendance, surface d'attaque), en-tête `alg` négociable, plusieurs encodages possibles d'un même grant |
-| JWT / JWS EdDSA | 400+ caractères | JSON et double base64, historique `alg: none` et confusion d'algorithme, trop long pour un champ mot de passe RDP |
+| JWT / JWS | 400+ caractères | JSON et double base64, historique `alg: none` et confusion d'algorithme, trop long pour un champ mot de passe RDP |
 | PASETO v4.public | ~300 caractères | JSON, dépendance, taille |
 | Protobuf / postcard / bincode | ~120–160 o | dépendance, encodage non canonique (protobuf) ou format lié à une bibliothèque |
 
@@ -33,10 +34,10 @@ Retenu : une **structure binaire de taille fixe**. Le décodeur lit à des posit
 |---|---|---|---|
 | 0 | 3 | magic `OSG` | sinon `GRT-E001` |
 | 3 | 1 | version = 1 | sinon `GRT-E002` |
-| 4 | 1 | algorithme = 1 (Ed25519) | sinon `GRT-E003`, même si la signature est valide |
+| 4 | 1 | algorithme = 2 (ECDSA P-256 / SHA-256) | sinon `GRT-E003`, même si la signature est valide ; la valeur 1 (Ed25519, premier projet) est refusée |
 | 5 | 1 | protocole : 1 SSH, 2 RDP, 3 VNC, 4 Web | sinon `GRT-E004` |
 | 6 | 2 | réservé | doit valoir 0 (`GRT-E001`) |
-| 8 | 8 | kid : 8 premiers octets du SHA-256 de la clé publique | |
+| 8 | 8 | kid : 8 premiers octets du SHA-256 de la clé publique au format SEC1 non compressé (65 octets, `0x04 ‖ x ‖ y`) | |
 | 16 | 16 | jti : identifiant aléatoire de 128 bits | |
 | 32 | 16 | sujet : UUID de l'utilisateur dans le core | |
 | 48 | 16 | ressource : UUID de la cible dans l'inventaire | |
@@ -45,7 +46,7 @@ Retenu : une **structure binaire de taille fixe**. Le décodeur lit à des posit
 | 84 | 4 | durée de session maximale (s) | 0 : `GRT-E004` ; au-dessus de la politique : `GRT-E009` |
 | 88 | 8 | iat : émission et début de validité (s Unix) | |
 | 96 | 8 | exp : expiration, exclue (s Unix) | `exp ≤ iat` : `GRT-E004` ; `exp − iat` au-dessus de la politique : `GRT-E009` |
-| 104 | 64 | signature Ed25519 | |
+| 104 | 64 | signature ECDSA P-256 / SHA-256 brute `r ‖ s` (32 + 32 octets, big-endian), forme low-S | |
 
 Droits v1 : presse-papiers vers la cible (bit 0), presse-papiers depuis la cible (1), dépôt de fichiers (2), récupération de fichiers (3), redirection de lecteurs (4), d'imprimante (5), de l'audio (6), redirection de ports SSH (7), agent forwarding SSH (8). Toute évolution du format passe par une nouvelle version.
 
@@ -54,7 +55,14 @@ Droits v1 : presse-papiers vers la cible (bit 0), presse-papiers depuis la cible
 ### Signature
 
 - **La signature couvre tous les octets qui la précèdent**, c'est-à-dire `octets[0..104]` : magic, version, algorithme et kid compris. Ces octets sont précédés d'un préfixe de séparation de domaine, `"ostena-grant-v1\0"` (16 octets), signé mais non transmis. Une signature produite par la même clé pour un autre usage ne peut donc pas passer pour un grant.
-- **La vérification Ed25519 est stricte.** En plus des contrôles d'`aws-lc-rs`, `ostena-crypto` refuse les encodages non canoniques : coordonnée y supérieure ou égale à p pour la clé publique ou pour `R`, points d'ordre faible (identité, ordre 2, 4 ou 8) pour la clé publique ou pour `R`, et `S` supérieur ou égal à l'ordre du groupe L (malléabilité). Un message n'a ainsi qu'une signature acceptée par clé. Ce sont des contrôles d'encodage, testés avec des vecteurs dédiés, pas de la cryptographie maison.
+- **Signature ECDSA P-256 / SHA-256 (FIPS 186-5), au format brut de 64 octets** `r ‖ s`, pas en DER : le grant garde sa taille fixe de 168 octets (224 caractères), ce que vérifient des assertions à la compilation.
+- **La vérification est stricte.** ECDSA est malléable : si `(r, s)` est valide, `(r, n − s)` l'est aussi. Le signataire produit donc toujours la forme **low-S** (`s ≤ (n − 1)/2`), et `ostena-crypto` refuse, avant la vérification d'`aws-lc-rs` :
+  - `r` ou `s` nul, ou supérieur ou égal à l'ordre du groupe n ;
+  - `s` au-dessus de `(n − 1)/2` (high-S), même si la signature est mathématiquement valide ;
+  - une clé publique qui n'est pas un point SEC1 non compressé situé sur la courbe.
+
+  Un message n'a ainsi qu'une signature acceptée par clé. L'anti-rejeu repose de toute façon sur le jti et pas sur les octets de la signature. Chaque refus a son test, dont un vecteur RFC 6979 high-S accepté par la vérification ECDSA de base et refusé par la nôtre.
+- **Pourquoi pas Ed25519** (premier projet de cet ADR) : EdDSA n'est cité ni par le guide ANSSI-PG-083 v3.00 ni par le guide de sélection ANSSI-PA-079 (voir ADR-0009). P-256 permettra aussi de garder la clé de signature du core dans un HSM. Rien n'était déployé : la valeur 1 est simplement refusée, sans période de transition.
 
 ### Forme texte
 
@@ -108,7 +116,7 @@ Politique par défaut côté vérificateur : tolérance d'horloge de 5 s, durée
 
 ### Fuzzing
 
-Une cible `cargo-fuzz` (`grant_decode`) exerce tous les décodeurs : binaire, texte et vérification complète avec une clé de test publique (RFC 8032). Elle vit dans `fuzz/`, hors du workspace, avec un nightly daté. La CI la fait tourner 60 s sous AddressSanitizer, sous Linux, et le corpus est rejoué comme test sur la toolchain stable.
+Une cible `cargo-fuzz` (`grant_decode`) exerce tous les décodeurs : binaire, texte et vérification complète avec une clé de test publique (RFC 6979, annexe A.2.5). Elle vit dans `fuzz/`, hors du workspace, avec un nightly daté. La CI la fait tourner 30 s sous AddressSanitizer, sous Linux, et le corpus est rejoué comme test sur la toolchain stable.
 
 ## Conséquences
 
