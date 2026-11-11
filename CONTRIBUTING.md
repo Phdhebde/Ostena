@@ -59,7 +59,7 @@ cargo build -p ostena-frame --target wasm32-unknown-unknown   # cœur protocolai
 
 Outils : `cargo install --locked cargo-deny cargo-cyclonedx cargo-fuzz`.
 
-Fuzzing : le dossier `fuzz/` est hors du workspace et utilise le nightly épinglé dans `fuzz/rust-toolchain.toml`. libFuzzer ne fonctionne de façon fiable que sous Linux. Tout fichier gardé dans `fuzz/corpus/` est rejoué par `cargo test` sur la toolchain stable.
+Fuzzing : le dossier `fuzz/` est hors du workspace et utilise le nightly épinglé dans `fuzz/rust-toolchain.toml`. libFuzzer ne fonctionne de façon fiable que sous Linux. Tout fichier gardé dans `fuzz/corpus/` est rejoué par `cargo test` sur la toolchain stable. En CI, chaque cible tourne 30 s sur chaque PR (un job par cible) et 1 h chaque nuit (workflow `fuzz-nightly.yml`, plantages publiés en artefact). Une nouvelle cible s'ajoute à `FUZZ_TARGETS` dans xtask et aux deux matrices ; un test de xtask vérifie qu'elles concordent.
 
 ## Construction hors ligne
 
