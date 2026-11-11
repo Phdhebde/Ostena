@@ -6,6 +6,8 @@
 // A developer tool: reporting progress on the console is its job.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod secrets;
+
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
@@ -18,10 +20,11 @@ const USAGE: &str = "\
 Usage: cargo xtask <TASK>
 
 Tasks:
-  ci       Run fmt, clippy, tests and cargo-deny like the CI does
-  vendor   Vendor all dependencies into vendor/ for offline builds
-  sbom     Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
-  help     Print this message
+  ci             Run fmt, clippy, tests, cargo-deny and check-secrets like the CI
+  check-secrets  Check that every secret exposure is justified
+  vendor         Vendor all dependencies into vendor/ for offline builds
+  sbom           Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
+  help           Print this message
 ";
 
 /// Directory receiving vendored crates.
@@ -33,6 +36,7 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1);
     let result = match task.as_deref() {
         Some("ci") => ci(),
+        Some("check-secrets") => check_secrets(),
         Some("vendor") => vendor(),
         Some("sbom") => sbom(),
         None | Some("help" | "-h" | "--help") => {
@@ -104,7 +108,22 @@ fn ci() -> Result<()> {
         cmd.args(args);
         run(cmd)?;
     }
-    Ok(())
+    check_secrets()
+}
+
+fn check_secrets() -> Result<()> {
+    let crates = workspace_root()?.join("crates");
+    eprintln!("$ check-secrets {}", crates.display());
+    let report = secrets::check_tree(&crates)?;
+    if report.is_empty() {
+        eprintln!("every secret exposure is justified");
+        Ok(())
+    } else {
+        for line in &report {
+            eprintln!("{line}");
+        }
+        Err(format!("{} unjustified secret exposure(s)", report.len()).into())
+    }
 }
 
 fn vendor() -> Result<()> {
