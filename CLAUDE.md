@@ -21,7 +21,7 @@ Exigences qui priment sur tout le reste :
 - **Agent passerelle** (Windows Server 2016+ et Debian 12+) : **un agent par groupe de cibles**, en passerelle de rebond. Il ouvre les sessions vers les cibles et joue l'authentification (Kerberos, CredSSP, clés SSH). Aucun agent sur les cibles. Aucune base de données sur l'agent. Il se connecte au core par un tunnel *dial-back* mTLS multiplexé (QUIC, repli HTTP/2).
 - **Grant de session** : le core autorise et signe un jeton court (ECDSA P-256 / SHA-256, `kid`, TTL 60 s, usage unique, anti-rejeu persistant). Le jeton porte l'autorisation, **jamais le secret**.
 - **Audit** : chaîne HMAC, horodatage RFC 3161, stockage WORM, export syslog/OCSF, outil `ostena-verify`.
-- **Coffre-fort** : module séparé, installable plus tard sur une autre machine, cryptographie hybride post-quantique (X25519 + ML-KEM-768, Ed25519 + ML-DSA-65). Il ne vit jamais sur le bastion.
+- **Coffre-fort** : module séparé, installable plus tard sur une autre machine, cryptographie hybride post-quantique (échange de clés et enveloppe des secrets : P-256 + ML-KEM-768 ; signatures : ECDSA P-256 + ML-DSA-65 ; voir l'ADR-0009). Il ne vit jamais sur le bastion.
 - Un **binaire unique** `ostena` dont les rôles sont activés à l'installation.
 
 ## Organisation du dépôt (cible)
