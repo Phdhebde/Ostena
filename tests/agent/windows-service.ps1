@@ -77,7 +77,11 @@ if ($LASTEXITCODE -ne 0 -or $status -notmatch 'Groupe : 2f6c9a4e') { Fail 'statu
 
 Write-Host '=== control pipe refuses a non-administrator'
 & (Join-Path $PSScriptRoot 'windows-pipe-nonadmin.ps1')
-if ($LASTEXITCODE -ne 0) { Fail 'a non-administrator reached the control pipe' }
+switch ($LASTEXITCODE) {
+    0 { }
+    1 { Fail 'a non-administrator reached the control pipe' }
+    default { Fail "the non-administrator pipe test could not run ($LASTEXITCODE)" }
+}
 
 Write-Host '=== clean stop'
 Stop-Service $Service
