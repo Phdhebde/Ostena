@@ -1,9 +1,11 @@
 //! Shared foundations for every Ostena crate.
 //!
 //! - [`secret`]: `Secret<T>`, values that cannot be printed or logged.
+//! - [`config`]: strict TOML configuration and its validation.
 
 #![forbid(unsafe_code)]
 
+pub mod config;
 pub mod secret;
 
 /// Product version, taken from the workspace manifest.
