@@ -216,20 +216,117 @@ fn e013_floor_exception_only_in_development() {
     assert_eq!(p.exception_reason(0), "cible de test locale");
 }
 
+/// 2026-11-11T12:00:00Z.
+const NOW: u64 = 1_794_398_400;
+
+fn waiver(justification: Option<&str>, expires: Option<&str>) -> PolicySpec {
+    PolicySpec {
+        allow_short_names: true,
+        short_names_justification: justification.map(str::to_owned),
+        short_names_expires: expires.map(str::to_owned),
+        ..spec()
+    }
+}
+
+fn codes(s: &PolicySpec, mode: Mode, now: u64) -> Vec<Code> {
+    CompiledPolicy::compile_at(s, mode, now)
+        .err()
+        .map(|e| e.codes())
+        .unwrap_or_default()
+}
+
 #[test]
 fn e015_short_names_need_justification_in_production() {
-    let mut s = spec();
-    s.allow_short_names = true;
-    let err = CompiledPolicy::compile(&s, Mode::Production).unwrap_err();
-    assert_eq!(err.codes(), vec![Code::ShortNamesInProduction]);
+    let s = waiver(None, Some("2027-01-31"));
+    assert_eq!(
+        codes(&s, Mode::Production, NOW),
+        vec![Code::ShortNamesInProduction]
+    );
 
-    let dev = CompiledPolicy::compile(&s, Mode::Development).unwrap();
-    assert!(dev.allow_short_names());
+    let dev = CompiledPolicy::compile_at(&waiver(None, None), Mode::Development, NOW).unwrap();
+    assert_eq!(dev.short_names_at(NOW), ShortNames::Allowed);
     assert_eq!(dev.weakenings()[0].kind, "allow_short_names");
 
-    s.short_names_justification = Some("parc NetBIOS historique, ticket SEC-42".into());
-    let prod = CompiledPolicy::compile(&s, Mode::Production).unwrap();
+    let ok = waiver(
+        Some("parc NetBIOS historique, ticket SEC-42"),
+        Some("2027-01-31"),
+    );
+    let prod = CompiledPolicy::compile_at(&ok, Mode::Production, NOW).unwrap();
     assert!(prod.weakenings()[0].message.contains("SEC-42"));
+    assert!(prod.weakenings()[0].message.contains("2027-01-31"));
+    assert_eq!(prod.short_names_expires().as_deref(), Some("2027-01-31"));
+}
+
+#[test]
+fn e017_waiver_rules() {
+    let long = Some("parc NetBIOS historique, ticket SEC-42");
+    // At least 20 characters, counted as characters (not bytes) after trimming.
+    let j19 = "é".repeat(19);
+    let j20 = "é".repeat(20);
+    let padded = format!("   {j19}   ");
+    for (j, expected) in [
+        (&j19, vec![Code::ShortNamesWaiver]),
+        (&padded, vec![Code::ShortNamesWaiver]),
+        (&j20, vec![]),
+    ] {
+        assert_eq!(
+            codes(&waiver(Some(j), Some("2027-01-31")), Mode::Production, NOW),
+            expected,
+            "{j}"
+        );
+    }
+    // Missing, malformed or too distant expiry.
+    assert_eq!(
+        codes(&waiver(long, None), Mode::Production, NOW),
+        vec![Code::ShortNamesWaiver]
+    );
+    for bad in ["2027-02-30", "31/01/2027", "2027-01-31T00:00:00Z", ""] {
+        assert_eq!(
+            codes(&waiver(long, Some(bad)), Mode::Production, NOW),
+            vec![Code::ShortNamesWaiver],
+            "{bad}"
+        );
+        // Malformed dates are refused in development too.
+        assert_eq!(
+            codes(&waiver(long, Some(bad)), Mode::Development, NOW),
+            vec![Code::ShortNamesWaiver],
+            "{bad}"
+        );
+    }
+    // At most 366 days ahead: 2027-11-11 ends 365.5 days after NOW.
+    assert_eq!(
+        codes(&waiver(long, Some("2027-11-11")), Mode::Production, NOW),
+        vec![]
+    );
+    assert_eq!(
+        codes(&waiver(long, Some("2027-11-12")), Mode::Production, NOW),
+        vec![Code::ShortNamesWaiver]
+    );
+}
+
+#[test]
+fn e018_expired_waiver_at_startup() {
+    let s = waiver(
+        Some("parc NetBIOS historique, ticket SEC-42"),
+        Some("2026-11-10"),
+    );
+    assert_eq!(
+        codes(&s, Mode::Production, NOW),
+        vec![Code::ShortNamesExpired]
+    );
+    // Last day included, refused from midnight UTC.
+    let today = waiver(
+        Some("parc NetBIOS historique, ticket SEC-42"),
+        Some("2026-11-11"),
+    );
+    let p = CompiledPolicy::compile_at(&today, Mode::Production, NOW).unwrap();
+    let midnight = 1_794_441_600; // 2026-11-12T00:00:00Z
+    assert_eq!(p.short_names_at(midnight - 1), ShortNames::Allowed);
+    assert_eq!(p.short_names_at(midnight), ShortNames::Expired);
+    // Development: compiles, but the expiry still applies at decision time.
+    let dev = CompiledPolicy::compile_at(&s, Mode::Development, NOW).unwrap();
+    assert_eq!(dev.short_names_at(NOW), ShortNames::Expired);
+    assert_eq!(compiled().short_names_at(NOW), ShortNames::Refused);
 }
 
 #[test]

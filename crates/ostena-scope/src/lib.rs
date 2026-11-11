@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod date;
 mod error;
 pub mod floor;
 pub mod local;
@@ -27,7 +28,7 @@ pub use local::{LocalAddresses, Refresher, SharedLocalAddresses};
 pub use net::{Network, PortRange, normalize};
 pub use policy::{
     AllowRuleSpec, Allowed, CompiledPolicy, DenyRuleSpec, FloorExceptionSpec, InfrastructureRole,
-    InfrastructureSpec, PolicyError, PolicySpec,
+    InfrastructureSpec, PolicyError, PolicySpec, ShortNames,
 };
-pub use resolve::{PinnedTarget, ResolveError, Resolver, Scope, SystemResolver};
+pub use resolve::{Clock, PinnedTarget, ResolveError, Resolver, Scope, SystemResolver};
 pub use target::{Host, Hostname, Target, TargetError, parse_host};

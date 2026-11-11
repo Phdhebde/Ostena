@@ -10,6 +10,7 @@ use std::net::{IpAddr, SocketAddr};
 use ostena_common::config::Mode;
 use serde::Deserialize;
 
+use crate::date::{DAY, Date};
 use crate::error::{Code, Refusal, Rule};
 use crate::floor::{FloorCause, static_floor};
 use crate::local::LocalAddresses;
@@ -17,6 +18,12 @@ use crate::net::{Family, Network, PortRange, key, normalize};
 
 /// Largest number of networks in a policy, to bound compilation.
 pub const MAX_NETWORKS: usize = 100_000;
+
+/// Shortest `short_names_justification` accepted in production.
+pub const MIN_JUSTIFICATION_CHARS: usize = 20;
+
+/// Furthest `short_names_expires` accepted, in days from today.
+pub const MAX_WAIVER_DAYS: u64 = 366;
 
 /// Policy of one gateway group, as written in the configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -39,9 +46,14 @@ pub struct PolicySpec {
     /// Accept single-label names (weakening, see ADR-0005).
     #[serde(default)]
     pub allow_short_names: bool,
-    /// Required to allow short names in production; logged.
+    /// Required to allow short names in production (at least 20 characters);
+    /// logged.
     #[serde(default)]
     pub short_names_justification: Option<String>,
+    /// Last day (`YYYY-MM-DD`, UTC) short names are allowed; required in
+    /// production, at most one year ahead.
+    #[serde(default)]
+    pub short_names_expires: Option<String>,
 }
 
 /// Allowed networks with their ports.
@@ -284,19 +296,52 @@ pub struct CompiledPolicy {
     deny_labels: Vec<String>,
     infrastructure_roles: Vec<InfrastructureRole>,
     exception_reasons: Vec<String>,
-    allow_short_names: bool,
+    short_names: ShortNamesWaiver,
     weakenings: Vec<Weakening>,
 }
 
+/// Compiled `allow_short_names` waiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortNamesWaiver {
+    Disabled,
+    Allowed { expires: Option<Date> },
+}
+
+/// Whether single-label names are accepted at a given time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortNames {
+    /// Not allowed by the policy.
+    Refused,
+    /// Allowed (a weakening).
+    Allowed,
+    /// Allowed until a date that has passed.
+    Expired,
+}
+
 impl CompiledPolicy {
-    /// Validates and compiles a specification for the given run mode.
+    /// [`Self::compile_at`] with the system clock.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::compile_at`].
+    pub fn compile(spec: &PolicySpec, mode: Mode) -> Result<Self, PolicyError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Self::compile_at(spec, mode, now)
+    }
+
+    /// Validates and compiles a specification for the given run mode, at
+    /// `now` (Unix seconds).
     ///
     /// # Errors
     ///
     /// Every problem at once: invalid network, port or empty rule
     /// (`SCP-E012`), floor exception in production (`SCP-E013`), short names
-    /// allowed in production without justification (`SCP-E015`).
-    pub fn compile(spec: &PolicySpec, mode: Mode) -> Result<Self, PolicyError> {
+    /// allowed in production without justification (`SCP-E015`), with a
+    /// justification under 20 characters or an invalid, missing or too distant
+    /// expiry (`SCP-E017`), or with an expired waiver (`SCP-E018`).
+    pub fn compile_at(spec: &PolicySpec, mode: Mode, now: u64) -> Result<Self, PolicyError> {
         let total = spec.allow.iter().map(|r| r.networks.len()).sum::<usize>()
             + spec.deny.iter().map(|r| r.networks.len()).sum::<usize>()
             + spec
@@ -337,7 +382,7 @@ impl CompiledPolicy {
             );
         }
         let exception_items = c.floor_exceptions(&spec.floor_exceptions, mode);
-        c.short_names(spec, mode);
+        let short_names = c.short_names(spec, mode, now);
 
         let Checker { issues, weakenings } = c;
         if !issues.is_empty() {
@@ -377,7 +422,7 @@ impl CompiledPolicy {
                 .iter()
                 .map(|e| e.reason.clone())
                 .collect(),
-            allow_short_names: spec.allow_short_names,
+            short_names,
             weakenings,
         })
     }
@@ -473,9 +518,25 @@ impl CompiledPolicy {
         &self.gateway_group
     }
 
-    /// Whether single-label names are accepted.
-    pub fn allow_short_names(&self) -> bool {
-        self.allow_short_names
+    /// Whether single-label names are accepted at `now` (Unix seconds). Checked
+    /// at every decision, so that an expired waiver stops applying without a
+    /// restart.
+    pub fn short_names_at(&self, now: u64) -> ShortNames {
+        match self.short_names {
+            ShortNamesWaiver::Disabled => ShortNames::Refused,
+            ShortNamesWaiver::Allowed { expires: Some(d) } if now >= d.end_unix() => {
+                ShortNames::Expired
+            }
+            ShortNamesWaiver::Allowed { .. } => ShortNames::Allowed,
+        }
+    }
+
+    /// Last day of the short names waiver, if any.
+    pub fn short_names_expires(&self) -> Option<String> {
+        match self.short_names {
+            ShortNamesWaiver::Allowed { expires: Some(d) } => Some(d.to_string()),
+            _ => None,
+        }
     }
 
     /// Weakenings accepted at compilation.
@@ -590,30 +651,82 @@ impl Checker {
         out
     }
 
-    fn short_names(&mut self, spec: &PolicySpec, mode: Mode) {
+    /// `allow_short_names` waiver. In production it needs a justification of
+    /// at least [`MIN_JUSTIFICATION_CHARS`] characters and an expiry date,
+    /// at most [`MAX_WAIVER_DAYS`] days ahead and not yet passed.
+    fn short_names(&mut self, spec: &PolicySpec, mode: Mode, now: u64) -> ShortNamesWaiver {
         if !spec.allow_short_names {
-            return;
+            return ShortNamesWaiver::Disabled;
         }
         let justification = spec
             .short_names_justification
             .as_deref()
             .map(str::trim)
             .filter(|j| !j.is_empty());
-        match (mode, justification) {
-            (Mode::Production, None) => self.issue(
-                Code::ShortNamesInProduction,
-                "allow_short_names = true en production exige short_names_justification \
-                 (les noms courts peuvent être résolus par LLMNR ou NetBIOS)"
-                    .into(),
-            ),
-            (_, j) => self.weakenings.push(Weakening {
-                kind: "allow_short_names",
-                message: format!(
-                    "noms courts acceptés (risque LLMNR/NetBIOS) ; justification : {}",
-                    j.unwrap_or("aucune (mode développement)")
-                ),
-            }),
+        let expires = match spec.short_names_expires.as_deref() {
+            None => None,
+            Some(text) => {
+                let date = Date::parse(text);
+                if date.is_none() {
+                    self.issue(
+                        Code::ShortNamesWaiver,
+                        format!(
+                            "short_names_expires = « {text} » : date attendue au format AAAA-MM-JJ"
+                        ),
+                    );
+                }
+                date
+            }
+        };
+        if let Some(d) = expires
+            && d.end_unix() > now.saturating_add(MAX_WAIVER_DAYS * DAY)
+        {
+            self.issue(
+                Code::ShortNamesWaiver,
+                format!("short_names_expires = {d} : échéance à plus d'un an ({MAX_WAIVER_DAYS} jours au plus)"),
+            );
         }
+        if mode == Mode::Production {
+            match justification {
+                None => self.issue(
+                    Code::ShortNamesInProduction,
+                    "allow_short_names = true en production exige short_names_justification \
+                     (les noms courts peuvent être résolus par LLMNR ou NetBIOS)"
+                        .into(),
+                ),
+                Some(j) if j.chars().count() < MIN_JUSTIFICATION_CHARS => self.issue(
+                    Code::ShortNamesWaiver,
+                    format!(
+                        "short_names_justification trop courte ({} caractères, {MIN_JUSTIFICATION_CHARS} au moins)",
+                        j.chars().count()
+                    ),
+                ),
+                Some(_) => {}
+            }
+            match expires {
+                None if spec.short_names_expires.is_none() => self.issue(
+                    Code::ShortNamesWaiver,
+                    "allow_short_names = true en production exige short_names_expires (AAAA-MM-JJ)".into(),
+                ),
+                Some(d) if now >= d.end_unix() => self.issue(
+                    Code::ShortNamesExpired,
+                    format!("dérogation allow_short_names expirée le {d} ; démarrage refusé en production"),
+                ),
+                _ => {}
+            }
+        }
+        self.weakenings.push(Weakening {
+            kind: "allow_short_names",
+            message: format!(
+                "noms courts acceptés (risque LLMNR/NetBIOS) jusqu'au {} ; justification : {}",
+                expires.map_or_else(
+                    || "(sans échéance, mode développement)".into(),
+                    |d| d.to_string()
+                ),
+                justification.unwrap_or("aucune (mode développement)")
+            ),
+        });
+        ShortNamesWaiver::Allowed { expires }
     }
 }
 

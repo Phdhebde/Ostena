@@ -55,7 +55,18 @@ impl Resolver for FakeResolver {
     }
 }
 
+/// 2026-11-11T12:00:00Z.
+const NOW: u64 = 1_794_398_400;
 fn scope(resolver: FakeResolver, short: bool, mode: Mode) -> Scope<FakeResolver> {
+    scope_with_clock(resolver, short, mode, Clock::from_fn(|| NOW))
+}
+
+fn scope_with_clock(
+    resolver: FakeResolver,
+    short: bool,
+    mode: Mode,
+    clock: Clock,
+) -> Scope<FakeResolver> {
     let spec = PolicySpec {
         gateway_group: "dc-paris".into(),
         allow: vec![AllowRuleSpec {
@@ -64,13 +75,15 @@ fn scope(resolver: FakeResolver, short: bool, mode: Mode) -> Scope<FakeResolver>
             ports: vec!["22".into(), "3389".into()],
         }],
         allow_short_names: short,
-        short_names_justification: Some("test".into()),
+        short_names_justification: Some("parc NetBIOS historique, ticket SEC-42".into()),
+        // Last valid day: today.
+        short_names_expires: Some("2026-11-11".into()),
         ..PolicySpec::default()
     };
-    let policy = Arc::new(CompiledPolicy::compile(&spec, mode).unwrap());
+    let policy = Arc::new(CompiledPolicy::compile_at(&spec, mode, NOW).unwrap());
     let local =
         SharedLocalAddresses::new(LocalAddresses::from_addrs(["10.0.0.2".parse().unwrap()]));
-    Scope::new(policy, local, resolver)
+    Scope::new(policy, local, resolver).with_clock(clock)
 }
 
 #[test]

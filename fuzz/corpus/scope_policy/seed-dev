@@ -1,4 +1,4 @@
 allow 0.0.0.0/0,::/0 1-65535
 except 127.0.0.0/8 lab
-short ticket-1
+short 2027-01-31 parc NetBIOS historique ticket SEC-42
 check 127.0.0.1 22
