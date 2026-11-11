@@ -1,0 +1,6 @@
+allow 10.1/8 0
+deny
+1/8 0
+den
+deny
+all

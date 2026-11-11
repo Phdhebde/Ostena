@@ -1,0 +1,4 @@
+allow
+all4
+deny
+allow  22

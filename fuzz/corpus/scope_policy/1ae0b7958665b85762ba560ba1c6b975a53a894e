@@ -1,0 +1,20 @@
+allf22
+heck ::f4 2:10.1a/10
+ahecf22
+check ::f4 22
+check ::f4 2:30.1f22
+check ::f4 2.1f22
+
+check2 ::f4: 10.1f22
+check ::f4 2.1f22
+check :30.1f22
+check ::f4 2.1f22
+
+check ::f4 2:10.1f22
+check ::f4 2.1f22
+check .1a/10
+ahecf22
+check ::f4 22
+check ::f4 2:30.1f22
+check ::f4 ::check ::f4 allow22
+c

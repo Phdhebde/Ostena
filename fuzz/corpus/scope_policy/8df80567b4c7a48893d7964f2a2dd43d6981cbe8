@@ -1,0 +1,22 @@
+allow 10.).01llow 10.0.01/8 0
+denyow 0
+deny
+allow ::0.0.0.0/104 2/8 00
+deny
+allow ::0.0.0.0/104 2/8 0
+deny
+allow ::0.
+deny
+allow ::0.0.0.0/104 22
+
+allow ::0.0.0.0/104 2/8 ::0.0.0.0/104 22
+
+allow ::0.0.0.0/104 2/8 00
+deny
+allow ::0.0.0.0/104 2/8 00
+deny
+allow ::0.0.0.0/104 2/8 0
+deny
+allow ::0.
+deny
+allow ::0.0.0.0/104 22

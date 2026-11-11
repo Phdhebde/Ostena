@@ -1,0 +1,3 @@
+allow 0.05
+except 15535
+except 2

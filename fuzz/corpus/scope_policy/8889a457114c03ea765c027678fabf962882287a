@@ -1,0 +1,9 @@
+allow tt5
+check 10n1.2.3 2E2
+check ::f.3 22
+check ffff:1 .1.2.2
+check ::f.32.3 20
+check ow `t5
+check 10n1.2.3 2E2
+check ::f.3 22
+check 3 22

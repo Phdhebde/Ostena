@@ -1,0 +1,11 @@
+allow ow ::fff0
+af:1f 0
+allow ::10
+allow all
+allow ::10
+allow ::10
+:1f 0
+allow ::10
+allow all
+allow ::10
+all0.

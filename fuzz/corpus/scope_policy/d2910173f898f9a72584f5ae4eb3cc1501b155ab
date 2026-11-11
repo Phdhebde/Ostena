@@ -1,0 +1,7 @@
+allow 10.0.01llow 10.0.01/8 0
+deny
+allow ::0.0.0.0/8 0
+deny
+allow .00104 /8 0
+deny
+allow ::0.0.0.0/104 22

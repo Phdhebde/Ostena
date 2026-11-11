@@ -1,0 +1,8 @@
+allow 10.0.0:f,0.
+allow /,/22
+allow :/22
+allow ::ffff:10ny
+allow ::fcny
+allow ::fkf
+allow ::ffff:10ny
+allow :/
