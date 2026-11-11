@@ -8,7 +8,7 @@ use crate::ids::{Jti, Kid, ResourceId, SubjectId};
 use crate::keys::Issuer;
 use crate::replay::tests::block_on;
 use crate::replay::{MemoryReplayStore, ReplayStoreError};
-use ostena_crypto::ed25519::SigningKey;
+use ostena_crypto::p256::SigningKey;
 
 const NOW: u64 = 1_800_000_000;
 const GROUP: GatewayGroupId = GatewayGroupId::from_bytes([0x42; 16]);
@@ -28,6 +28,12 @@ fn fixture() -> Fixture {
         key,
         issuer,
         verifier: Verifier::new(keys, GROUP, Policy::default()),
+    }
+}
+
+impl Issuer {
+    fn sign_ok(&self, grant: &Grant) -> SignedGrant {
+        self.sign(grant).unwrap()
     }
 }
 
@@ -56,7 +62,7 @@ fn grant(f: &Fixture) -> Grant {
 /// after a valid signature.
 fn sign_raw(key: &SigningKey, mut unsigned: [u8; SIGNED_LEN]) -> SignedGrant {
     unsigned[8..16].copy_from_slice(&Kid::of(&key.verifying_key()).to_bytes());
-    let sig = key.sign(&format::signed_message(&unsigned));
+    let sig = key.sign(&format::signed_message(&unsigned)).unwrap();
     format::assemble(&unsigned, &sig.to_bytes())
 }
 
@@ -95,7 +101,7 @@ fn text_form_round_trip() {
 #[test]
 fn e001_malformed() {
     let f = fixture();
-    let signed = f.issuer.sign(&grant(&f));
+    let signed = f.issuer.sign_ok(&grant(&f));
     assert_eq!(
         f.verifier
             .check(&signed.as_bytes()[..167], NOW)
@@ -115,7 +121,8 @@ fn e002_e003_version_and_algorithm() {
     let f = fixture();
     assert_eq!(code(&f, &tampered(&f, |b| b[3] = 2), NOW), "GRT-E002");
     // Validly signed, but announcing another algorithm: refused anyway.
-    for alg in [0u8, 2, 0xff] {
+    // 1 was Ed25519 in the first draft: refused like any other value.
+    for alg in [0u8, 1, 3, 0xff] {
         assert_eq!(code(&f, &tampered(&f, |b| b[4] = alg), NOW), "GRT-E003");
     }
 }
@@ -153,8 +160,33 @@ fn e005_unknown_kid() {
 #[test]
 fn e006_bad_signature() {
     let f = fixture();
-    let mut bytes = *f.issuer.sign(&grant(&f)).as_bytes();
+    let mut bytes = *f.issuer.sign_ok(&grant(&f)).as_bytes();
     bytes[33] ^= 1; // subject changed, not re-signed
+    assert_eq!(
+        f.verifier.check(&bytes, NOW).unwrap_err().code(),
+        "GRT-E006"
+    );
+}
+
+#[test]
+fn e006_high_s_form_of_a_valid_grant() {
+    // The P-256 group order, big-endian.
+    const N: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63,
+        0x25, 0x51,
+    ];
+    let f = fixture();
+    let mut bytes = *f.issuer.sign_ok(&grant(&f)).as_bytes();
+    assert!(f.verifier.check(&bytes, NOW).is_ok());
+    // s ← n − s: the same signature, mathematically valid, in its high form.
+    let s = &mut bytes[SIGNED_LEN + 32..];
+    let mut borrow = 0u16;
+    for i in (0..32).rev() {
+        let d = u16::from(N[i]) + 256 - u16::from(s[i]) - borrow;
+        s[i] = d.to_le_bytes()[0];
+        borrow = u16::from(d < 256);
+    }
     assert_eq!(
         f.verifier.check(&bytes, NOW).unwrap_err().code(),
         "GRT-E006"
@@ -164,7 +196,7 @@ fn e006_bad_signature() {
 #[test]
 fn e007_e008_validity_window() {
     let f = fixture();
-    let signed = f.issuer.sign(&grant(&f));
+    let signed = f.issuer.sign_ok(&grant(&f));
     // Issued up to 5 s "in the future" is tolerated.
     assert!(f.verifier.check(signed.as_bytes(), NOW - 5).is_ok());
     assert_eq!(code(&f, &signed, NOW - 6), "GRT-E007");
@@ -179,14 +211,14 @@ fn e009_out_of_bounds() {
         expires_at: NOW + 301,
         ..grant(&f)
     };
-    assert_eq!(code(&f, &f.issuer.sign(&long_ttl), NOW), "GRT-E009");
+    assert_eq!(code(&f, &f.issuer.sign_ok(&long_ttl), NOW), "GRT-E009");
     let max_ttl = Grant {
         expires_at: NOW + 300,
         ..grant(&f)
     };
     assert!(
         f.verifier
-            .check(f.issuer.sign(&max_ttl).as_bytes(), NOW)
+            .check(f.issuer.sign_ok(&max_ttl).as_bytes(), NOW)
             .is_ok()
     );
     let long_session = Grant {
@@ -196,7 +228,7 @@ fn e009_out_of_bounds() {
         },
         ..grant(&f)
     };
-    assert_eq!(code(&f, &f.issuer.sign(&long_session), NOW), "GRT-E009");
+    assert_eq!(code(&f, &f.issuer.sign_ok(&long_session), NOW), "GRT-E009");
 }
 
 #[test]
@@ -209,13 +241,13 @@ fn e011_wrong_audience() {
         },
         ..grant(&f)
     };
-    assert_eq!(code(&f, &f.issuer.sign(&other), NOW), "GRT-E011");
+    assert_eq!(code(&f, &f.issuer.sign_ok(&other), NOW), "GRT-E011");
 }
 
 #[test]
 fn e012_e013_revoked_and_retired_keys() {
     let mut f = fixture();
-    let signed = f.issuer.sign(&grant(&f));
+    let signed = f.issuer.sign_ok(&grant(&f));
     let kid = f.issuer.kid();
     f.verifier.keys_mut().retire_at(kid, NOW + 10).unwrap();
     assert!(f.verifier.check(signed.as_bytes(), NOW).is_ok());
@@ -228,7 +260,7 @@ fn e012_e013_revoked_and_retired_keys() {
 #[test]
 fn rotation_accepts_old_and_new_keys() {
     let mut f = fixture();
-    let old = f.issuer.sign(&grant(&f));
+    let old = f.issuer.sign_ok(&grant(&f));
     let next = Issuer::new(SigningKey::generate().unwrap().0);
     f.verifier.keys_mut().insert(next.verifying_key());
     assert!(f.verifier.check(old.as_bytes(), NOW).is_ok());
@@ -266,7 +298,7 @@ impl ReplayStore for FencedStore {
 #[test]
 fn e014_store_failure_refuses_and_fence_counts_as_replay() {
     let f = fixture();
-    let signed = f.issuer.sign(&grant(&f));
+    let signed = f.issuer.sign_ok(&grant(&f));
     let broken = block_on(f.verifier.verify(signed.as_bytes(), NOW, &BrokenStore));
     assert_eq!(broken.unwrap_err().code(), "GRT-E014");
     let fenced = block_on(f.verifier.verify(signed.as_bytes(), NOW, &FencedStore));
@@ -276,7 +308,7 @@ fn e014_store_failure_refuses_and_fence_counts_as_replay() {
 #[test]
 fn rejected_grant_does_not_consume_the_jti() {
     let f = fixture();
-    let signed = f.issuer.sign(&grant(&f));
+    let signed = f.issuer.sign_ok(&grant(&f));
     let store = MemoryReplayStore::new();
     let early = block_on(f.verifier.verify(signed.as_bytes(), NOW - 10, &store));
     assert_eq!(early.unwrap_err().code(), "GRT-E007");

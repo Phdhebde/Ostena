@@ -3,7 +3,7 @@
 use std::fmt;
 
 use ostena_crypto::CryptoError;
-use ostena_crypto::ed25519::VerifyingKey;
+use ostena_crypto::p256::VerifyingKey;
 
 macro_rules! uuid_id {
     ($(#[$doc:meta])* $name:ident) => {
@@ -72,7 +72,8 @@ impl Jti {
     }
 }
 
-/// Key identifier: the first 8 bytes of SHA-256 of the public key.
+/// Key identifier: the first 8 bytes of SHA-256 of the public key in its
+/// uncompressed SEC1 form (65 bytes, `0x04 ‖ x ‖ y`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Kid([u8; 8]);
 
@@ -127,8 +128,8 @@ mod tests {
 
     #[test]
     fn kid_is_derived_from_the_key() {
-        let a = ostena_crypto::ed25519::SigningKey::generate().unwrap().0;
-        let b = ostena_crypto::ed25519::SigningKey::generate().unwrap().0;
+        let a = ostena_crypto::p256::SigningKey::generate().unwrap().0;
+        let b = ostena_crypto::p256::SigningKey::generate().unwrap().0;
         assert_eq!(Kid::of(&a.verifying_key()), Kid::of(&a.verifying_key()));
         assert_ne!(Kid::of(&a.verifying_key()), Kid::of(&b.verifying_key()));
         assert_eq!(Kid::of(&a.verifying_key()).to_string().len(), 16);

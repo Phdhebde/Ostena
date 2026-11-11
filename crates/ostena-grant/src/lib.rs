@@ -1,6 +1,6 @@
 //! Short-lived session grants (ADR-0004).
 //!
-//! The core authorises a session and signs a compact binary grant with Ed25519;
+//! The core authorises a session and signs a compact binary grant with ECDSA P-256;
 //! the gateway verifies it, checks it is meant for its group, and consumes its
 //! jti once. A grant carries the authorisation, never a secret.
 //!

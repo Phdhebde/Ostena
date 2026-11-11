@@ -9,7 +9,7 @@ use crate::format::{self, GRANT_LEN, Grant, SignedGrant};
 use crate::ids::GatewayGroupId;
 use crate::keys::KeySet;
 use crate::replay::{Freshness, ReplayStore};
-use ostena_crypto::ed25519::Signature;
+use ostena_crypto::p256::Signature;
 
 /// Verification limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
