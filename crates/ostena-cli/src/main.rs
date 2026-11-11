@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod ca;
 mod control;
 mod sessions;
 
@@ -29,6 +30,108 @@ enum Command {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Root ceremony and certification of the core keys (offline workstation).
+    Ca {
+        #[command(subcommand)]
+        command: CaCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CaCommand {
+    /// The offline root.
+    Root {
+        #[command(subcommand)]
+        command: RootCommand,
+    },
+    /// A P-256 key, generated where it is used (on the core).
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+    /// The online issuing CA (agent certificates only).
+    Issuing {
+        #[command(subcommand)]
+        command: SignCommand,
+    },
+    /// The core server certificate.
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RootCommand {
+    /// Generate the root and its passphrase; write one copy per `--out`.
+    Init {
+        /// Common name of the root.
+        #[arg(long)]
+        name: String,
+        /// Validity in days.
+        #[arg(long, default_value_t = 3650)]
+        days: u32,
+        /// Output directory, one per removable medium (at least two).
+        #[arg(long = "out", required = true)]
+        outs: Vec<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    /// Generate a key (PEM, mode 0600) and its public key file.
+    New {
+        /// Private key file to create.
+        #[arg(long)]
+        key_out: PathBuf,
+        /// Public key file to carry to the ceremony.
+        #[arg(long)]
+        public_out: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SignCommand {
+    /// Certify the issuing CA key with the root (passphrase on standard input).
+    Sign {
+        /// Directory holding the root copy.
+        #[arg(long)]
+        root: PathBuf,
+        /// Public key file from `ostena ca key new`.
+        #[arg(long)]
+        public_key: PathBuf,
+        /// Common name of the issuing CA.
+        #[arg(long)]
+        name: String,
+        /// Validity in days.
+        #[arg(long, default_value_t = 365)]
+        days: u32,
+        /// Certificate to create (PEM).
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ServerCommand {
+    /// Certify the core server key with the root (passphrase on standard input).
+    Sign {
+        /// Directory holding the root copy.
+        #[arg(long)]
+        root: PathBuf,
+        /// Public key file from `ostena ca key new`.
+        #[arg(long)]
+        public_key: PathBuf,
+        /// Name the agents use to reach the core (DNS name or IP address).
+        #[arg(long = "name", required = true)]
+        names: Vec<String>,
+        /// Validity in days.
+        #[arg(long, default_value_t = 365)]
+        days: u32,
+        /// Certificate to create (PEM).
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -143,6 +246,38 @@ fn main() -> ExitCode {
                         },
                 },
         }) => repair_replay_store(&path, max_ttl_secs, clock_skew_secs),
+        Some(Command::Ca { command }) => match command {
+            CaCommand::Root {
+                command: RootCommand::Init { name, days, outs },
+            } => ca::root_init(&name, days, &outs),
+            CaCommand::Key {
+                command:
+                    KeyCommand::New {
+                        key_out,
+                        public_out,
+                    },
+            } => ca::key_new(&key_out, &public_out),
+            CaCommand::Issuing {
+                command:
+                    SignCommand::Sign {
+                        root,
+                        public_key,
+                        name,
+                        days,
+                        out,
+                    },
+            } => ca::issuing_sign(&root, &public_key, &name, days, &out),
+            CaCommand::Server {
+                command:
+                    ServerCommand::Sign {
+                        root,
+                        public_key,
+                        names,
+                        days,
+                        out,
+                    },
+            } => ca::server_sign(&root, &public_key, &names, days, &out),
+        },
     }
 }
 

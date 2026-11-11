@@ -6,9 +6,12 @@
 //! - key exchange: `SecP256r1MLKEM768` only (hybrid P-256 + ML-KEM-768); a
 //!   peer that does not offer it fails the handshake;
 //! - signatures (certificates and handshake): ECDSA P-256 / SHA-256 only;
-//! - trust: one pinned CA per side, never the system roots;
-//! - client certificate: mandatory, checked against the CA, then against an
-//!   [`ClientAuthorizer`] (the core registry: unknown or revoked agents).
+//! - trust: the agent pins the offline root and accepts only a core
+//!   certificate the root signed directly, with no intermediate; the core
+//!   trusts its issuing CAs for agent certificates; never the system roots;
+//! - client certificate: mandatory, checked against the issuing CAs, then
+//!   against a [`ClientAuthorizer`] (the core registry: unknown or revoked
+//!   agents).
 //!
 //! The transports receive the [`ClientConfig`] and [`ServerConfig`] built
 //! here; no other crate depends on rustls directly (`deny.toml`).
@@ -78,9 +81,34 @@ pub enum HandshakeFailure {
     NoClientCertificate,
     /// No common application protocol (ALPN).
     NoApplicationProtocol,
+    /// The core presented a chain: its certificate is not signed directly
+    /// by the pinned root (for example, issued by the online issuing CA).
+    NotRootIssued,
     /// Anything else (signature, encoding, peer misbehaviour, I/O).
     Other,
 }
+
+/// Text of the refusal of a core certificate not signed directly by the
+/// root; it travels in the QUIC close reason, so both ends can classify it.
+pub const NOT_ROOT_ISSUED: &str = "core certificate not issued directly by the pinned root";
+
+/// Its `Debug` form is the refusal text: rustls shows the details of an
+/// `Other` certificate error with `Debug`, and that text reaches the peer.
+struct NotRootIssued;
+
+impl fmt::Debug for NotRootIssued {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(NOT_ROOT_ISSUED)
+    }
+}
+
+impl fmt::Display for NotRootIssued {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(NOT_ROOT_ISSUED)
+    }
+}
+
+impl std::error::Error for NotRootIssued {}
 
 /// Classifies a handshake error, seen from either side.
 pub fn classify(error: &rustls::Error) -> HandshakeFailure {
@@ -112,6 +140,9 @@ pub fn classify(error: &rustls::Error) -> HandshakeFailure {
             }
             CertificateError::Revoked => HandshakeFailure::Revoked,
             CertificateError::ApplicationVerificationFailure => HandshakeFailure::UnknownClient,
+            CertificateError::Other(other) if other.0.downcast_ref::<NotRootIssued>().is_some() => {
+                HandshakeFailure::NotRootIssued
+            }
             _ => HandshakeFailure::Other,
         },
         E::NoCertificatesPresented | E::AlertReceived(AlertDescription::CertificateRequired) => {
@@ -231,12 +262,18 @@ impl TrustAnchor {
     }
 
     fn roots(&self) -> Result<Arc<RootCertStore>, TlsError> {
-        let mut roots = RootCertStore::empty();
-        roots
-            .add(self.0.clone())
-            .map_err(|e| TlsError::Config(e.to_string()))?;
-        Ok(Arc::new(roots))
+        roots(std::slice::from_ref(self))
     }
+}
+
+fn roots(anchors: &[TrustAnchor]) -> Result<Arc<RootCertStore>, TlsError> {
+    let mut roots = RootCertStore::empty();
+    for anchor in anchors {
+        roots
+            .add(anchor.0.clone())
+            .map_err(|e| TlsError::Config(e.to_string()))?;
+    }
+    Ok(Arc::new(roots))
 }
 
 /// A certificate chain and its ECDSA P-256 private key. No `Debug`.
@@ -312,10 +349,12 @@ pub trait ClientAuthorizer: Send + Sync + fmt::Debug {
 /// How a server authenticates its clients.
 #[derive(Debug, Clone)]
 pub enum ClientAuth {
-    /// Mandatory certificate from `ca`, then the registry (tunnel listener).
+    /// Mandatory certificate from one of `issuing_cas`, then the registry
+    /// (tunnel listener).
     Required {
-        /// The CA of agent certificates.
-        ca: TrustAnchor,
+        /// The issuing CAs of agent certificates: the current one, plus the
+        /// previous one during a rotation.
+        issuing_cas: Vec<TrustAnchor>,
         /// The registry.
         authorizer: Arc<dyn ClientAuthorizer>,
     },
@@ -375,22 +414,73 @@ impl ClientCertVerifier for RegistryClientVerifier {
     }
 }
 
-/// The agent side: trusts only `core_ca`, presents `identity` if given
-/// (absent only for enrolment), offers `alpn`.
+/// Accepts only a core certificate signed directly by the pinned root:
+/// a chain with an intermediate (such as the online issuing CA) is refused
+/// before any other check.
+#[derive(Debug)]
+struct RootIssuedServerVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for RootIssuedServerVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(
+                CertificateError::Other(rustls::OtherError(Arc::new(NotRootIssued))).into(),
+            );
+        }
+        // No intermediate: the only possible chain is end entity -> root.
+        self.inner
+            .verify_server_cert(end_entity, &[], server_name, ocsp, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// The agent side: trusts only a core certificate signed directly by
+/// `root`, presents `identity` if given (absent only for enrolment), offers
+/// `alpn`.
 ///
 /// # Errors
 ///
 /// [`TlsError::Config`] if rustls refuses the configuration.
 pub fn client_config(
-    core_ca: &TrustAnchor,
+    root: &TrustAnchor,
     identity: Option<&Identity>,
     alpn: &[&[u8]],
 ) -> Result<Arc<ClientConfig>, TlsError> {
     let provider = provider();
-    let verifier: Arc<dyn ServerCertVerifier> =
-        WebPkiServerVerifier::builder_with_provider(core_ca.roots()?, provider.clone())
-            .build()
-            .map_err(|e| TlsError::Config(e.to_string()))?;
+    let inner = WebPkiServerVerifier::builder_with_provider(root.roots()?, provider.clone())
+        .build()
+        .map_err(|e| TlsError::Config(e.to_string()))?;
+    let verifier: Arc<dyn ServerCertVerifier> = Arc::new(RootIssuedServerVerifier { inner });
     let builder = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TlsError::Config(e.to_string()))?
@@ -424,8 +514,11 @@ pub fn server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TlsError::Config(e.to_string()))?;
     let builder = match client_auth {
-        ClientAuth::Required { ca, authorizer } => {
-            let inner = WebPkiClientVerifier::builder_with_provider(ca.roots()?, provider)
+        ClientAuth::Required {
+            issuing_cas,
+            authorizer,
+        } => {
+            let inner = WebPkiClientVerifier::builder_with_provider(roots(&issuing_cas)?, provider)
                 .build()
                 .map_err(|e| TlsError::Config(e.to_string()))?;
             builder

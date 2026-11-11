@@ -5,6 +5,8 @@
 //! fixed and never negotiated:
 //!
 //! - [`p256`] — ECDSA P-256 / SHA-256 signatures, with strict verification;
+//! - [`tls`] and [`pki`] — the tunnel TLS configurations and certificates;
+//! - [`sealed`] — sealing of the offline root key;
 //! - [`rand`] — operating system randomness;
 //! - [`hkdf`] — HKDF-SHA-256;
 //! - [`sha256`] — digests.
@@ -15,6 +17,7 @@ pub mod hkdf;
 pub mod p256;
 pub mod pki;
 pub mod rand;
+pub mod sealed;
 pub mod sha256;
 pub mod tls;
 
