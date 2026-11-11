@@ -21,6 +21,8 @@ version = 2
 confidence-threshold = 0.93
 # The allow list is the policy, not an inventory: unused entries are fine.
 unused-allowed-license = "allow"
+# The libfuzzer-sys exception only applies to the fuzz/ workspace.
+unused-license-exception = "allow"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -36,6 +38,10 @@ exceptions = [
     # dependency of every procedural macro (serde_derive, thiserror) and is not
     # linked into the shipped binary. Scoped to this crate only.
     { crate = "unicode-ident", allow = ["Unicode-3.0"] },
+    # libfuzzer-sys bundles LLVM libFuzzer (NCSA). Only used by the fuzz/ crate,
+    # which has its own workspace and is never shipped. cargo-fuzz itself is a
+    # tool (MIT OR Apache-2.0), not a dependency.
+    { crate = "libfuzzer-sys", allow = ["NCSA"] },
 ]
 
 [licenses.private]
@@ -55,6 +61,12 @@ deny = [
     { crate = "openssl", reason = "OpenSSL is forbidden, use ostena-crypto" },
     { crate = "openssl-sys", reason = "OpenSSL is forbidden, use ostena-crypto" },
     { crate = "native-tls", reason = "OpenSSL/SChannel bindings are forbidden, use ostena-crypto" },
+    # Cryptography goes through ostena-crypto only: aws-lc-rs may be a direct
+    # dependency of ostena-crypto and nothing else (future rustls will need the
+    # same treatment), and ring is refused everywhere.
+    { crate = "aws-lc-rs", wrappers = ["ostena-crypto"], reason = "only ostena-crypto may call aws-lc-rs" },
+    { crate = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "only reachable through aws-lc-rs" },
+    { crate = "ring", reason = "use ostena-crypto (aws-lc-rs)" },
 ]
 
 [sources]

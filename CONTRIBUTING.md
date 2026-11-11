@@ -51,9 +51,12 @@ cargo xtask ci        # tout ce qui précède, dans l'ordre de la CI
 cargo xtask check-secrets  # justification de chaque exposition de secret
 cargo xtask vendor    # vendorise les dépendances dans vendor/
 cargo xtask sbom      # SBOM CycloneDX dans target/sbom/
+cargo xtask fuzz 60   # fuzzing du décodeur de grants (Linux, cargo-fuzz)
 ```
 
-Outils : `cargo install --locked cargo-deny cargo-cyclonedx`.
+Outils : `cargo install --locked cargo-deny cargo-cyclonedx cargo-fuzz`.
+
+Fuzzing : le dossier `fuzz/` est hors du workspace et utilise le nightly épinglé dans `fuzz/rust-toolchain.toml`. libFuzzer ne fonctionne de façon fiable que sous Linux. Tout fichier gardé dans `fuzz/corpus/` est rejoué par `cargo test` sur la toolchain stable.
 
 ## Construction hors ligne
 

@@ -1,5 +1,7 @@
 [workspace]
 resolver = "3"
+# Fuzzing has its own workspace (nightly toolchain, libfuzzer-sys).
+exclude = ["fuzz"]
 members = [
     "crates/ostena-common",
     "crates/ostena-crypto",
@@ -21,6 +23,11 @@ ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 
 # Third-party dependencies. Each one is justified in the PR that adds it.
+# Only ostena-crypto may depend on it (enforced by deny.toml). prebuilt-nasm: no
+# NASM needed on Windows, and it works offline.
+aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys", "alloc", "prebuilt-nasm"] }
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 secrecy = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }

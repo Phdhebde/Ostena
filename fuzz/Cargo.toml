@@ -1,0 +1,29 @@
+# Fuzzing crate, outside the main workspace: it needs a nightly toolchain
+# (fuzz/rust-toolchain.toml) and libfuzzer-sys (NCSA license, never shipped).
+# Run with `cargo xtask fuzz [seconds]`.
+[package]
+name = "ostena-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+ostena-grant = { path = "../crates/ostena-grant" }
+
+[[bin]]
+name = "grant_decode"
+path = "fuzz_targets/grant_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Its own workspace, so the main one does not pull libfuzzer-sys.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1

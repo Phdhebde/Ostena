@@ -1,14 +1,35 @@
 //! The only crate allowed to call cryptographic primitives.
 //!
-//! Every other crate goes through the API exposed here; algorithms are fixed
-//! according to ANSSI guidelines and never negotiated. Empty during L0.
+//! A thin facade over `aws-lc-rs`; `deny.toml` refuses `aws-lc-rs` as a direct
+//! dependency of any other crate, and refuses `ring` everywhere. Algorithms are
+//! fixed and never negotiated:
+//!
+//! - [`ed25519`] — signatures, with strict verification;
+//! - [`rand`] — operating system randomness;
+//! - [`hkdf`] — HKDF-SHA-256;
+//! - [`sha256`] — digests.
 
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "ostena-crypto");
-    }
+pub mod ed25519;
+pub mod hkdf;
+pub mod rand;
+pub mod sha256;
+
+/// Errors raised by this crate. Deliberately coarse: callers must not be able
+/// to tell apart the reasons of a cryptographic failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CryptoError {
+    /// The operating system random generator failed.
+    #[error("échec du générateur d'aléa du système")]
+    Random,
+    /// A key is malformed or not acceptable.
+    #[error("clé invalide")]
+    InvalidKey,
+    /// A signature does not verify.
+    #[error("signature invalide")]
+    BadSignature,
+    /// A key derivation request is out of bounds.
+    #[error("paramètres de dérivation de clé invalides")]
+    Derivation,
 }
