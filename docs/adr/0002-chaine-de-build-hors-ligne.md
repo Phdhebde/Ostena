@@ -24,3 +24,10 @@ Le produit doit pouvoir être construit et exécuté en environnement isolé (ai
 - La cible `aarch64-unknown-linux-musl` est installée mais pas encore construite en CI : il faut un éditeur de liens croisé ou un runner ARM. À traiter avec le packaging.
 - Les dépendances qui compilent du C (par exemple `aws-lc-rs`, attendu dans `ostena-crypto`) demanderont une chaîne C musl et CMake en CI et sur les postes de build. À traiter quand la dépendance arrivera.
 - La reproductibilité bit à bit des binaires (chemins, horodatages) n'est pas encore vérifiée ; ce sera une tâche `xtask` ultérieure.
+
+## Note (2026-11-11) : aws-lc-rs
+
+Constat au lot L1, sans changement de la décision :
+
+- `aws-lc-rs` (via `aws-lc-sys`) est compilé avec la crate `cc`, **sans CMake ni Go** en mode standard. Sous Windows, la fonctionnalité `prebuilt-nasm` fournit les objets assembleur précompilés livrés dans la crate : NASM est inutile et le build fonctionne hors ligne. Pour la cible musl, `musl-gcc` (paquet `musl-tools`) est nécessaire, en CI comme sur les postes de build.
+- Le futur **mode FIPS** (`aws-lc-fips-sys`) exigera en plus **CMake et Go** sur les machines de build, y compris en environnement isolé. Il faudra les intégrer à la chaîne hors ligne, en versions épinglées, le moment venu.
