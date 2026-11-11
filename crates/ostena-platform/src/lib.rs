@@ -1,0 +1,26 @@
+//! Operating system integration (ADR-0007): permission checks, and in the
+//! next lots services and local IPC.
+//!
+//! This is the only crate allowed to contain `unsafe` code, confined to the
+//! Windows FFI modules. Every `unsafe` block carries a `// SAFETY:` comment
+//! (enforced by `clippy::undocumented_unsafe_blocks`) and is exercised by a
+//! test.
+
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+pub mod acl;
+
+use ostena_common::config::PermissionChecker;
+
+/// The permission checker of this platform: Unix permissions (from
+/// `ostena-common`) or Windows ACLs.
+pub fn permission_checker() -> &'static dyn PermissionChecker {
+    #[cfg(windows)]
+    {
+        &acl::WindowsPermissions
+    }
+    #[cfg(not(windows))]
+    {
+        &ostena_common::config::DefaultPermissions
+    }
+}

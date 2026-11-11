@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-11-11
+- **Révisé** : 2026-11-11 — section `[agent]` (`CFG-V006` à `V010`, `CFG-P007` à `P010`) et `CFG-P006` sous Windows
 
 ## Contexte
 
@@ -44,8 +45,21 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P004` | production | algorithme de signature de grant autre qu'Ed25519 |
 | `CFG-P005` | production | journaux ou audit envoyés en clair (syslog UDP/TCP) vers une autre machine |
 | `CFG-P006` | production | fichier de configuration ou son dossier modifiable par un autre compte que root ou le compte du service |
+| `CFG-V006` | cohérence | `agent.gateway_group` n'est pas un UUID |
+| `CFG-V007` | cohérence | `agent.core_address` invalide (hôte:port attendu) |
+| `CFG-V008` | cohérence | chemin de l'agent non absolu |
+| `CFG-V009` | cohérence | délai d'arrêt (1 à 300 s) ou nombre de threads (1 à 64) hors bornes |
+| `CFG-V010` | cohérence | déclaration d'infrastructure invalide, ou composants Ostena placés dans `agent.scope.infrastructure` au lieu de `[[agent.infrastructure]]` |
+| `CFG-P007` | production | pas de CA dédiée au certificat du core (`agent.tls_core_ca`) |
+| `CFG-P008` | production | clé privée de l'agent lisible ou modifiable par un autre compte que le service ou les administrateurs |
+| `CFG-P009` | production | dossier du journal anti-rejeu modifiable par un autre compte |
+| `CFG-P010` | production | nom d'infrastructure impossible à résoudre au démarrage |
 
 `CFG-P006` sous Unix : le fichier (après résolution des liens symboliques) et son dossier doivent appartenir à root ou au compte du service, sans droit d'écriture pour le groupe ni pour les autres. Le compte du service est le propriétaire de `/proc/self`, ce qui évite un appel FFI `unsafe`. S'il est indisponible, seul root est accepté.
+
+`CFG-P006` sous Windows : le propriétaire et la DACL du fichier et de son dossier sont lus par `ostena-platform` (API Win32, seul crate autorisé à contenir de l'`unsafe`). Seuls SYSTEM, les Administrateurs, TrustedInstaller et le compte du service (`NT SERVICE\OstenaAgent`) peuvent en être propriétaires ou y écrire ; les entrées de refus et celles qui ne s'appliquent qu'aux enfants sont ignorées ; une DACL nulle ou un type d'entrée inconnu est refusé. Les comptes intégrés sont identifiés par leur SID, jamais par leur nom (traduit selon la langue de Windows). La vérification est injectée par un trait (`PermissionChecker`) : `load()` garde la vérification par défaut, qui refuse sous Windows, et l'agent utilise `load_with(chemin, ostena_platform::permission_checker())`.
+
+**Section `[agent]`** (détails dans l'ADR-0007) : identifiant du groupe de passerelles, adresse du core, certificat, clé privée (chargée dans un `Secret`) et CA dédiée du core, journal anti-rejeu, délai d'arrêt, threads de travail (par défaut min(4, cœurs)), politique de périmètre et composants Ostena. Les types de données de la politique de périmètre vivent dans `ostena-common` pour que tout le fichier soit analysé en une seule passe stricte ; `ostena-scope` les réexporte et les compile. `CFG-P008` et `CFG-P009` passent par le même `PermissionChecker` : la clé privée doit être réservée au compte du service (Unix : mode 600 au plus), le dossier du journal ne doit être modifiable que par lui.
 
 ### Secrets et journaux
 
@@ -64,7 +78,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 - `CFG-P002` porte sur la politique globale. Les empreintes épinglées par cible vivront dans l'inventaire du core, et le driver RDP devra refaire le contrôle à l'exécution.
 - `CFG-P005` ne voit pas un fichier de journal posé sur un montage réseau non chiffré (NFS, SMB).
 - `CFG-P006` ne contrôle que le fichier et son dossier immédiat, pas toute l'arborescence. Si le processus n'est pas « dumpable », `/proc/self` appartient à root : seul un fichier appartenant à root est alors accepté (refus par défaut).
-- **Windows : `CFG-P006` n'est pas encore implémenté** (TODO `CFG-P006-windows`). Le contrôle des ACL (écriture limitée à SYSTEM, Administrateurs et au compte du service) demande les API de sécurité Win32, donc du code `unsafe`, qui ira dans `ostena-platform`. En attendant, la règle échoue toujours sous Windows : la production y est refusée et le mode développement l'affiche en avertissement.
+- **Windows** : `CFG-P006` est implémenté dans `ostena-platform` (voir plus haut). Sans le vérificateur de la plateforme, `load()` refuse toujours la production sous Windows.
 - Les destinations syslog sont validées mais pas encore implémentées. L'initialisation des journaux renvoie `LOG-E002` tant qu'`ostena-audit` n'existe pas.
 
 ### Autres conséquences

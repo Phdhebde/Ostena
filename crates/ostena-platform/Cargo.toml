@@ -1,0 +1,17 @@
+[package]
+name = "ostena-platform"
+description = "Operating system integration: services, ACLs, local IPC. The only crate allowed to contain unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+ostena-common.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

@@ -122,7 +122,9 @@ fn parse_error_message_is_french_and_coded() {
 fn codes_are_stable_and_unique() {
     let expected = [
         "CFG-E001", "CFG-E002", "CFG-V001", "CFG-V002", "CFG-V003", "CFG-V004", "CFG-V005",
-        "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006",
+        "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
+        "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
+        "CFG-P010",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -439,7 +441,7 @@ fn load_production_fails_closed_on_windows() {
     let path = dir.write("");
     let err = load(&path).unwrap_err();
     assert_eq!(err.codes(), vec![Code::ConfigFileWritableByOthers]);
-    assert!(err.to_string().contains("CFG-P006-windows"));
+    assert!(err.to_string().contains("ostena-platform"));
 }
 
 #[test]
@@ -540,6 +542,7 @@ fn config() -> impl Strategy<Value = Config> {
                     outputs: logging,
                 },
                 audit: AuditConfig { outputs: audit },
+                agent: None,
             },
         )
 }
@@ -663,5 +666,230 @@ proptest! {
         let refused = permissions::evaluate("le fichier", Path::new("/x"), owner, mode, service).is_some();
         let expected = (owner != 0 && owner != service) || mode & 0o022 != 0;
         prop_assert_eq!(refused, expected);
+    }
+}
+
+// ---------------------------------------------------------------- agent
+
+const AGENT: &str = r#"
+[agent]
+gateway_group = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6"
+core_address = "core.corp.example:8443"
+tls_certificate = "/etc/ostena/agent.crt"
+tls_private_key = "/etc/ostena/agent.key"
+tls_core_ca = "/etc/ostena/core-ca.pem"
+replay_journal = "/var/lib/ostena/replay.journal"
+
+[[agent.scope.allow]]
+networks = ["10.0.0.0/8"]
+ports = ["22", "3389"]
+
+[[agent.infrastructure]]
+role = "core"
+addresses = ["core.corp.example", "10.0.0.5"]
+
+[[agent.infrastructure]]
+role = "postgresql"
+addresses = ["10.0.0.0/30"]
+"#;
+
+fn agent_with(replace: &str, by: &str) -> Config {
+    parse(&AGENT.replace(replace, by))
+}
+
+fn agent_codes(c: &Config) -> Vec<Code> {
+    c.validate().err().map(|v| v.codes()).unwrap_or_default()
+}
+
+#[test]
+fn agent_section_parses() {
+    let c = parse(AGENT);
+    assert!(c.validate_for_production().is_ok());
+    let a = c.agent.as_ref().unwrap();
+    assert_eq!(a.shutdown_grace_secs, 30);
+    assert_eq!(a.infrastructure.len(), 2);
+    assert_eq!(a.scope.allow[0].ports, ["22", "3389"]);
+    let policy = a.scope_policy();
+    assert_eq!(policy.gateway_group, a.gateway_group);
+    let workers = a.worker_threads();
+    assert!((1..=4).contains(&workers));
+}
+
+#[test]
+fn agent_unknown_fields_are_rejected() {
+    for (anchor, extra) in [
+        ("[agent]\n", "[agent]\nunknown = 1\n"),
+        (
+            "[[agent.scope.allow]]\n",
+            "[[agent.scope.allow]]\nunknown = 1\n",
+        ),
+        (
+            "role = \"postgresql\"\n",
+            "role = \"postgresql\"\nunknown = 1\n",
+        ),
+        ("role = \"postgresql\"", "role = \"mysql\""),
+    ] {
+        let text = AGENT.replacen(anchor, extra, 1);
+        assert_eq!(
+            Config::from_toml_str(&text).unwrap_err().codes(),
+            vec![Code::Parse],
+            "{extra}"
+        );
+    }
+}
+
+#[test]
+fn v006_gateway_group() {
+    let c = agent_with("2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6", "dc-paris");
+    assert_eq!(agent_codes(&c), vec![Code::AgentGatewayGroup]);
+}
+
+#[test]
+fn v007_core_address() {
+    for bad in [
+        "core.corp.example",
+        "core.corp.example:0",
+        "https://core:443",
+    ] {
+        let c = agent_with("core.corp.example:8443", bad);
+        assert_eq!(agent_codes(&c), vec![Code::AgentCoreAddress], "{bad}");
+    }
+}
+
+#[test]
+fn v003_v008_paths() {
+    let c = agent_with("/etc/ostena/agent.key", "agent.key");
+    assert_eq!(agent_codes(&c), vec![Code::RelativePath]);
+    let c = agent_with("/var/lib/ostena/replay.journal", "");
+    assert_eq!(agent_codes(&c), vec![Code::EmptyPath]);
+}
+
+#[test]
+fn v009_bounds() {
+    let c = agent_with(
+        "[agent]\n",
+        "[agent]\nshutdown_grace_secs = 0\nworker_threads = 65\n",
+    );
+    assert_eq!(agent_codes(&c), vec![Code::AgentBounds, Code::AgentBounds]);
+}
+
+#[test]
+fn v010_infrastructure() {
+    let c = agent_with("addresses = [\"10.0.0.0/30\"]", "addresses = []");
+    assert_eq!(agent_codes(&c), vec![Code::AgentInfrastructure]);
+    let c = agent_with("\"10.0.0.0/30\"", "\"http://db\"");
+    assert_eq!(agent_codes(&c), vec![Code::AgentInfrastructure]);
+    let c = agent_with(
+        "[[agent.scope.allow]]\n",
+        "[[agent.scope.infrastructure]]\nrole = \"core\"\nnetworks = [\"10.0.0.5\"]\n\n[[agent.scope.allow]]\n",
+    );
+    assert_eq!(agent_codes(&c), vec![Code::AgentInfrastructure]);
+    let c = agent_with(
+        "[[agent.scope.allow]]\n",
+        "[agent.scope]\ngateway_group = \"other\"\n\n[[agent.scope.allow]]\n",
+    );
+    assert_eq!(agent_codes(&c), vec![Code::AgentInfrastructure]);
+}
+
+#[test]
+fn p007_core_ca_required_in_production() {
+    let c = agent_with("tls_core_ca = \"/etc/ostena/core-ca.pem\"\n", "");
+    assert!(c.validate().is_ok());
+    assert_eq!(production_codes(&c), vec![Code::CoreCaMissing]);
+}
+
+/// Refuses the paths it is told to refuse.
+struct FakeChecker {
+    writable: Vec<PathBuf>,
+    exposed: Vec<PathBuf>,
+}
+
+impl PermissionChecker for FakeChecker {
+    fn not_writable_by_others(&self, path: &Path) -> Result<(), String> {
+        if self.writable.iter().any(|p| p == path) {
+            Err("modifiable".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn private(&self, path: &Path) -> Result<(), String> {
+        if self.exposed.iter().any(|p| p == path) {
+            Err("lisible".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[test]
+fn p006_p008_p009_through_the_injected_checker() {
+    let dir = TempDir::new("agent-perms");
+    let path = dir.write(AGENT);
+    let ok = FakeChecker {
+        writable: vec![],
+        exposed: vec![],
+    };
+    assert_eq!(load_with(&path, &ok).unwrap().weakenings, Vec::new());
+
+    let bad = FakeChecker {
+        writable: vec![path.clone(), PathBuf::from("/var/lib/ostena")],
+        exposed: vec![PathBuf::from("/etc/ostena/agent.key")],
+    };
+    let codes = load_with(&path, &bad).unwrap_err().codes();
+    assert_eq!(
+        codes,
+        vec![
+            Code::ConfigFileWritableByOthers,
+            Code::PrivateKeyExposed,
+            Code::ReplayJournalExposed
+        ]
+    );
+}
+
+#[test]
+fn private_key_is_read_into_a_secret() {
+    let dir = TempDir::new("agent-key");
+    let key = dir.0.join("agent.key");
+    std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----").unwrap();
+    let mut c = parse(AGENT);
+    let agent = c.agent.as_mut().unwrap();
+    agent.tls_private_key = key;
+    let secret = agent.read_private_key().unwrap();
+    // SECRET-EXPOSURE: test checks the loaded bytes.
+    #[expect(clippy::disallowed_methods)]
+    let bytes = secret.expose_secret();
+    assert_eq!(bytes, b"-----BEGIN PRIVATE KEY-----");
+}
+
+#[test]
+fn private_rule_on_unix_modes() {
+    let p = PathBuf::from("/etc/ostena/agent.key");
+    assert_eq!(
+        permissions::evaluate_private("le fichier", &p, 0, 0o100_600, 999),
+        None
+    );
+    assert_eq!(
+        permissions::evaluate_private("le fichier", &p, 999, 0o100_400, 999),
+        None
+    );
+    assert!(
+        permissions::evaluate_private("le fichier", &p, 0, 0o100_640, 999)
+            .unwrap()
+            .contains("chmod 600")
+    );
+    assert!(permissions::evaluate_private("le fichier", &p, 1000, 0o100_600, 999).is_some());
+}
+
+proptest! {
+    #[test]
+    fn prop_v009_iff_out_of_bounds(grace in 0u64..1_000, workers in proptest::option::of(0usize..100)) {
+        let mut c = parse(AGENT);
+        let a = c.agent.as_mut().unwrap();
+        a.shutdown_grace_secs = grace;
+        a.worker_threads = workers;
+        let n = agent_codes(&c).iter().filter(|x| **x == Code::AgentBounds).count();
+        let expected = usize::from(!(1..=300).contains(&grace)) + usize::from(workers.is_some_and(|w| !(1..=64).contains(&w)));
+        prop_assert_eq!(n, expected);
     }
 }

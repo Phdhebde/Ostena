@@ -8,6 +8,7 @@ members = [
     "crates/ostena-grant",
     "crates/ostena-scope",
     "crates/ostena-frame",
+    "crates/ostena-platform",
     "crates/ostena-cli",
     "xtask",
 ]
@@ -24,6 +25,7 @@ ostena-common = { path = "crates/ostena-common" }
 ostena-frame = { path = "crates/ostena-frame" }
 ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
+ostena-platform = { path = "crates/ostena-platform" }
 ostena-scope = { path = "crates/ostena-scope" }
 
 # Third-party dependencies. Each one is justified in the PR that adds it.
@@ -31,6 +33,8 @@ ostena-scope = { path = "crates/ostena-scope" }
 # NASM needed on Windows, and it works offline.
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys", "alloc", "prebuilt-nasm"] }
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+# Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
 # Test only: proves the scope decision does not allocate.
 dhat = "0.3.3"
 # Lists the agent interface addresses (no std API for it).
