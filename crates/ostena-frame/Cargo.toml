@@ -1,0 +1,22 @@
+[package]
+name = "ostena-frame"
+description = "Versioned binary framing between the gateway and the browser (no_std + alloc)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+# No dependency: the crate is also built for wasm32-unknown-unknown.
+[dependencies]
+
+[dev-dependencies]
+dhat.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
+
+[lints]
+workspace = true

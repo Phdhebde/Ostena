@@ -9,3 +9,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0003](0003-format-et-validation-de-la-configuration.md) | Format et validation de la configuration | Accepté |
 | [0004](0004-format-des-grants.md) | Format des grants | Accepté |
 | [0005](0005-perimetre-et-anti-ssrf.md) | Contrôle de périmètre et anti-SSRF | Accepté |
+| [0006](0006-framing-passerelle-navigateur.md) | Framing binaire entre la passerelle et le navigateur | Accepté |

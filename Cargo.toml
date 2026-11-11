@@ -7,6 +7,7 @@ members = [
     "crates/ostena-crypto",
     "crates/ostena-grant",
     "crates/ostena-scope",
+    "crates/ostena-frame",
     "crates/ostena-cli",
     "xtask",
 ]
@@ -20,6 +21,7 @@ repository = "https://github.com/Phdhebde/Ostena"
 
 [workspace.dependencies]
 ostena-common = { path = "crates/ostena-common" }
+ostena-frame = { path = "crates/ostena-frame" }
 ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 ostena-scope = { path = "crates/ostena-scope" }

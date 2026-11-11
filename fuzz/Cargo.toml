@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
 ostena-scope = { path = "../crates/ostena-scope" }
 
@@ -42,3 +43,16 @@ members = ["."]
 
 [profile.release]
 debug = 1
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_reassembly"
+path = "fuzz_targets/frame_reassembly.rs"
+test = false
+doc = false
+bench = false

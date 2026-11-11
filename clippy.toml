@@ -4,7 +4,7 @@ allow-panic-in-tests = true
 allow-print-in-tests = true
 
 # Protocol and standard names that are not code identifiers.
-doc-valid-idents = ["EdDSA", "CycloneDX", "RustSec", "NetBIOS", "LLMNR", "NAT64", "IPv4", "IPv6", ".."]
+doc-valid-idents = ["EdDSA", "CycloneDX", "RustSec", "NetBIOS", "LLMNR", "NAT64", "IPv4", "IPv6", "HelloAck", "WebSocket", "WebAssembly", ".."]
 
 # Reading a secret must be visible in review: every call needs
 # `#[expect(clippy::disallowed_methods)]` under a `// SECRET-EXPOSURE: <reason>`
