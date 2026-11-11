@@ -1,0 +1,5 @@
+low 0.0.0.0/0,short
+infray
+allow ::fbff:10.0.0.0,::/0 1-6,535
+except 127.0.0.0/9 lab
+s2

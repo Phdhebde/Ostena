@@ -1,0 +1,10 @@
+low 0.0.05
+except 127.0.0.0/8 l,::/0 1-6,
+except 127.0.0.0/8 lab
+allow 0w 0.0.05
+except 127.0.0.0/8 .535
+except 127.0.0.0/8 lab
+allow 0w 0.0.05
+except 127.0.0.0/8 .0.0.0/0,::/01-6,535
+except 127.0.0.0/8 lab
+s2

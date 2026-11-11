@@ -1,0 +1,4 @@
+allf22
+check ::f4 2:10.f22
+check ::f4 2:10.1f22
+check ::f4 2:10.1allow22

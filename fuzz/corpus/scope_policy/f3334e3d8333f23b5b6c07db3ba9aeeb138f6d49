@@ -1,0 +1,9 @@
+allow 10.0
+deny
+a 00
+deny
+a 05.8 0
+deny
+al 0
+deny
+a104 22

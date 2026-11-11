@@ -1,0 +1,23 @@
+allow 10.0.0.0/8,2001:db8::/32 22,3389,5900-5910
+deny 10.66.0.0/16
+infra 10.0.0.5
+check 
+infra 10.0.0.5
+check 10.1.2.3 22
+check 10.1.2.3 22
+,2001:db8::/32 22,3389,5900-5910
+deny 10.66.0.0/16
+infra 10.0.0.5
+check 
+infra 10.0.0.5
+check 10.1.2.3 22
+check 10.1.2.3 22
+checa 
+infra 10.0.0.5
+check 10.1.2.3 22
+check 10.1.2.3 22
+check ::ffff:10.1.2.k ::ffff:10.1.2.3 2checa 
+infra 10.0.0.5
+check 10.1.2.3 22
+check 10.1.2.3 22
+check ::ffff:10.1.2.k ::ffff:10.1.2.3 22

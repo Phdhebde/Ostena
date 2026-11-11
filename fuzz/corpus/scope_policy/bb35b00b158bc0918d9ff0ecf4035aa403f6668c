@@ -1,0 +1,6 @@
+allow 10.allw y
+all0 1/65535
+except 128.0.0.0/8 lab128.0.0.0/8 lab
+short 
+s~:rt Qi0 1-65535
+except 128.0.0.0/8 lab3

@@ -1,0 +1,18 @@
+allow 0.0.0.0/0,::/0 1-6
+exceptexcept 127.:/0 1-6
+except 127.0.0.0/8 lab
+short ticket-1
+check 127.0.0.1 22
+ab
+short tick0.0.0/8 lab
+short ticket-1
+check 127.0.0.1 22
+ab
+short ticket-1
+check 127.0.0llow 0.0.0.0/0,::/0 1-6
+except 127.0.0.0/8 lab
+short ticket-1
+check 127.0.0.1 22
+ab
+short ticket-1
+check 127.0.0.1 22

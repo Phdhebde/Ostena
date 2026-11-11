@@ -1,0 +1,13 @@
+low 0.0.0.0/0,shor
+exceptinfray
+allow ::fbff:75.0.0.0/104 22
+.0.0.5t
+i
+infray
+allow ::fbff:79.0.0.0/104 22
+.0.0.5t
+infray
+allow ::fbff:10.0.0.0/104 22
+.0.0.5
+ch0,5.e
+530/86.xcept 0.127.0.00.0/86.xcept 0.127.0.00

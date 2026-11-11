@@ -5,6 +5,9 @@
 /vendor/
 /.cargo/vendor.toml
 
+# Heap profile written by dhat-based tests
+dhat-heap.json
+
 # SBOMs produced by cargo-cyclonedx before xtask gathers them
 *.cdx.json
 *.cdx.xml

@@ -1,0 +1,2 @@
+allow dbg,10.1.2.3 22
+check ::ffff:low 51.0.0.1

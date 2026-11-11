@@ -13,10 +13,25 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4.13"
 ostena-grant = { path = "../crates/ostena-grant" }
+ostena-scope = { path = "../crates/ostena-scope" }
 
 [[bin]]
 name = "grant_decode"
 path = "fuzz_targets/grant_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scope_target"
+path = "fuzz_targets/scope_target.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scope_policy"
+path = "fuzz_targets/scope_policy.rs"
 test = false
 doc = false
 bench = false

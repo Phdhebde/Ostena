@@ -1,0 +1,4 @@
+allow 0.0.0.0/0,::/0 1-65535
+except 127.0.0.0/8 lab
+short ticket-1
+check 127.0.0.1 22

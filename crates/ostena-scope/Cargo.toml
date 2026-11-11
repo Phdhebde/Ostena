@@ -1,0 +1,26 @@
+[package]
+name = "ostena-scope"
+description = "Target scope control and anti-SSRF: allowed networks, floor, resolution pinning."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+if-addrs.workspace = true
+ostena-common.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+dhat.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "decision"
+harness = false
+
+[lints]
+workspace = true

@@ -51,7 +51,8 @@ cargo xtask ci        # tout ce qui précède, dans l'ordre de la CI
 cargo xtask check-secrets  # justification de chaque exposition de secret
 cargo xtask vendor    # vendorise les dépendances dans vendor/
 cargo xtask sbom      # SBOM CycloneDX dans target/sbom/
-cargo xtask fuzz 60   # fuzzing du décodeur de grants (Linux, cargo-fuzz)
+cargo xtask fuzz 60   # 60 s par cible de fuzz (Linux, cargo-fuzz)
+cargo bench -p ostena-scope   # banc de la décision de périmètre (affiché, sans seuil)
 ```
 
 Outils : `cargo install --locked cargo-deny cargo-cyclonedx cargo-fuzz`.

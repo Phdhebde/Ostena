@@ -1,0 +1,35 @@
+allow 10.0.0.1/8 0
+deny
+a .0.0.1/9 0
+deny
+a.0.0.1/8 0
+deny
+al  0
+deny
+a.0.0.1/8 0
+deny
+al 010.0.0.al  0
+deny
+a.1/8 0
+deny
+a104010.0.0.1/9 0
+deny
+a.0.0.1/8 0
+deny
+al  0
+deny
+a.0.0.1/8 0
+deny
+al 010.0.0.al  0
+deny
+a.1/8 0
+deny
+a104010.0.0.1/8 0
+deny
+a10422 
+deny
+.0.1/8 0
+deny
+a10422 
+deny
+al 010.0.0.1/

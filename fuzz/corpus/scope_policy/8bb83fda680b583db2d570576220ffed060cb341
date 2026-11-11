@@ -1,0 +1,7 @@
+allow 0.0.0.0/0,::/0 1-65535
+e/8 lab
+shcheck 127. 0.low 0.0.0.0/0,shor
+infray
+allow ::fbff:107.0.0.0/104 22
+.~.0.5t
+0.0.1 22

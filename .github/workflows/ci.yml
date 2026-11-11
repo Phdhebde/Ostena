@@ -60,6 +60,9 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       - run: cargo test --workspace --locked
+      # Displayed only: no regression gate yet (ADR-0005).
+      - if: runner.os == 'Linux'
+        run: cargo bench --locked -p ostena-scope
 
   deny:
     runs-on: ubuntu-24.04
