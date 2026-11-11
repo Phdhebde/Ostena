@@ -8,7 +8,10 @@ targets = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
-    "wasm32-unknown-unknown",
+    # wasm32-unknown-unknown is left out: the only wasm crate, ostena-frame,
+    # has no dependency, and native crates would show their wasm-only
+    # dependencies (quinn-proto pulls ring there). Add it back, scoped, with
+    # ostena-web-client.
 ]
 
 [advisories]
@@ -65,9 +68,12 @@ deny = [
     # Cryptography goes through ostena-crypto only (ADR-0009): aws-lc-rs,
     # rustls and rcgen may be direct dependencies of ostena-crypto, and of the
     # libraries ostena-crypto drives, nothing else. ring is refused everywhere.
-    { crate = "aws-lc-rs", wrappers = ["ostena-crypto", "rustls", "rustls-webpki", "rcgen"], reason = "only ostena-crypto may call aws-lc-rs" },
+    { crate = "aws-lc-rs", wrappers = ["ostena-crypto", "rustls", "rustls-webpki", "rcgen", "quinn-proto"], reason = "only ostena-crypto may call aws-lc-rs" },
     { crate = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "only reachable through aws-lc-rs" },
-    { crate = "rustls", wrappers = ["ostena-crypto"], reason = "TLS configurations are built by ostena-crypto::tls only" },
+    { crate = "rustls", wrappers = ["ostena-crypto", "quinn", "quinn-proto"], reason = "TLS configurations are built by ostena-crypto::tls only; quinn only carries them" },
+    # QUIC is the tunnel's business only (ADR-0008).
+    { crate = "quinn", wrappers = ["ostena-tunnel"], reason = "QUIC is used by ostena-tunnel only" },
+    { crate = "quinn-proto", wrappers = ["quinn"], reason = "only reachable through quinn" },
     { crate = "rustls-webpki", wrappers = ["rustls"], reason = "certificate verification only through rustls" },
     { crate = "rcgen", wrappers = ["ostena-crypto"], reason = "certificates are issued by ostena-crypto::pki only" },
     { crate = "ring", reason = "use ostena-crypto (aws-lc-rs)" },
