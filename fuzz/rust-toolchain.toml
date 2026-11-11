@@ -1,0 +1,5 @@
+# Dated nightly for cargo-fuzz (sanitizers need unstable flags). Read by
+# `cargo xtask fuzz`; bump it deliberately, like the stable toolchain.
+[toolchain]
+channel = "nightly-2026-11-01"
+profile = "minimal"

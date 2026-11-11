@@ -24,6 +24,7 @@ Tasks:
   check-secrets  Check that every secret exposure is justified
   vendor         Vendor all dependencies into vendor/ for offline builds
   sbom           Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
+  fuzz [SECS]    Run the grant decoder fuzzer (default 60 s; needs cargo-fuzz, Linux)
   help           Print this message
 ";
 
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         Some("check-secrets") => check_secrets(),
         Some("vendor") => vendor(),
         Some("sbom") => sbom(),
+        Some("fuzz") => fuzz(std::env::args().nth(2).as_deref()),
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
@@ -200,9 +202,61 @@ fn collect_sboms(dir: &Path, out_dir: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Fuzz target run by `cargo xtask fuzz`.
+const FUZZ_TARGET: &str = "grant_decode";
+
+/// Runs the fuzzer with the nightly pinned in `fuzz/rust-toolchain.toml`.
+/// libFuzzer is only reliable on Linux (the CI runs it there).
+fn fuzz(seconds: Option<&str>) -> Result<()> {
+    let seconds: u32 = seconds
+        .map_or(Ok(60), str::parse)
+        .map_err(|_| "fuzz duration must be a number of seconds")?;
+    let root = workspace_root()?;
+    let channel = fuzz_toolchain(&fs::read_to_string(root.join("fuzz/rust-toolchain.toml"))?)
+        .ok_or("no channel in fuzz/rust-toolchain.toml")?;
+    // The rustup proxy, not $CARGO: `+toolchain` selects the pinned nightly.
+    let mut cmd = Command::new("cargo");
+    cmd.env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .arg(format!("+{channel}"))
+        .args(["fuzz", "run", FUZZ_TARGET, "--"])
+        .arg(format!("-max_total_time={seconds}"));
+    run(cmd)
+}
+
+/// Reads `channel = "..."` from a rust-toolchain.toml.
+fn fuzz_toolchain(toml: &str) -> Option<String> {
+    toml.lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("channel"))
+        .and_then(|rest| rest.trim_start().strip_prefix('='))
+        .map(|v| v.trim().trim_matches('"').to_owned())
+        .filter(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_fuzz_toolchain() {
+        let toml = "# comment
+[toolchain]
+channel = \"nightly-2026-11-01\"
+profile = \"minimal\"
+";
+        assert_eq!(fuzz_toolchain(toml).as_deref(), Some("nightly-2026-11-01"));
+        assert_eq!(
+            fuzz_toolchain(
+                "[toolchain]
+"
+            ),
+            None
+        );
+        let real =
+            fs::read_to_string(workspace_root().unwrap().join("fuzz/rust-toolchain.toml")).unwrap();
+        assert!(fuzz_toolchain(&real).is_some_and(|c| c.starts_with("nightly-")));
+    }
 
     #[test]
     fn workspace_root_contains_manifest() {

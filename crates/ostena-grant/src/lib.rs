@@ -18,6 +18,8 @@ pub mod keys;
 pub mod replay;
 pub mod verify;
 
+#[doc(hidden)]
+pub mod fuzz;
 
 pub use error::GrantError;
 pub use format::{Claims, GRANT_LEN, Grant, Protocol, Rights, SignedGrant, TEXT_LEN};
