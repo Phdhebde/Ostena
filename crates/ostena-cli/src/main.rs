@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod control;
+mod sessions;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -63,8 +65,16 @@ enum AgentCommand {
         #[arg(long, hide = true)]
         service: bool,
     },
-    /// Service state (exit code 0 running, 3 stopped, 4 not installed).
-    Status,
+    /// Service state and what the agent reports (exit code 0 running, 3
+    /// stopped, 4 not installed).
+    Status {
+        /// Configuration file (for the control endpoint).
+        #[arg(long, default_value_os_t = agent::default_config())]
+        config: PathBuf,
+        /// Query a foreground agent with this process id (development).
+        #[arg(long)]
+        pid: Option<u32>,
+    },
     /// Anti-replay journal of the gateway.
     ReplayStore {
         #[command(subcommand)]
@@ -120,8 +130,8 @@ fn main() -> ExitCode {
             command: AgentCommand::Run { config, service },
         }) => agent::run(&config, service),
         Some(Command::Agent {
-            command: AgentCommand::Status,
-        }) => agent::status(),
+            command: AgentCommand::Status { config, pid },
+        }) => agent::status(&config, pid),
         Some(Command::Agent {
             command:
                 AgentCommand::ReplayStore {
