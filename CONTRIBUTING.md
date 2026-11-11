@@ -52,6 +52,7 @@ cargo xtask check-secrets  # justification de chaque exposition de secret
 cargo xtask vendor    # vendorise les dépendances dans vendor/
 cargo xtask sbom      # SBOM CycloneDX dans target/sbom/
 cargo xtask fuzz 60   # 60 s par cible de fuzz (Linux, cargo-fuzz)
+cargo xtask footprint # mémoire au repos de l'agent (version optimisée)
 cargo bench -p ostena-scope   # banc de la décision de périmètre (affiché, sans seuil)
 cargo bench -p ostena-frame   # banc du décodage des trames (affiché, sans seuil)
 cargo build -p ostena-frame --target wasm32-unknown-unknown   # cœur protocolaire du client web
