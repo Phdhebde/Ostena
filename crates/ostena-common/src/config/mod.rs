@@ -13,6 +13,7 @@
 //! [`Secret`](crate::secret::Secret) where they are used. See ADR-0003.
 
 mod permissions;
+pub mod scope;
 mod validation;
 
 use std::fmt;
