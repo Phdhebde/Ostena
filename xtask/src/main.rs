@@ -24,7 +24,8 @@ Tasks:
   check-secrets  Check that every secret exposure is justified
   vendor         Vendor all dependencies into vendor/ for offline builds
   sbom           Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
-  fuzz [SECS]    Run the grant decoder fuzzer (default 60 s; needs cargo-fuzz, Linux)
+  fuzz [SECS] [TARGET...]
+                 Run fuzz targets, each for SECS (default 60, all targets)
   help           Print this message
 ";
 
@@ -40,7 +41,7 @@ fn main() -> ExitCode {
         Some("check-secrets") => check_secrets(),
         Some("vendor") => vendor(),
         Some("sbom") => sbom(),
-        Some("fuzz") => fuzz(std::env::args().nth(2).as_deref()),
+        Some("fuzz") => fuzz(&std::env::args().skip(2).collect::<Vec<_>>()),
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
@@ -203,14 +204,28 @@ fn collect_sboms(dir: &Path, out_dir: &Path) -> Result<usize> {
 }
 
 /// Fuzz target run by `cargo xtask fuzz`.
-const FUZZ_TARGET: &str = "grant_decode";
+const FUZZ_TARGETS: [&str; 3] = ["grant_decode", "scope_target", "scope_policy"];
 
-/// Runs the fuzzer with the nightly pinned in `fuzz/rust-toolchain.toml`.
-/// libFuzzer is only reliable on Linux (the CI runs it there).
-fn fuzz(seconds: Option<&str>) -> Result<()> {
-    let seconds: u32 = seconds
-        .map_or(Ok(60), str::parse)
+/// Runs each fuzz target (all by default) for `SECS` seconds with the nightly
+/// pinned in `fuzz/rust-toolchain.toml`. libFuzzer is only reliable on Linux
+/// (the CI runs it there).
+fn fuzz(args: &[String]) -> Result<()> {
+    let seconds: u32 = args
+        .first()
+        .map_or(Ok(60), |s| s.parse())
         .map_err(|_| "fuzz duration must be a number of seconds")?;
+    let targets: Vec<&str> = if args.len() > 1 {
+        args[1..].iter().map(String::as_str).collect()
+    } else {
+        FUZZ_TARGETS.to_vec()
+    };
+    if let Some(unknown) = targets.iter().find(|t| !FUZZ_TARGETS.contains(t)) {
+        return Err(format!(
+            "unknown fuzz target {unknown} (known: {})",
+            FUZZ_TARGETS.join(", ")
+        )
+        .into());
+    }
     let root = workspace_root()?;
     let channel = fuzz_toolchain(&fs::read_to_string(root.join("fuzz/rust-toolchain.toml"))?)
         .ok_or("no channel in fuzz/rust-toolchain.toml")?;
@@ -218,14 +233,17 @@ fn fuzz(seconds: Option<&str>) -> Result<()> {
     // prebuilt CI binary), and AddressSanitizer refuses a static libc: always
     // build for the host.
     let host = host_triple(&channel)?;
-    // The rustup proxy, not $CARGO: `+toolchain` selects the pinned nightly.
-    let mut cmd = Command::new("cargo");
-    cmd.env_remove("RUSTUP_TOOLCHAIN")
-        .env_remove("RUSTC")
-        .arg(format!("+{channel}"))
-        .args(["fuzz", "run", "--target", &host, FUZZ_TARGET, "--"])
-        .arg(format!("-max_total_time={seconds}"));
-    run(cmd)
+    for target in targets {
+        // The rustup proxy, not $CARGO: `+toolchain` selects the pinned nightly.
+        let mut cmd = Command::new("cargo");
+        cmd.env_remove("RUSTUP_TOOLCHAIN")
+            .env_remove("RUSTC")
+            .arg(format!("+{channel}"))
+            .args(["fuzz", "run", "--target", &host, target, "--"])
+            .arg(format!("-max_total_time={seconds}"));
+        run(cmd)?;
+    }
+    Ok(())
 }
 
 /// Host triple of a toolchain, from `rustc -vV`.
