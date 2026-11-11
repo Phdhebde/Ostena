@@ -214,14 +214,38 @@ fn fuzz(seconds: Option<&str>) -> Result<()> {
     let root = workspace_root()?;
     let channel = fuzz_toolchain(&fs::read_to_string(root.join("fuzz/rust-toolchain.toml"))?)
         .ok_or("no channel in fuzz/rust-toolchain.toml")?;
+    // cargo-fuzz defaults to the target it was itself built for (musl for the
+    // prebuilt CI binary), and AddressSanitizer refuses a static libc: always
+    // build for the host.
+    let host = host_triple(&channel)?;
     // The rustup proxy, not $CARGO: `+toolchain` selects the pinned nightly.
     let mut cmd = Command::new("cargo");
     cmd.env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC")
         .arg(format!("+{channel}"))
-        .args(["fuzz", "run", FUZZ_TARGET, "--"])
+        .args(["fuzz", "run", "--target", &host, FUZZ_TARGET, "--"])
         .arg(format!("-max_total_time={seconds}"));
     run(cmd)
+}
+
+/// Host triple of a toolchain, from `rustc -vV`.
+fn host_triple(channel: &str) -> Result<String> {
+    let output = Command::new("rustc")
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .arg(format!("+{channel}"))
+        .arg("-vV")
+        .output()?;
+    parse_host(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| format!("no host triple in `rustc +{channel} -vV`").into())
+}
+
+/// Reads the `host: <triple>` line of `rustc -vV`.
+fn parse_host(version: &str) -> Option<String> {
+    version
+        .lines()
+        .find_map(|l| l.strip_prefix("host:"))
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
 }
 
 /// Reads `channel = "..."` from a rust-toolchain.toml.
@@ -237,6 +261,23 @@ fn fuzz_toolchain(toml: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_host_triple() {
+        let out = "rustc 1.101.0-nightly (f9ceb4a4d 2026-10-31)
+binary: rustc
+host: x86_64-unknown-linux-gnu
+release: 1.101.0-nightly
+";
+        assert_eq!(parse_host(out).as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(
+            parse_host(
+                "rustc 1.0
+"
+            ),
+            None
+        );
+    }
 
     #[test]
     fn reads_fuzz_toolchain() {
