@@ -177,10 +177,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostena-frame"
+version = "0.0.0"
+
+[[package]]
 name = "ostena-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "ostena-frame",
  "ostena-grant",
  "ostena-scope",
 ]

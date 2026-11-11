@@ -204,7 +204,13 @@ fn collect_sboms(dir: &Path, out_dir: &Path) -> Result<usize> {
 }
 
 /// Fuzz target run by `cargo xtask fuzz`.
-const FUZZ_TARGETS: [&str; 3] = ["grant_decode", "scope_target", "scope_policy"];
+const FUZZ_TARGETS: [&str; 5] = [
+    "grant_decode",
+    "scope_target",
+    "scope_policy",
+    "frame_decode",
+    "frame_reassembly",
+];
 
 /// Runs each fuzz target (all by default) for `SECS` seconds with the nightly
 /// pinned in `fuzz/rust-toolchain.toml`. libFuzzer is only reliable on Linux
