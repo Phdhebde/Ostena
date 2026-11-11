@@ -14,7 +14,7 @@ Le bastion doit refuser de démarrer dans une configuration qui affaiblit sa sé
 
 - Un **fichier TOML unique**, lu par `ostena_common::config::load`.
 - **Désérialisation stricte** : `deny_unknown_fields` sur toutes les structures, y compris les variantes des destinations de journaux. `Stdout` est une variante struct vide (`Stdout {}`), car serde ignore les champs inconnus sur une variante unitaire d'enum à tag interne. Pas de `#[serde(flatten)]`, qui désactive ce contrôle.
-- **Défauts sûrs** : un fichier vide donne une configuration valide en production. Mode `production`, `ssh.host_key_verification = "strict"`, `rdp.certificate_validation = "pinned"`, pas de repli NTLM, grants `ed25519`, transport syslog `tls`.
+- **Défauts sûrs** : un fichier vide donne une configuration valide en production. Mode `production`, `ssh.host_key_verification = "strict"`, `rdp.certificate_validation = "pinned"`, pas de repli NTLM, grants `ecdsa-p256-sha256`, transport syslog `tls`.
 - Les options dangereuses n'existent pas quand elles n'ont aucun usage légitime : par exemple, il n'y a pas de valeur `off` pour la vérification de clé hôte SSH.
 - **Aucun secret dans la configuration.** Un secret est référencé par un chemin et chargé dans un `Secret<…>` à l'usage. `Config` reste donc `Debug` sans risque : un champ `Secret` ne pourrait pas y être ajouté sans casser `derive(Debug)`, ce que prouve un test trybuild.
 
@@ -42,7 +42,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P001` | production | vérification de clé hôte SSH non stricte (`accept-new`) |
 | `CFG-P002` | production | certificat RDP des cibles ni épinglé ni validé par une PKI |
 | `CFG-P003` | production | repli NTLM autorisé alors qu'un mot de passe est délégué |
-| `CFG-P004` | production | algorithme de signature de grant autre qu'Ed25519 |
+| `CFG-P004` | production | algorithme de signature de grant autre qu'ECDSA P-256 / SHA-256 (`ecdsa-p256-sha256`, ADR-0004) |
 | `CFG-P005` | production | journaux ou audit envoyés en clair (syslog UDP/TCP) vers une autre machine |
 | `CFG-P006` | production | fichier de configuration ou son dossier modifiable par un autre compte que root ou le compte du service |
 | `CFG-V006` | cohérence | `agent.gateway_group` n'est pas un UUID |

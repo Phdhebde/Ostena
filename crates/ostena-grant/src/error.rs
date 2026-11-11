@@ -11,8 +11,10 @@ pub enum GrantError {
     /// Format version not supported.
     #[error("[GRT-E002] version de grant non prise en charge : {0}")]
     UnsupportedVersion(u8),
-    /// Algorithm other than Ed25519.
-    #[error("[GRT-E003] algorithme de signature interdit : {0} (seul Ed25519 est accepté)")]
+    /// Algorithm other than ECDSA P-256 / SHA-256 (value 2).
+    #[error(
+        "[GRT-E003] algorithme de signature interdit : {0} (seul ECDSA P-256 / SHA-256, valeur 2, est accepté)"
+    )]
     AlgorithmNotAllowed(u8),
     /// Unknown protocol, unknown right, or inconsistent value.
     #[error("[GRT-E004] champ de grant invalide : {0}")]

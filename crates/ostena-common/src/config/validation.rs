@@ -6,8 +6,11 @@ use std::path::Path;
 
 use super::{CertificateValidation, Config, HostKeyVerification, Output, Transport};
 
-/// Signature algorithm names that are recognised, so that the non-EdDSA ones
-/// are refused in production with a clear message rather than as unknown.
+/// The only grant signature algorithm accepted in production (ADR-0004).
+pub const GRANT_SIGNATURE_ALGORITHM: &str = "ecdsa-p256-sha256";
+
+/// Signature algorithm names that are recognised, so that the other ones are
+/// refused in production with a clear message rather than as unknown.
 pub const KNOWN_SIGNATURE_ALGORITHMS: &[&str] = &[
     "ed25519",
     "ecdsa-p256-sha256",
@@ -39,8 +42,8 @@ pub enum Code {
     RdpCertificateNotValidated,
     /// NTLM allowed while a password is delegated.
     NtlmWithPasswordDelegation,
-    /// Grant signature algorithm other than Ed25519.
-    GrantAlgorithmNotEd25519,
+    /// Grant signature algorithm other than ECDSA P-256 / SHA-256.
+    GrantAlgorithmNotEcdsaP256,
     /// Logs or audit sent unencrypted to another machine.
     UnencryptedRemoteOutput,
     /// Configuration file or directory writable by another account.
@@ -80,7 +83,7 @@ impl Code {
         Self::SshHostKeyNotStrict,
         Self::RdpCertificateNotValidated,
         Self::NtlmWithPasswordDelegation,
-        Self::GrantAlgorithmNotEd25519,
+        Self::GrantAlgorithmNotEcdsaP256,
         Self::UnencryptedRemoteOutput,
         Self::ConfigFileWritableByOthers,
         Self::AgentGatewayGroup,
@@ -108,7 +111,7 @@ impl Code {
             Self::SshHostKeyNotStrict => "CFG-P001",
             Self::RdpCertificateNotValidated => "CFG-P002",
             Self::NtlmWithPasswordDelegation => "CFG-P003",
-            Self::GrantAlgorithmNotEd25519 => "CFG-P004",
+            Self::GrantAlgorithmNotEcdsaP256 => "CFG-P004",
             Self::UnencryptedRemoteOutput => "CFG-P005",
             Self::ConfigFileWritableByOthers => "CFG-P006",
             Self::AgentGatewayGroup => "CFG-V006",
@@ -131,7 +134,7 @@ impl Code {
             Self::SshHostKeyNotStrict
                 | Self::RdpCertificateNotValidated
                 | Self::NtlmWithPasswordDelegation
-                | Self::GrantAlgorithmNotEd25519
+                | Self::GrantAlgorithmNotEcdsaP256
                 | Self::UnencryptedRemoteOutput
                 | Self::ConfigFileWritableByOthers
                 | Self::CoreCaMissing
@@ -240,7 +243,7 @@ pub(crate) fn consistency(config: &Config) -> Vec<Violation> {
             Code::UnknownSignatureAlgorithm,
             format!(
                 "grant.signature_algorithm = \"{algorithm}\" est inconnu ; seule la valeur \
-                 \"ed25519\" est prise en charge."
+                 \"{GRANT_SIGNATURE_ALGORITHM}\" est prise en charge."
             ),
         ));
     }
@@ -299,12 +302,12 @@ pub(crate) fn weakenings(config: &Config) -> Vec<Violation> {
     }
 
     let algorithm = config.grant.signature_algorithm.as_str();
-    if algorithm != "ed25519" && KNOWN_SIGNATURE_ALGORITHMS.contains(&algorithm) {
+    if algorithm != GRANT_SIGNATURE_ALGORITHM && KNOWN_SIGNATURE_ALGORITHMS.contains(&algorithm) {
         out.push(Violation::new(
-            Code::GrantAlgorithmNotEd25519,
+            Code::GrantAlgorithmNotEcdsaP256,
             format!(
                 "grant.signature_algorithm = \"{algorithm}\" : seuls les grants signés en \
-                 Ed25519 (EdDSA) sont acceptés en production."
+                 ECDSA P-256 / SHA-256 sont acceptés en production."
             ),
         ));
     }

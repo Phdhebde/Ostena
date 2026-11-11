@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use ostena_crypto::CryptoError;
-use ostena_crypto::ed25519::{SigningKey, VerifyingKey};
+use ostena_crypto::p256::{SigningKey, VerifyingKey};
 
 use crate::error::GrantError;
 use crate::format::{self, Claims, Grant, SignedGrant};
@@ -130,7 +130,8 @@ impl Issuer {
     ///
     /// # Errors
     ///
-    /// [`CryptoError::Random`] if no jti can be drawn.
+    /// [`CryptoError::Random`] if no jti can be drawn, [`CryptoError::Signing`] if
+    /// the signature fails.
     pub fn issue(&self, claims: &Claims, now: u64) -> Result<SignedGrant, CryptoError> {
         let grant = Grant {
             kid: self.kid,
@@ -142,14 +143,14 @@ impl Issuer {
             issued_at: now,
             expires_at: now.saturating_add(u64::from(self.ttl_secs)),
         };
-        Ok(self.sign(&grant))
+        self.sign(&grant)
     }
 
     /// Signs arbitrary grant content (tests and tooling).
-    pub(crate) fn sign(&self, grant: &Grant) -> SignedGrant {
+    pub(crate) fn sign(&self, grant: &Grant) -> Result<SignedGrant, CryptoError> {
         let unsigned = format::encode_unsigned(grant);
-        let signature = self.key.sign(&format::signed_message(&unsigned));
-        format::assemble(&unsigned, &signature.to_bytes())
+        let signature = self.key.sign(&format::signed_message(&unsigned))?;
+        Ok(format::assemble(&unsigned, &signature.to_bytes()))
     }
 }
 

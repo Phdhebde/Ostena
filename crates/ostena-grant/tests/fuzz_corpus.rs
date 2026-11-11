@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use ostena_common::secret::SecretBytes;
-use ostena_crypto::ed25519::SigningKey;
+use ostena_crypto::p256::SigningKey;
 use ostena_grant::{Claims, GatewayGroupId, Issuer, Protocol, ResourceId, Rights, SubjectId};
 
 fn corpus_dir() -> PathBuf {
@@ -23,24 +23,39 @@ fn replay_fuzz_corpus() {
     assert!(count > 0, "empty corpus");
 }
 
+/// The RFC 6979 appendix A.2.5 P-256 test key (public test vector), whose
+/// public key the fuzz harness trusts.
+#[expect(clippy::expect_used, reason = "test helper on a fixed test vector")]
+fn harness_key() -> SigningKey {
+    // PKCS#8 wrapping of the scalar, without the optional public key.
+    let mut der = vec![
+        0x30, 0x41, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
+        0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x27, 0x30, 0x25,
+        0x02, 0x01, 0x01, 0x04, 0x20,
+    ];
+    der.extend_from_slice(&[
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16, 0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6,
+        0x93, 0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12, 0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f,
+        0x67, 0x21,
+    ]);
+    SigningKey::from_pkcs8(&SecretBytes::from(der)).expect("RFC 6979 key")
+}
+
+#[test]
+fn harness_key_matches_the_fuzz_key() {
+    assert_eq!(
+        harness_key().verifying_key().to_bytes(),
+        ostena_grant::fuzz::FUZZ_KEY
+    );
+}
+
 /// Regenerates the seed inputs: `cargo test -p ostena-grant --test fuzz_corpus -- --ignored`.
-/// The valid seed is signed with the RFC 8032 test 1 key, which the fuzz
-/// harness trusts, so the fuzzer starts from grants that pass the signature.
+/// The valid seed is signed with the key the fuzz harness trusts, so the
+/// fuzzer starts from grants that pass the signature.
 #[test]
 #[ignore = "writes files; run on demand"]
 fn write_seed_corpus() {
-    // PKCS#8 v1 wrapping of the RFC 8032 section 7.1 TEST 1 secret key (public test vector).
-    let mut der = vec![
-        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
-        0x20,
-    ];
-    der.extend_from_slice(&[
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ]);
-    let key = SigningKey::from_pkcs8(&SecretBytes::from(der)).expect("RFC 8032 key");
-    let issuer = Issuer::new(key);
+    let issuer = Issuer::new(harness_key());
     let claims = Claims {
         subject: SubjectId::from_bytes([1; 16]),
         resource: ResourceId::from_bytes([2; 16]),
@@ -62,13 +77,11 @@ fn write_seed_corpus() {
 /// never reaches the code behind the signature.
 #[test]
 fn valid_seed_passes_the_harness_verifier() {
-    let pk = [
-        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
-        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
-        0x51, 0x1a,
-    ];
     let mut keys = ostena_grant::KeySet::new();
-    keys.insert(ostena_crypto::ed25519::VerifyingKey::from_bytes(&pk).expect("valid key"));
+    keys.insert(
+        ostena_crypto::p256::VerifyingKey::from_bytes(&ostena_grant::fuzz::FUZZ_KEY)
+            .expect("valid key"),
+    );
     let verifier = ostena_grant::Verifier::new(
         keys,
         GatewayGroupId::from_bytes([0; 16]),

@@ -24,7 +24,9 @@ use serde::Deserialize;
 
 pub use agent::{AgentConfig, InfrastructureEndpoint};
 pub use permissions::{DefaultPermissions, PermissionChecker};
-pub use validation::{Code, KNOWN_SIGNATURE_ALGORITHMS, Violation, Violations};
+pub use validation::{
+    Code, GRANT_SIGNATURE_ALGORITHM, KNOWN_SIGNATURE_ALGORITHMS, Violation, Violations,
+};
 
 /// The whole configuration file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -108,14 +110,14 @@ pub enum CertificateValidation {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GrantConfig {
-    /// Signature algorithm. Only `ed25519` is accepted in production.
+    /// Signature algorithm. Only `ecdsa-p256-sha256` is accepted in production.
     pub signature_algorithm: String,
 }
 
 impl Default for GrantConfig {
     fn default() -> Self {
         Self {
-            signature_algorithm: "ed25519".to_owned(),
+            signature_algorithm: GRANT_SIGNATURE_ALGORITHM.to_owned(),
         }
     }
 }

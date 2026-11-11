@@ -4,7 +4,7 @@
 //! |---|---|---|
 //! | 0 | 3 | magic `OSG` |
 //! | 3 | 1 | version = 1 |
-//! | 4 | 1 | algorithm = 1 (Ed25519) |
+//! | 4 | 1 | algorithm = 2 (ECDSA P-256 / SHA-256) |
 //! | 5 | 1 | protocol |
 //! | 6 | 2 | reserved, 0 |
 //! | 8 | 8 | kid |
@@ -16,12 +16,16 @@
 //! | 84 | 4 | maximum session length (s) |
 //! | 88 | 8 | issued at (Unix s) |
 //! | 96 | 8 | expires at (Unix s) |
-//! | 104 | 64 | Ed25519 signature over `DOMAIN ‖ bytes[0..104]` |
+//! | 104 | 64 | ECDSA P-256 / SHA-256 signature over `DOMAIN ‖ bytes[0..104]`, raw `r ‖ s`, low-S |
 //!
 //! Text form: base64url without padding, 224 characters.
+//!
+//! Algorithm 1 (Ed25519, the first draft) is refused like any other value.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+use ostena_crypto::p256::SIGNATURE_LEN;
 
 use crate::error::GrantError;
 use crate::ids::{GatewayGroupId, Jti, Kid, ResourceId, SubjectId};
@@ -35,6 +39,9 @@ pub const TEXT_LEN: usize = 224;
 // including the null terminator, UTF-16 when INFO_UNICODE is set
 // ([MS-RDPBCGR] 2.2.1.11.1.1). 224 characters take 450 bytes.
 const _: () = assert!(TEXT_LEN * 2 + 2 <= 512);
+// The raw P-256 signature keeps the grant at 168 bytes (224 characters).
+const _: () = assert!(SIGNED_LEN + SIGNATURE_LEN == GRANT_LEN);
+const _: () = assert!(GRANT_LEN.div_ceil(3) * 4 == TEXT_LEN);
 /// Length of the signed part (everything before the signature).
 pub(crate) const SIGNED_LEN: usize = 104;
 /// Domain separation prefix, signed but not transmitted.
@@ -42,7 +49,8 @@ pub(crate) const DOMAIN: &[u8; 16] = b"ostena-grant-v1\0";
 
 const MAGIC: [u8; 3] = *b"OSG";
 const VERSION: u8 = 1;
-const ALG_ED25519: u8 = 1;
+/// ECDSA P-256 / SHA-256, the only accepted value.
+const ALG_ECDSA_P256_SHA256: u8 = 2;
 
 /// Protocol a grant opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -213,7 +221,7 @@ pub(crate) fn parse_header(bytes: &[u8; GRANT_LEN]) -> Result<Kid, GrantError> {
     if bytes[3] != VERSION {
         return Err(GrantError::UnsupportedVersion(bytes[3]));
     }
-    if bytes[4] != ALG_ED25519 {
+    if bytes[4] != ALG_ECDSA_P256_SHA256 {
         return Err(GrantError::AlgorithmNotAllowed(bytes[4]));
     }
     Ok(Kid::from_bytes(array(bytes, 8)))
@@ -261,7 +269,7 @@ pub(crate) fn encode_unsigned(grant: &Grant) -> [u8; SIGNED_LEN] {
     let mut out = [0u8; SIGNED_LEN];
     out[0..3].copy_from_slice(&MAGIC);
     out[3] = VERSION;
-    out[4] = ALG_ED25519;
+    out[4] = ALG_ECDSA_P256_SHA256;
     out[5] = grant.claims.protocol as u8;
     out[8..16].copy_from_slice(&grant.kid.to_bytes());
     out[16..32].copy_from_slice(&grant.jti.to_bytes());
@@ -284,7 +292,7 @@ pub(crate) fn signed_message(signed: &[u8]) -> [u8; DOMAIN.len() + SIGNED_LEN] {
 }
 
 /// Assembles a signed grant.
-pub(crate) fn assemble(signed: &[u8; SIGNED_LEN], signature: &[u8; 64]) -> SignedGrant {
+pub(crate) fn assemble(signed: &[u8; SIGNED_LEN], signature: &[u8; SIGNATURE_LEN]) -> SignedGrant {
     let mut out = [0u8; GRANT_LEN];
     out[..SIGNED_LEN].copy_from_slice(signed);
     out[SIGNED_LEN..].copy_from_slice(signature);
@@ -304,7 +312,7 @@ mod tests {
 
     #[test]
     fn lengths() {
-        assert_eq!(SIGNED_LEN + 64, GRANT_LEN);
+        assert_eq!(SIGNED_LEN + SIGNATURE_LEN, GRANT_LEN);
         assert_eq!(GRANT_LEN.div_ceil(3) * 4, TEXT_LEN);
         assert_eq!(URL_SAFE_NO_PAD.encode([0u8; GRANT_LEN]).len(), TEXT_LEN);
     }

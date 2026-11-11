@@ -39,7 +39,7 @@ fn empty_file_gives_safe_defaults() {
         CertificateValidation::Pinned
     );
     assert!(!config.rdp.ntlm_fallback);
-    assert_eq!(config.grant.signature_algorithm, "ed25519");
+    assert_eq!(config.grant.signature_algorithm, "ecdsa-p256-sha256");
     assert_eq!(config.logging.outputs, vec![Output::Stdout {}]);
     assert!(config.validate_for_production().is_ok());
 }
@@ -57,7 +57,7 @@ fn full_example_parses() {
         password_delegation = true
         ntlm_fallback = false
         [grant]
-        signature_algorithm = "ed25519"
+        signature_algorithm = "ecdsa-p256-sha256"
         [logging]
         level = "debug"
         [[logging.outputs]]
@@ -174,7 +174,7 @@ fn v004_unknown_algorithm() {
         vec![Code::UnknownSignatureAlgorithm]
     );
     // Not reported twice as P004.
-    assert!(!has(&config, Code::GrantAlgorithmNotEd25519));
+    assert!(!has(&config, Code::GrantAlgorithmNotEcdsaP256));
 }
 
 #[test]
@@ -239,16 +239,16 @@ fn p003_ntlm_with_password_delegation() {
 }
 
 #[test]
-fn p004_non_ed25519_grant() {
+fn p004_grant_not_ecdsa_p256() {
     for algorithm in KNOWN_SIGNATURE_ALGORITHMS
         .iter()
-        .filter(|a| **a != "ed25519")
+        .filter(|a| **a != GRANT_SIGNATURE_ALGORITHM)
     {
         let config = parse(&format!("[grant]\nsignature_algorithm = \"{algorithm}\""));
         assert!(config.validate().is_ok());
         assert_eq!(
             production_codes(&config),
-            vec![Code::GrantAlgorithmNotEd25519]
+            vec![Code::GrantAlgorithmNotEcdsaP256]
         );
     }
 }
@@ -297,7 +297,7 @@ fn all_violations_are_reported_at_once() {
             Code::SshHostKeyNotStrict,
             Code::RdpCertificateNotValidated,
             Code::NtlmWithPasswordDelegation,
-            Code::GrantAlgorithmNotEd25519,
+            Code::GrantAlgorithmNotEcdsaP256,
             Code::UnencryptedRemoteOutput,
         ]
     );
@@ -577,11 +577,11 @@ proptest! {
     }
 
     #[test]
-    fn prop_p004_iff_known_non_ed25519(c in config()) {
+    fn prop_p004_iff_known_non_ecdsa_p256(c in config()) {
         let a = c.grant.signature_algorithm.as_str();
         prop_assert_eq!(
-            has(&c, Code::GrantAlgorithmNotEd25519),
-            a != "ed25519" && KNOWN_SIGNATURE_ALGORITHMS.contains(&a)
+            has(&c, Code::GrantAlgorithmNotEcdsaP256),
+            a != GRANT_SIGNATURE_ALGORITHM && KNOWN_SIGNATURE_ALGORITHMS.contains(&a)
         );
     }
 
