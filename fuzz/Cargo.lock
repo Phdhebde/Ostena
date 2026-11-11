@@ -445,6 +445,7 @@ dependencies = [
  "rustls",
  "thiserror",
  "time",
+ "zeroize",
 ]
 
 [[package]]
