@@ -4,6 +4,7 @@
 //! dependency of any other crate, and refuses `ring` everywhere. Algorithms are
 //! fixed and never negotiated:
 //!
+//! - [`p256`] — ECDSA P-256 / SHA-256 signatures, with strict verification;
 //! - [`ed25519`] — signatures, with strict verification;
 //! - [`rand`] — operating system randomness;
 //! - [`hkdf`] — HKDF-SHA-256;
@@ -13,6 +14,7 @@
 
 pub mod ed25519;
 pub mod hkdf;
+pub mod p256;
 pub mod rand;
 pub mod sha256;
 
@@ -32,4 +34,7 @@ pub enum CryptoError {
     /// A key derivation request is out of bounds.
     #[error("paramètres de dérivation de clé invalides")]
     Derivation,
+    /// The library failed to produce a signature.
+    #[error("échec de la signature")]
+    Signing,
 }
