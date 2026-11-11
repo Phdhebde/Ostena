@@ -24,6 +24,7 @@ Tasks:
   check-secrets  Check that every secret exposure is justified
   vendor         Vendor all dependencies into vendor/ for offline builds
   sbom           Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
+  footprint      Measure the idle memory of the agent (release build)
   fuzz [SECS] [TARGET...]
                  Run fuzz targets, each for SECS (default 60, all targets)
   help           Print this message
@@ -41,6 +42,7 @@ fn main() -> ExitCode {
         Some("check-secrets") => check_secrets(),
         Some("vendor") => vendor(),
         Some("sbom") => sbom(),
+        Some("footprint") => footprint(),
         Some("fuzz") => fuzz(&std::env::args().skip(2).collect::<Vec<_>>()),
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
@@ -203,6 +205,84 @@ fn collect_sboms(dir: &Path, out_dir: &Path) -> Result<usize> {
     Ok(count)
 }
 
+/// Indicative idle footprint target (ADR-0007): displayed, not enforced.
+const FOOTPRINT_TARGET_MIB: f64 = 20.0;
+
+/// Starts a release agent in the foreground with a development
+/// configuration, waits for its `agent.idle_footprint` event (5 s after
+/// start) and prints the resident memory.
+fn footprint() -> Result<()> {
+    use std::io::BufRead;
+    use std::process::Stdio;
+
+    let root = workspace_root()?;
+    let mut build = cargo();
+    build.args(["build", "--release", "--locked", "--package", "ostena-cli"]);
+    run(build)?;
+    let exe = root
+        .join("target/release")
+        .join(format!("ostena{}", std::env::consts::EXE_SUFFIX));
+
+    let dir = std::env::temp_dir().join(format!("ostena-footprint-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("state"))?;
+    let path = |p: &str| dir.join(p).display().to_string().replace('\\', "\\\\");
+    let endpoint = if cfg!(windows) {
+        format!(r"\\\\.\\pipe\\ostena-footprint-{}", std::process::id())
+    } else {
+        path("run/agent.sock")
+    };
+    let config = format!(
+        "mode = \"development\"\n\n[agent]\ngateway_group = \"00000000-0000-0000-0000-000000000000\"\n\
+         core_address = \"core.invalid:8443\"\ntls_certificate = \"{}\"\ntls_private_key = \"{}\"\n\
+         replay_journal = \"{}\"\ncontrol_endpoint = \"{endpoint}\"\n",
+        path("agent.crt"),
+        path("agent.key"),
+        path("state/replay.journal"),
+    );
+    let file = dir.join("ostena.toml");
+    fs::write(&file, config)?;
+
+    eprintln!("$ {} agent run --config {}", exe.display(), file.display());
+    let mut child = Command::new(&exe)
+        .args(["agent", "run", "--config"])
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().ok_or("no agent output")?;
+    let line = std::io::BufReader::new(stdout)
+        .lines()
+        .map_while(std::result::Result::ok)
+        .find(|l| l.contains("agent.idle_footprint"));
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&dir);
+
+    let line = line.ok_or("the agent stopped before reporting its footprint")?;
+    let bytes = resident_bytes_of(&line).ok_or_else(|| format!("no resident_bytes in: {line}"))?;
+    #[expect(clippy::cast_precision_loss, reason = "display only")]
+    let mib = bytes as f64 / 1_048_576.0;
+    let verdict = if mib <= FOOTPRINT_TARGET_MIB {
+        "within"
+    } else {
+        "ABOVE"
+    };
+    println!(
+        "idle footprint: {mib:.1} MiB resident ({verdict} the indicative {FOOTPRINT_TARGET_MIB} MiB target)"
+    );
+    Ok(())
+}
+
+/// `"resident_bytes":12345` in a JSON log line.
+fn resident_bytes_of(line: &str) -> Option<u64> {
+    let rest = line.split("\"resident_bytes\":").nth(1)?;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
 /// Fuzz target run by `cargo xtask fuzz`.
 const FUZZ_TARGETS: [&str; 5] = [
     "grant_decode",
@@ -285,6 +365,13 @@ fn fuzz_toolchain(toml: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_resident_bytes() {
+        let line = r#"{"fields":{"event":"agent.idle_footprint","resident_bytes":9437184},"level":"INFO"}"#;
+        assert_eq!(resident_bytes_of(line), Some(9_437_184));
+        assert_eq!(resident_bytes_of(r#"{"resident_bytes":null}"#), None);
+    }
 
     #[test]
     fn reads_host_triple() {
