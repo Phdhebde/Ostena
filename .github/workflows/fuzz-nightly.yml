@@ -1,0 +1,57 @@
+name: Fuzz (nightly)
+
+# One hour per fuzz target, every night, in parallel. Crashes are published
+# as artifacts. Keep the list in sync with FUZZ_TARGETS in xtask (checked by
+# its tests).
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fuzz:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # The dated nightly pinned in fuzz/rust-toolchain.toml.
+      - run: rustup toolchain install
+        working-directory: fuzz
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          shared-key: fuzz
+          save-if: false
+          workspaces: |
+            . -> target
+            fuzz -> target
+      - run: cargo xtask fuzz 3600 ${{ matrix.target }}
+      # Crash inputs (crash-*, leak-*, timeout-*, oom-*), to reproduce with
+      # `cargo fuzz run <target> <file>` and add to the corpus once fixed.
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 90
