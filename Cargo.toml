@@ -34,7 +34,8 @@ ostena-scope = { path = "crates/ostena-scope" }
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys", "alloc", "prebuilt-nasm"] }
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 # Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Services"] }
 # Test only: proves the scope decision does not allocate.
 dhat = "0.3.3"
 # Lists the agent interface addresses (no std API for it).
