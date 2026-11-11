@@ -1,68 +1,135 @@
 //! Entry point of the single `ostena` binary.
 //!
-//! Roles are enabled at installation time. During L0 the binary only answers
-//! `--version` and `--help`; argument parsing moves to `clap` with the first
-//! real subcommand.
+//! Roles are enabled at installation time; subcommands are added as lots
+//! deliver them.
 
 #![forbid(unsafe_code)]
 
-use std::io::{self, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "\
-Usage: ostena [OPTIONS]
+use clap::{CommandFactory, Parser, Subcommand};
+use ostena_common::config::LoggingConfig;
 
-Options:
-  -h, --help       Print help
-  -V, --version    Print version
-";
-
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let (code, out, err) = run(&args);
-    // Nothing sensible can be done if the standard streams are closed.
-    let _ = io::stdout().lock().write_all(out.as_bytes());
-    let _ = io::stderr().lock().write_all(err.as_bytes());
-    code
+/// Ostena administration bastion.
+#[derive(Debug, Parser)]
+#[command(name = "ostena", version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-/// Runs the command line and returns the exit code with stdout and stderr contents.
-fn run(args: &[String]) -> (ExitCode, String, String) {
-    match args.first().map(String::as_str) {
-        None | Some("-h" | "--help") => (ExitCode::SUCCESS, USAGE.to_owned(), String::new()),
-        Some("-V" | "--version") => (
-            ExitCode::SUCCESS,
-            format!("ostena {}\n", ostena_common::VERSION),
-            String::new(),
-        ),
-        Some(other) => (
-            ExitCode::from(2),
-            String::new(),
-            format!("error: unexpected argument '{other}'\n\n{USAGE}"),
-        ),
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Gateway agent operations.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// Anti-replay journal of the gateway.
+    ReplayStore {
+        #[command(subcommand)]
+        command: ReplayStoreCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReplayStoreCommand {
+    /// Rebuild a damaged journal. The original is kept as
+    /// `<path>.corrupt-<time>`, and grants issued before the repair are refused.
+    /// The agent must be stopped.
+    Repair {
+        /// Journal path.
+        #[arg(long)]
+        path: PathBuf,
+        /// Longest grant lifetime accepted by the agent, in seconds.
+        #[arg(long, default_value_t = 300)]
+        max_ttl_secs: u64,
+        /// Clock tolerance of the agent, in seconds.
+        #[arg(long, default_value_t = 5)]
+        clock_skew_secs: u64,
+    },
+}
+
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Help and version also arrive here, with exit code 0.
+            let _ = e.print();
+            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(2));
+        }
+    };
+    match cli.command {
+        None => {
+            let _ = Cli::command().print_help();
+            ExitCode::SUCCESS
+        }
+        Some(Command::Agent {
+            command:
+                AgentCommand::ReplayStore {
+                    command:
+                        ReplayStoreCommand::Repair {
+                            path,
+                            max_ttl_secs,
+                            clock_skew_secs,
+                        },
+                },
+        }) => repair_replay_store(&path, max_ttl_secs, clock_skew_secs),
+    }
+}
+
+/// `ostena agent replay-store repair`: logs `replay_store.repaired` or
+/// `replay_store.repair_failed` as JSON on standard output.
+fn repair_replay_store(
+    path: &std::path::Path,
+    max_ttl_secs: u64,
+    clock_skew_secs: u64,
+) -> ExitCode {
+    if ostena_common::logging::init(&LoggingConfig::default()).is_err() {
+        return ExitCode::FAILURE;
+    }
+    let now = ostena_grant::unix_now();
+    let fence = now
+        .saturating_add(max_ttl_secs)
+        .saturating_add(clock_skew_secs);
+    match ostena_grant::replay::repair(path, now, fence) {
+        Ok(report) => {
+            tracing::info!(
+                event = "replay_store.repaired",
+                path = %path.display(),
+                backup = %report.backup.display(),
+                kept = report.kept,
+                dropped = report.dropped,
+                truncated_bytes = report.truncated_bytes,
+                fence = report.fence,
+                "journal anti-rejeu reconstruit ; l'original est conservé"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(
+                event = "replay_store.repair_failed",
+                path = %path.display(),
+                "{e}"
+            );
+            ExitCode::FAILURE
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use clap::CommandFactory;
 
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| (*s).to_owned()).collect()
-    }
+    use super::Cli;
 
     #[test]
-    fn version_flag_prints_version() {
-        let (_, out, err) = run(&args(&["--version"]));
-        assert_eq!(out, format!("ostena {}\n", ostena_common::VERSION));
-        assert_eq!(err, "");
-    }
-
-    #[test]
-    fn unknown_argument_is_rejected() {
-        let (code, out, err) = run(&args(&["--nope"]));
-        assert_eq!(code, std::process::ExitCode::from(2));
-        assert_eq!(out, "");
-        assert!(err.contains("'--nope'"));
+    fn command_line_definition_is_consistent() {
+        Cli::command().debug_assert();
     }
 }

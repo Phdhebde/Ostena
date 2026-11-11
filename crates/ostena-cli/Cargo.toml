@@ -12,7 +12,10 @@ name = "ostena"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 ostena-common.workspace = true
+ostena-grant.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
