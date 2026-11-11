@@ -5,14 +5,12 @@
 //! fixed and never negotiated:
 //!
 //! - [`p256`] — ECDSA P-256 / SHA-256 signatures, with strict verification;
-//! - [`ed25519`] — signatures, with strict verification;
 //! - [`rand`] — operating system randomness;
 //! - [`hkdf`] — HKDF-SHA-256;
 //! - [`sha256`] — digests.
 
 #![forbid(unsafe_code)]
 
-pub mod ed25519;
 pub mod hkdf;
 pub mod p256;
 pub mod rand;
