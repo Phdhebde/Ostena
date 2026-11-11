@@ -1,9 +1,10 @@
 //! Shared foundations for every Ostena crate.
 //!
-//! Will host strict TOML configuration, typed errors, structured logging,
-//! metrics and `Secret<…>` types. Empty during L0.
+//! - [`secret`]: `Secret<T>`, values that cannot be printed or logged.
 
 #![forbid(unsafe_code)]
+
+pub mod secret;
 
 /// Product version, taken from the workspace manifest.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

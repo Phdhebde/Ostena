@@ -1,0 +1,14 @@
+error[E0599]: `Secret<str>` doesn't implement `std::fmt::Display`
+ --> tests/ui/to_string.rs:5:20
+  |
+5 |     let _ = secret.to_string();
+  |                    ^^^^^^^^^ method cannot be called on `Secret<str>` due to unsatisfied trait bounds
+  |
+ ::: src/secret.rs
+  |
+  | pub struct Secret<T: Zeroize + ?Sized>(SecretBox<T>);
+  | -------------------------------------- doesn't satisfy `Secret<str>: ToString` or `Secret<str>: std::fmt::Display`
+  |
+  = note: the following trait bounds were not satisfied:
+          `Secret<str>: std::fmt::Display`
+          which is required by `Secret<str>: ToString`

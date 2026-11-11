@@ -5,3 +5,11 @@ allow-print-in-tests = true
 
 # Protocol and standard names that are not code identifiers.
 doc-valid-idents = ["EdDSA", "CycloneDX", "RustSec", ".."]
+
+# Reading a secret must be visible in review: every call needs
+# `#[expect(clippy::disallowed_methods)]` under a `// SECRET-EXPOSURE: <reason>`
+# comment (checked by `cargo xtask check-secrets`).
+disallowed-methods = [
+  { path = "ostena_common::secret::Secret::expose_secret", reason = "secret exposure must be justified: add `// SECRET-EXPOSURE: <reason>` and `#[expect(clippy::disallowed_methods)]`" },
+  { path = "ostena_common::secret::Secret::expose_secret_mut", reason = "secret exposure must be justified: add `// SECRET-EXPOSURE: <reason>` and `#[expect(clippy::disallowed_methods)]`" },
+]
