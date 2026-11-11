@@ -62,7 +62,9 @@ jobs:
       - run: cargo test --workspace --locked
       # Displayed only: no regression gate yet (ADR-0005).
       - if: runner.os == 'Linux'
-        run: cargo bench --locked -p ostena-scope
+        run: |
+          cargo bench --locked -p ostena-scope
+          cargo bench --locked -p ostena-frame
 
   deny:
     runs-on: ubuntu-24.04
@@ -101,6 +103,18 @@ jobs:
           name: ostena-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/ostena
           retention-days: 7
+
+  build-wasm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      # ostena-frame is also the protocol core of the browser client.
+      - run: cargo build --locked --release -p ostena-frame --target wasm32-unknown-unknown
 
   build-windows:
     runs-on: windows-2025
