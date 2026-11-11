@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub use crate::error::{Code, PlatformError};
+
 #[cfg(target_os = "linux")]
 mod systemd;
 #[cfg(windows)]
@@ -24,53 +26,6 @@ pub const RESTART_BURST: u32 = 3;
 pub const RESTART_WINDOW_SECS: u64 = 600;
 /// Delay before an automatic restart, in seconds.
 pub const RESTART_DELAY_SECS: u64 = 5;
-
-/// Stable error codes of the agent platform layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Code {
-    /// Administrator (root) rights needed.
-    Privileges,
-    /// Installation failed.
-    Install,
-    /// Uninstallation failed.
-    Uninstall,
-    /// Service state unavailable.
-    State,
-    /// Service runtime failure.
-    Runtime,
-}
-
-impl Code {
-    /// The code as written in messages, e.g. `AGT-E001`.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Privileges => "AGT-E001",
-            Self::Install => "AGT-E002",
-            Self::Uninstall => "AGT-E003",
-            Self::State => "AGT-E004",
-            Self::Runtime => "AGT-E005",
-        }
-    }
-}
-
-/// A platform failure, with a stable code and a French message.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("[{}] {message}", code.as_str())]
-pub struct PlatformError {
-    /// Stable code.
-    pub code: Code,
-    /// What went wrong.
-    pub message: String,
-}
-
-impl PlatformError {
-    pub(crate) fn new(code: Code, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-        }
-    }
-}
 
 /// What to install.
 #[derive(Debug, Clone, PartialEq, Eq)]
