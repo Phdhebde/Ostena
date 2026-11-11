@@ -124,7 +124,7 @@ fn codes_are_stable_and_unique() {
         "CFG-E001", "CFG-E002", "CFG-V001", "CFG-V002", "CFG-V003", "CFG-V004", "CFG-V005",
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
-        "CFG-P010",
+        "CFG-P010", "CFG-V011",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -891,5 +891,33 @@ proptest! {
         let n = agent_codes(&c).iter().filter(|x| **x == Code::AgentBounds).count();
         let expected = usize::from(!(1..=300).contains(&grace)) + usize::from(workers.is_some_and(|w| !(1..=64).contains(&w)));
         prop_assert_eq!(n, expected);
+    }
+}
+
+#[test]
+fn v011_control_endpoint() {
+    for ok in [
+        r"\\.\pipe\ostena-dev",
+        "/run/ostena/agent.sock",
+        "/tmp/ostena-dev/agent.sock",
+    ] {
+        let c = agent_with(
+            "[agent]\n",
+            &format!("[agent]\ncontrol_endpoint = '{ok}'\n"),
+        );
+        assert_eq!(agent_codes(&c), vec![], "{ok}");
+    }
+    for bad in [
+        "agent.sock",
+        r"\\.\pipe\",
+        r"\\server\pipe\x",
+        r"\\.\pipe\a\b",
+        r"C:\agent.sock",
+    ] {
+        let c = agent_with(
+            "[agent]\n",
+            &format!("[agent]\ncontrol_endpoint = '{bad}'\n"),
+        );
+        assert_eq!(agent_codes(&c), vec![Code::ControlEndpoint], "{bad}");
     }
 }
