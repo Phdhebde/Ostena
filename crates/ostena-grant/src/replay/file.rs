@@ -294,6 +294,20 @@ impl FileReplayStore {
         Ok(removed)
     }
 
+    /// Flushes the journal to disk (`fsync`), e.g. before stopping. Every
+    /// record is already synced when written; this also covers metadata.
+    ///
+    /// # Errors
+    ///
+    /// The store is poisoned or the file cannot be synced.
+    pub fn sync(&self) -> Result<(), ReplayStoreError> {
+        let inner = self.lock()?;
+        inner
+            .file
+            .sync_all()
+            .map_err(|e| io_err("impossible de synchroniser", &self.path, &e))
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>, ReplayStoreError> {
         let inner = self
             .inner
@@ -432,6 +446,16 @@ mod tests {
 
     fn consume(store: &FileReplayStore, j: Jti, exp: u64) -> Freshness {
         block_on(store.consume(j, exp)).unwrap()
+    }
+
+    #[test]
+    fn sync_flushes_and_reports_poisoning() {
+        let dir = TempDir::new("sync");
+        let store = FileReplayStore::open(&dir.journal()).unwrap();
+        consume(&store, jti(1), 100);
+        store.sync().unwrap();
+        store.inner.lock().unwrap().poisoned = true;
+        assert!(store.sync().is_err());
     }
 
     #[test]
