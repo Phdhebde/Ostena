@@ -1,6 +1,6 @@
 # ADR-0008 : Tunnel entre l'agent et le core, et enrôlement
 
-- **Statut** : Proposé. Les parties transport, TLS, multiplexage, bornes, heartbeat et messages de contrôle sont implémentées (PR 1 et 2 du lot L2, partie 2). L'enrôlement, la reconnexion et le repli TCP viendront dans les PR suivantes. La clé de la CA du core est une **proposition à trancher avant la PR 3**.
+- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, la reconnexion et le repli TCP viendront dans les PR suivantes.
 - **Date** : 2026-11-11
 
 ## Contexte
@@ -41,12 +41,13 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 - ALPN `ostena-tunnel/1`, vérifié après la poignée de main.
 
 **Côté agent :**
-- la CA du core est épinglée ;
-- le nom attendu est celui de `agent.core_address` (nom DNS ou adresse IP).
+- la **racine hors ligne** est épinglée (`agent.tls_core_ca`) ;
+- le certificat du core doit être **signé directement par la racine**, avec l'EKU serverAuth et le nom de `agent.core_address` (nom DNS ou adresse IP) ;
+- un core qui présente une chaîne (par exemple un certificat signé par la CA émettrice en ligne, avec son intermédiaire) est refusé avant tout autre contrôle (`TUN-E017`) ; sans son intermédiaire, ce certificat ne remonte pas à la racine (`TUN-E003`).
 
 **Côté core :**
 - le certificat client est **obligatoire au niveau TLS** ;
-- il est vérifié contre la CA des agents, puis contre le **registre** à chaque poignée de main : un agent inconnu donne `TUN-E006`, un agent révoqué `TUN-E005`. Le registre identifie un agent par le SHA-256 de son certificat ;
+- il est vérifié contre la ou les CA émettrices (deux pendant une rotation), puis contre le **registre** à chaque poignée de main : un agent inconnu donne `TUN-E006`, un agent révoqué `TUN-E005`. Le registre identifie un agent par le SHA-256 de son certificat ;
 - `quinn` transmet la raison du refus dans la trame de fermeture : l'agent obtient le même code que le core.
 
 ### Multiplexage, priorités, bornes
@@ -119,56 +120,81 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
   - il ne sert **que** le protocole d'enrôlement (ALPN `ostena-enroll/1`) : toute autre requête est refusée, et un test le vérifie.
 - **La révocation** : un statut dans le registre, contrôlé à chaque poignée de main ; les tunnels ouverts sont fermés immédiatement.
 
-### Proposition : clé privée de la CA du core
+### Clé de la CA du core (décidé le 2026-11-11)
 
-**À trancher avant la PR 3.**
+**1. Hiérarchie à deux niveaux, rôles séparés :**
 
-**1. Hiérarchie à deux niveaux :**
-- **Racine hors ligne** :
-  - ECDSA P-256, valide 10 ans ;
-  - générée lors d'une cérémonie sur un poste isolé (`ostena ca init`), sa clé est conservée hors ligne (support chiffré au coffre, puis HSM) ;
-  - **les agents épinglent la racine**.
-- **CA émettrice en ligne sur le core** :
-  - intermédiaire ECDSA P-256 valide 1 an, avec la contrainte `pathLen=0` ;
-  - elle signe les certificats des agents et le certificat serveur du core ;
-  - c'est la seule clé de CA présente sur le core.
+| | Racine hors ligne | CA émettrice en ligne |
+|---|---|---|
+| Algorithme, durée | ECDSA P-256, 10 ans | ECDSA P-256, 1 an |
+| Où vit la clé | hors ligne : deux copies scellées sur deux supports, puis HSM | sur le core |
+| Ce qu'elle signe | la CA émettrice et le **certificat serveur du core** (1 an), lors d'une cérémonie | **uniquement les certificats d'agent** |
+| Contraintes | `pathLen 1` | `pathLen 0`, EKU clientAuth seul, contraintes de nom excluant **tous les noms DNS et toutes les adresses IP** |
+| Qui lui fait confiance | les agents (ils l'épinglent) | le core, pour les certificats clients |
+
+**Écart à la demande initiale.** Une contrainte de nom X.509 restreignant les SAN à `urn:ostena:agent` et `urn:ostena:gateway-group` est impossible :
+- RFC 5280 § 4.2.1.10 : les contraintes d'URI ne portent que sur la partie hôte, et une URI sans hôte (c'est le cas d'un URN) doit faire **rejeter** le certificat ;
+- webpki ne gère pas ce type de contrainte.
+
+La restriction est donc assurée autrement :
+- les contraintes d'exclusion DNS et IP empêchent la CA émettrice de produire un certificat serveur valide pour quiconque (testé) ;
+- le code d'émission (`IssuingAuthority::issue_agent`) n'accepte que des identifiants en minuscules, chiffres et tirets ;
+- le registre du core n'accepte que les certificats qu'il a émis.
+
+**Conséquence : la compromission de la CA émettrice ne permet que de fabriquer des certificats d'agent**, et ceux-ci sont refusés par le registre (empreinte inconnue, `TUN-E006`). Elle ne permet pas d'usurper le core auprès des agents : ils n'acceptent qu'un certificat signé directement par la racine (`TUN-E017`).
 
 **2. Stockage sur le core** (Linux) :
 - clé PKCS#8 dans `/var/lib/ostena/ca/issuing.key` ;
-- dossier en `0700` et fichier en `0600`, propriété du compte du service du core (`ostena`) ;
-- certificat dans `/etc/ostena/ca/issuing.pem`.
+- dossier en `0700` et fichier en `0600`, propriété du compte du service du core ;
+- certificat dans `/etc/ostena/ca/issuing.pem` ;
+- certificat serveur et sa clé à côté (`server.pem`, `server.key`), avec les mêmes droits et la même protection au repos.
 
-**3. Protection au repos en attendant le HSM** :
-- la clé n'est **jamais en clair sur disque** : elle est chiffrée avec `systemd-creds encrypt --with-key=tpm2+host` ;
-- elle est chargée par l'unité du core avec `LoadCredentialEncrypted=` ;
-- systemd la déchiffre au démarrage dans `$CREDENTIALS_DIRECTORY` (ramfs non swappé, lisible par le seul service) ; le core la lit dans un `Secret` puis supprime toute copie ;
-- avec TPM 2.0, la clé est liée à la machine (une copie du disque ne suffit pas) ; sans TPM, systemd utilise la clé de l'hôte, ce qui reste meilleur que du clair, et c'est journalisé comme affaiblissement.
+**3. Protection au repos, liée au TPM 2.0, en attendant le HSM** :
+- la clé n'est **jamais en clair sur disque** : elle est chiffrée avec `systemd-creds encrypt --with-key=tpm2` (ou `host+tpm2`) et chargée par l'unité du core avec `LoadCredentialEncrypted=` ;
+- systemd la déchiffre au démarrage dans `$CREDENTIALS_DIRECTORY` (ramfs non swappé, lisible par le seul service) ; le core la lit dans un `Secret` ;
+- **en production, un chiffrement sans TPM 2.0 est refusé** : le core ne démarre pas, sauf dérogation explicite.
 
-**4. Nouvelles règles de production** :
-- **`CFG-P011`** : clé de la CA émettrice lisible au-delà du compte du service, ou dossier modifiable par un autre compte ;
-- **`CFG-P012`** : clé de la CA émettrice chargée en clair depuis un fichier, au lieu d'un credential systemd chiffré ou, plus tard, d'un HSM.
+  Sur le modèle de `allow_short_names`, la dérogation exige :
+  - une justification d'au moins 20 caractères ;
+  - une date d'échéance d'au plus un an ;
+  - une journalisation à chaque démarrage.
 
-  En développement, les deux sont journalisées et acceptées.
+  Passé l'échéance, le refus revient.
 
-**5. Rotation de la CA émettrice** (annuelle, à 2/3 de sa validité) :
-1. générer une nouvelle clé sur le core et produire une demande ;
-2. la faire signer par la racine lors d'une cérémonie hors ligne ;
-3. installer le nouvel intermédiaire : le core émet désormais avec lui, et accepte les chaînes des deux intermédiaires pendant le recouvrement ;
-4. les certificats d'agent (30 jours) migrent d'eux-mêmes au renouvellement ;
-5. après 30 jours plus une marge, retirer l'ancien intermédiaire.
+**4. Règles de production** (implémentées avec le lot du core, qui n'a pas encore de configuration) :
+- **`CFG-P011`** : clé d'une CA ou du serveur lisible au-delà du compte du service, ou dossier modifiable par un autre compte ;
+- **`CFG-P012`** : clé d'une CA ou du serveur chargée en clair depuis un fichier, au lieu d'un credential systemd chiffré ou, plus tard, d'un HSM ;
+- **`CFG-P013`** : credential non lié au TPM 2.0 sans dérogation valide (justification d'au moins 20 caractères, échéance d'au plus un an).
 
-Aucune intervention sur les agents : ils épinglent la racine.
+En développement, les trois sont journalisées et acceptées.
 
-**6. Compromission de la CA émettrice** :
-- le core la retire de l'ensemble accepté, ce qui ferme tous les tunnels qui en dépendent ;
-- une nouvelle CA émettrice est signée par la racine ;
-- les agents se ré-enrôlent avec un nouveau jeton.
+**5. Cérémonie** (`ostena ca`, procédure dans `docs/exploitation/ceremonie-racine.md`) :
+- **Sur le poste isolé**, `ostena ca root init --name … --out <support A> --out <support B>` :
+  - tire la clé racine et une **phrase secrète générée** (30 caractères base32, 150 bits), affichée une seule fois en deux moitiés pour deux dépositaires ;
+  - écrit sur chaque support `root.pem`, `root.name` et `root.key.sealed` (scellé, voir l'ADR-0009).
+- **Sur le core**, `ostena ca key new` génère chaque clé (CA émettrice, serveur). Seule la clé publique est portée à la cérémonie.
+- **À la cérémonie**, `ostena ca issuing sign` et `ostena ca server sign` certifient ces clés publiques avec la racine (phrase secrète lue sur l'entrée standard).
+- Rien n'est jamais écrasé.
 
-**7. Rotation de la racine** (10 ans, ou en cas de compromission) : il faut déposer la nouvelle racine sur chaque agent (configuration `tls_core_ca`), procédure documentée. Un futur message de contrôle pourrait la pousser, signée par l'ancienne racine.
+**6. Rotation annuelle** (à 2/3 de la validité), en une seule cérémonie :
+1. sur le core, générer les nouvelles clés de la CA émettrice et du serveur ;
+2. les faire certifier par la racine ;
+3. installer le nouveau certificat serveur. Les agents l'acceptent tel quel : ils épinglent la racine ;
+4. installer la nouvelle CA émettrice : le core émet avec elle et accepte les deux CA émettrices pendant le recouvrement ;
+5. les certificats d'agent (30 jours) migrent d'eux-mêmes au renouvellement ;
+6. après 30 jours plus une marge, retirer l'ancienne CA émettrice.
 
-**8. HSM** : la CA émettrice passera en PKCS#11. L'interface de signature d'`ostena-crypto::pki` est prévue pour une clé non exportable.
+**7. Compromission de la CA émettrice** :
+- **portée limitée** : seuls des certificats d'agent peuvent être forgés, et le registre refuse ceux qu'il n'a pas émis ;
+- **réponse** : on retire la CA de l'ensemble accepté par le core (les tunnels qui en dépendent sont fermés), on en fait certifier une nouvelle par la racine, et les agents se ré-enrôlent avec un nouveau jeton.
 
-**Alternative écartée** : une CA unique en ligne. Elle est plus simple, mais sa rotation impose de redéployer la CA sur tous les agents, et sa compromission oblige à tout ré-enrôler sans racine de confiance intacte.
+**Compromission du certificat serveur** : il faut une cérémonie pour en certifier un nouveau, puis le révoquer. L'agent n'a pas de liste de révocation : jusqu'à l'expiration de l'ancien certificat (1 an au plus), un attaquant qui a volé sa clé peut usurper le core sur le réseau. **Cette limite est acceptée en v1 et à revoir** : distribution d'une liste de révocation, ou certificats serveur plus courts.
+
+**8. Rotation de la racine** (10 ans, ou en cas de compromission) : il faut déposer la nouvelle racine sur chaque agent (`tls_core_ca`), selon une procédure documentée. Un futur message de contrôle pourrait la pousser, signée par l'ancienne racine.
+
+**9. HSM** : la CA émettrice et la racine passeront en PKCS#11. L'interface de signature d'`ostena-crypto::pki` est prévue pour une clé non exportable.
+
+**Alternative écartée** : une CA unique en ligne. Sa compromission permettrait d'usurper le core, et sa rotation impose de redéployer la CA sur tous les agents.
 
 ### Codes
 
@@ -190,6 +216,7 @@ Aucune intervention sur les agents : ils épinglent la racine.
 | `TUN-E014` | erreur locale |
 | `TUN-E015` | configuration |
 | `TUN-E016` | autre échec de poignée de main |
+| `TUN-E017` | certificat du core non signé directement par la racine épinglée |
 
 Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused`.
 

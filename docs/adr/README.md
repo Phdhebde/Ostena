@@ -11,5 +11,5 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0005](0005-perimetre-et-anti-ssrf.md) | Contrôle de périmètre et anti-SSRF | Accepté |
 | [0006](0006-framing-passerelle-navigateur.md) | Framing binaire entre la passerelle et le navigateur | Accepté |
 | [0007](0007-service-agent-et-plan-de-controle.md) | Service de l'agent passerelle et plan de contrôle local | Accepté |
-| [0008](0008-tunnel-agent-core-et-enrolement.md) | Tunnel entre l'agent et le core, et enrôlement | Proposé |
+| [0008](0008-tunnel-agent-core-et-enrolement.md) | Tunnel entre l'agent et le core, et enrôlement | Accepté en partie |
 | [0009](0009-choix-cryptographiques.md) | Choix cryptographiques et conformité aux guides ANSSI | Accepté |

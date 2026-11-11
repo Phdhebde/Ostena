@@ -51,6 +51,15 @@ L'encadré « Attention » du § 2.2.3 rappelle qu'ECDSA n'est pas fortement ré
 - aléa du système d'exploitation via `aws-lc-rs` ;
 - HKDF-SHA-256 (déjà dans `ostena-crypto`).
 
+**Scellement de la clé racine hors ligne** (`ostena-crypto::sealed`, cérémonie de l'ADR-0008) :
+- **AES-256-GCM** (conforme, § 2.1.2.1), sous une clé dérivée par PBKDF2-HMAC-SHA256 avec 600 000 itérations et un sel aléatoire de 128 bits ;
+- l'en-tête (version, itérations, sel, nonce) est authentifié comme donnée associée.
+
+**La phrase secrète n'est pas choisie par une personne.** Elle est tirée par l'outil : 30 caractères base32, soit 150 bits.
+- Une phrase choisie serait un secret de faible entropie, attaquable hors ligne une fois le fichier volé, ce qu'interdit `RègleSecretFaibleEntropie` (§ 2.2.4).
+- Avec 150 bits, la clé respecte `RègleTailleCléSym` (§ 2.1.1) et `RecoPQTailleCléSym` (au moins 192 bits de clé AES et 150 bits d'entropie, hors de portée d'une recherche exhaustive, même quantique au sens du § 2.1.1). La dérivation n'ajoute qu'une marge.
+- La phrase est affichée une seule fois, en deux moitiés, pour deux dépositaires.
+
 ### Risque accepté : authentification classique
 
 Les certificats du tunnel et les grants restent signés en ECDSA P-256, sans composante post-quantique. C'est un écart à la recommandation `RecoSécuLongTerme` et à l'encadré du § 2.2 sur l'authentification post-quantique des produits à longue durée de vie. **Ce n'est pas un écart à une règle.**
