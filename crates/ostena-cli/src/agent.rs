@@ -1,0 +1,263 @@
+//! `ostena agent install | uninstall | run | status` (ADR-0007).
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use ostena_common::config::{self, Config, LoggingConfig};
+use ostena_grant::FileReplayStore;
+use ostena_platform::service::{InstallOptions, ServiceManager, ServiceState, service_manager};
+
+/// Exit code of `status` when the service is installed but not running
+/// (LSB convention).
+const NOT_RUNNING: u8 = 3;
+
+/// Default configuration path.
+pub(crate) fn default_config() -> PathBuf {
+    if cfg!(windows) {
+        let base = std::env::var_os("ProgramData")
+            .map_or_else(|| PathBuf::from("C:\\ProgramData"), PathBuf::from);
+        base.join("Ostena").join("ostena.toml")
+    } else {
+        PathBuf::from("/etc/ostena/ostena.toml")
+    }
+}
+
+fn say(quiet: bool, text: &str) {
+    if !quiet {
+        let _ = writeln!(io::stdout(), "{text}");
+    }
+}
+
+fn fail(text: &str) -> ExitCode {
+    let _ = writeln!(io::stderr(), "{text}");
+    ExitCode::FAILURE
+}
+
+/// Reads the configuration without the startup checks, to install or to set
+/// up logging before the full load.
+fn read(path: &Path) -> Result<Config, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{} : {e}", path.display()))?;
+    Config::from_toml_str(&text).map_err(|e| e.to_string())
+}
+
+pub(crate) fn install(
+    config: &Path,
+    executable: Option<PathBuf>,
+    start: bool,
+    quiet: bool,
+) -> ExitCode {
+    let parsed = match read(config) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    if let Err(v) = parsed.validate() {
+        return fail(&v.to_string());
+    }
+    let Some(agent) = parsed.agent else {
+        return fail(&format!("{} : section [agent] absente", config.display()));
+    };
+    let executable = match executable.map_or_else(std::env::current_exe, Ok) {
+        Ok(p) => p,
+        Err(e) => return fail(&format!("exécutable introuvable : {e}")),
+    };
+    let options = InstallOptions {
+        executable,
+        config: config.to_path_buf(),
+        private_key: Some(agent.tls_private_key.clone()),
+        state_dir: agent.replay_journal.parent().map(Path::to_path_buf),
+        start,
+    };
+    match service_manager().and_then(|m| m.install(&options)) {
+        Ok(()) => {
+            say(
+                quiet,
+                if start {
+                    "Agent installé et démarré."
+                } else {
+                    "Agent installé."
+                },
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+pub(crate) fn uninstall(quiet: bool) -> ExitCode {
+    match service_manager().and_then(ServiceManager::uninstall) {
+        Ok(()) => {
+            say(
+                quiet,
+                "Agent désinstallé (configuration, données et compte conservés).",
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e.to_string()),
+    }
+}
+
+pub(crate) fn status() -> ExitCode {
+    let state = match service_manager().and_then(ServiceManager::state) {
+        Ok(s) => s,
+        Err(e) => return fail(&e.to_string()),
+    };
+    let (text, code) = match state {
+        ServiceState::Running => ("en cours d'exécution", 0),
+        ServiceState::Starting => ("en cours de démarrage", 0),
+        ServiceState::Stopping => ("en cours d'arrêt", NOT_RUNNING),
+        ServiceState::Stopped => ("arrêté", NOT_RUNNING),
+        ServiceState::Failed => ("arrêté après des échecs répétés", NOT_RUNNING),
+        ServiceState::NotInstalled => ("non installé", 4),
+        ServiceState::Other(ref s) => (s.as_str(), 1),
+    };
+    say(false, &format!("Agent : {text}"));
+    ExitCode::from(code)
+}
+
+/// How the agent learns it must stop.
+pub(crate) enum StopSource {
+    /// `SIGTERM` or `SIGINT` (Unix), Ctrl-C (Windows console).
+    Signals,
+    /// The Windows SCM.
+    #[cfg_attr(not(windows), expect(dead_code, reason = "Windows only"))]
+    Service(std::sync::mpsc::Receiver<()>),
+}
+
+impl StopSource {
+    async fn wait(self) {
+        match self {
+            Self::Service(rx) => {
+                let _ = tokio::task::spawn_blocking(move || rx.recv()).await;
+            }
+            Self::Signals => wait_for_signals().await,
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_signals() {
+    use std::sync::Arc;
+    use tokio::signal::unix::{SignalKind, signal};
+    let notify = Arc::new(tokio::sync::Notify::new());
+    for kind in [SignalKind::terminate(), SignalKind::interrupt()] {
+        match signal(kind) {
+            Ok(mut stream) => {
+                let notify = Arc::clone(&notify);
+                tokio::spawn(async move {
+                    stream.recv().await;
+                    notify.notify_one();
+                });
+            }
+            Err(e) => tracing::error!(event = "agent.signal_failed", "signal non installé : {e}"),
+        }
+    }
+    notify.notified().await;
+}
+
+#[cfg(not(unix))]
+async fn wait_for_signals() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::error!(event = "agent.signal_failed", "Ctrl-C non installé : {e}");
+    }
+}
+
+/// `ostena agent run`: in the foreground, under systemd, or under the SCM
+/// (`--service`, Windows).
+pub(crate) fn run(config: &Path, service: bool) -> ExitCode {
+    if service {
+        #[cfg(windows)]
+        {
+            let config = config.to_path_buf();
+            return match ostena_platform::service::run_service(move |ctx| {
+                agent_main(&config, StopSource::Service(ctx.stop), ctx.ready)
+            }) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e.to_string()),
+            };
+        }
+        #[cfg(not(windows))]
+        return fail(
+            "--service n'existe que sous Windows ; sous Linux, systemd lance `ostena agent run`",
+        );
+    }
+    let ready: Box<dyn FnOnce() + Send> = Box::new(|| {
+        #[cfg(target_os = "linux")]
+        ostena_platform::service::notify("READY=1");
+    });
+    ExitCode::from(u8::try_from(agent_main(config, StopSource::Signals, ready)).unwrap_or(1))
+}
+
+/// The agent itself. Returns the process exit code.
+fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Send>) -> u32 {
+    let started = Instant::now();
+    // Logging first, from the raw configuration if it parses.
+    let logging = read(config_path).map_or_else(|_| LoggingConfig::default(), |c| c.logging);
+    if ostena_common::logging::init(&logging).is_err() {
+        let _ = ostena_common::logging::init(&LoggingConfig::default());
+    }
+    let loaded = match config::load_with(config_path, ostena_platform::permission_checker()) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(event = "agent.config_refused", codes = ?e.codes(), "{e}");
+            return 1;
+        }
+    };
+    loaded.log_weakenings();
+    let Some(agent) = loaded.config.agent.clone() else {
+        tracing::error!(
+            event = "agent.config_refused",
+            "section [agent] absente de {}",
+            config_path.display()
+        );
+        return 1;
+    };
+    let journal = match FileReplayStore::open(&agent.replay_journal) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(event = "agent.replay_store_refused", "{e}");
+            return 1;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(agent.worker_threads())
+        .thread_name("ostena-agent")
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(event = "agent.runtime_failed", "{e}");
+            return 1;
+        }
+    };
+    runtime.block_on(async {
+        ready();
+        tracing::info!(
+            event = "agent.started",
+            version = ostena_common::VERSION,
+            gateway_group = %agent.gateway_group,
+            worker_threads = agent.worker_threads(),
+            pid = std::process::id(),
+        );
+        stop.wait().await;
+    });
+    #[cfg(target_os = "linux")]
+    ostena_platform::service::notify("STOPPING=1");
+    tracing::info!(event = "agent.stopping");
+    let code = match journal.sync() {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(event = "agent.replay_store_sync_failed", "{e}");
+            1
+        }
+    };
+    drop(journal);
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    tracing::info!(
+        event = "agent.stopped",
+        uptime_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    );
+    code
+}
