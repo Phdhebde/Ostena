@@ -12,6 +12,7 @@
 //! never holds secrets: they are referenced by path and loaded into a
 //! [`Secret`](crate::secret::Secret) where they are used. See ADR-0003.
 
+pub mod agent;
 mod permissions;
 pub mod scope;
 mod validation;
@@ -21,6 +22,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+pub use agent::{AgentConfig, InfrastructureEndpoint};
+pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{Code, KNOWN_SIGNATURE_ALGORITHMS, Violation, Violations};
 
 /// The whole configuration file.
@@ -39,6 +42,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     /// Audit export.
     pub audit: AuditConfig,
+    /// Gateway agent (only on gateway hosts).
+    pub agent: Option<AgentConfig>,
 }
 
 /// Run mode. Production refuses every weakening option.
@@ -305,7 +310,8 @@ impl LoadedConfig {
     }
 }
 
-/// Reads, parses and validates the configuration file for startup.
+/// Reads, parses and validates the configuration file for startup, with the
+/// default permission checks (Unix permissions; refused on Windows).
 ///
 /// In production every weakening option, including `CFG-P006` (file or
 /// directory writable by another account), is refused. In development they
@@ -315,6 +321,18 @@ impl LoadedConfig {
 ///
 /// [`ConfigError`] with every problem found.
 pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
+    load_with(path, &DefaultPermissions)
+}
+
+/// [`load`] with a platform permission checker (`ostena-platform` on Windows).
+///
+/// # Errors
+///
+/// [`ConfigError`] with every problem found.
+pub fn load_with(
+    path: &Path,
+    checker: &dyn PermissionChecker,
+) -> Result<LoadedConfig, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
@@ -322,7 +340,7 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
     let config = Config::from_toml_str(&text)?;
 
     let mut weakenings = config.weakenings();
-    weakenings.extend(permissions::check(path));
+    weakenings.extend(file_rules(&config, path, checker));
     let mut errors = validation::consistency(&config);
     if config.mode == Mode::Production {
         errors.append(&mut weakenings);
@@ -334,6 +352,44 @@ pub fn load(path: &Path) -> Result<LoadedConfig, ConfigError> {
         path: path.to_path_buf(),
         weakenings,
     })
+}
+
+/// Rules that need the file system: `CFG-P006`, and for an agent `CFG-P008`
+/// and `CFG-P009`.
+fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> Vec<Violation> {
+    let mut out = Vec::new();
+    if let Err(reason) = checker.not_writable_by_others(path) {
+        out.push(Violation::new(
+            Code::ConfigFileWritableByOthers,
+            format!("{} : {reason}", path.display()),
+        ));
+    }
+    if let Some(agent) = &config.agent {
+        if let Err(reason) = checker.private(&agent.tls_private_key) {
+            out.push(Violation::new(
+                Code::PrivateKeyExposed,
+                format!(
+                    "agent.tls_private_key {} : {reason}",
+                    agent.tls_private_key.display()
+                ),
+            ));
+        }
+        // The journal may not exist yet: its directory must.
+        let dir = agent
+            .replay_journal
+            .parent()
+            .unwrap_or(&agent.replay_journal);
+        if let Err(reason) = checker.not_writable_by_others(dir) {
+            out.push(Violation::new(
+                Code::ReplayJournalExposed,
+                format!(
+                    "agent.replay_journal {} : {reason}",
+                    agent.replay_journal.display()
+                ),
+            ));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

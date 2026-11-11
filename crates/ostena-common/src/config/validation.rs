@@ -45,11 +45,29 @@ pub enum Code {
     UnencryptedRemoteOutput,
     /// Configuration file or directory writable by another account.
     ConfigFileWritableByOthers,
+    /// Agent: gateway group is not a UUID.
+    AgentGatewayGroup,
+    /// Agent: invalid core address.
+    AgentCoreAddress,
+    /// Agent: relative path.
+    RelativePath,
+    /// Agent: value out of bounds (shutdown delay, worker threads).
+    AgentBounds,
+    /// Agent: invalid infrastructure declaration.
+    AgentInfrastructure,
+    /// Agent: no CA configured for the core certificate.
+    CoreCaMissing,
+    /// Agent: private key readable or writable by another account.
+    PrivateKeyExposed,
+    /// Agent: replay journal directory writable by another account.
+    ReplayJournalExposed,
+    /// Agent: an infrastructure name cannot be resolved.
+    InfrastructureUnresolved,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 22] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -63,6 +81,15 @@ impl Code {
         Self::GrantAlgorithmNotEd25519,
         Self::UnencryptedRemoteOutput,
         Self::ConfigFileWritableByOthers,
+        Self::AgentGatewayGroup,
+        Self::AgentCoreAddress,
+        Self::RelativePath,
+        Self::AgentBounds,
+        Self::AgentInfrastructure,
+        Self::CoreCaMissing,
+        Self::PrivateKeyExposed,
+        Self::ReplayJournalExposed,
+        Self::InfrastructureUnresolved,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -81,6 +108,15 @@ impl Code {
             Self::GrantAlgorithmNotEd25519 => "CFG-P004",
             Self::UnencryptedRemoteOutput => "CFG-P005",
             Self::ConfigFileWritableByOthers => "CFG-P006",
+            Self::AgentGatewayGroup => "CFG-V006",
+            Self::AgentCoreAddress => "CFG-V007",
+            Self::RelativePath => "CFG-V008",
+            Self::AgentBounds => "CFG-V009",
+            Self::AgentInfrastructure => "CFG-V010",
+            Self::CoreCaMissing => "CFG-P007",
+            Self::PrivateKeyExposed => "CFG-P008",
+            Self::ReplayJournalExposed => "CFG-P009",
+            Self::InfrastructureUnresolved => "CFG-P010",
         }
     }
 
@@ -94,6 +130,10 @@ impl Code {
                 | Self::GrantAlgorithmNotEd25519
                 | Self::UnencryptedRemoteOutput
                 | Self::ConfigFileWritableByOthers
+                | Self::CoreCaMissing
+                | Self::PrivateKeyExposed
+                | Self::ReplayJournalExposed
+                | Self::InfrastructureUnresolved
         )
     }
 }
@@ -167,6 +207,9 @@ impl std::error::Error for Violations {}
 /// Consistency rules (`CFG-V…`).
 pub(crate) fn consistency(config: &Config) -> Vec<Violation> {
     let mut out = Vec::new();
+    if let Some(agent) = &config.agent {
+        super::agent::consistency(agent, &mut out);
+    }
     let rdp = &config.rdp;
 
     match (rdp.certificate_validation, &rdp.pki_ca_bundle) {
@@ -223,6 +266,9 @@ pub(crate) fn consistency(config: &Config) -> Vec<Violation> {
 /// Production refusals that do not depend on the file system (`CFG-P001` to `CFG-P005`).
 pub(crate) fn weakenings(config: &Config) -> Vec<Violation> {
     let mut out = Vec::new();
+    if let Some(agent) = &config.agent {
+        super::agent::weakenings(agent, &mut out);
+    }
 
     if config.ssh.host_key_verification != HostKeyVerification::Strict {
         out.push(Violation::new(

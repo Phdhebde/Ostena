@@ -1,59 +1,94 @@
-//! `CFG-P006`: the configuration file and its directory must not be writable
-//! by any account other than the service account or root.
+//! File permission rules of the configuration (ADR-0003, ADR-0007):
+//!
+//! - `CFG-P006`: the configuration file and its directory are writable only by
+//!   the service account or the administrators;
+//! - `CFG-P008`: the agent private key is readable and writable only by them;
+//! - `CFG-P009`: the anti-replay journal directory is writable only by them.
+//!
+//! The check is behind [`PermissionChecker`]: Unix permissions are checked
+//! here; Windows ACLs need Win32 security calls (`unsafe`) and are checked by
+//! `ostena-platform`, which callers inject. Without it, Windows fails closed.
 
 use std::path::Path;
 
-use super::validation::{Code, Violation};
+/// Platform permission checks. Errors are French explanations.
+pub trait PermissionChecker: Sync {
+    /// The file or directory, and its parent directory, can only be modified
+    /// by the service account or the administrators.
+    ///
+    /// # Errors
+    ///
+    /// Why it is not the case, or why it cannot be checked.
+    fn not_writable_by_others(&self, path: &Path) -> Result<(), String>;
 
-/// Returns a `CFG-P006` violation if the file or its directory is not protected.
-#[cfg(unix)]
-pub(crate) fn check(path: &Path) -> Option<Violation> {
-    use std::os::unix::fs::MetadataExt;
-
-    let refuse = |reason: String| {
-        Some(Violation::new(
-            Code::ConfigFileWritableByOthers,
-            format!("{} : {reason}", path.display()),
-        ))
-    };
-    // Check the real file, not a symbolic link pointing to it.
-    let real = match std::fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(e) => return refuse(format!("droits impossibles à vérifier ({e}).")),
-    };
-    let service_uid = service_uid();
-    let parent = real.parent().unwrap_or(&real);
-    for (what, target) in [("le fichier", real.as_path()), ("le dossier", parent)] {
-        let meta = match std::fs::metadata(target) {
-            Ok(m) => m,
-            Err(e) => return refuse(format!("droits impossibles à vérifier ({e}).")),
-        };
-        if let Some(reason) = evaluate(what, target, meta.uid(), meta.mode(), service_uid) {
-            return refuse(reason);
-        }
-    }
-    None
+    /// The file can only be read or written by the service account or the
+    /// administrators, and its directory is protected as above.
+    ///
+    /// # Errors
+    ///
+    /// Why it is not the case, or why it cannot be checked.
+    fn private(&self, path: &Path) -> Result<(), String>;
 }
 
-/// Windows ACLs are not checked yet: fail closed, refused in production.
-// TODO(CFG-P006-windows): check that the DACL of the file and its directory only
-// grants write access to SYSTEM, Administrators and the service account. It
-// needs Win32 security APIs, hence `unsafe`: to be done in `ostena-platform`.
+/// Unix permissions on Unix; on other platforms, refuses (fail closed) and
+/// points to `ostena-platform`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultPermissions;
+
+#[cfg(unix)]
+impl PermissionChecker for DefaultPermissions {
+    fn not_writable_by_others(&self, path: &Path) -> Result<(), String> {
+        check_unix(path, false)
+    }
+
+    fn private(&self, path: &Path) -> Result<(), String> {
+        check_unix(path, true)
+    }
+}
+
 #[cfg(not(unix))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "same signature as the Unix version"
-)]
-pub(crate) fn check(path: &Path) -> Option<Violation> {
-    Some(Violation::new(
-        Code::ConfigFileWritableByOthers,
-        format!(
-            "{} : la vérification des ACL du fichier de configuration n'est pas encore \
-             implémentée sous Windows (TODO CFG-P006-windows) ; démarrage refusé en \
-             production.",
-            path.display()
-        ),
-    ))
+impl PermissionChecker for DefaultPermissions {
+    fn not_writable_by_others(&self, _: &Path) -> Result<(), String> {
+        Err(NO_PLATFORM_CHECKER.into())
+    }
+
+    fn private(&self, _: &Path) -> Result<(), String> {
+        Err(NO_PLATFORM_CHECKER.into())
+    }
+}
+
+#[cfg(not(unix))]
+const NO_PLATFORM_CHECKER: &str = "vérification des ACL indisponible sans le vérificateur de \
+     ostena-platform ; démarrage refusé en production";
+
+/// Checks `path` (after resolving symbolic links) and its directory.
+#[cfg(unix)]
+fn check_unix(path: &Path, private: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let real =
+        std::fs::canonicalize(path).map_err(|e| format!("droits impossibles à vérifier ({e})."))?;
+    let service_uid = service_uid();
+    let parent = real.parent().unwrap_or(&real);
+    let meta =
+        std::fs::metadata(&real).map_err(|e| format!("droits impossibles à vérifier ({e})."))?;
+    let what = if meta.is_dir() {
+        "le dossier"
+    } else {
+        "le fichier"
+    };
+    let check = if private { evaluate_private } else { evaluate };
+    if let Some(reason) = check(what, &real, meta.uid(), meta.mode(), service_uid) {
+        return Err(reason);
+    }
+    if parent != real {
+        let meta = std::fs::metadata(parent)
+            .map_err(|e| format!("droits impossibles à vérifier ({e})."))?;
+        if let Some(reason) = evaluate("le dossier", parent, meta.uid(), meta.mode(), service_uid) {
+            return Err(reason);
+        }
+    }
+    Ok(())
 }
 
 /// Effective uid of the process. `/proc/self` belongs to it on Linux, which
@@ -65,7 +100,19 @@ fn service_uid() -> u32 {
     std::fs::metadata("/proc/self").map_or(0, |m| m.uid())
 }
 
-/// Pure decision, testable on every platform.
+const ROOT: u32 = 0;
+
+fn owner_rule(what: &str, path: &Path, owner: u32, service_uid: u32) -> Option<String> {
+    (owner != ROOT && owner != service_uid).then(|| {
+        format!(
+            "{what} {} appartient à l'uid {owner}, ni root ni le compte du service \
+             (uid {service_uid}).",
+            path.display()
+        )
+    })
+}
+
+/// Not writable by others: owner root or service, no group or other write.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn evaluate(
     what: &str,
@@ -74,22 +121,37 @@ pub(crate) fn evaluate(
     mode: u32,
     service_uid: u32,
 ) -> Option<String> {
-    const ROOT: u32 = 0;
     const GROUP_OR_OTHER_WRITE: u32 = 0o022;
-    if owner != ROOT && owner != service_uid {
-        return Some(format!(
-            "{what} {} appartient à l'uid {owner}, ni root ni le compte du service \
-             (uid {service_uid}).",
-            path.display()
-        ));
-    }
-    if mode & GROUP_OR_OTHER_WRITE != 0 {
-        return Some(format!(
-            "{what} {} est modifiable par le groupe ou par tous (mode {:o}) ; \
-             retirez ces droits (chmod go-w).",
-            path.display(),
-            mode & 0o7777
-        ));
-    }
-    None
+    owner_rule(what, path, owner, service_uid).or_else(|| {
+        (mode & GROUP_OR_OTHER_WRITE != 0).then(|| {
+            format!(
+                "{what} {} est modifiable par le groupe ou par tous (mode {:o}) ; \
+                 retirez ces droits (chmod go-w).",
+                path.display(),
+                mode & 0o7777
+            )
+        })
+    })
+}
+
+/// Private: owner root or service, no permission at all for group or others.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn evaluate_private(
+    what: &str,
+    path: &Path,
+    owner: u32,
+    mode: u32,
+    service_uid: u32,
+) -> Option<String> {
+    const GROUP_OR_OTHER_ANY: u32 = 0o077;
+    owner_rule(what, path, owner, service_uid).or_else(|| {
+        (mode & GROUP_OR_OTHER_ANY != 0).then(|| {
+            format!(
+                "{what} {} est accessible au groupe ou à tous (mode {:o}) ; \
+                 réservez-le au compte du service (chmod 600).",
+                path.display(),
+                mode & 0o7777
+            )
+        })
+    })
 }
