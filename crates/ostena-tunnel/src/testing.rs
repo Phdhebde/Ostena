@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ostena_crypto::p256;
-use ostena_crypto::pki::{CertificateAuthority, Validity};
+use ostena_crypto::pki::Validity;
+use ostena_crypto::pki::testing::TestPki;
+pub use ostena_crypto::pki::testing::valid;
 use ostena_crypto::tls::{
     self, ClientAuth, ClientAuthorizer, ClientRefusal, Identity, TrustAnchor,
 };
@@ -25,22 +27,6 @@ use crate::tunnel::{ALPN, AgentConfig, CoreListener, CoreTunnel, Hello};
 
 /// Text present in any binary that links the test core.
 pub const MARKER: &str = "ostena-testing-core: never in a release build";
-
-const DAY: u64 = 86_400;
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Valid from yesterday for 30 days.
-pub fn valid() -> Validity {
-    Validity {
-        not_before: now() - DAY,
-        not_after: now() + 30 * DAY,
-    }
-}
 
 #[derive(Debug, Clone, Copy)]
 struct Entry {
@@ -73,6 +59,9 @@ impl Registry {
 pub struct Behaviour {
     /// Stop answering heartbeats once connected (QUIC stays up).
     pub mute: bool,
+    /// Present a server certificate signed by the issuing CA (with its
+    /// chain), as an attacker holding that key would.
+    pub rogue_server: bool,
 }
 
 #[derive(Debug, Default)]
@@ -83,7 +72,7 @@ struct State {
 
 /// A core listening on 127.0.0.1, for tests and benchmarks.
 pub struct TestCore {
-    ca: Arc<CertificateAuthority>,
+    pki: Arc<TestPki>,
     registry: Arc<Registry>,
     listener: Arc<CoreListener>,
     addr: SocketAddr,
@@ -112,17 +101,18 @@ impl TestCore {
     pub fn start(limits: Limits, behaviour: Behaviour) -> Result<Self, TunnelError> {
         tracing::debug!(marker = MARKER);
         let config = |e: ostena_crypto::pki::PkiError| TunnelError::Config(e.to_string());
-        let ca = Arc::new(
-            CertificateAuthority::generate("Ostena test core CA", valid()).map_err(config)?,
-        );
-        let server = ca
-            .issue_server(&["localhost", "127.0.0.1"], valid())
-            .map_err(config)?;
+        let pki = Arc::new(TestPki::new("Ostena test core").map_err(config)?);
+        let names = ["localhost", "127.0.0.1"];
+        let server = if behaviour.rogue_server {
+            pki.rogue_server(&names).map_err(config)?
+        } else {
+            pki.server(&names).map_err(config)?
+        };
         let registry = Arc::new(Registry::default());
         let tls = tls::server_config(
             &server,
             ClientAuth::Required {
-                ca: ca.trust_anchor(),
+                issuing_cas: vec![pki.issuing_anchor()],
                 authorizer: registry.clone(),
             },
             &[ALPN],
@@ -143,7 +133,7 @@ impl TestCore {
             limits,
         ));
         Ok(Self {
-            ca,
+            pki,
             registry,
             listener,
             addr,
@@ -157,9 +147,9 @@ impl TestCore {
         self.addr
     }
 
-    /// The CA the agents must pin.
+    /// The root the agents pin.
     pub fn trust_anchor(&self) -> TrustAnchor {
-        self.ca.trust_anchor()
+        self.pki.root_anchor()
     }
 
     /// Issues an agent certificate for `group` with `validity` and, if
@@ -177,7 +167,8 @@ impl TestCore {
         let (key, pkcs8) =
             p256::SigningKey::generate().map_err(|e| TunnelError::Config(e.to_string()))?;
         let cert = self
-            .ca
+            .pki
+            .issuing
             .issue_agent(
                 &key.verifying_key(),
                 &group.to_string(),

@@ -146,7 +146,14 @@ fn loss_of_the_core_is_detected() {
 #[test]
 fn silent_core_trips_the_heartbeat() {
     run(async {
-        let core = TestCore::start(fast(), Behaviour { mute: true }).unwrap();
+        let core = TestCore::start(
+            fast(),
+            Behaviour {
+                mute: true,
+                ..Behaviour::default()
+            },
+        )
+        .unwrap();
         let id = core.agent_identity(group(), valid(), true).unwrap();
         let (tunnel, _) = connect(&core.agent_config(&id, group(), fast()).unwrap())
             .await
@@ -168,6 +175,28 @@ fn core_certificate_from_an_unknown_ca_is_refused() {
         config.tls = tls::client_config(&other.trust_anchor(), Some(&id), &[ALPN]).unwrap();
         let (agent, _) = refused(&core, config).await;
         assert_eq!(agent, TunnelError::UnknownIssuer);
+    });
+}
+
+#[test]
+fn core_certificate_from_the_issuing_ca_is_refused() {
+    run(async {
+        // The core presents a certificate signed by the online issuing CA,
+        // with its chain to the root: what an attacker holding that key
+        // could do. Only a certificate signed directly by the root passes.
+        let core = TestCore::start(
+            fast(),
+            Behaviour {
+                rogue_server: true,
+                ..Behaviour::default()
+            },
+        )
+        .unwrap();
+        let id = core.agent_identity(group(), valid(), true).unwrap();
+        let (agent, at_core) =
+            refused(&core, core.agent_config(&id, group(), fast()).unwrap()).await;
+        assert_eq!(agent, TunnelError::NotRootIssued);
+        assert_eq!(at_core, Some(TunnelError::NotRootIssued));
     });
 }
 

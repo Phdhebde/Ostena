@@ -54,6 +54,10 @@ pub enum TunnelError {
     /// Any other handshake failure.
     #[error("[TUN-E016] échec de la poignée de main TLS : {0}")]
     Handshake(String),
+    /// The core certificate is not signed directly by the pinned root (for
+    /// example, issued by the online issuing CA).
+    #[error("[TUN-E017] certificat du core non émis directement par la racine épinglée : refusé")]
+    NotRootIssued,
 }
 
 impl TunnelError {
@@ -76,6 +80,7 @@ impl TunnelError {
             Self::Io(_) => "TUN-E014",
             Self::Config(_) => "TUN-E015",
             Self::Handshake(_) => "TUN-E016",
+            Self::NotRootIssued => "TUN-E017",
         }
     }
 }
@@ -104,6 +109,10 @@ fn crypto_alert(code: TransportErrorCode) -> Option<u8> {
 /// Maps a TLS failure: the alert, refined by the local rustls message when
 /// this side detected it.
 fn from_alert(alert: u8, reason: &str) -> TunnelError {
+    // rustls sends certificate_unknown with our text: the text decides.
+    if reason.contains(ostena_crypto::tls::NOT_ROOT_ISSUED) {
+        return TunnelError::NotRootIssued;
+    }
     match alert {
         ALERT_HANDSHAKE_FAILURE if reason.contains("NoKxGroupsInCommon") => {
             TunnelError::NoCommonGroup
@@ -171,6 +180,7 @@ mod tests {
             TunnelError::Io("x".into()),
             TunnelError::Config("x".into()),
             TunnelError::Handshake("x".into()),
+            TunnelError::NotRootIssued,
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("TUN-E{:03}", i + 1);

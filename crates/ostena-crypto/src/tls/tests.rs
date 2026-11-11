@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use rustls::{CipherSuite, NamedGroup, ProtocolVersion};
 
 use super::*;
-use crate::pki::{CertificateAuthority, Validity};
+use crate::pki::testing::TestPki;
+use crate::pki::{IssuingAuthority, Validity};
 
 const ALPN: &[u8] = b"ostena-tunnel/1";
 const DAY: u64 = 86_400;
@@ -55,36 +56,30 @@ impl ClientAuthorizer for Strict {
 }
 
 struct Fixture {
-    ca: CertificateAuthority,
+    pki: TestPki,
     server: Identity,
     registry: Arc<Registry>,
 }
 
 fn fixture() -> Fixture {
-    let ca = CertificateAuthority::generate("Ostena test CA", valid()).unwrap();
-    let server = ca
-        .issue_server(&["core.test", "127.0.0.1"], valid())
-        .unwrap();
+    let pki = TestPki::new("Ostena test").unwrap();
+    let server = pki.server(&["core.test", "127.0.0.1"]).unwrap();
     Fixture {
-        ca,
+        pki,
         server,
         registry: Arc::new(Registry::default()),
     }
 }
 
-fn agent(ca: &CertificateAuthority, validity: Validity) -> Identity {
-    let (key, pkcs8) = p256::SigningKey::generate().unwrap();
-    let cert = ca
-        .issue_agent(&key.verifying_key(), "group-1", "agent-1", validity)
-        .unwrap();
-    Identity::new(vec![cert], pkcs8).unwrap()
+fn agent(pki: &TestPki, validity: Validity) -> Identity {
+    pki.agent("group-1", validity).unwrap()
 }
 
 fn server_config_for(f: &Fixture, authorizer: Arc<dyn ClientAuthorizer>) -> Arc<ServerConfig> {
     server_config(
         &f.server,
         ClientAuth::Required {
-            ca: f.ca.trust_anchor(),
+            issuing_cas: vec![f.pki.issuing_anchor()],
             authorizer,
         },
         &[ALPN],
@@ -182,8 +177,8 @@ fn quic_initial_suite_is_aes_128_gcm_and_not_negotiable() {
 #[test]
 fn mutual_handshake_negotiates_the_fixed_parameters() {
     let f = fixture();
-    let agent = agent(&f.ca, valid());
-    let client = client_config(&f.ca.trust_anchor(), Some(&agent), &[ALPN]).unwrap();
+    let agent = agent(&f.pki, valid());
+    let client = client_config(&f.pki.root_anchor(), Some(&agent), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -219,11 +214,64 @@ fn mutual_handshake_negotiates_the_fixed_parameters() {
 }
 
 #[test]
+fn server_certificate_from_the_issuing_ca_is_refused() {
+    let f = fixture();
+    // An attacker with the issuing CA key makes a server certificate for
+    // the right name and presents the full chain to the root.
+    let rogue = f.pki.rogue_server(&["core.test"]).unwrap();
+    let server = server_config(&rogue, ClientAuth::None, &[ALPN]).unwrap();
+    let client = client_config(&f.pki.root_anchor(), None, &[ALPN]).unwrap();
+    let o = handshake(client, server, "core.test");
+    assert_eq!(failure(&o.client), HandshakeFailure::NotRootIssued);
+    assert!(
+        o.client
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains(NOT_ROOT_ISSUED)
+    );
+
+    // Without the intermediate, it does not chain to the root at all.
+    // SECRET-EXPOSURE: a throwaway test key, reused for a second identity.
+    #[expect(clippy::disallowed_methods)]
+    let key = SecretBytes::from(rogue.key.expose_secret().to_vec());
+    let alone = Identity::new(vec![rogue.certificate().clone()], key).unwrap();
+    let server = server_config(&alone, ClientAuth::None, &[ALPN]).unwrap();
+    let client = client_config(&f.pki.root_anchor(), None, &[ALPN]).unwrap();
+    let o = handshake(client, server, "core.test");
+    assert_eq!(failure(&o.client), HandshakeFailure::UnknownIssuer);
+}
+
+#[test]
+fn issuing_ca_name_constraints_forbid_server_names() {
+    // Even a relying party that accepts intermediates refuses a server
+    // certificate under the issuing CA: DNS names and IP addresses are
+    // excluded by its name constraints.
+    let f = fixture();
+    let rogue = f.pki.rogue_server(&["core.test"]).unwrap();
+    let verifier = WebPkiServerVerifier::builder_with_provider(
+        f.pki.root_anchor().roots().unwrap(),
+        provider(),
+    )
+    .build()
+    .unwrap();
+    let chain = &rogue.chain;
+    let result = verifier.verify_server_cert(
+        &chain[0],
+        &chain[1..],
+        &ServerName::try_from("core.test").unwrap(),
+        &[],
+        UnixTime::now(),
+    );
+    assert!(result.is_err(), "{result:?}");
+}
+
+#[test]
 fn server_certificate_from_another_ca_is_refused() {
     let f = fixture();
-    let other = CertificateAuthority::generate("Other CA", valid()).unwrap();
-    let agent = agent(&f.ca, valid());
-    let client = client_config(&other.trust_anchor(), Some(&agent), &[ALPN]).unwrap();
+    let other = TestPki::new("Other").unwrap();
+    let agent = agent(&f.pki, valid());
+    let client = client_config(&other.root_anchor(), Some(&agent), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -236,9 +284,9 @@ fn server_certificate_from_another_ca_is_refused() {
 #[test]
 fn agent_certificate_from_another_ca_is_refused() {
     let f = fixture();
-    let other = CertificateAuthority::generate("Other CA", valid()).unwrap();
+    let other = TestPki::new("Other").unwrap();
     let client =
-        client_config(&f.ca.trust_anchor(), Some(&agent(&other, valid())), &[ALPN]).unwrap();
+        client_config(&f.pki.root_anchor(), Some(&agent(&other, valid())), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -251,7 +299,7 @@ fn agent_certificate_from_another_ca_is_refused() {
 #[test]
 fn client_certificate_is_mandatory() {
     let f = fixture();
-    let client = client_config(&f.ca.trust_anchor(), None, &[ALPN]).unwrap();
+    let client = client_config(&f.pki.root_anchor(), None, &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -269,7 +317,7 @@ fn expired_agent_certificate_is_refused() {
         not_after: now() - DAY,
     };
     let client =
-        client_config(&f.ca.trust_anchor(), Some(&agent(&f.ca, expired)), &[ALPN]).unwrap();
+        client_config(&f.pki.root_anchor(), Some(&agent(&f.pki, expired)), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -286,7 +334,8 @@ fn agent_certificate_not_valid_yet_is_refused() {
         not_before: now() + DAY,
         not_after: now() + 30 * DAY,
     };
-    let client = client_config(&f.ca.trust_anchor(), Some(&agent(&f.ca, future)), &[ALPN]).unwrap();
+    let client =
+        client_config(&f.pki.root_anchor(), Some(&agent(&f.pki, future)), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -298,9 +347,9 @@ fn agent_certificate_not_valid_yet_is_refused() {
 #[test]
 fn revoked_agent_certificate_is_refused() {
     let f = fixture();
-    let agent = agent(&f.ca, valid());
+    let agent = agent(&f.pki, valid());
     f.registry.set(agent.certificate(), ClientRefusal::Revoked);
-    let client = client_config(&f.ca.trust_anchor(), Some(&agent), &[ALPN]).unwrap();
+    let client = client_config(&f.pki.root_anchor(), Some(&agent), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -314,7 +363,7 @@ fn revoked_agent_certificate_is_refused() {
 fn agent_unknown_to_the_registry_is_refused() {
     let f = fixture();
     let client =
-        client_config(&f.ca.trust_anchor(), Some(&agent(&f.ca, valid())), &[ALPN]).unwrap();
+        client_config(&f.pki.root_anchor(), Some(&agent(&f.pki, valid())), &[ALPN]).unwrap();
     let o = handshake(client, server_config_for(&f, Arc::new(Strict)), "core.test");
     assert_eq!(failure(&o.server), HandshakeFailure::UnknownClient);
     assert!(o.client.is_err());
@@ -323,15 +372,19 @@ fn agent_unknown_to_the_registry_is_refused() {
 #[test]
 fn certificate_from_a_reloaded_ca_is_accepted() {
     let f = fixture();
-    let reloaded = CertificateAuthority::from_parts(
-        "Ostena test CA",
-        &f.ca.key_pkcs8(),
-        f.ca.trust_anchor().certificate().clone(),
+    let reloaded = IssuingAuthority::from_parts(
+        "Ostena test issuing",
+        &f.pki.issuing_key,
+        f.pki.issuing_certificate.clone(),
     )
     .unwrap();
+    let (key, pkcs8) = p256::SigningKey::generate().unwrap();
+    let cert = reloaded
+        .issue_agent(&key.verifying_key(), "group-1", "agent-1", valid())
+        .unwrap();
     let client = client_config(
-        &f.ca.trust_anchor(),
-        Some(&agent(&reloaded, valid())),
+        &f.pki.root_anchor(),
+        Some(&Identity::new(vec![cert], pkcs8).unwrap()),
         &[ALPN],
     )
     .unwrap();
@@ -352,7 +405,7 @@ fn certificate_from_a_reloaded_ca_is_accepted() {
 fn server_name_mismatch_is_refused() {
     let f = fixture();
     let client =
-        client_config(&f.ca.trust_anchor(), Some(&agent(&f.ca, valid())), &[ALPN]).unwrap();
+        client_config(&f.pki.root_anchor(), Some(&agent(&f.pki, valid())), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -365,7 +418,7 @@ fn server_name_mismatch_is_refused() {
 fn ip_address_name_is_accepted() {
     let f = fixture();
     let client =
-        client_config(&f.ca.trust_anchor(), Some(&agent(&f.ca, valid())), &[ALPN]).unwrap();
+        client_config(&f.pki.root_anchor(), Some(&agent(&f.pki, valid())), &[ALPN]).unwrap();
     let o = handshake(
         client,
         server_config_for(&f, f.registry.clone()),
@@ -383,8 +436,8 @@ fn ip_address_name_is_accepted() {
 fn agent_certificate_cannot_serve_as_server_certificate() {
     let f = fixture();
     // An agent certificate (client authentication only) presented by a server.
-    let rogue = server_config(&agent(&f.ca, valid()), ClientAuth::None, &[ALPN]).unwrap();
-    let client = client_config(&f.ca.trust_anchor(), None, &[ALPN]).unwrap();
+    let rogue = server_config(&agent(&f.pki, valid()), ClientAuth::None, &[ALPN]).unwrap();
+    let client = client_config(&f.pki.root_anchor(), None, &[ALPN]).unwrap();
     let o = handshake(client, rogue, "core.test");
     assert!(o.client.is_err());
 }
@@ -395,12 +448,12 @@ fn foreign_client(f: &Fixture, adjust: impl FnOnce(&mut CryptoProvider)) -> Arc<
     adjust(&mut p);
     let p = Arc::new(p);
     let verifier = WebPkiServerVerifier::builder_with_provider(
-        f.ca.trust_anchor().roots().unwrap(),
+        f.pki.root_anchor().roots().unwrap(),
         p.clone(),
     )
     .build()
     .unwrap();
-    let agent = agent(&f.ca, valid());
+    let agent = agent(&f.pki, valid());
     let mut config = ClientConfig::builder_with_provider(p)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
@@ -474,8 +527,8 @@ fn stock_peer_offering_the_hybrid_group_succeeds() {
 fn application_protocol_mismatch_fails() {
     let f = fixture();
     let client = client_config(
-        &f.ca.trust_anchor(),
-        Some(&agent(&f.ca, valid())),
+        &f.pki.root_anchor(),
+        Some(&agent(&f.pki, valid())),
         &[b"other/1"],
     )
     .unwrap();
@@ -492,7 +545,7 @@ fn application_protocol_mismatch_fails() {
 fn enrolment_listener_needs_no_client_certificate() {
     let f = fixture();
     let server = server_config(&f.server, ClientAuth::None, &[b"ostena-enroll/1"]).unwrap();
-    let client = client_config(&f.ca.trust_anchor(), None, &[b"ostena-enroll/1"]).unwrap();
+    let client = client_config(&f.pki.root_anchor(), None, &[b"ostena-enroll/1"]).unwrap();
     let o = handshake(client, server, "core.test");
     assert!(
         o.client.is_ok() && o.server.is_ok(),
@@ -505,7 +558,7 @@ fn enrolment_listener_needs_no_client_certificate() {
 #[test]
 fn no_resumption_and_no_early_data() {
     let f = fixture();
-    let client = client_config(&f.ca.trust_anchor(), None, &[ALPN]).unwrap();
+    let client = client_config(&f.pki.root_anchor(), None, &[ALPN]).unwrap();
     assert!(!client.enable_early_data);
     let server = server_config_for(&f, f.registry.clone());
     assert_eq!(server.send_tls13_tickets, 0);
@@ -515,7 +568,7 @@ fn no_resumption_and_no_early_data() {
 #[test]
 fn identity_requires_a_p256_key() {
     let f = fixture();
-    let agent = agent(&f.ca, valid());
+    let agent = agent(&f.pki, valid());
     let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
     assert_eq!(
         Identity::new(
@@ -535,9 +588,11 @@ fn identity_requires_a_p256_key() {
 fn identity_and_anchor_from_pem() {
     let f = fixture();
     let (key, pkcs8) = p256::SigningKey::generate().unwrap();
-    let cert =
-        f.ca.issue_agent(&key.verifying_key(), "g", "a", valid())
-            .unwrap();
+    let cert = f
+        .pki
+        .issuing
+        .issue_agent(&key.verifying_key(), "g", "a", valid())
+        .unwrap();
     let cert_pem = crate::pki::pem_certificate(&cert);
     // SECRET-EXPOSURE: a throwaway test key, converted to PEM.
     #[expect(clippy::disallowed_methods)]
@@ -551,7 +606,7 @@ fn identity_and_anchor_from_pem() {
     )
     .unwrap();
     assert_eq!(id.certificate(), &cert);
-    let anchor = TrustAnchor::from_pem(f.ca.certificate_pem().as_bytes()).unwrap();
-    assert_eq!(anchor.certificate(), f.ca.trust_anchor().certificate());
+    let anchor = TrustAnchor::from_pem(f.pki.root.certificate_pem().as_bytes()).unwrap();
+    assert_eq!(anchor.certificate(), f.pki.root_anchor().certificate());
     assert!(TrustAnchor::from_pem(b"not pem").is_err());
 }
