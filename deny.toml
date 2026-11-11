@@ -1,0 +1,60 @@
+# cargo-deny configuration. Run with `cargo deny check`.
+# Air-gapped environments: mirror the advisory database and run
+# `cargo deny check --disable-fetch` (see CONTRIBUTING.md).
+
+[graph]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every ignored advisory needs an id, a reason and an owner.
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# The allow list is the policy, not an inventory: unused entries are fine.
+unused-allowed-license = "allow"
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "MPL-2.0",
+]
+exceptions = []
+
+[licenses.private]
+# Workspace crates are not published and carry no license yet.
+ignore = true
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# Duplicates that cannot be avoided go here, each with a reason.
+skip = []
+skip-tree = []
+deny = [
+    # TLS and crypto go through rustls / aws-lc-rs in ostena-crypto only.
+    { crate = "openssl", reason = "OpenSSL is forbidden, use ostena-crypto" },
+    { crate = "openssl-sys", reason = "OpenSSL is forbidden, use ostena-crypto" },
+    { crate = "native-tls", reason = "OpenSSL/SChannel bindings are forbidden, use ostena-crypto" },
+]
+
+[sources]
+unknown-registry = "deny"
+# Git dependencies are refused unless explicitly listed here; any entry must be
+# pinned with `rev = "<full commit hash>"` in Cargo.toml.
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
