@@ -27,6 +27,9 @@ Tasks:
   footprint      Measure the idle memory of the agent (release build)
   fuzz [SECS] [TARGET...]
                  Run fuzz targets, each for SECS (default 60, all targets)
+  check-release [BINARY]
+                 Fail if a test-only feature is in the release build of ostena-cli,
+                 or if BINARY contains the test core
   help           Print this message
 ";
 
@@ -44,6 +47,7 @@ fn main() -> ExitCode {
         Some("sbom") => sbom(),
         Some("footprint") => footprint(),
         Some("fuzz") => fuzz(&std::env::args().skip(2).collect::<Vec<_>>()),
+        Some("check-release") => check_release(std::env::args().nth(2).as_deref()),
         None | Some("help" | "-h" | "--help") => {
             print!("{USAGE}");
             Ok(())
@@ -113,7 +117,8 @@ fn ci() -> Result<()> {
         cmd.args(args);
         run(cmd)?;
     }
-    check_secrets()
+    check_secrets()?;
+    check_release(None)
 }
 
 fn check_secrets() -> Result<()> {
@@ -283,6 +288,68 @@ fn resident_bytes_of(line: &str) -> Option<u64> {
         .ok()
 }
 
+/// Text the test core of ostena-tunnel puts in any binary that links it
+/// (`ostena_tunnel::testing::MARKER`).
+const TESTING_MARKER: &[u8] = b"ostena-testing-core";
+
+/// Fails if a test-only feature (`testing`) of an Ostena crate is enabled in
+/// the release build of ostena-cli, or if `binary` contains the test core.
+fn check_release(binary: Option<&str>) -> Result<()> {
+    let root = workspace_root()?;
+    let args = [
+        "tree",
+        "--locked",
+        "-p",
+        "ostena-cli",
+        "-e",
+        "normal,features",
+        "--prefix",
+        "none",
+        "--target",
+        "all",
+    ];
+    eprintln!("$ cargo {}", args.join(" "));
+    let out = cargo().args(args).current_dir(&root).output()?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+    }
+    let found = testing_features(&String::from_utf8_lossy(&out.stdout));
+    if !found.is_empty() {
+        return Err(format!(
+            "test-only features in the release build: {}",
+            found.join(", ")
+        )
+        .into());
+    }
+    eprintln!("no test-only feature in the release build of ostena-cli");
+    if let Some(path) = binary {
+        let bytes = fs::read(path)?;
+        if contains(&bytes, TESTING_MARKER) {
+            return Err(format!("{path} contains the test core").into());
+        }
+        eprintln!("{path}: no test core");
+    }
+    Ok(())
+}
+
+/// The `testing` features of Ostena crates in a `cargo tree -e features`
+/// output.
+fn testing_features(tree: &str) -> Vec<String> {
+    let mut found: Vec<String> = tree
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("ostena-") && l.contains("feature \"testing\""))
+        .map(|l| l.split(" (").next().unwrap_or(l).to_owned())
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Fuzz target run by `cargo xtask fuzz`.
 const FUZZ_TARGETS: [&str; 6] = [
     "grant_decode",
@@ -397,6 +464,28 @@ mod tests {
                 "{workflow} is out of sync with FUZZ_TARGETS"
             );
         }
+    }
+
+    #[test]
+    fn finds_testing_features_in_a_cargo_tree() {
+        let clean = "ostena-cli v0.0.0 (C:\\x)\nostena-tunnel feature \"default\"\nquinn feature \"testing\"\n";
+        assert_eq!(testing_features(clean), Vec::<String>::new());
+        let leaked = "ostena-tunnel feature \"testing\"\nostena-crypto feature \"testing\" (*)\nostena-tunnel feature \"testing\"\n";
+        assert_eq!(
+            testing_features(leaked),
+            vec![
+                "ostena-crypto feature \"testing\"",
+                "ostena-tunnel feature \"testing\""
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_the_test_core_marker_in_a_binary() {
+        let mut binary = vec![0u8; 1000];
+        assert!(!contains(&binary, TESTING_MARKER));
+        binary[500..500 + TESTING_MARKER.len()].copy_from_slice(TESTING_MARKER);
+        assert!(contains(&binary, TESTING_MARKER));
     }
 
     #[test]
