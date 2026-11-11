@@ -2,10 +2,11 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-11-11
+- **Révision** : 2026-11-11, support Linux à partir de Debian 12 (systemd 252), Debian 11 abandonné
 
 ## Contexte
 
-L'agent passerelle tourne en service sur Windows Server (2016 à 2025) et sur Debian (11 et plus). Il détient une clé privée mTLS et un journal anti-rejeu, il ouvre des sessions vers des cibles sensibles, et il doit pouvoir être interrogé localement par un administrateur. Il doit s'installer sans interaction, tourner avec le minimum de droits, ne pas redémarrer en boucle, s'arrêter proprement et rester léger. Seul `ostena-platform` peut contenir du code `unsafe` (CLAUDE.md).
+L'agent passerelle tourne en service sur Windows Server (2016 à 2025) et sur Debian (12 et plus). Il détient une clé privée mTLS et un journal anti-rejeu, il ouvre des sessions vers des cibles sensibles, et il doit pouvoir être interrogé localement par un administrateur. Il doit s'installer sans interaction, tourner avec le minimum de droits, ne pas redémarrer en boucle, s'arrêter proprement et rester léger. Seul `ostena-platform` peut contenir du code `unsafe` (CLAUDE.md).
 
 ## Décision
 
@@ -56,7 +57,13 @@ Un trait commun, `ServiceManager`, masque la différence entre le SCM et systemd
   - `SystemCallArchitectures=native`, `SystemCallFilter=@system-service ~@privileged @resources` ;
   - `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` (le netlink sert à lister les interfaces, pour le plancher du périmètre).
 - **Redémarrage borné** : `Restart=on-failure`, `RestartSec=5`, `StartLimitIntervalSec=600`, `StartLimitBurst=3`. Au-delà, l'unité passe en `failed` et systemd journalise « Start request repeated too quickly ».
-- **Compatibilité** : uniquement des directives de systemd 247 (Debian 11). L'unité générée passe `systemd-analyze verify` sous systemd 247 sans avertissement, et obtient un score `systemd-analyze security` de **1,3 « OK »** sous systemd 257.
+- **Isolation complémentaire** : `PrivateIPC` (systemd 248) et `PrivateMounts`. `PrivateUsers` est écarté : une capacité détenue dans un espace de noms utilisateur privé ne vaut pas pour le réseau de l'hôte, ce qui empêcherait le futur `CAP_NET_BIND_SERVICE`.
+- **Compatibilité : Debian 12 (systemd 252) au minimum.** Debian 11 n'est plus pris en charge : il est en fin de vie, et ses paquets ne sont plus que sur `archive.debian.org`. L'unité générée passe `systemd-analyze verify` sous systemd 252 sans aucun message, et obtient un score `systemd-analyze security` de **1,3 « OK »** sous systemd 252 (cycle de vie complet vérifié sous cette version).
+- **Directives écartées pour l'instant** :
+  - `RestrictFileSystems` exige le LSM BPF, absent par défaut du noyau Debian ;
+  - `SocketBindDeny` gênerait le socket UDP du futur tunnel QUIC.
+
+  Les deux sont à revoir avec le tunnel.
 
 ### Plan de contrôle local
 
@@ -122,9 +129,9 @@ Le lint `clippy::undocumented_unsafe_blocks` y est actif. Chaque bloc a un comme
 ## Conséquences
 
 - **Tests d'intégration en CI** :
-  - `agent-linux` exécute le cycle complet sous un vrai systemd : installation de production, droits, `status` (refusé à un utilisateur non root), score de durcissement, arrêt propre, redémarrages bornés, désinstallation, puis vérification de l'unité sous Debian 11 et empreinte ;
+  - `agent-linux` exécute le cycle complet sous un vrai systemd : installation de production, droits, `status` (refusé à un utilisateur non root), score de durcissement, arrêt propre, redémarrages bornés, désinstallation, puis vérification stricte de l'unité sous Debian 12 et empreinte ;
   - `agent-windows`, sur Windows Server 2025 et 2022, vérifie le compte, le SID restreint, les privilèges, les actions d'échec, les ACL, `status`, le **refus du pipe à un utilisateur non administrateur**, l'arrêt propre et la désinstallation.
 - **Windows Server 2016** n'est pas disponible en CI. Il est vérifié à la main (essai S5, `docs/exploitation/agent-installation.md`). Si le SID restreint y bloque quelque chose, on en reparle avant d'assouplir.
-- **Debian 11 est en fin de vie** : ses paquets ne sont plus que sur `archive.debian.org`, d'où la vérification de l'unité depuis cette archive. L'exigence « Debian 11+ » de CLAUDE.md est à réexaminer.
+- **Debian 11 est abandonné** (révision du 2026-11-11) : CLAUDE.md exige désormais Debian 12 et plus. Une passerelle sous Debian 11 doit être migrée avant d'installer l'agent.
 - **Les comptes intégrés sont identifiés par SID** et jamais par nom, ces noms étant traduits selon la langue de Windows.
 - **Contrainte d'administration Active Directory** : comme le compte machine des passerelles porte l'identité réseau de l'agent, l'administration AD doit s'interdire toute délégation et tout droit sur ce compte. La fiche d'exploitation le rappelle.
