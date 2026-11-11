@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ostena-common",
+    "crates/ostena-crypto",
+    "crates/ostena-grant",
+    "crates/ostena-cli",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+repository = "https://github.com/Phdhebde/Ostena"
+
+[workspace.dependencies]
+ostena-common = { path = "crates/ostena-common" }
+ostena-crypto = { path = "crates/ostena-crypto" }
+ostena-grant = { path = "crates/ostena-grant" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Too noisy for little value at the pedantic level.
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+# Restriction lints: panics and leftovers must not reach production code.
+# Tests are exempted through clippy.toml.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
