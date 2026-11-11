@@ -33,6 +33,11 @@ ostena-scope = { path = "crates/ostena-scope" }
 # NASM needed on Windows, and it works offline.
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys", "alloc", "prebuilt-nasm"] }
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+# TLS 1.3 for the agent-core tunnel; the provider is built from aws-lc-rs in ostena-crypto (ADR-0009).
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
+# X.509 issuance (core CA, agent certificates); no parser (no x509-parser).
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+time = { version = "0.3.55", default-features = false }
 # Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
 windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Services", "Win32_System_Threading"] }

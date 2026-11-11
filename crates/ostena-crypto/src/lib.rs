@@ -13,8 +13,10 @@
 
 pub mod hkdf;
 pub mod p256;
+pub mod pki;
 pub mod rand;
 pub mod sha256;
+pub mod tls;
 
 /// Errors raised by this crate. Deliberately coarse: callers must not be able
 /// to tell apart the reasons of a cryptographic failure.
