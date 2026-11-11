@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4253a88a3bab1396b05529f311e81a0ae9abb176bb061dcc9863f3cab276a26a # shrinks to g = GenPolicy { allow: [([V4(0, 0), V4(0, 0)], [(1, 1)]), ([V4(0, 0)], [(1, 1)])], deny: [[V4(0, 0), V4(0, 1)], [V4(2147483648, 1)]] }, pick = Index(15372286728091293014), r = 182987526776210935118601957232607232, port = 0
