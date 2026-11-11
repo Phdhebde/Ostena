@@ -30,7 +30,13 @@ allow = [
     "Zlib",
     "MPL-2.0",
 ]
-exceptions = []
+exceptions = [
+    # unicode-ident embeds Unicode character tables under the permissive
+    # Unicode-3.0 license, on top of MIT OR Apache-2.0. It is a build-time
+    # dependency of every procedural macro (serde_derive, thiserror) and is not
+    # linked into the shipped binary. Scoped to this crate only.
+    { crate = "unicode-ident", allow = ["Unicode-3.0"] },
+]
 
 [licenses.private]
 # Workspace crates are not published and carry no license yet.

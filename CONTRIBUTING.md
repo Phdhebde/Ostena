@@ -24,9 +24,10 @@ N'introduisez aucun code, document, test ou capture provenant d'un produit tiers
 - Les crates protocolaires (`ssh`, `rdp`, `tsgu`, `rfb`, `frame`) ne dépendent ni de la base ni de l'API.
 - Toute la cryptographie passe par `ostena-crypto`. Pas de crypto maison, pas d'OpenSSL. Les algorithmes suivent les guides ANSSI et ne sont pas négociables.
 - Les secrets vivent dans des types `Secret<…>` : jamais de `Debug`/`Display`, jamais de conversion en `String`, jamais journalisés.
+- Lire un secret (`expose_secret`) est interdit par clippy ; chaque usage porte `#[expect(clippy::disallowed_methods)]` juste sous un commentaire `// SECRET-EXPOSURE: raison`, vérifié par `cargo xtask check-secrets`. Aucun secret dans le fichier de configuration : on y référence un chemin.
 - Sécurité par défaut : toute option qui affaiblit la sécurité est journalisée et refusée en mode production.
 - Pas de `unwrap()`/`expect()` hors tests et hors invariants documentés. Erreurs typées avec `thiserror` ; `anyhow` seulement dans les binaires et `xtask`.
-- Dépendances : licences MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, MPL-2.0 uniquement (contrôlées par `cargo deny`). Toute nouvelle dépendance se justifie dans la PR. Les dépendances git sont refusées par défaut ; une exception doit être épinglée par `rev`.
+- Dépendances : licences MIT, Apache-2.0, BSD-2/3-Clause, ISC, Zlib, MPL-2.0 uniquement (contrôlées par `cargo deny`). Seule exception : `Unicode-3.0` pour `unicode-ident`. Toute nouvelle dépendance se justifie dans la PR. Les dépendances git sont refusées par défaut ; une exception doit être épinglée par `rev`.
 - Code, identifiants et commits en anglais ; documentation et ADR en français.
 
 ## Définition de « terminé »
@@ -47,6 +48,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check
 cargo xtask ci        # tout ce qui précède, dans l'ordre de la CI
+cargo xtask check-secrets  # justification de chaque exposition de secret
 cargo xtask vendor    # vendorise les dépendances dans vendor/
 cargo xtask sbom      # SBOM CycloneDX dans target/sbom/
 ```
