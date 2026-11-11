@@ -284,12 +284,13 @@ fn resident_bytes_of(line: &str) -> Option<u64> {
 }
 
 /// Fuzz target run by `cargo xtask fuzz`.
-const FUZZ_TARGETS: [&str; 5] = [
+const FUZZ_TARGETS: [&str; 6] = [
     "grant_decode",
     "scope_target",
     "scope_policy",
     "frame_decode",
     "frame_reassembly",
+    "tunnel_control_decode",
 ];
 
 /// Runs each fuzz target (all by default) for `SECS` seconds with the nightly

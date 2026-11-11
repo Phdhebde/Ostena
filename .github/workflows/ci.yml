@@ -157,7 +157,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly]
+        target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

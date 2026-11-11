@@ -15,6 +15,7 @@ libfuzzer-sys = "0.4.13"
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
 ostena-scope = { path = "../crates/ostena-scope" }
+ostena-tunnel = { path = "../crates/ostena-tunnel" }
 
 [[bin]]
 name = "grant_decode"
@@ -53,6 +54,13 @@ bench = false
 [[bin]]
 name = "frame_reassembly"
 path = "fuzz_targets/frame_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tunnel_control_decode"
+path = "fuzz_targets/tunnel_control_decode.rs"
 test = false
 doc = false
 bench = false

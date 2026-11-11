@@ -1,0 +1,39 @@
+//! Replays the cargo-fuzz corpus (`fuzz/corpus/tunnel_control_decode`) on the
+//! stable toolchain, so that every input the fuzzer kept is a regression test.
+
+#![allow(clippy::expect_used, reason = "test helpers")]
+
+use std::path::PathBuf;
+
+#[test]
+fn replay_tunnel_control_decode_corpus() {
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/tunnel_control_decode");
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir).expect("corpus directory must exist") {
+        let data = std::fs::read(entry.expect("entry").path()).expect("corpus file");
+        ostena_tunnel::fuzz::decode(&data);
+        count += 1;
+    }
+    assert!(count > 0, "empty corpus {}", dir.display());
+}
+
+/// The seeds are valid messages, so that the fuzzer starts past the JSON layer.
+#[test]
+fn json_seeds_decode() {
+    use ostena_tunnel::control::{AgentMessage, CoreMessage, decode};
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/tunnel_control_decode");
+    for name in [
+        "seed-hello-ack",
+        "seed-policy",
+        "seed-session-params",
+        "seed-refused",
+        "seed-ping",
+    ] {
+        let data = std::fs::read(dir.join(format!("{name}.json"))).expect("seed");
+        assert!(decode::<CoreMessage>(&data).is_ok(), "{name}");
+    }
+    let hello = std::fs::read(dir.join("seed-hello.json")).expect("seed");
+    assert!(decode::<AgentMessage>(&hello).is_ok());
+}
