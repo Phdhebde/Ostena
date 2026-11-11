@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+mod agent;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -30,6 +32,39 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AgentCommand {
+    /// Register the agent as a service (systemd or Windows SCM) and start it.
+    /// Non-interactive; can be run again.
+    Install {
+        /// Configuration file.
+        #[arg(long, default_value_os_t = agent::default_config())]
+        config: PathBuf,
+        /// Executable to register (default: this one).
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// Do not start the service.
+        #[arg(long)]
+        no_start: bool,
+        /// No output on success.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Stop and unregister the service (configuration, data and account kept).
+    Uninstall {
+        /// No output on success.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Run the agent (in the foreground, or as started by the service manager).
+    Run {
+        /// Configuration file.
+        #[arg(long, default_value_os_t = agent::default_config())]
+        config: PathBuf,
+        /// Started by the Windows SCM.
+        #[arg(long, hide = true)]
+        service: bool,
+    },
+    /// Service state (exit code 0 running, 3 stopped, 4 not installed).
+    Status,
     /// Anti-replay journal of the gateway.
     ReplayStore {
         #[command(subcommand)]
@@ -69,6 +104,24 @@ fn main() -> ExitCode {
             let _ = Cli::command().print_help();
             ExitCode::SUCCESS
         }
+        Some(Command::Agent {
+            command:
+                AgentCommand::Install {
+                    config,
+                    executable,
+                    no_start,
+                    quiet,
+                },
+        }) => agent::install(&config, executable, !no_start, quiet),
+        Some(Command::Agent {
+            command: AgentCommand::Uninstall { quiet },
+        }) => agent::uninstall(quiet),
+        Some(Command::Agent {
+            command: AgentCommand::Run { config, service },
+        }) => agent::run(&config, service),
+        Some(Command::Agent {
+            command: AgentCommand::Status,
+        }) => agent::status(),
         Some(Command::Agent {
             command:
                 AgentCommand::ReplayStore {

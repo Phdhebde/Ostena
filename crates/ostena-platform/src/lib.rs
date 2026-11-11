@@ -9,6 +9,7 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod acl;
+pub mod service;
 
 use ostena_common::config::PermissionChecker;
 
