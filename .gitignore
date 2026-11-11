@@ -1,0 +1,25 @@
+# Build output
+/target/
+
+# Vendored dependencies (produced by `cargo xtask vendor`)
+/vendor/
+/.cargo/vendor.toml
+
+# SBOMs produced by cargo-cyclonedx before xtask gathers them
+*.cdx.json
+*.cdx.xml
+
+# Third-party specification PDFs: public references, kept out of history
+/docs/windows/
+*.pdf
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local Claude Code settings
+.claude/settings.local.json
