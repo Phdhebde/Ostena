@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-11-11
+- **Révision** : 2026-11-11, algorithmes du coffre-fort décidés (P-256 + ML-KEM-768, ECDSA P-256 + ML-DSA-65)
 
 ## Contexte
 
@@ -73,9 +74,14 @@ La migration post-quantique des grants demandera donc **un autre canal pour l'ac
 
 Le choix devra préserver l'usage unique et l'absence de secret dans le jeton.
 
-### Point ouvert : coffre-fort
+### Coffre-fort (décidé le 2026-11-11)
 
-CLAUDE.md prévoit pour le coffre-fort « X25519 + ML-KEM-768, Ed25519 + ML-DSA-65 ». D'après le tableau ci-dessus, X25519 et Ed25519 posent la même question que pour le tunnel et les grants. Ce choix sera tranché quand le lot du coffre-fort commencera ; P-256 + ML-KEM-768 et ECDSA P-256 + ML-DSA-65 restent dans les listes explicites de [PG-083].
+CLAUDE.md prévoyait pour le coffre-fort « X25519 + ML-KEM-768, Ed25519 + ML-DSA-65 ». X25519 et Ed25519 posant la même question que pour le tunnel et les grants, le coffre-fort s'aligne sur les listes explicites de [PG-083] :
+
+- **Échange de clés et enveloppe des secrets** : P-256 + ML-KEM-768, combinés par une fonction de dérivation de clés (§ 2.2, « Modes d'hybridation conformes » ; § 2.2.2).
+- **Signatures** (têtes de chaîne d'audit, mises à jour, futurs grants hybrides) : ECDSA P-256 + ML-DSA-65, hybridées par concaténation : ML-DSA signe le message, puis ECDSA signe le couple (message, signature ML-DSA). La signature n'est valide que si les deux le sont (§ 2.2.3).
+
+Les bloquants d'outillage notés pour l'authentification hybride (ML-DSA derrière une fonctionnalité instable d'`aws-lc-rs`) s'appliqueront au lot du coffre-fort.
 
 ## Conséquences
 
