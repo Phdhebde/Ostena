@@ -165,6 +165,21 @@ fn provider_offers_exactly_one_suite_and_one_group() {
 }
 
 #[test]
+fn quic_initial_suite_is_aes_128_gcm_and_not_negotiable() {
+    let initial = quic_initial_suite();
+    assert_eq!(
+        initial.suite.common.suite,
+        CipherSuite::TLS13_AES_128_GCM_SHA256
+    );
+    assert!(
+        provider()
+            .cipher_suites
+            .iter()
+            .all(|s| s.suite() != CipherSuite::TLS13_AES_128_GCM_SHA256)
+    );
+}
+
+#[test]
 fn mutual_handshake_negotiates_the_fixed_parameters() {
     let f = fixture();
     let agent = agent(&f.ca, valid());

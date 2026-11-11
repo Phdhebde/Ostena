@@ -175,6 +175,30 @@ pub fn provider() -> Arc<CryptoProvider> {
     })
 }
 
+pub use rustls::quic::Suite as QuicInitialSuite;
+
+/// The suite QUIC uses for its Initial packets (RFC 9001 section 5.2):
+/// AES-128-GCM with keys derived from a public salt and the connection ID.
+/// It hides nothing from an observer and carries only the start of the
+/// handshake; the handshake and all data use the negotiated
+/// `TLS_AES_256_GCM_SHA384`. It is not offered for negotiation.
+///
+/// # Panics
+///
+/// Never: the rustls aws-lc-rs provider always has this suite and its QUIC
+/// variant.
+pub fn quic_initial_suite() -> QuicInitialSuite {
+    // The aws-lc-rs TLS 1.3 suite always has a QUIC variant.
+    #[expect(
+        clippy::expect_used,
+        reason = "invariant of the rustls aws-lc-rs provider"
+    )]
+    aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
+        .tls13()
+        .and_then(rustls::Tls13CipherSuite::quic_suite)
+        .expect("TLS13_AES_128_GCM_SHA256 has a QUIC suite")
+}
+
 /// SHA-256 of a certificate (DER): the identity of an agent in the registry.
 pub fn fingerprint(certificate: &CertificateDer<'_>) -> [u8; 32] {
     crate::sha256::digest(certificate.as_ref())
@@ -421,3 +445,64 @@ pub fn server_config(
 
 #[cfg(test)]
 mod tests;
+
+/// Deliberately non-compliant peers, to prove they are refused.
+#[cfg(feature = "testing")]
+pub mod testing {
+    use super::{
+        Arc, ClientConfig, Identity, TlsError, TrustAnchor, WebPkiServerVerifier, aws_lc_rs,
+    };
+
+    /// What a foreign client offers instead of the fixed parameters.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Offer {
+        /// Only X25519 (classical).
+        X25519,
+        /// Only P-256 (classical).
+        Secp256r1,
+        /// Only X25519MLKEM768 (hybrid, but not the one we fixed).
+        X25519MlKem768,
+        /// The right group, but only AES-128-GCM and ChaCha20-Poly1305.
+        Aes128Suite,
+    }
+
+    /// A client on the stock aws-lc-rs provider, restricted to `offer`, that
+    /// trusts `core_ca` and presents `identity`.
+    ///
+    /// # Errors
+    ///
+    /// [`TlsError::Config`] if rustls refuses the configuration.
+    pub fn foreign_client_config(
+        offer: Offer,
+        core_ca: &TrustAnchor,
+        identity: &Identity,
+        alpn: &[&[u8]],
+    ) -> Result<Arc<ClientConfig>, TlsError> {
+        let mut p = aws_lc_rs::default_provider();
+        match offer {
+            Offer::X25519 => p.kx_groups = vec![aws_lc_rs::kx_group::X25519],
+            Offer::Secp256r1 => p.kx_groups = vec![aws_lc_rs::kx_group::SECP256R1],
+            Offer::X25519MlKem768 => p.kx_groups = vec![aws_lc_rs::kx_group::X25519MLKEM768],
+            Offer::Aes128Suite => {
+                p.kx_groups = vec![aws_lc_rs::kx_group::SECP256R1MLKEM768];
+                p.cipher_suites = vec![
+                    aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256,
+                    aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+                ];
+            }
+        }
+        let p = Arc::new(p);
+        let verifier = WebPkiServerVerifier::builder_with_provider(core_ca.roots()?, p.clone())
+            .build()
+            .map_err(|e| TlsError::Config(e.to_string()))?;
+        let mut config = ClientConfig::builder_with_provider(p)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| TlsError::Config(e.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(identity.chain.clone(), identity.rustls_key())
+            .map_err(|e| TlsError::Config(e.to_string()))?;
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Ok(Arc::new(config))
+    }
+}

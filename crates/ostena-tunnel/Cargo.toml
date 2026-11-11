@@ -1,0 +1,38 @@
+[package]
+name = "ostena-tunnel"
+description = "Dial-back mTLS tunnel between the gateway agent and the core: QUIC, control messages, prioritised session channels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+# In-process test core and foreign TLS peers. Never in a release binary:
+# `cargo xtask check-release` fails if it is enabled for ostena-cli.
+testing = ["ostena-crypto/testing"]
+
+[dependencies]
+base64.workspace = true
+ostena-common.workspace = true
+ostena-crypto.workspace = true
+ostena-grant.workspace = true
+ostena-scope.workspace = true
+quinn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The integration tests and the benchmark run against the test core.
+ostena-tunnel = { path = ".", features = ["testing"] }
+proptest.workspace = true
+
+[[bench]]
+name = "latency"
+harness = false
+
+[lints]
+workspace = true

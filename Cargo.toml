@@ -9,6 +9,7 @@ members = [
     "crates/ostena-scope",
     "crates/ostena-frame",
     "crates/ostena-platform",
+    "crates/ostena-tunnel",
     "crates/ostena-cli",
     "xtask",
 ]
@@ -27,6 +28,7 @@ ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 ostena-platform = { path = "crates/ostena-platform" }
 ostena-scope = { path = "crates/ostena-scope" }
+ostena-tunnel = { path = "crates/ostena-tunnel" }
 
 # Third-party dependencies. Each one is justified in the PR that adds it.
 # Only ostena-crypto may depend on it (enforced by deny.toml). prebuilt-nasm: no
@@ -38,6 +40,8 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 # X.509 issuance (core CA, agent certificates); no parser (no x509-parser).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 time = { version = "0.3.55", default-features = false }
+# QUIC transport of the agent-core tunnel (ADR-0008); TLS comes from ostena-crypto::tls.
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 # Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
 windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Services", "Win32_System_Threading"] }
