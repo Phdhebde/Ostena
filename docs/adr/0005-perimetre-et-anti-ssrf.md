@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté
 - **Date** : 2026-11-11
+- **Révisé** : 2026-11-11 — échéance obligatoire de la dérogation aux noms courts (`SCP-E017`, `SCP-E018`)
 
 ## Contexte
 
@@ -78,7 +79,14 @@ Les réseaux privés (RFC 1918), CGNAT, documentation ou banc d'essai ne sont **
 
 `allow_short_names = true` est un **affaiblissement** :
 - en développement, accepté et journalisé (`scope.weakening`) ;
-- en production, refusé (`SCP-E015`) **sauf** avec `short_names_justification`, qui est journalisée à chaque démarrage. Chaque usage est aussi tracé (`scope.short_name_used`).
+- en production, refusé **sauf** si la dérogation est complète :
+  - `short_names_justification` d'au moins **20 caractères**, espaces de début et de fin non comptés. Absente : `SCP-E015` ; trop courte : `SCP-E017` ;
+  - `short_names_expires`, une **date d'échéance ISO 8601** (`AAAA-MM-JJ`, analysée strictement), **au plus 366 jours** après le jour du démarrage. Absente, invalide ou trop lointaine : `SCP-E017`. Une date invalide est refusée aussi en développement ;
+  - la dérogation vaut **jusqu'à la fin du jour d'échéance en UTC**. À partir du lendemain 00:00 UTC, l'agent **refuse de démarrer** en production (`SCP-E018`).
+
+La justification et l'échéance sont journalisées à chaque démarrage (`scope.weakening`), et chaque usage d'un nom court est tracé (`scope.short_name_used`).
+
+**L'échéance est aussi vérifiée à chaque décision** qui s'appuie sur la dérogation, avec l'heure courante (horloge injectable, testée en franchissant minuit UTC). Un agent qui tourne encore après l'échéance refuse les noms courts (`SCP-E018`) sans attendre un redémarrage. Il journalise alors une fois l'événement `scope.weakening_expired`, et chaque refus produit son `scope.refused`. Cela vaut aussi en développement si une échéance est donnée.
 
 La fiche d'exploitation recommande de désactiver LLMNR et NetBIOS sur l'hôte de l'agent.
 
@@ -102,11 +110,13 @@ La fiche d'exploitation recommande de désactiver LLMNR et NetBIOS sur l'hôte d
 | `SCP-E014` | nom court refusé |
 | `SCP-E015` | noms courts en production sans justification |
 | `SCP-E016` | adresse de l'infrastructure Ostena |
+| `SCP-E017` | dérogation aux noms courts invalide : justification de moins de 20 caractères, échéance absente, mal formée ou à plus d'un an |
+| `SCP-E018` | dérogation aux noms courts expirée (au démarrage en production, ou à la décision) |
 
 Événements :
 - **`scope.refused`** : code, cible demandée, adresse jugée (normalisée), adresse d'origine si elle cachait une IPv4, identifiant de la règle (`floor:cloud-metadata`, `deny[2]`, `infrastructure[0]`, `default-deny`, `port`…) et groupe de passerelles. Il est prêt pour l'audit ;
 - **`scope.pinned`** : adresses retenues ;
-- **`scope.weakening`**, **`scope.floor_exception_used`**, **`scope.short_name_used`** ;
+- **`scope.weakening`**, **`scope.weakening_expired`**, **`scope.floor_exception_used`**, **`scope.short_name_used`** ;
 - **`scope.local_addresses_failed`** : la liste des adresses de la passerelle n'a pas pu être rafraîchie ; l'ancienne est conservée.
 
 ### Vérification

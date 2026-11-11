@@ -41,6 +41,11 @@ pub enum Code {
     ShortNamesInProduction,
     /// Address of an Ostena infrastructure component.
     Infrastructure,
+    /// Short names waiver: justification too short, expiry missing, invalid
+    /// or more than a year ahead.
+    ShortNamesWaiver,
+    /// Short names waiver expired.
+    ShortNamesExpired,
 }
 
 impl Code {
@@ -63,6 +68,8 @@ impl Code {
             Self::ShortName => "SCP-E014",
             Self::ShortNamesInProduction => "SCP-E015",
             Self::Infrastructure => "SCP-E016",
+            Self::ShortNamesWaiver => "SCP-E017",
+            Self::ShortNamesExpired => "SCP-E018",
         }
     }
 }
@@ -126,6 +133,16 @@ pub enum ScopeError {
         /// Target as requested.
         requested: String,
     },
+    /// Single-label name refused because the waiver expired (`SCP-E018`).
+    #[error(
+        "[SCP-E018] nom court « {requested} » refusé : la dérogation allow_short_names a \n         expiré le {expired_on}"
+    )]
+    ShortNameExpired {
+        /// Target as requested.
+        requested: String,
+        /// Last valid day of the waiver.
+        expired_on: String,
+    },
     /// Resolution failed (`SCP-E010`).
     #[error("[SCP-E010] résolution de « {requested} » impossible : {reason}")]
     Resolution {
@@ -156,6 +173,7 @@ impl ScopeError {
         match self {
             Self::Target { source, .. } => source.code,
             Self::ShortName { .. } => Code::ShortName,
+            Self::ShortNameExpired { .. } => Code::ShortNamesExpired,
             Self::Resolution { .. } => Code::Resolution,
             Self::Refused { via_name: true, .. } => Code::ResolvedAddressRefused,
             Self::Refused { refusal, .. } => refusal.code,
@@ -186,6 +204,8 @@ mod tests {
             Code::ShortName,
             Code::ShortNamesInProduction,
             Code::Infrastructure,
+            Code::ShortNamesWaiver,
+            Code::ShortNamesExpired,
         ];
         for (i, c) in all.iter().enumerate() {
             assert_eq!(c.as_str(), format!("SCP-E{:03}", i + 1));

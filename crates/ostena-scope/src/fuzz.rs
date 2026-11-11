@@ -13,6 +13,9 @@ use crate::policy::{
 };
 use crate::target::{Host, Target, parse_host};
 
+/// Fixed date for deterministic runs: 2026-11-11T12:00:00Z.
+const FUZZ_NOW: u64 = 1_794_398_400;
+
 /// Allows everything, so that only the floor and deny rules refuse.
 fn wide_policy() -> Option<&'static CompiledPolicy> {
     static POLICY: OnceLock<Option<CompiledPolicy>> = OnceLock::new();
@@ -63,7 +66,7 @@ pub fn target(data: &[u8]) {
 /// Policy parsing and compilation from a line format. Must never panic.
 ///
 /// Lines: `allow <net,...> <port,...>`, `deny <net,...>`, `infra <net,...>`,
-/// `except <net> <reason>`, `short [justification]`, `check <ip> <port>`.
+/// `except <net> <reason>`, `short <expires> [justification]`, `check <ip> <port>`.
 pub fn policy(data: &[u8]) {
     let Ok(text) = std::str::from_utf8(data) else {
         return;
@@ -99,7 +102,9 @@ pub fn policy(data: &[u8]) {
             }),
             Some("short") => {
                 spec.allow_short_names = true;
-                spec.short_names_justification = words.next().map(str::to_owned);
+                spec.short_names_expires = words.next().map(str::to_owned);
+                let justification: Vec<&str> = words.collect();
+                spec.short_names_justification = Some(justification.join(" "));
             }
             Some("check") => {
                 if let (Some(ip), Some(port)) = (words.next(), words.next())
@@ -113,7 +118,8 @@ pub fn policy(data: &[u8]) {
     }
     let local = LocalAddresses::default();
     for mode in [Mode::Production, Mode::Development] {
-        if let Ok(policy) = CompiledPolicy::compile(&spec, mode) {
+        if let Ok(policy) = CompiledPolicy::compile_at(&spec, mode, FUZZ_NOW) {
+            let _ = policy.short_names_at(FUZZ_NOW + 86_400);
             for addr in &checks {
                 let _ = policy.check(*addr, &local);
             }

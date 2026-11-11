@@ -8,14 +8,14 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use crate::error::{Refusal, ScopeError};
 use crate::local::SharedLocalAddresses;
-use crate::policy::CompiledPolicy;
+use crate::policy::{CompiledPolicy, ShortNames};
 use crate::target::{Host, Hostname, Target};
 
 /// Largest number of addresses accepted in one answer.
@@ -188,6 +188,39 @@ pub struct Scope<R> {
     policy: Arc<CompiledPolicy>,
     local: SharedLocalAddresses,
     resolver: R,
+    clock: Clock,
+    expiry_logged: AtomicBool,
+}
+
+/// Source of the current time (Unix seconds), injectable for tests.
+#[derive(Clone)]
+pub struct Clock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl Clock {
+    /// The system clock.
+    pub fn system() -> Self {
+        Self(Arc::new(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        }))
+    }
+
+    /// A clock reading `now`.
+    pub fn from_fn(now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    /// The current time.
+    pub fn now(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Clock")
+    }
 }
 
 impl<R: Resolver + Sync> Scope<R> {
@@ -197,7 +230,16 @@ impl<R: Resolver + Sync> Scope<R> {
             policy,
             local,
             resolver,
+            clock: Clock::system(),
+            expiry_logged: AtomicBool::new(false),
         }
+    }
+
+    /// Replaces the clock (tests).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// The compiled policy.
@@ -238,10 +280,7 @@ impl<R: Resolver + Sync> Scope<R> {
             Host::Ip(ip) => (vec![*ip], None),
             Host::Name(name) => {
                 if name.is_short() {
-                    if !self.policy.allow_short_names() {
-                        return Err(ScopeError::ShortName { requested });
-                    }
-                    tracing::info!(event = "scope.short_name_used", requested = %requested);
+                    self.check_short_name(&requested)?;
                 }
                 let mut ips =
                     self.resolver
@@ -290,6 +329,36 @@ impl<R: Resolver + Sync> Scope<R> {
             }
         }
         Ok(PinnedTarget { addrs, name })
+    }
+
+    /// The waiver is checked against the clock at every use: once expired, short
+    /// names are refused without waiting for a restart.
+    fn check_short_name(&self, requested: &str) -> Result<(), ScopeError> {
+        match self.policy.short_names_at(self.clock.now()) {
+            ShortNames::Refused => Err(ScopeError::ShortName {
+                requested: requested.to_owned(),
+            }),
+            ShortNames::Expired => {
+                let expired_on = self.policy.short_names_expires().unwrap_or_default();
+                if !self.expiry_logged.swap(true, Ordering::AcqRel) {
+                    tracing::warn!(
+                        event = "scope.weakening_expired",
+                        kind = "allow_short_names",
+                        expired_on = %expired_on,
+                        gateway_group = self.policy.gateway_group(),
+                        "dérogation allow_short_names expirée : les noms courts sont désormais refusés"
+                    );
+                }
+                Err(ScopeError::ShortNameExpired {
+                    requested: requested.to_owned(),
+                    expired_on,
+                })
+            }
+            ShortNames::Allowed => {
+                tracing::info!(event = "scope.short_name_used", requested = %requested);
+                Ok(())
+            }
+        }
     }
 
     fn refused(&self, requested: String, refusal: Refusal, via_name: bool) -> ScopeError {
