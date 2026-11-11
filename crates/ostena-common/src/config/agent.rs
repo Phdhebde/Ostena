@@ -41,6 +41,11 @@ pub struct AgentConfig {
     /// Runtime worker threads, 1 to 64; default min(4, cores).
     #[serde(default)]
     pub worker_threads: Option<usize>,
+    /// Local control plane: a socket path (Linux, default
+    /// `/run/ostena/agent.sock`) or a pipe name (Windows, default
+    /// `\\.\pipe\ostena-agent`).
+    #[serde(default)]
+    pub control_endpoint: Option<String>,
     /// Scope policy of the gateway group.
     #[serde(default)]
     pub scope: PolicySpec,
@@ -175,6 +180,22 @@ pub(crate) fn consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
             Code::AgentBounds,
             format!("agent.worker_threads = {n} : attendu de 1 à 64."),
         ));
+    }
+    if let Some(endpoint) = &agent.control_endpoint {
+        let pipe = endpoint
+            .strip_prefix(r"\\.\pipe\")
+            .is_some_and(|name| !name.is_empty() && !name.contains('\\'));
+        // sun_path holds 108 bytes, terminator included.
+        let socket = endpoint.starts_with('/') && endpoint.len() < 108;
+        if !(pipe || socket) {
+            out.push(Violation::new(
+                Code::ControlEndpoint,
+                format!(
+                    "agent.control_endpoint = « {endpoint} » : chemin de socket absolu ou nom de pipe \
+                     \\\\.\\pipe\\… attendu."
+                ),
+            ));
+        }
     }
     if !agent.scope.infrastructure.is_empty() {
         out.push(Violation::new(

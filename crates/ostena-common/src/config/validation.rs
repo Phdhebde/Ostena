@@ -63,11 +63,13 @@ pub enum Code {
     ReplayJournalExposed,
     /// Agent: an infrastructure name cannot be resolved.
     InfrastructureUnresolved,
+    /// Agent: invalid control endpoint.
+    ControlEndpoint,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -90,6 +92,7 @@ impl Code {
         Self::PrivateKeyExposed,
         Self::ReplayJournalExposed,
         Self::InfrastructureUnresolved,
+        Self::ControlEndpoint,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -117,6 +120,7 @@ impl Code {
             Self::PrivateKeyExposed => "CFG-P008",
             Self::ReplayJournalExposed => "CFG-P009",
             Self::InfrastructureUnresolved => "CFG-P010",
+            Self::ControlEndpoint => "CFG-V011",
         }
     }
 

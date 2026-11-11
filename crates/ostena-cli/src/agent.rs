@@ -3,11 +3,34 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use ostena_common::config::{self, Config, LoggingConfig};
+use ostena_common::config::{self, AgentConfig, Config, LoggingConfig};
 use ostena_grant::FileReplayStore;
+use ostena_platform::control::{ControlListener, DEFAULT_ENDPOINT, ExpectedServer};
 use ostena_platform::service::{InstallOptions, ServiceManager, ServiceState, service_manager};
+
+use crate::control;
+use crate::sessions::Sessions;
+
+/// Delay before the idle footprint is measured (`agent.idle_footprint`).
+const IDLE_FOOTPRINT_DELAY: Duration = Duration::from_secs(5);
+
+/// SHA-256 of the configuration file as loaded, for `status`.
+fn fingerprint(path: &Path) -> String {
+    std::fs::read(path).map_or_else(
+        |_| "indisponible".to_owned(),
+        |bytes| {
+            use std::fmt::Write as _;
+            let digest = ostena_crypto::sha256::digest(&bytes);
+            digest.iter().fold(String::from("sha256:"), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
+        },
+    )
+}
 
 /// Exit code of `status` when the service is installed but not running
 /// (LSB convention).
@@ -98,22 +121,75 @@ pub(crate) fn uninstall(quiet: bool) -> ExitCode {
     }
 }
 
-pub(crate) fn status() -> ExitCode {
-    let state = match service_manager().and_then(ServiceManager::state) {
-        Ok(s) => s,
+/// Control plane endpoint of a configuration (or the platform default).
+fn endpoint_of(config: &Path) -> String {
+    read(config)
+        .ok()
+        .and_then(|c| c.agent)
+        .and_then(|a| a.control_endpoint)
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned())
+}
+
+/// `ostena agent status`: the service state, then, if it runs, what its
+/// control plane reports. `pid` targets a foreground agent (development).
+pub(crate) fn status(config: &Path, pid: Option<u32>) -> ExitCode {
+    let expected = if let Some(pid) = pid {
+        ExpectedServer::Process(pid)
+    } else {
+        let state = match service_manager().and_then(ServiceManager::state) {
+            Ok(s) => s,
+            Err(e) => return fail(&e.to_string()),
+        };
+        let (text, code) = match state {
+            ServiceState::Running => ("en cours d'exécution", 0),
+            ServiceState::Starting => ("en cours de démarrage", 0),
+            ServiceState::Stopping => ("en cours d'arrêt", NOT_RUNNING),
+            ServiceState::Stopped => ("arrêté", NOT_RUNNING),
+            ServiceState::Failed => ("arrêté après des échecs répétés", NOT_RUNNING),
+            ServiceState::NotInstalled => ("non installé", 4),
+            ServiceState::Other(ref s) => (s.as_str(), 1),
+        };
+        say(false, &format!("Agent : {text}"));
+        if state != ServiceState::Running {
+            return ExitCode::from(code);
+        }
+        ExpectedServer::Service
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
         Err(e) => return fail(&e.to_string()),
     };
-    let (text, code) = match state {
-        ServiceState::Running => ("en cours d'exécution", 0),
-        ServiceState::Starting => ("en cours de démarrage", 0),
-        ServiceState::Stopping => ("en cours d'arrêt", NOT_RUNNING),
-        ServiceState::Stopped => ("arrêté", NOT_RUNNING),
-        ServiceState::Failed => ("arrêté après des échecs répétés", NOT_RUNNING),
-        ServiceState::NotInstalled => ("non installé", 4),
-        ServiceState::Other(ref s) => (s.as_str(), 1),
+    let endpoint = endpoint_of(config);
+    let answer = match runtime.block_on(control::query(&endpoint, expected, "status")) {
+        Ok(a) => a,
+        Err(e) => return fail(&e.to_string()),
     };
-    say(false, &format!("Agent : {text}"));
-    ExitCode::from(code)
+    let field = |k: &str| {
+        answer[k]
+            .as_str()
+            .map_or_else(|| answer[k].to_string(), str::to_owned)
+    };
+    #[expect(clippy::cast_precision_loss, reason = "display only")]
+    let mib = answer["resident_bytes"].as_u64().map_or_else(
+        || "?".to_owned(),
+        |b| format!("{:.1}", b as f64 / 1_048_576.0),
+    );
+    say(
+        false,
+        &format!(
+            "Version : {}\nGroupe : {}\nCore : {}\nSessions : {}\nEn service depuis : {} s\nMémoire résidente : {mib} Mio\nEmpreinte de la configuration : {}",
+            field("version"),
+            field("gateway_group"),
+            field("core"),
+            field("sessions"),
+            field("uptime_secs"),
+            field("config_fingerprint"),
+        ),
+    );
+    ExitCode::SUCCESS
 }
 
 /// How the agent learns it must stop.
@@ -232,20 +308,23 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
             return 1;
         }
     };
-    runtime.block_on(async {
-        ready();
-        tracing::info!(
-            event = "agent.started",
-            version = ostena_common::VERSION,
-            gateway_group = %agent.gateway_group,
-            worker_threads = agent.worker_threads(),
-            pid = std::process::id(),
-        );
-        stop.wait().await;
+    let endpoint = agent
+        .control_endpoint
+        .clone()
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned());
+    let info = Arc::new(control::AgentInfo {
+        started,
+        gateway_group: agent.gateway_group.clone(),
+        config_fingerprint: fingerprint(config_path),
+        sessions: Arc::new(Sessions::new()),
     });
-    #[cfg(target_os = "linux")]
-    ostena_platform::service::notify("STOPPING=1");
-    tracing::info!(event = "agent.stopping");
+    let grace = Duration::from_secs(agent.shutdown_grace_secs);
+    let served = runtime.block_on(serve_until_stopped(
+        &agent, &endpoint, info, grace, stop, ready,
+    ));
+    if !served {
+        return 1;
+    }
     let code = match journal.sync() {
         Ok(()) => 0,
         Err(e) => {
@@ -254,10 +333,67 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
         }
     };
     drop(journal);
-    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    runtime.shutdown_timeout(Duration::from_secs(5));
     tracing::info!(
         event = "agent.stopped",
         uptime_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
     );
     code
+}
+
+/// Control plane and idle footprint until the stop request, then the bounded
+/// shutdown of the sessions. Returns `false` when the control plane cannot
+/// start (`AGT-E006`: another agent or a squat).
+async fn serve_until_stopped(
+    agent: &AgentConfig,
+    endpoint: &str,
+    info: Arc<control::AgentInfo>,
+    grace: Duration,
+    stop: StopSource,
+    ready: Box<dyn FnOnce() + Send>,
+) -> bool {
+    let listener = match ControlListener::bind(endpoint) {
+        Ok(l) => Arc::new(l),
+        Err(e) => {
+            tracing::error!(event = "agent.control_unavailable", code = e.code.as_str(), endpoint = %endpoint, "{e}");
+            return false;
+        }
+    };
+    let server = tokio::spawn(control::serve(Arc::clone(&listener), Arc::clone(&info)));
+    let footprint = tokio::spawn(async {
+        tokio::time::sleep(IDLE_FOOTPRINT_DELAY).await;
+        tracing::info!(
+            event = "agent.idle_footprint",
+            resident_bytes = ostena_platform::memory::resident_bytes()
+        );
+    });
+    ready();
+    tracing::info!(
+        event = "agent.started",
+        version = ostena_common::VERSION,
+        gateway_group = %agent.gateway_group,
+        worker_threads = agent.worker_threads(),
+        control_endpoint = %endpoint,
+        pid = std::process::id(),
+    );
+    stop.wait().await;
+    #[cfg(target_os = "linux")]
+    ostena_platform::service::notify("STOPPING=1");
+    tracing::info!(
+        event = "agent.stopping",
+        sessions = info.sessions.active(),
+        grace_secs = grace.as_secs()
+    );
+    let report = info.sessions.shutdown(grace).await;
+    tracing::info!(
+        event = "agent.sessions_closed",
+        finished = report.finished,
+        aborted = report.aborted
+    );
+    footprint.abort();
+    server.abort();
+    let _ = server.await;
+    // Dropping the listener removes the Unix socket.
+    drop(listener);
+    true
 }

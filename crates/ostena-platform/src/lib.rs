@@ -9,7 +9,12 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 pub mod acl;
+pub mod control;
+mod error;
+pub mod memory;
 pub mod service;
+
+pub use error::{Code, PlatformError};
 
 use ostena_common::config::PermissionChecker;
 
