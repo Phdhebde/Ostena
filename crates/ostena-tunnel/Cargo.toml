@@ -36,5 +36,9 @@ tracing-subscriber.workspace = true
 name = "latency"
 harness = false
 
+[[example]]
+name = "test_core"
+required-features = ["testing"]
+
 [lints]
 workspace = true

@@ -213,9 +213,14 @@ fn collect_sboms(dir: &Path, out_dir: &Path) -> Result<usize> {
 /// Indicative idle footprint target (ADR-0007): displayed, not enforced.
 const FOOTPRINT_TARGET_MIB: f64 = 20.0;
 
-/// Starts a release agent in the foreground with a development
-/// configuration, waits for its `agent.idle_footprint` event (5 s after
-/// start) and prints the resident memory.
+/// The gateway group of the measured agent.
+const FOOTPRINT_GROUP: &str = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
+
+/// Measures the idle footprint of a release agent in three states: without
+/// a link to the core, with a link that cannot connect, and connected to a
+/// test core (the `test_core` example, in its own process). Each agent runs
+/// in the foreground with a development configuration; its
+/// `agent.idle_footprint` event (5 s after start) gives the resident memory.
 fn footprint() -> Result<()> {
     use std::io::BufRead;
     use std::process::Stdio;
@@ -224,23 +229,92 @@ fn footprint() -> Result<()> {
     let mut build = cargo();
     build.args(["build", "--release", "--locked", "--package", "ostena-cli"]);
     run(build)?;
-    let exe = root
-        .join("target/release")
-        .join(format!("ostena{}", std::env::consts::EXE_SUFFIX));
+    let mut build = cargo();
+    build.args([
+        "build",
+        "--release",
+        "--locked",
+        "--package",
+        "ostena-tunnel",
+        "--features",
+        "testing",
+        "--example",
+        "test_core",
+    ]);
+    run(build)?;
+    let release = root.join("target/release");
+    let exe = release.join(format!("ostena{}", std::env::consts::EXE_SUFFIX));
+    let test_core = release
+        .join("examples")
+        .join(format!("test_core{}", std::env::consts::EXE_SUFFIX));
 
     let dir = std::env::temp_dir().join(format!("ostena-footprint-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(dir.join("state"))?;
+
+    // The test core writes the agent identity and the root, then serves.
+    let mut core = Command::new(&test_core)
+        .arg(&dir)
+        .arg(FOOTPRINT_GROUP)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let core_line = std::io::BufReader::new(core.stdout.take().ok_or("no test core output")?)
+        .lines()
+        .map_while(std::result::Result::ok)
+        .find(|l| l.starts_with("core "));
+    let measures = core_line
+        .and_then(|l| l.strip_prefix("core ").map(str::to_owned))
+        .ok_or_else(|| "the test core did not start".into())
+        .and_then(|address| {
+            [
+                ("without link", None),
+                ("not connected", Some("127.0.0.1:9")),
+                ("connected", Some(address.as_str())),
+            ]
+            .into_iter()
+            .map(|(state, core)| Ok((state, measure(&exe, &dir, core)?)))
+            .collect::<Result<Vec<_>>>()
+        });
+    drop(core.stdin.take());
+    let _ = core.wait();
+    let _ = fs::remove_dir_all(&dir);
+
+    for (state, bytes) in measures? {
+        #[expect(clippy::cast_precision_loss, reason = "display only")]
+        let mib = bytes as f64 / 1_048_576.0;
+        let verdict = if mib <= FOOTPRINT_TARGET_MIB {
+            "within"
+        } else {
+            "ABOVE"
+        };
+        println!(
+            "idle footprint ({state}): {mib:.1} MiB resident ({verdict} the indicative {FOOTPRINT_TARGET_MIB} MiB target)"
+        );
+    }
+    Ok(())
+}
+
+/// Runs one agent until its `agent.idle_footprint` event; `core` is the
+/// core address, `None` for an agent without link (no `tls_core_ca`).
+fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<u64> {
+    use std::io::BufRead;
+    use std::process::Stdio;
+
     let path = |p: &str| dir.join(p).display().to_string().replace('\\', "\\\\");
     let endpoint = if cfg!(windows) {
         format!(r"\\\\.\\pipe\\ostena-footprint-{}", std::process::id())
     } else {
         path("run/agent.sock")
     };
+    let ca = core.map_or_else(String::new, |_| {
+        format!("tls_core_ca = \"{}\"\n", path("root.pem"))
+    });
     let config = format!(
-        "mode = \"development\"\n\n[agent]\ngateway_group = \"00000000-0000-0000-0000-000000000000\"\n\
-         core_address = \"core.invalid:8443\"\ntls_certificate = \"{}\"\ntls_private_key = \"{}\"\n\
+        "mode = \"development\"\n\n[agent]\ngateway_group = \"{FOOTPRINT_GROUP}\"\n\
+         core_address = \"{}\"\ntls_certificate = \"{}\"\ntls_private_key = \"{}\"\n{ca}\
          replay_journal = \"{}\"\ncontrol_endpoint = \"{endpoint}\"\n",
+        core.unwrap_or("core.invalid:8443"),
         path("agent.crt"),
         path("agent.key"),
         path("state/replay.journal"),
@@ -249,33 +323,32 @@ fn footprint() -> Result<()> {
     fs::write(&file, config)?;
 
     eprintln!("$ {} agent run --config {}", exe.display(), file.display());
-    let mut child = Command::new(&exe)
+    let mut child = Command::new(exe)
         .args(["agent", "run", "--config"])
         .arg(&file)
         .stdout(Stdio::piped())
         .spawn()?;
     let stdout = child.stdout.take().ok_or("no agent output")?;
-    let line = std::io::BufReader::new(stdout)
+    let mut connected = false;
+    let mut footprint = None;
+    for line in std::io::BufReader::new(stdout)
         .lines()
         .map_while(std::result::Result::ok)
-        .find(|l| l.contains("agent.idle_footprint"));
+    {
+        connected |= line.contains("agent.core_connected");
+        if line.contains("agent.idle_footprint") {
+            footprint = Some(line);
+            break;
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
-    let _ = fs::remove_dir_all(&dir);
-
-    let line = line.ok_or("the agent stopped before reporting its footprint")?;
-    let bytes = resident_bytes_of(&line).ok_or_else(|| format!("no resident_bytes in: {line}"))?;
-    #[expect(clippy::cast_precision_loss, reason = "display only")]
-    let mib = bytes as f64 / 1_048_576.0;
-    let verdict = if mib <= FOOTPRINT_TARGET_MIB {
-        "within"
-    } else {
-        "ABOVE"
-    };
-    println!(
-        "idle footprint: {mib:.1} MiB resident ({verdict} the indicative {FOOTPRINT_TARGET_MIB} MiB target)"
-    );
-    Ok(())
+    let _ = fs::remove_file(dir.join("state/replay.journal"));
+    let line = footprint.ok_or("the agent stopped before reporting its footprint")?;
+    if core.is_some_and(|c| c != "127.0.0.1:9") && !connected {
+        return Err("the agent did not connect to the test core".into());
+    }
+    resident_bytes_of(&line).ok_or_else(|| format!("no resident_bytes in: {line}").into())
 }
 
 /// `"resident_bytes":12345` in a JSON log line.
