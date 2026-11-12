@@ -55,10 +55,13 @@ L'encadré « Attention » du § 2.2.3 rappelle qu'ECDSA n'est pas fortement ré
 - **AES-256-GCM** (conforme, § 2.1.2.1), sous une clé dérivée par PBKDF2-HMAC-SHA256 avec 600 000 itérations et un sel aléatoire de 128 bits ;
 - l'en-tête (version, itérations, sel, nonce) est authentifié comme donnée associée.
 
-**La phrase secrète n'est pas choisie par une personne.** Elle est tirée par l'outil : 30 caractères base32, soit 150 bits.
-- Une phrase choisie serait un secret de faible entropie, attaquable hors ligne une fois le fichier volé, ce qu'interdit `RègleSecretFaibleEntropie` (§ 2.2.4).
-- Avec 150 bits, la clé respecte `RègleTailleCléSym` (§ 2.1.1) et `RecoPQTailleCléSym` (au moins 192 bits de clé AES et 150 bits d'entropie, hors de portée d'une recherche exhaustive, même quantique au sens du § 2.1.1). La dérivation n'ajoute qu'une marge.
-- La phrase est affichée une seule fois, en deux moitiés, pour deux dépositaires.
+**Le secret de scellement n'est pas choisi par une personne.** Il est tiré par l'outil : 160 bits.
+- Un mot de passe choisi serait un secret de faible entropie, attaquable hors ligne une fois le fichier volé, ce qu'interdit `RègleSecretFaibleEntropie` (§ 2.2.4).
+- Avec 160 bits d'entropie, il respecte `RègleTailleCléSym` (§ 2.1.1) et reste hors de portée d'une recherche exhaustive, même accélérée par un calcul quantique (§ 2.1.1). La clé AES fait 256 bits (`RecoPQTailleCléSym`). La dérivation n'ajoute qu'une marge.
+
+**Ce secret n'est jamais affiché tel quel.** Il est partagé en trois parts selon le schéma de Shamir sur GF(256), deux quelconques le reconstituant (`vsss-rs`, ADR-0008).
+- Une seule part ne donne **aucune information** sur le secret : c'est la sécurité inconditionnelle du schéma de seuil, qui ne repose sur aucun problème calculatoire et n'est donc pas affaiblie par un calcul quantique.
+- Chaque part porte une CRC-16, qui ne sert qu'à détecter les fautes de recopie. Une part forgée produit seulement un secret qui n'ouvre pas le scellé (AES-GCM authentifié).
 
 ### Risque accepté : authentification classique
 

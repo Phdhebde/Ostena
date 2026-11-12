@@ -170,11 +170,24 @@ En développement, les trois sont journalisées et acceptées.
 
 **5. Cérémonie** (`ostena ca`, procédure dans `docs/exploitation/ceremonie-racine.md`) :
 - **Sur le poste isolé**, `ostena ca root init --name … --out <support A> --out <support B>` :
-  - tire la clé racine et une **phrase secrète générée** (30 caractères base32, 150 bits), affichée une seule fois en deux moitiés pour deux dépositaires ;
-  - écrit sur chaque support `root.pem`, `root.name` et `root.key.sealed` (scellé, voir l'ADR-0009).
+  - tire la clé racine et un **secret de 160 bits**, qui scelle la clé (voir l'ADR-0009) ;
+  - partage ce secret en **trois parts dont deux quelconques suffisent** (partage de Shamir 2 sur 3), une par dépositaire : la perte d'une enveloppe ne rend pas la racine irrécupérable, et aucun dépositaire seul ne peut la rouvrir ;
+  - affiche les parts une seule fois, chacune en 37 caractères base32 avec une CRC-16 qui détecte toute faute de recopie ;
+  - écrit sur chaque support `root.pem`, `root.name` et `root.key.sealed`.
 - **Sur le core**, `ostena ca key new` génère chaque clé (CA émettrice, serveur). Seule la clé publique est portée à la cérémonie.
-- **À la cérémonie**, `ostena ca issuing sign` et `ostena ca server sign` certifient ces clés publiques avec la racine (phrase secrète lue sur l'entrée standard).
+- **À la cérémonie**, `ostena ca issuing sign` et `ostena ca server sign` certifient ces clés publiques avec la racine. Deux parts sont lues sur l'entrée standard.
+- **Enveloppe perdue ou changement de dépositaire** : `ostena ca root reseal` rouvre la racine avec deux parts et la scelle sous un nouveau secret, en trois nouvelles parts, sur des supports neufs. Les anciens supports et enveloppes sont ensuite détruits.
 - Rien n'est jamais écrasé.
+
+**Implémentation du partage : `vsss-rs`** (Apache-2.0 ou MIT), utilisé dans `ostena-crypto` seulement.
+- Ses auteurs indiquent des audits de sécurité financés par deux utilisateurs industriels. Il est en production chez plusieurs d'entre eux, et propose un partage octet par octet sur GF(256).
+- Écartés :
+  - `sharks` : abandonné depuis 2021, avec un biais corrigé seulement dans son fork ;
+  - `blahaj`, ce fork : non audité ;
+  - `shamirsecretsharing` : liaison C plus ancienne, qui tire `rand` 0.8 en doublon ;
+  - `gf256` : son auteur le présente comme pédagogique.
+- `vsss-rs` n'ajoute que de petites crates sans doublon de version (`ff`, `subtle`, `rand_core`, `typenum`, `generic-array`, `hybrid-array`).
+- **L'aléa des coefficients vient d'`aws-lc-rs`** : il est tiré à l'avance par `ostena-crypto`, puis servi à `vsss-rs`.
 
 **6. Rotation annuelle** (à 2/3 de la validité), en une seule cérémonie :
 1. sur le core, générer les nouvelles clés de la CA émettrice et du serveur ;
@@ -188,7 +201,7 @@ En développement, les trois sont journalisées et acceptées.
 - **portée limitée** : seuls des certificats d'agent peuvent être forgés, et le registre refuse ceux qu'il n'a pas émis ;
 - **réponse** : on retire la CA de l'ensemble accepté par le core (les tunnels qui en dépendent sont fermés), on en fait certifier une nouvelle par la racine, et les agents se ré-enrôlent avec un nouveau jeton.
 
-**Compromission du certificat serveur** : il faut une cérémonie pour en certifier un nouveau, puis le révoquer. L'agent n'a pas de liste de révocation : jusqu'à l'expiration de l'ancien certificat (1 an au plus), un attaquant qui a volé sa clé peut usurper le core sur le réseau. **Cette limite est acceptée en v1 et à revoir** : distribution d'une liste de révocation, ou certificats serveur plus courts.
+**Compromission du certificat serveur** : il faut une cérémonie pour en certifier un nouveau, puis le révoquer. L'agent n'a pas de liste de révocation : jusqu'à l'expiration de l'ancien certificat (1 an au plus), un attaquant qui a volé sa clé peut usurper le core sur le réseau. **Cette limite est acceptée en v1.** Elle est inscrite aux [points à trancher](../points-a-trancher.md) du lot L15, avec ses deux pistes : une liste de révocation distribuée aux agents, ou des certificats serveur plus courts.
 
 **8. Rotation de la racine** (10 ans, ou en cas de compromission) : il faut déposer la nouvelle racine sur chaque agent (`tls_core_ca`), selon une procédure documentée. Un futur message de contrôle pourrait la pousser, signée par l'ancienne racine.
 
