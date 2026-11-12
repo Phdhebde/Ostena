@@ -27,7 +27,9 @@ pub(crate) struct AgentInfo {
     pub config_fingerprint: String,
     pub sessions: Arc<Sessions>,
     /// The link to the core, once started.
-    pub link: std::sync::OnceLock<ostena_tunnel::link::AgentLink>,
+    pub link: std::sync::OnceLock<Arc<ostena_tunnel::link::AgentLink>>,
+    /// What the core pushed, once the link is started.
+    pub gateway: std::sync::OnceLock<ostena_tunnel::gateway::Gateway>,
 }
 
 fn unix_now() -> u64 {
@@ -51,7 +53,8 @@ pub(crate) fn answer(info: &AgentInfo, request: &[u8]) -> Value {
                 || "lien désactivé (configuration)".to_owned(),
                 |l| l.status().summary(unix_now()),
             ),
-            "core_link": info.link.get().map(ostena_tunnel::link::AgentLink::status),
+            "core_link": info.link.get().map(|l| l.status()),
+            "pushes": info.gateway.get().map(|g| g.state().versions()),
             "sessions": info.sessions.active(),
             "resident_bytes": ostena_platform::memory::resident_bytes(),
             "config_fingerprint": info.config_fingerprint,
@@ -122,6 +125,7 @@ mod tests {
             config_fingerprint: "sha256:abcd".into(),
             sessions: Arc::new(Sessions::new()),
             link: std::sync::OnceLock::new(),
+            gateway: std::sync::OnceLock::new(),
         }
     }
 
