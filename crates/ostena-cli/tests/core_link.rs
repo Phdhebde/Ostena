@@ -82,6 +82,17 @@ fn run_agent(config: &PathBuf) -> Child {
 }
 
 impl Agent {
+    /// Stops the agent process, files kept.
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+
+    /// Starts it again after [`Agent::stop`].
+    fn start(&mut self, config: &PathBuf) {
+        self.0 = run_agent(config);
+    }
+
     /// Stops the agent process and starts it again with the same files.
     fn restart(&mut self, config: &PathBuf) {
         let _ = self.0.kill();
@@ -238,4 +249,56 @@ fn keyset_version_is_kept_across_a_restart() {
         status(&agent, &config).contains("dernière version acceptée : 5"),
         "lower version not applied"
     );
+}
+
+/// After a repair of a corrupt state file, the agent accepts the version
+/// the core pushes at the next connection, then none lower.
+#[test]
+fn after_a_repair_the_next_pushed_version_is_the_reference() {
+    use ostena_tunnel::control::CoreMessage;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let core = runtime
+        .block_on(async { TestCore::start(Limits::default(), Behaviour::default()) })
+        .unwrap();
+    let (mut agent, config) = start_agent(&core, "repair", valid(), None);
+    let push = |version| {
+        runtime.block_on(core.push(&CoreMessage::KeySet {
+            version,
+            keys: vec![core.grant_key()],
+        }))
+    };
+    read_until(&mut agent, "agent.core_connected");
+    push(5);
+    read_until(&mut agent, "agent.keyset_applied");
+
+    agent.stop();
+    let state = agent.1.join("state").join("keyset.version");
+    // The file is private (read and delete only, on Windows): replace it.
+    std::fs::remove_file(&state).unwrap();
+    std::fs::write(&state, "corrupted by hand").unwrap();
+    let repaired = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["agent", "keyset-state", "repair", "--yes", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        repaired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repaired.stdout)
+    );
+
+    agent.start(&config);
+    read_until(&mut agent, "agent.core_connected");
+    assert!(push(3) >= 1);
+    let log = read_until(&mut agent, "agent.keyset_applied");
+    assert!(log.contains("\"initial\":true"), "{log}");
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), "3\n");
+    push(2);
+    let log = read_until(&mut agent, "agent.keyset_refused");
+    assert!(log.contains("TUN-E024"), "{log}");
 }

@@ -109,12 +109,18 @@ impl std::fmt::Debug for GatewayState {
     }
 }
 
-fn read_floor(path: &Path) -> Result<Option<u64>, TunnelError> {
+/// The last key set version accepted, from the state file; `None` if there
+/// is none.
+///
+/// # Errors
+///
+/// [`TunnelError::Config`] if the file exists but cannot be read.
+pub fn read_floor(path: &Path) -> Result<Option<u64>, TunnelError> {
     match std::fs::read_to_string(path) {
         Ok(text) => text.trim().parse().map(Some).map_err(|_| {
             TunnelError::Config(format!(
                 "{} : version du jeu de clés illisible ; l'interdiction de revenir en arrière ne \
-                 peut pas être garantie",
+                 peut pas être garantie. Reprise, agent arrêté : `ostena agent keyset-state repair`",
                 path.display()
             ))
         }),
@@ -563,18 +569,26 @@ async fn dispatch(
                     "{e}"
                 ),
             },
-            CoreMessage::KeySet { version, keys } => match state.apply_keyset(version, &keys) {
-                Ok(Applied::Applied) => {
-                    tracing::info!(event = "agent.keyset_applied", version, keys = keys.len());
+            CoreMessage::KeySet { version, keys } => {
+                // No version accepted before (first start, or after a repair of
+                // the state file): this one sets the reference.
+                let initial = state.versions().keyset_floor.is_none();
+                match state.apply_keyset(version, &keys) {
+                    Ok(Applied::Applied) => tracing::info!(
+                        event = "agent.keyset_applied",
+                        version,
+                        keys = keys.len(),
+                        initial
+                    ),
+                    Ok(Applied::Unchanged) => {}
+                    Err(e) => tracing::warn!(
+                        event = "agent.keyset_refused",
+                        version,
+                        code = e.code(),
+                        "{e}"
+                    ),
                 }
-                Ok(Applied::Unchanged) => {}
-                Err(e) => tracing::warn!(
-                    event = "agent.keyset_refused",
-                    version,
-                    code = e.code(),
-                    "{e}"
-                ),
-            },
+            }
             CoreMessage::SessionParams { request_id, .. }
             | CoreMessage::SessionRefused { request_id, .. } => {
                 let waiter = pending.lock().ok().and_then(|mut p| p.remove(&request_id));
