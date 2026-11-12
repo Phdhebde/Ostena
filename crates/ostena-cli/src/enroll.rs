@@ -18,6 +18,7 @@ use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::pem_private_key;
 use ostena_crypto::tls::TrustAnchor;
+use ostena_platform::private_file::{self, Reader};
 use ostena_tunnel::Uuid;
 use ostena_tunnel::enroll::{EnrollParams, EnrollmentToken, enroll};
 
@@ -26,22 +27,32 @@ fn fail(text: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Creates a new file; the key is created with its final rights before any
+/// byte is written (`ostena_platform::private_file`). A missing directory
+/// (the state directory before `install`) is created, private.
 fn create(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    let failed = |e: io::Error| format!("{} : {e}", path.display());
+    if let Some(dir) = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty() && !d.exists())
+    {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir).map_err(failed)?;
     }
-    #[cfg(not(unix))]
-    let _ = secret;
-    let mut file = options
+    if secret {
+        return private_file::create(path, bytes, Reader::Service).map_err(failed);
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
         .open(path)
-        .map_err(|e| format!("{} : {e}", path.display()))?;
+        .map_err(failed)?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("{} : {e}", path.display()))
+        .map_err(failed)
 }
 
 fn read_token(source: &Path) -> Result<EnrollmentToken, String> {
@@ -117,7 +128,7 @@ fn run(agent: &AgentConfig, token: &Path, timeout: Duration) -> Result<String, S
         key
     } else {
         let (key, pkcs8) = SigningKey::generate().map_err(|e| e.to_string())?;
-        // SECRET-EXPOSURE: written once to a new 0600 file.
+        // SECRET-EXPOSURE: written once, to a file created with its final rights.
         #[expect(clippy::disallowed_methods)]
         create(
             &agent.tls_private_key,

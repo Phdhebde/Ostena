@@ -41,13 +41,16 @@ path = 'C:\ProgramData\Ostena\state\agent.log'
 [agent]
 gateway_group = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6"
 core_address = "core.invalid:8443"
-tls_certificate = 'C:\ProgramData\Ostena\agent.crt'
-tls_private_key = 'C:\ProgramData\Ostena\agent.key'
+tls_certificate = 'C:\ProgramData\Ostena\state\agent.crt'
+tls_private_key = 'C:\ProgramData\Ostena\state\agent.key'
 tls_core_ca = 'C:\ProgramData\Ostena\core-ca.pem'
 replay_journal = 'C:\ProgramData\Ostena\state\replay.journal'
 shutdown_grace_secs = 5
 '@ | Set-Content -Encoding utf8NoBOM $Config
-'not a real key' | Set-Content -Encoding ascii (Join-Path $Data 'agent.key')
+# The identity lives in the state directory, where the service may write
+# (renewal).
+New-Item -ItemType Directory -Force (Join-Path $Data 'state') | Out-Null
+'not a real key' | Set-Content -Encoding ascii (Join-Path $Data 'state\agent.key')
 
 & $Exe agent install --config $Config
 if ($LASTEXITCODE -ne 0) { Fail "install failed ($LASTEXITCODE)" }
@@ -67,7 +70,11 @@ Write-Host $qc, $sid, $privs, $failure
 
 Write-Host '=== permissions'
 icacls $Config
-icacls (Join-Path $Data 'agent.key')
+$keyAcl = icacls (Join-Path $Data 'state\agent.key') | Out-String
+Write-Host $keyAcl
+# Read and delete: a renewal replaces the key.
+if ($keyAcl -notmatch 'NT SERVICE\\OstenaAgent:\(R,D\)') { Fail "service rights on the key: $keyAcl" }
+if ($keyAcl -match '\(I\)') { Fail "inherited entries on the key: $keyAcl" }
 icacls (Join-Path $Data 'state')
 
 Write-Host '=== status (administrator)'

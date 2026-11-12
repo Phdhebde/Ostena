@@ -207,6 +207,16 @@ pub(crate) fn status(config: &Path, pid: Option<u32>) -> ExitCode {
                 days(due)
             ),
         );
+        if link["renewal_overdue"].as_bool() == Some(true) {
+            say(
+                false,
+                &format!(
+                    "AVERTISSEMENT : certificat non renouvelé à 90 % de sa validité, il expire dans \
+                     {} h. Vérifiez le lien avec le core (événement tunnel.renewal_overdue).",
+                    not_after.saturating_sub(now) / 3600
+                ),
+            );
+        }
     }
     ExitCode::SUCCESS
 }

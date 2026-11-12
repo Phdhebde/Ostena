@@ -26,6 +26,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+ostena-platform.workspace = true
+# Paused time for the tests that depend on it (no tolerance margins).
+tokio = { workspace = true, features = ["test-util"] }
 # The integration tests and the benchmark run against the test core.
 ostena-tunnel = { path = ".", features = ["testing"] }
 proptest.workspace = true
@@ -35,6 +38,10 @@ tracing-subscriber.workspace = true
 [[bench]]
 name = "latency"
 harness = false
+
+[[example]]
+name = "test_core"
+required-features = ["testing"]
 
 [lints]
 workspace = true

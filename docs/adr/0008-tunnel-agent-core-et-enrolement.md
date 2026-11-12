@@ -156,11 +156,26 @@ Pas de PKCS#10, donc aucun analyseur ASN.1 exposé côté core.
 - l'ancien certificat reste valide jusqu'à son expiration, sauf révocation.
 
 **Côté agent, le renouvellement est automatique** :
-- au démarrage de chaque connexion, l'agent lit la validité de son certificat (lecture DER minimale, `pki::certificate_validity`) et arme une échéance aux 2/3 ;
+- l'agent lit la validité de son certificat (lecture DER minimale, `pki::certificate_validity`) et arme une échéance aux 2/3 ;
 - à l'échéance, il envoie `renew` avec une nouvelle clé ;
-- à la réception de `certificate`, il vérifie que le certificat porte bien sa nouvelle clé, écrit la clé et le certificat à côté des actuels (`.new`), renomme la clé, puis le certificat, et réarme l'échéance.
+- à la réception de `certificate`, il vérifie que le certificat porte bien sa nouvelle clé ;
+- il crée `agent.key.new` **avec ses droits définitifs avant d'y écrire quoi que ce soit** (`ostena-platform::private_file`) : mode `0600` passé à la création sous Linux ; sous Windows, un descripteur de sécurité protégé (sans héritage) passé à `CreateFileW` : SYSTEM et Administrateurs en contrôle total, le compte de l'agent en lecture et suppression ;
+- il écrit `agent.crt.new`, puis renomme la clé, puis le certificat. Le renommage remplace l'ancienne clé, qui disparaît du disque ;
+- dès qu'aucun canal de session n'est ouvert, il ferme la connexion et se reconnecte aussitôt avec la nouvelle identité, sans délai d'attente. Une session en cours n'est jamais coupée pour cela.
 
-Un arrêt entre les deux renommages laisse la nouvelle clé et `agent.crt.new` : la connexion suivante termine le renommage avant de lire l'identité.
+**L'ancienne clé en mémoire.** La clé lue sur disque n'est gardée que le temps de construire la configuration TLS (`SecretBytes`, effacé à la libération). Elle ne vit ensuite que dans l'état TLS de la connexion en cours (aws-lc efface les clés qu'il libère). La reconnexion qui suit le renouvellement la libère : sans session ouverte, c'est immédiat ; avec des sessions ouvertes, c'est à la fermeture de la dernière.
+
+**L'identité vit dans le dossier d'état** (`/var/lib/ostena`, `C:ProgramDataOstenastate`) : c'est le seul dossier où le service peut écrire (`ProtectSystem=strict` sous Linux ; lecture seule sur le dossier de configuration sous Windows). `ostena agent install` donne au service, sous Windows, la lecture et la suppression sur la clé (`(R,D)`), pour qu'un renouvellement puisse la remplacer. Au démarrage, si le dossier de la clé ou du certificat n'est pas inscriptible, l'agent le signale aussitôt (`agent.renewal_impossible`), plutôt qu'au renouvellement, vingt jours plus tard.
+
+**Renouvellement en retard.** Une surveillance, indépendante de la connexion, relit la validité du certificat sur disque toutes les heures. À partir de **90 %** de la validité sans renouvellement réussi :
+- `ostena agent status` affiche un avertissement ;
+- l'agent émet `tunnel.renewal_overdue` (échéance, secondes restantes), **répété chaque heure** jusqu'au renouvellement.
+
+L'horloge est injectable (`link::Clock`) : les tests qui dépendent du temps utilisent une horloge simulée et le temps suspendu de Tokio, sans marge de tolérance.
+
+**Renouvellement interrompu** par un arrêt de l'agent, traité à la connexion suivante, avant de lire l'identité :
+- `agent.key.new` encore présent : les renommages n'avaient pas commencé, la paire courante est cohérente ; les fichiers `.new` sont supprimés et le renouvellement sera redemandé ;
+- seul `agent.crt.new` reste : la clé a été renommée ; le certificat l'est à son tour.
 
 **La révocation** :
 - c'est un statut dans le registre, contrôlé à chaque poignée de main (`TUN-E005`) ;
@@ -287,7 +302,7 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E022` | preuve de possession invalide |
 | `TUN-E023` | jeton brûlé après trois échecs |
 
-Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`.
+Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`, `agent.identity_rotated`, `agent.renewal_impossible`, `tunnel.renewal_overdue` (avertissement, répété chaque heure).
 
 ## Conséquences
 

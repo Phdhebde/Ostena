@@ -116,8 +116,8 @@ fn pipe_dacl_is_restricted() {
     );
     assert!(!sddl.contains(";WD)") && !sddl.contains(";AU)") && !sddl.contains(";BU)"));
     // The SDDL converts (exercises the descriptor FFI and its release).
-    assert!(windows::Descriptor::from_sddl(&sddl).is_ok());
-    assert!(windows::Descriptor::from_sddl("not sddl").is_err());
+    assert!(Descriptor::from_sddl(&sddl).is_ok());
+    assert!(Descriptor::from_sddl("not sddl").is_err());
 }
 
 #[cfg(unix)]

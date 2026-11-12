@@ -4,7 +4,7 @@
 
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,24 @@ pub struct Channel {
     pub send: SendStream,
     /// From the peer.
     pub recv: RecvStream,
+    _open: OpenChannel,
+}
+
+/// Counts a channel as open until it is dropped.
+#[derive(Debug)]
+struct OpenChannel(Arc<Shared>);
+
+impl OpenChannel {
+    fn new(shared: &Arc<Shared>) -> Self {
+        shared.open_channels.fetch_add(1, Ordering::Relaxed);
+        Self(shared.clone())
+    }
+}
+
+impl Drop for OpenChannel {
+    fn drop(&mut self) {
+        self.0.open_channels.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -45,6 +63,8 @@ struct Shared {
     last_pong: Mutex<Instant>,
     /// Test core only: stop answering pings.
     muted: AtomicBool,
+    /// Session channels not dropped yet.
+    open_channels: AtomicUsize,
 }
 
 impl Shared {
@@ -115,6 +135,7 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
             failure: Mutex::new(None),
             last_pong: Mutex::new(Instant::now()),
             muted: AtomicBool::new(false),
+            open_channels: AtomicUsize::new(0),
         });
         let (tx, inbox) = mpsc::channel(INBOX);
 
@@ -228,7 +249,11 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
         send.write_all(&channel::encode_header(session, class))
             .await
             .map_err(|e| TunnelError::ConnectionLost(e.to_string()))?;
-        Ok(Channel { send, recv })
+        Ok(Channel {
+            send,
+            recv,
+            _open: OpenChannel::new(&self.shared),
+        })
     }
 
     /// Accepts the next session channel opened by the peer.
@@ -265,7 +290,20 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
         };
         send.set_priority(class.priority())
             .map_err(|e| TunnelError::ConnectionLost(e.to_string()))?;
-        Ok((session, class, Channel { send, recv }))
+        Ok((
+            session,
+            class,
+            Channel {
+                send,
+                recv,
+                _open: OpenChannel::new(&self.shared),
+            },
+        ))
+    }
+
+    /// Session channels opened or accepted and not dropped yet.
+    pub fn open_channels(&self) -> usize {
+        self.shared.open_channels.load(Ordering::Relaxed)
     }
 
     /// Smoothed round-trip time measured by QUIC.

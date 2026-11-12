@@ -12,6 +12,7 @@ pub mod acl;
 pub mod control;
 mod error;
 pub mod memory;
+pub mod private_file;
 pub mod service;
 
 pub use error::{Code, PlatformError};

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::{certificate_validity, pem_private_key};
-use ostena_crypto::tls::{self, Identity, TrustAnchor};
+use ostena_crypto::tls::{self, CertificateDer, Identity, TrustAnchor};
 use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -103,6 +103,8 @@ pub struct LinkStatus {
     pub certificate_not_after: Option<u64>,
     /// When it will be renewed (Unix seconds).
     pub renewal_due: Option<u64>,
+    /// 90 % of the validity are past without a successful renewal.
+    pub renewal_overdue: bool,
     /// Connections established since the start.
     pub connections: u64,
 }
@@ -135,10 +137,37 @@ impl LinkStatus {
     }
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+/// Wall clock in Unix seconds, injectable so that the tests that depend on
+/// time do not rely on tolerance margins.
+pub trait Clock: Send + Sync + std::fmt::Debug {
+    /// Now, in Unix seconds.
+    fn now(&self) -> u64;
+}
+
+/// The system clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs())
+    }
+}
+
+/// Creates a private file with its final rights before writing it, and
+/// refuses an existing file (`ostena_platform::private_file::create` in the
+/// agent).
+pub type KeyWriter = fn(&Path, &[u8]) -> std::io::Result<()>;
+
+/// How often an overdue renewal is checked and reported.
+pub const OVERDUE_CHECK: Duration = Duration::from_hours(1);
+
+/// From when, without a successful renewal, it is overdue: 90 % of the
+/// validity.
+pub fn overdue_at(not_before: u64, not_after: u64) -> u64 {
+    not_before.saturating_add(not_after.saturating_sub(not_before) / 10 * 9)
 }
 
 /// What the link needs.
@@ -158,6 +187,10 @@ pub struct LinkParams {
     pub limits: Limits,
     /// Reconnection delays.
     pub backoff: Backoff,
+    /// Wall clock.
+    pub clock: Arc<dyn Clock>,
+    /// Writes the renewed key.
+    pub write_key: KeyWriter,
 }
 
 /// The link to the core. Dropping it stops it.
@@ -169,6 +202,17 @@ pub struct AgentLink {
     pushes: Mutex<Option<mpsc::Receiver<CoreMessage>>>,
 }
 
+fn initial_status() -> LinkStatus {
+    LinkStatus {
+        state: LinkState::Connecting,
+        rtt_micros: None,
+        certificate_not_after: None,
+        renewal_due: None,
+        renewal_overdue: false,
+        connections: 0,
+    }
+}
+
 impl AgentLink {
     /// Starts the link.
     ///
@@ -176,13 +220,7 @@ impl AgentLink {
     ///
     /// Outside a Tokio runtime.
     pub fn spawn(params: LinkParams) -> Self {
-        let status = Arc::new(Mutex::new(LinkStatus {
-            state: LinkState::Connecting,
-            rtt_micros: None,
-            certificate_not_after: None,
-            renewal_due: None,
-            connections: 0,
-        }));
+        let status = Arc::new(Mutex::new(initial_status()));
         let (stop, stop_rx) = watch::channel(false);
         let (push_tx, push_rx) = mpsc::channel(64);
         let task = tokio::spawn(run(params, status.clone(), stop_rx, push_tx));
@@ -199,10 +237,7 @@ impl AgentLink {
         self.status.lock().map_or_else(
             |_| LinkStatus {
                 state: LinkState::Stopped,
-                rtt_micros: None,
-                certificate_not_after: None,
-                renewal_due: None,
-                connections: 0,
+                ..initial_status()
             },
             |s| s.clone(),
         )
@@ -242,12 +277,20 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Completes a renewal interrupted between the two renames.
+/// Completes or discards a renewal interrupted by a stop.
+///
+/// - The new key is still next to the current one: the renames had not
+///   started and the current pair is consistent; the new files are removed.
+/// - Only the new certificate is left: the key was renamed, the
+///   certificate is renamed now.
 fn complete_pending_renewal(params: &LinkParams) {
-    let pending = with_suffix(&params.certificate, ".new");
-    if pending.exists() && !with_suffix(&params.private_key, ".new").exists() {
-        // The key was renamed, not the certificate yet.
-        let _ = std::fs::rename(&pending, &params.certificate);
+    let key_new = with_suffix(&params.private_key, ".new");
+    let cert_new = with_suffix(&params.certificate, ".new");
+    if key_new.exists() {
+        let _ = std::fs::remove_file(&key_new);
+        let _ = std::fs::remove_file(&cert_new);
+    } else if cert_new.exists() {
+        let _ = std::fs::rename(&cert_new, &params.certificate);
     }
 }
 
@@ -259,6 +302,13 @@ fn load_identity(params: &LinkParams) -> Result<Identity, TunnelError> {
     let chain = read(&params.certificate)?;
     let key = SecretBytes::from(read(&params.private_key)?);
     Identity::from_pem(&chain, &key).map_err(|e| TunnelError::Config(e.to_string()))
+}
+
+/// Validity of the certificate on disk.
+fn validity_on_disk(certificate: &Path) -> Option<(u64, u64)> {
+    let pem = std::fs::read(certificate).ok()?;
+    let der = TrustAnchor::from_pem(&pem).ok()?;
+    certificate_validity(der.certificate())
 }
 
 async fn resolve(address: &str) -> Result<(String, std::net::SocketAddr), TunnelError> {
@@ -276,12 +326,67 @@ async fn resolve(address: &str) -> Result<(String, std::net::SocketAddr), Tunnel
     Ok((host, resolved))
 }
 
+/// Checks every `every` whether the renewal is overdue (90 % of the validity
+/// without a successful renewal): sets the status and calls `report` each
+/// time it is. Runs whether the core is reachable or not.
+async fn watch_overdue(
+    validity: impl Fn() -> Option<(u64, u64)>,
+    clock: Arc<dyn Clock>,
+    status: Arc<Mutex<LinkStatus>>,
+    every: Duration,
+    report: impl Fn(u64, u64),
+) {
+    loop {
+        if let Some((not_before, not_after)) = validity() {
+            let now = clock.now();
+            let overdue = now >= overdue_at(not_before, not_after);
+            set(&status, |s| {
+                s.certificate_not_after = Some(not_after);
+                s.renewal_due = Some(renewal::due_at(not_before, not_after));
+                s.renewal_overdue = overdue;
+            });
+            if overdue {
+                report(not_after, now);
+            }
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+fn report_overdue(not_after: u64, now: u64) {
+    tracing::warn!(
+        event = "tunnel.renewal_overdue",
+        not_after,
+        remaining_secs = not_after.saturating_sub(now),
+        "certificat de l'agent non renouvelé à 90 % de sa validité ; vérifier le lien avec le core"
+    );
+}
+
+/// Why one connection ended.
+enum Ended {
+    /// Lost or refused.
+    Failed(TunnelError),
+    /// Renewed: reconnect now with the new identity, so that the old key
+    /// leaves memory.
+    Renewed,
+}
+
 async fn run(
     params: LinkParams,
     status: Arc<Mutex<LinkStatus>>,
     mut stop: watch::Receiver<bool>,
     pushes: mpsc::Sender<CoreMessage>,
 ) {
+    let overdue = {
+        let certificate = params.certificate.clone();
+        tokio::spawn(watch_overdue(
+            move || validity_on_disk(&certificate),
+            params.clock.clone(),
+            status.clone(),
+            OVERDUE_CHECK,
+            report_overdue,
+        ))
+    };
     let mut attempt = 0u32;
     loop {
         if *stop.borrow() {
@@ -289,26 +394,34 @@ async fn run(
         }
         set(&status, |s| s.state = LinkState::Connecting);
         let started = Instant::now();
-        let failure = match open(&params).await {
-            Ok((tunnel, identity)) => {
+        let ended = match open(&params).await {
+            Ok((tunnel, certificate)) => {
                 set(&status, |s| {
                     s.state = LinkState::Connected {
-                        since: now(),
+                        since: params.clock.now(),
                         transport: "quic",
                     };
                     s.connections += 1;
                 });
                 tracing::info!(event = "agent.core_connected", core = %params.core_address);
-                let why = serve(&params, &tunnel, &identity, &status, &stop, &pushes).await;
+                let ended = serve(&params, &tunnel, &certificate, &status, &stop, &pushes).await;
                 drop(tunnel);
-                why
+                ended
             }
-            Err(e) => e,
+            Err(e) => Ended::Failed(e),
         };
         set(&status, |s| s.rtt_micros = None);
         if *stop.borrow() {
             break;
         }
+        let failure = match ended {
+            Ended::Renewed => {
+                tracing::info!(event = "agent.identity_rotated");
+                attempt = 0;
+                continue;
+            }
+            Ended::Failed(e) => e,
+        };
         if started.elapsed() >= params.backoff.stable_after {
             attempt = 0;
         }
@@ -322,7 +435,7 @@ async fn run(
         );
         set(&status, |s| {
             s.state = LinkState::Reconnecting {
-                retry_at: now() + delay.as_secs(),
+                retry_at: params.clock.now() + delay.as_secs(),
                 code: failure.code(),
                 error: failure.to_string(),
             };
@@ -330,11 +443,18 @@ async fn run(
         // Wait for the delay, or for the stop request.
         let _ = tokio::time::timeout(delay, stop.changed()).await;
     }
+    overdue.abort();
     set(&status, |s| s.state = LinkState::Stopped);
 }
 
-async fn open(params: &LinkParams) -> Result<(Arc<AgentTunnel>, Identity), TunnelError> {
+/// Connects; returns the tunnel and the certificate in use. The identity
+/// read from disk is dropped (and its key erased) once the TLS configuration
+/// is built: the key then lives only in the TLS state of this connection.
+async fn open(
+    params: &LinkParams,
+) -> Result<(Arc<AgentTunnel>, CertificateDer<'static>), TunnelError> {
     let identity = load_identity(params)?;
+    let certificate = identity.certificate().clone();
     let (server_name, core) = resolve(&params.core_address).await?;
     let config = AgentConfig {
         core,
@@ -344,8 +464,9 @@ async fn open(params: &LinkParams) -> Result<(Arc<AgentTunnel>, Identity), Tunne
         limits: params.limits,
         hello: params.hello.clone(),
     };
+    drop(identity);
     let (tunnel, _) = connect(&config).await?;
-    Ok((Arc::new(tunnel), identity))
+    Ok((Arc::new(tunnel), certificate))
 }
 
 enum Event {
@@ -355,19 +476,20 @@ enum Event {
     Stop,
 }
 
-/// Runs one connection until it closes or the agent stops; returns why it
-/// ended.
+/// Runs one connection until it closes, the agent stops, or a renewal asks
+/// for a new connection.
 async fn serve(
     params: &LinkParams,
     tunnel: &Arc<AgentTunnel>,
-    identity: &Identity,
+    certificate: &CertificateDer<'static>,
     status: &Mutex<LinkStatus>,
     stop: &watch::Receiver<bool>,
     pushes: &mpsc::Sender<CoreMessage>,
-) -> TunnelError {
+) -> Ended {
     let (tx, mut events) = mpsc::channel::<Event>(16);
     let mut pending: Option<(SigningKey, SecretBytes)> = None;
-    let mut renewal_timer = schedule_renewal(identity, status, tx.clone());
+    let mut renewed = false;
+    let renewal_timer = schedule_renewal(certificate, params, status, tx.clone());
     let forwarder = {
         let tx = tx.clone();
         let tunnel = tunnel.clone();
@@ -392,20 +514,30 @@ async fn serve(
             }
         })
     };
-    let why = loop {
+    let ended = loop {
         set(status, |s| {
             s.rtt_micros = Some(u64::try_from(tunnel.rtt().as_micros()).unwrap_or(u64::MAX));
         });
+        // Renewed: reconnect with the new identity as soon as no session
+        // channel is open, never cutting a session.
+        if renewed && tunnel.open_channels() == 0 {
+            tunnel.close(TunnelError::ConnectionLost(
+                "reconnexion avec le certificat renouvelé".into(),
+            ));
+            break Ended::Renewed;
+        }
         // Wake up at least every second to refresh the round-trip time.
         let event = match tokio::time::timeout(Duration::from_secs(1), events.recv()).await {
             Ok(Some(event)) => event,
-            Ok(None) => break TunnelError::Io("canal interne fermé".into()),
+            Ok(None) => break Ended::Failed(TunnelError::Io("canal interne fermé".into())),
             Err(_) => continue,
         };
         match event {
-            Event::Stop => break TunnelError::ConnectionLost("arrêt de l'agent".into()),
-            Event::Closed(e) => break e,
-            Event::RenewalDue => match start_renewal(tunnel, identity).await {
+            Event::Stop => {
+                break Ended::Failed(TunnelError::ConnectionLost("arrêt de l'agent".into()));
+            }
+            Event::Closed(e) => break Ended::Failed(e),
+            Event::RenewalDue => match start_renewal(tunnel, certificate).await {
                 Ok(next) => pending = Some(next),
                 Err(e) => tracing::warn!(event = "agent.renewal_failed", code = e.code(), "{e}"),
             },
@@ -414,6 +546,7 @@ async fn serve(
                 not_before,
                 not_after,
             }) => {
+                // The new key leaves memory when this pair is dropped.
                 let Some((key, pkcs8)) = pending.take() else {
                     tracing::warn!(
                         event = "agent.renewal_failed",
@@ -432,9 +565,10 @@ async fn serve(
                         set(status, |s| {
                             s.certificate_not_after = Some(not_after);
                             s.renewal_due = Some(due);
+                            s.renewal_overdue = false;
                         });
                         renewal_timer.abort();
-                        renewal_timer = timer_until(due, tx.clone());
+                        renewed = true;
                     }
                     Err(e) => {
                         tracing::warn!(event = "agent.renewal_failed", code = e.code(), "{e}");
@@ -450,30 +584,31 @@ async fn serve(
     renewal_timer.abort();
     forwarder.abort();
     stopper.abort();
-    why
+    ended
 }
 
-fn timer_until(due: u64, tx: mpsc::Sender<Event>) -> JoinHandle<()> {
+fn timer_until(due: u64, clock: Arc<dyn Clock>, tx: mpsc::Sender<Event>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let wait = due.saturating_sub(now());
+        let wait = due.saturating_sub(clock.now());
         tokio::time::sleep(Duration::from_secs(wait)).await;
         let _ = tx.send(Event::RenewalDue).await;
     })
 }
 
-/// Reads the validity of the current certificate and arms the timer.
+/// Reads the validity of the certificate in use and arms the timer.
 fn schedule_renewal(
-    identity: &Identity,
+    certificate: &CertificateDer<'static>,
+    params: &LinkParams,
     status: &Mutex<LinkStatus>,
     tx: mpsc::Sender<Event>,
 ) -> JoinHandle<()> {
-    if let Some((not_before, not_after)) = certificate_validity(identity.certificate()) {
+    if let Some((not_before, not_after)) = certificate_validity(certificate) {
         let due = renewal::due_at(not_before, not_after);
         set(status, |s| {
             s.certificate_not_after = Some(not_after);
             s.renewal_due = Some(due);
         });
-        timer_until(due, tx)
+        timer_until(due, params.clock.clone(), tx)
     } else {
         tracing::warn!(
             event = "agent.renewal_failed",
@@ -485,17 +620,19 @@ fn schedule_renewal(
 
 async fn start_renewal(
     tunnel: &AgentTunnel,
-    identity: &Identity,
+    certificate: &CertificateDer<'static>,
 ) -> Result<(SigningKey, SecretBytes), TunnelError> {
     let (key, pkcs8) = SigningKey::generate().map_err(|e| TunnelError::Io(e.to_string()))?;
-    let current = tls::fingerprint(identity.certificate());
+    let current = tls::fingerprint(certificate);
     tunnel.send(&renewal::request(&key, &current)?).await?;
     tracing::info!(event = "agent.renewal_requested");
     Ok((key, pkcs8))
 }
 
-/// Writes the renewed key and certificate next to the current ones, then
-/// renames the key, then the certificate.
+/// Writes the renewed key (created with its final rights by
+/// [`LinkParams::write_key`]) and certificate next to the current ones, then
+/// renames the key over the old one, which removes it, then the
+/// certificate.
 fn install(
     params: &LinkParams,
     key: &SigningKey,
@@ -513,26 +650,20 @@ fn install(
     let io = |e: std::io::Error| TunnelError::Io(e.to_string());
     let key_new = with_suffix(&params.private_key, ".new");
     let cert_new = with_suffix(&params.certificate, ".new");
-    // SECRET-EXPOSURE: written once to a new 0600 file.
+    // Leftovers of an attempt that failed before the renames.
+    let _ = std::fs::remove_file(&key_new);
+    let _ = std::fs::remove_file(&cert_new);
+    // SECRET-EXPOSURE: written once, to a file created with its final rights.
     #[expect(clippy::disallowed_methods)]
-    write_file(&key_new, pem_private_key(pkcs8).expose_secret(), true).map_err(io)?;
-    write_file(&cert_new, certificate.as_bytes(), false).map_err(io)?;
+    (params.write_key)(&key_new, pem_private_key(pkcs8).expose_secret()).map_err(io)?;
+    write_file(&cert_new, certificate.as_bytes()).map_err(io)?;
     std::fs::rename(&key_new, &params.private_key).map_err(io)?;
     std::fs::rename(&cert_new, &params.certificate).map_err(io)
 }
 
-fn write_file(path: &Path, bytes: &[u8], secret: bool) -> std::io::Result<()> {
+fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    if secret {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    #[cfg(not(unix))]
-    let _ = secret;
-    let mut file = options.open(path)?;
+    let mut file = std::fs::File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
@@ -570,6 +701,7 @@ mod tests {
             rtt_micros: Some(420),
             certificate_not_after: None,
             renewal_due: None,
+            renewal_overdue: false,
             connections: 1,
         };
         assert_eq!(s.summary(112), "connecté (QUIC) depuis 12 s, RTT 0.4 ms");
@@ -582,5 +714,77 @@ mod tests {
             s.summary(112)
                 .starts_with("non connecté, nouvelle tentative dans 8 s (TUN-E013")
         );
+    }
+
+    /// A clock the test sets by hand.
+    #[derive(Debug, Default)]
+    struct ManualClock(std::sync::atomic::AtomicU64);
+
+    impl Clock for ManualClock {
+        fn now(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn overdue_from_ninety_percent() {
+        assert_eq!(overdue_at(1_000, 2_000), 1_900);
+        assert_eq!(overdue_at(0, 30 * 86_400), 27 * 86_400);
+        assert_eq!(
+            overdue_at(2_000, 1_000),
+            2_000,
+            "inverted validity never panics"
+        );
+    }
+
+    /// Simulated wall clock and paused Tokio time: no margin. Before 90 %:
+    /// nothing; from 90 %: the status says so and the event is repeated at
+    /// every check (each hour).
+    #[test]
+    fn renewal_overdue_is_reported_every_hour() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let clock = Arc::new(ManualClock::default());
+            // Valid from 0 to 1000: overdue from 900.
+            clock.0.store(899, std::sync::atomic::Ordering::SeqCst);
+            let status = Arc::new(Mutex::new(initial_status()));
+            let reports = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let watcher = tokio::spawn(watch_overdue(
+                || Some((0, 1_000)),
+                clock.clone(),
+                status.clone(),
+                OVERDUE_CHECK,
+                {
+                    let reports = reports.clone();
+                    move |not_after, _| {
+                        assert_eq!(not_after, 1_000);
+                        reports.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+            ));
+            let count = || reports.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            assert_eq!(count(), 0);
+            assert!(!status.lock().unwrap().renewal_overdue);
+            assert_eq!(
+                status.lock().unwrap().renewal_due,
+                Some(renewal::due_at(0, 1_000))
+            );
+
+            // 90 % reached: reported at the next check, then every hour.
+            clock.0.store(900, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(OVERDUE_CHECK).await;
+            tokio::task::yield_now().await;
+            assert_eq!(count(), 1);
+            assert!(status.lock().unwrap().renewal_overdue);
+            tokio::time::sleep(OVERDUE_CHECK * 2).await;
+            tokio::task::yield_now().await;
+            assert_eq!(count(), 3);
+            watcher.abort();
+        });
     }
 }

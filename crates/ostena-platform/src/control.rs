@@ -100,6 +100,8 @@ pub enum ExpectedServer {
 #[cfg(unix)]
 pub use unix::{ControlListener, connect};
 #[cfg(windows)]
+pub(crate) use windows::Descriptor;
+#[cfg(windows)]
 pub use windows::{ControlListener, connect, sddl};
 
 #[cfg(unix)]
@@ -304,6 +306,11 @@ mod windows {
                 ));
             }
             Ok(Self(sd))
+        }
+
+        /// The raw descriptor, valid while `self` lives.
+        pub(crate) fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+            self.0
         }
     }
 

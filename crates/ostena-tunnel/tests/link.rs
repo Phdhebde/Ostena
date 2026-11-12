@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use ostena_crypto::pki::{Validity, certificate_validity};
 use ostena_crypto::tls::TrustAnchor;
-use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, LinkState};
+use ostena_platform::private_file::{self, Reader};
+use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, LinkState, SystemClock};
 use ostena_tunnel::testing::{Behaviour, TestCore, valid};
 use ostena_tunnel::{Hello, Limits, Uuid};
 
@@ -82,6 +83,8 @@ fn params(core: &TestCore, name: &str, validity: Validity) -> (LinkParams, Files
             max: Duration::from_millis(400),
             stable_after: Duration::from_secs(60),
         },
+        clock: std::sync::Arc::new(SystemClock),
+        write_key: |path, bytes| private_file::create(path, bytes, Reader::CurrentProcess),
     };
     (params, Files(dir))
 }
@@ -179,10 +182,25 @@ fn renews_its_certificate_at_two_thirds_with_a_new_key() {
         assert!(!files.0.join("agent.key.new").exists());
         assert!(!files.0.join("agent.crt.new").exists());
         assert!(link.status().certificate_not_after.unwrap() > now() + 86_400);
-        // The renewed identity opens the next connection.
-        core.stop();
-        core.restart().await.unwrap();
+        assert!(!link.status().renewal_overdue);
+        // No session open: the agent reconnects at once with the renewed
+        // identity, and the old key leaves memory.
+        assert!(
+            until(&link, |_| link.status().connections == 2).await,
+            "{:?}",
+            link.status()
+        );
         assert!(until(&link, connected).await);
+        renewed_key_is_private(&params.private_key);
+        let names: Vec<_> = std::fs::read_dir(&files.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "only the current key and certificate: {names:?}"
+        );
         link.stop().await;
     });
 }
@@ -202,6 +220,61 @@ fn interrupted_renewal_is_completed_at_the_next_connection() {
         let link = AgentLink::spawn(params.clone());
         assert!(until(&link, connected).await, "{:?}", link.status());
         assert_eq!(std::fs::read_to_string(&params.certificate).unwrap(), cert);
+        link.stop().await;
+    });
+}
+
+/// The renewed key was created with its final rights: 0600, or on Windows a
+/// protected DACL (SYSTEM, Administrators, the agent account), nothing
+/// inherited.
+fn renewed_key_is_private(key: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    #[cfg(windows)]
+    {
+        use ostena_platform::acl::{ADMINISTRATORS, SYSTEM, read_security};
+        let me = private_file::current_user_sid().unwrap();
+        let security = read_security(key).unwrap();
+        let mut sids: Vec<String> = security
+            .dacl
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.allow)
+            .map(|a| a.sid)
+            .collect();
+        sids.sort();
+        let mut expected = vec![SYSTEM.to_owned(), ADMINISTRATORS.to_owned(), me];
+        expected.sort();
+        expected.dedup();
+        assert_eq!(sids, expected);
+        let icacls = std::process::Command::new("icacls")
+            .arg(key)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&icacls.stdout);
+        assert!(!text.contains("(I)"), "nothing inherited: {text}");
+    }
+}
+
+#[test]
+fn renewal_interrupted_before_the_renames_is_discarded() {
+    run(async {
+        let core = TestCore::start(fast(), Behaviour::default()).unwrap();
+        let (params, files) = params(&core, "discarded", valid());
+        let cert = std::fs::read(&params.certificate).unwrap();
+        // As if the agent stopped after writing the new files, before any
+        // rename: the current pair is consistent, the new files are left.
+        std::fs::write(files.0.join("agent.key.new"), b"partial").unwrap();
+        std::fs::write(files.0.join("agent.crt.new"), b"partial").unwrap();
+        let link = AgentLink::spawn(params.clone());
+        assert!(until(&link, connected).await, "{:?}", link.status());
+        assert!(!files.0.join("agent.key.new").exists());
+        assert!(!files.0.join("agent.crt.new").exists());
+        assert_eq!(std::fs::read(&params.certificate).unwrap(), cert);
         link.stop().await;
     });
 }
