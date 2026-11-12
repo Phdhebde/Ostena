@@ -280,7 +280,7 @@ fn footprint() -> Result<()> {
     let _ = core.wait();
     let _ = fs::remove_dir_all(&dir);
 
-    for (state, bytes) in measures? {
+    for (state, (bytes, detail)) in measures? {
         #[expect(clippy::cast_precision_loss, reason = "display only")]
         let mib = bytes as f64 / 1_048_576.0;
         let verdict = if mib <= FOOTPRINT_TARGET_MIB {
@@ -289,7 +289,7 @@ fn footprint() -> Result<()> {
             "ABOVE"
         };
         println!(
-            "idle footprint ({state}): {mib:.1} MiB resident ({verdict} the indicative {FOOTPRINT_TARGET_MIB} MiB target)"
+            "idle footprint ({state}): {mib:.1} MiB resident ({verdict} the indicative {FOOTPRINT_TARGET_MIB} MiB target){detail}"
         );
     }
     Ok(())
@@ -297,7 +297,7 @@ fn footprint() -> Result<()> {
 
 /// Runs one agent until its `agent.idle_footprint` event; `core` is the
 /// core address, `None` for an agent without link (no `tls_core_ca`).
-fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<u64> {
+fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<(u64, String)> {
     use std::io::BufRead;
     use std::process::Stdio;
 
@@ -341,6 +341,7 @@ fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<u64> {
             break;
         }
     }
+    let detail = breakdown(child.id());
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(dir.join("state/replay.journal"));
@@ -348,7 +349,30 @@ fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<u64> {
     if core.is_some_and(|c| c != "127.0.0.1:9") && !connected {
         return Err("the agent did not connect to the test core".into());
     }
-    resident_bytes_of(&line).ok_or_else(|| format!("no resident_bytes in: {line}").into())
+    let bytes = resident_bytes_of(&line).ok_or_else(|| format!("no resident_bytes in: {line}"))?;
+    Ok((bytes, detail))
+}
+
+/// Linux: anonymous (heap, stacks) and file-backed (code of the binary and
+/// of the libraries) resident memory, and the thread count, to explain a
+/// difference. Empty elsewhere.
+fn breakdown(pid: u32) -> String {
+    let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return String::new();
+    };
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map_or("?", str::trim)
+            .to_owned()
+    };
+    format!(
+        " [anonymous {}, file-backed {}, threads {}]",
+        field("RssAnon:"),
+        field("RssFile:"),
+        field("Threads:")
+    )
 }
 
 /// `"resident_bytes":12345` in a JSON log line.
