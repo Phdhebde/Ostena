@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use ostena_crypto::pki::pem_certificate;
+use ostena_crypto::pki::{Validity, pem_certificate};
 use ostena_tunnel::testing::{Behaviour, TestCore, valid};
 use ostena_tunnel::{Limits, Uuid};
 
@@ -28,13 +28,19 @@ impl Drop for Agent {
     }
 }
 
-/// Starts `agent run` with an enrolled identity for `core`.
-fn start_agent(core: &TestCore) -> (Agent, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("ostena-cli-link-{}", std::process::id()));
+/// Starts `agent run` with an identity enrolled on `core`, valid `validity`;
+/// the agent dials `address` (the core by default).
+fn start_agent(
+    core: &TestCore,
+    name: &str,
+    validity: Validity,
+    address: Option<&str>,
+) -> (Agent, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("ostena-cli-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("state")).unwrap();
     let (cert, key) = core
-        .agent_files(Uuid::parse(GROUP).unwrap(), valid())
+        .agent_files(Uuid::parse(GROUP).unwrap(), validity)
         .unwrap();
     std::fs::write(dir.join("agent.crt"), cert).unwrap();
     // SECRET-EXPOSURE: test only, the key file `agent enroll` would write.
@@ -47,7 +53,7 @@ fn start_agent(core: &TestCore) -> (Agent, PathBuf) {
     .unwrap();
     let path = |p: &str| dir.join(p).display().to_string().replace('\\', "\\\\");
     let endpoint = if cfg!(windows) {
-        format!(r"\\\\.\\pipe\\ostena-cli-link-{}", std::process::id())
+        format!(r"\\\\.\\pipe\\ostena-cli-{name}-{}", std::process::id())
     } else {
         path("run/agent.sock")
     };
@@ -55,7 +61,7 @@ fn start_agent(core: &TestCore) -> (Agent, PathBuf) {
         "mode = \"development\"\n\n[agent]\ngateway_group = \"{GROUP}\"\ncore_address = \"{}\"\n\
          tls_certificate = \"{}\"\ntls_private_key = \"{}\"\ntls_core_ca = \"{}\"\n\
          replay_journal = \"{}\"\nshutdown_grace_secs = 2\ncontrol_endpoint = \"{endpoint}\"\n",
-        core.addr(),
+        address.map_or_else(|| core.addr().to_string(), str::to_owned),
         path("agent.crt"),
         path("agent.key"),
         path("root.pem"),
@@ -107,7 +113,7 @@ fn agent_connects_at_startup_and_reports_it() {
     let core = runtime
         .block_on(async { TestCore::start(Limits::default(), Behaviour::default()) })
         .unwrap();
-    let (mut agent, config) = start_agent(&core);
+    let (mut agent, config) = start_agent(&core, "link", valid(), None);
     let log = read_until(&mut agent, "agent.core_connected");
     assert!(log.contains("agent.core_connected"), "{log}");
 
@@ -137,4 +143,34 @@ fn agent_connects_at_startup_and_reports_it() {
     );
     drop(core);
     drop(runtime);
+}
+
+#[test]
+fn overdue_renewal_is_reported_by_status_and_event() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let core = runtime
+        .block_on(async { TestCore::start(Limits::default(), Behaviour::default()) })
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // 95 % of a 100-day validity are past; the core cannot be reached, so
+    // the renewal cannot happen.
+    let late = Validity {
+        not_before: now - 95 * 86_400,
+        not_after: now + 5 * 86_400,
+    };
+    let (mut agent, config) = start_agent(&core, "overdue", late, Some("127.0.0.1:9"));
+    let log = read_until(&mut agent, "tunnel.renewal_overdue");
+    assert!(log.contains("tunnel.renewal_overdue"), "{log}");
+    let text = status(&agent, &config);
+    assert!(
+        text.contains("AVERTISSEMENT : certificat non renouvelé à 90 % de sa validité"),
+        "{text}"
+    );
 }

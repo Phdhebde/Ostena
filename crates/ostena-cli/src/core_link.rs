@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use ostena_common::config::{AgentConfig, Mode};
 use ostena_crypto::tls::TrustAnchor;
+use ostena_platform::private_file::{self, Reader};
 use ostena_scope::infrastructure::{self, Unresolved};
 use ostena_scope::{InfrastructureSpec, SystemResolver};
-use ostena_tunnel::link::{AgentLink, Backoff, LinkParams};
+use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, SystemClock};
 use ostena_tunnel::{Hello, Limits, Uuid};
 
 /// How often the component names are resolved again.
@@ -86,6 +87,30 @@ pub(crate) fn refresh_infrastructure(
     })
 }
 
+/// The renewal writes next to the key and the certificate: their directory
+/// must be writable by the agent account (the state directory). Says so at
+/// startup rather than at the renewal, twenty days later.
+fn check_renewable(agent: &AgentConfig) {
+    for file in [&agent.tls_private_key, &agent.tls_certificate] {
+        let Some(dir) = file.parent() else { continue };
+        let probe = dir.join(".ostena-renewal-probe");
+        let writable = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if !writable {
+            tracing::warn!(
+                event = "agent.renewal_impossible",
+                path = %dir.display(),
+                "le compte de l'agent ne peut pas écrire dans ce dossier : le certificat ne pourra \
+                 pas être renouvelé. Placez la clé et le certificat dans le dossier d'état."
+            );
+        }
+    }
+}
+
 /// Starts the link to the core, or explains why it cannot start (no core CA
 /// configured, unreadable CA, invalid group).
 ///
@@ -100,6 +125,7 @@ pub(crate) fn start(agent: &AgentConfig, config_fingerprint: &str) -> Result<Age
     let pem = std::fs::read(ca).map_err(|e| format!("{} : {e}", ca.display()))?;
     let root = TrustAnchor::from_pem(&pem).map_err(|e| e.to_string())?;
     let gateway_group = Uuid::parse(&agent.gateway_group).ok_or("agent.gateway_group invalide")?;
+    check_renewable(agent);
     Ok(AgentLink::spawn(LinkParams {
         core_address: agent.core_address.clone(),
         certificate: agent.tls_certificate.clone(),
@@ -112,6 +138,10 @@ pub(crate) fn start(agent: &AgentConfig, config_fingerprint: &str) -> Result<Age
         },
         limits: Limits::default(),
         backoff: Backoff::default(),
+        clock: Arc::new(SystemClock),
+        // The agent account reads its renewed key (the service, in
+        // production).
+        write_key: |path, bytes| private_file::create(path, bytes, Reader::CurrentProcess),
     }))
 }
 

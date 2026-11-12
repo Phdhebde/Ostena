@@ -863,6 +863,7 @@ dependencies = [
  "ostena-common",
  "ostena-crypto",
  "ostena-grant",
+ "ostena-platform",
  "ostena-scope",
  "ostena-tunnel",
  "proptest",
