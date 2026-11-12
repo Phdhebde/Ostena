@@ -15,6 +15,7 @@ pub mod channel;
 pub mod control;
 pub mod enroll;
 mod error;
+pub mod gateway;
 mod ids;
 pub mod limits;
 pub mod link;
