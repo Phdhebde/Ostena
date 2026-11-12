@@ -21,7 +21,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::control::CoreMessage;
+use crate::control::{AgentMessage, CoreMessage};
 use crate::error::TunnelError;
 use crate::limits::Limits;
 use crate::renewal;
@@ -197,10 +197,14 @@ pub struct LinkParams {
 #[derive(Debug)]
 pub struct AgentLink {
     status: Arc<Mutex<LinkStatus>>,
+    current: Current,
     stop: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
     pushes: Mutex<Option<mpsc::Receiver<CoreMessage>>>,
 }
+
+/// The tunnel of the connection in use, if any.
+type Current = Arc<Mutex<Option<Arc<AgentTunnel>>>>;
 
 fn initial_status() -> LinkStatus {
     LinkStatus {
@@ -223,9 +227,17 @@ impl AgentLink {
         let status = Arc::new(Mutex::new(initial_status()));
         let (stop, stop_rx) = watch::channel(false);
         let (push_tx, push_rx) = mpsc::channel(64);
-        let task = tokio::spawn(run(params, status.clone(), stop_rx, push_tx));
+        let current = Current::default();
+        let task = tokio::spawn(run(
+            params,
+            status.clone(),
+            current.clone(),
+            stop_rx,
+            push_tx,
+        ));
         Self {
             status,
+            current,
             stop,
             task: Mutex::new(Some(task)),
             pushes: Mutex::new(Some(push_rx)),
@@ -241,6 +253,21 @@ impl AgentLink {
             },
             |s| s.clone(),
         )
+    }
+
+    /// Sends a control message on the connection in use.
+    ///
+    /// # Errors
+    ///
+    /// [`TunnelError::ConnectionLost`] when not connected, or the send error.
+    pub async fn send(&self, message: &AgentMessage) -> Result<(), TunnelError> {
+        let tunnel = self.current.lock().ok().and_then(|c| c.clone());
+        match tunnel {
+            Some(tunnel) => tunnel.send(message).await,
+            None => Err(TunnelError::ConnectionLost(
+                "pas de connexion au core".into(),
+            )),
+        }
     }
 
     /// The control messages pushed by the core (policy, keys, session
@@ -374,6 +401,7 @@ enum Ended {
 async fn run(
     params: LinkParams,
     status: Arc<Mutex<LinkStatus>>,
+    current: Current,
     mut stop: watch::Receiver<bool>,
     pushes: mpsc::Sender<CoreMessage>,
 ) {
@@ -404,7 +432,13 @@ async fn run(
                     s.connections += 1;
                 });
                 tracing::info!(event = "agent.core_connected", core = %params.core_address);
+                if let Ok(mut c) = current.lock() {
+                    *c = Some(tunnel.clone());
+                }
                 let ended = serve(&params, &tunnel, &certificate, &status, &stop, &pushes).await;
+                if let Ok(mut c) = current.lock() {
+                    *c = None;
+                }
                 drop(tunnel);
                 ended
             }
