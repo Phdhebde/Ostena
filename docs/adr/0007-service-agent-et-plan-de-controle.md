@@ -96,7 +96,17 @@ Sur `SIGTERM` ou `SIGINT`, Ctrl-C, ou l'arrêt par le SCM, l'agent suit cette s�
 
 ### Empreinte mémoire
 
-`agent.idle_footprint` est journalisé 5 s après le démarrage, avec la mémoire résidente (`VmRSS` sous Linux, *working set* sous Windows). `cargo xtask footprint` lance l'agent optimisé et l'affiche. Mesures au repos : **3,7 Mio sous Linux** et **9,0 Mio sous Windows 11**, pour un objectif indicatif de 20 Mio. Ce banc est affiché en CI sans seuil bloquant, comme les autres (ADR-0005).
+`agent.idle_footprint` est journalisé 5 s après le démarrage, avec la mémoire résidente (`VmRSS` sous Linux, *working set* sous Windows). `cargo xtask footprint` lance l'agent optimisé dans trois états et l'affiche : sans lien avec le core, lien configuré mais core injoignable, et connecté à un core de test (l'exemple `test_core` d'`ostena-tunnel`, dans son propre processus, jamais dans le binaire `ostena`). Sous Linux, il détaille la mémoire anonyme, la mémoire adossée à des fichiers et le nombre de threads.
+
+Mesures au repos, pour un objectif indicatif de 20 Mio :
+
+| État | Linux (Debian, conteneur) | Windows 11 |
+|---|---|---|
+| sans lien | 3,9 Mio (anonyme 0,4 ; fichiers 3,6 ; 5 threads) | 6,7 Mio |
+| non connecté | 5,4 Mio (anonyme 0,5 ; fichiers 5,0 ; 5 threads) | 8,6 Mio |
+| connecté | 5,3 Mio (anonyme 0,5 ; fichiers 4,9 ; 5 threads) | 9,3 Mio |
+
+Le lien coûte environ 1,5 Mio sous Linux et 2,6 Mio sous Windows. **Presque tout est du code** : les pages de la pile QUIC/TLS et d'aws-lc dans l'exécutable, partagées et en lecture seule, et, sous Windows, `mswsock.dll`, chargée par la première socket UDP. La mémoire anonyme ne croît que d'environ 100 Kio (tampons QUIC, configuration TLS) ; la mémoire privée Windows passe de 1,2 à 1,7 Mio ; le nombre de threads ne change pas. Aucune part évitable n'a été trouvée. Une mesure prise pendant un autre build sur la même machine est faussée (11,5 Mio relevés ainsi sous Windows) : mesurer sur une machine au repos. Ce banc est affiché en CI sans seuil bloquant, comme les autres (ADR-0005).
 
 ### Codes et événements
 
