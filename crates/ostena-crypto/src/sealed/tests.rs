@@ -62,7 +62,7 @@ fn shares_of_another_root_do_not_open() {
 }
 
 #[test]
-fn shares_are_37_base32_characters_with_ids_1_to_3() {
+fn shares_are_56_base32_characters_with_ids_1_to_3() {
     let (_, shares) = RootSecret::generate().unwrap();
     let ids: Vec<u8> = shares.iter().map(Share::id).collect();
     assert_eq!(ids, vec![1, 2, 3]);
@@ -92,7 +92,7 @@ fn transcription_mistakes_are_caught() {
             "position {i}"
         );
     }
-    for bad in ["", "ABC", &"U".repeat(37), &"A".repeat(38)] {
+    for bad in ["", "ABC", &"U".repeat(56), &"A".repeat(57), &"A".repeat(55)] {
         assert_eq!(Share::parse(&secret(bad)).err(), Some(SealError::Share));
     }
 }
@@ -119,4 +119,11 @@ fn tampering_is_refused() {
 fn crc_matches_the_ccitt_reference() {
     // CRC-16/CCITT-FALSE check value.
     assert_eq!(crc16(b"123456789".iter()), 0x29b1);
+}
+
+#[test]
+fn secret_is_256_bits_and_shares_56_characters() {
+    // PG-083 v3.00 RecoPQTailleCléSym: at least 192 bits; 256 bits like AES-256.
+    assert_eq!(SECRET_LEN * 8, 256);
+    assert_eq!(SHARE_CHARS, 56);
 }

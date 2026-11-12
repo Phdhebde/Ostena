@@ -13,6 +13,9 @@ pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
 /// Default upper bound of runtime worker threads.
 pub const DEFAULT_MAX_WORKER_THREADS: usize = 4;
 
+/// Default port of the core enrolment listener.
+pub const DEFAULT_ENROLLMENT_PORT: u16 = 8444;
+
 const fn default_grace() -> u64 {
     DEFAULT_SHUTDOWN_GRACE_SECS
 }
@@ -25,6 +28,10 @@ pub struct AgentConfig {
     pub gateway_group: String,
     /// Core address, `host:port`.
     pub core_address: String,
+    /// Core enrolment address, `host:port`; default: the host of
+    /// `core_address` on port 8444 (ADR-0008).
+    #[serde(default)]
+    pub enrollment_address: Option<String>,
     /// Agent certificate for mTLS (public).
     pub tls_certificate: PathBuf,
     /// Agent private key for mTLS, loaded into a `Secret`.
@@ -81,6 +88,18 @@ impl AgentConfig {
             gateway_group: self.gateway_group.clone(),
             ..self.scope.clone()
         }
+    }
+
+    /// The enrolment address: `enrollment_address`, or the host of
+    /// `core_address` on [`DEFAULT_ENROLLMENT_PORT`].
+    pub fn enrollment_address(&self) -> String {
+        self.enrollment_address.clone().unwrap_or_else(|| {
+            let host = self
+                .core_address
+                .rsplit_once(':')
+                .map_or(self.core_address.as_str(), |(host, _)| host);
+            format!("{host}:{DEFAULT_ENROLLMENT_PORT}")
+        })
     }
 
     /// Reads the private key into a secret.
@@ -155,6 +174,16 @@ pub(crate) fn consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
             format!(
                 "agent.core_address = « {} » : attendu hôte:port, ipv4:port ou [ipv6]:port.",
                 agent.core_address
+            ),
+        ));
+    }
+    if let Some(address) = &agent.enrollment_address
+        && parse_host_port(address).is_none()
+    {
+        out.push(Violation::new(
+            Code::AgentCoreAddress,
+            format!(
+                "agent.enrollment_address = « {address} » : attendu hôte:port, ipv4:port ou [ipv6]:port."
             ),
         ));
     }

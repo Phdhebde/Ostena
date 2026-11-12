@@ -164,10 +164,15 @@ pub enum CoreMessage {
         /// Explanation.
         message: String,
     },
-    /// A renewed agent certificate (PEM).
+    /// A renewed agent certificate (PEM), with its validity, so that the
+    /// agent schedules the next renewal without parsing X.509.
     Certificate {
         /// The certificate.
         certificate: String,
+        /// Start of validity (Unix seconds).
+        not_before: u64,
+        /// End of validity (Unix seconds).
+        not_after: u64,
     },
     /// The core closes the tunnel.
     Shutdown {
@@ -348,7 +353,14 @@ impl CoreMessage {
                 }
                 text("message", message, 256)
             }
-            Self::Certificate { certificate } => {
+            Self::Certificate {
+                certificate,
+                not_before,
+                not_after,
+            } => {
+                if not_after <= not_before {
+                    return Err(invalid("validité du certificat incohérente"));
+                }
                 let pem_chars = certificate
                     .bytes()
                     .all(|b| b.is_ascii_graphic() || matches!(b, b' ' | b'\n' | b'\r'));

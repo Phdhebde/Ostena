@@ -921,3 +921,36 @@ fn v011_control_endpoint() {
         assert_eq!(agent_codes(&c), vec![Code::ControlEndpoint], "{bad}");
     }
 }
+
+#[test]
+fn enrollment_address_defaults_to_the_core_host_on_8444() {
+    let c = parse(AGENT);
+    let a = c.agent.as_ref().unwrap();
+    let host = a.core_address.rsplit_once(':').unwrap().0;
+    assert_eq!(a.enrollment_address(), format!("{host}:8444"));
+    let c = agent_with(
+        "[agent]\n",
+        "[agent]\nenrollment_address = \"[2001:db8::1]:9000\"\n",
+    );
+    assert_eq!(c.agent.unwrap().enrollment_address(), "[2001:db8::1]:9000");
+}
+
+#[test]
+fn invalid_enrollment_address_is_refused() {
+    let c = agent_with("[agent]\n", "[agent]\nenrollment_address = \"no port\"\n");
+    assert_eq!(agent_codes(&c), vec![Code::AgentCoreAddress]);
+}
+
+#[test]
+fn enrollment_loader_does_not_need_the_key() {
+    let dir = std::env::temp_dir().join(format!("ostena-enroll-config-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("ostena.toml");
+    // AGENT points to key and certificate files that do not exist.
+    std::fs::write(&file, AGENT).unwrap();
+    let config = load_for_enrollment(&file).unwrap();
+    assert!(config.agent.is_some());
+    std::fs::write(&file, AGENT.replace("core_address", "core_addres")).unwrap();
+    assert!(load_for_enrollment(&file).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

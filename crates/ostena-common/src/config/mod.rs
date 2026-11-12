@@ -356,6 +356,24 @@ pub fn load_with(
     })
 }
 
+/// Reads, parses and checks the consistency of the configuration for
+/// `ostena agent enroll`, which creates the agent key and certificate: the
+/// rules on those files (`CFG-P008`) and the other weakening rules do not
+/// apply yet; `agent install` and the service startup check them.
+///
+/// # Errors
+///
+/// [`ConfigError`] with every consistency problem found.
+pub fn load_for_enrollment(path: &Path) -> Result<Config, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let config = Config::from_toml_str(&text)?;
+    Violations::into_result(validation::consistency(&config)).map_err(ConfigError::Invalid)?;
+    Ok(config)
+}
+
 /// Rules that need the file system: `CFG-P006`, and for an agent `CFG-P008`
 /// and `CFG-P009`.
 fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> Vec<Violation> {

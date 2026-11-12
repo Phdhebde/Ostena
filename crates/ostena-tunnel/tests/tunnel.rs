@@ -345,7 +345,7 @@ fn pushes_reach_the_agent_and_invalid_ones_close_the_tunnel() {
     run(async {
         let core = core();
         let id = core.agent_identity(group(), valid(), true).unwrap();
-        let (mut tunnel, _) = connect(&core.agent_config(&id, group(), fast()).unwrap())
+        let (tunnel, _) = connect(&core.agent_config(&id, group(), fast()).unwrap())
             .await
             .unwrap();
         let shutdown = CoreMessage::Shutdown {

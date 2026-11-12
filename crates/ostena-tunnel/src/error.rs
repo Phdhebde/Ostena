@@ -58,9 +58,47 @@ pub enum TunnelError {
     /// example, issued by the online issuing CA).
     #[error("[TUN-E017] certificat du core non émis directement par la racine épinglée : refusé")]
     NotRootIssued,
+    /// Enrolment token unknown or wrong.
+    #[error("[TUN-E018] jeton d'enrôlement inconnu ou faux")]
+    TokenUnknown,
+    /// Enrolment token expired.
+    #[error("[TUN-E019] jeton d'enrôlement expiré ; demandez-en un nouveau")]
+    TokenExpired,
+    /// Enrolment token already used.
+    #[error("[TUN-E020] jeton d'enrôlement déjà utilisé")]
+    TokenUsed,
+    /// Enrolment token issued for another gateway group.
+    #[error("[TUN-E021] jeton d'enrôlement émis pour un autre groupe de passerelles")]
+    TokenGroup,
+    /// The proof of possession of the private key is invalid.
+    #[error("[TUN-E022] preuve de possession de la clé invalide")]
+    ProofOfPossession,
 }
 
 impl TunnelError {
+    /// The error of a code that carries no detail (`TUN-E005`, `TUN-E020`…),
+    /// as received from the peer.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "TUN-E001" => Self::NoCommonGroup,
+            "TUN-E003" => Self::UnknownIssuer,
+            "TUN-E004" => Self::CertificateValidity,
+            "TUN-E005" => Self::Revoked,
+            "TUN-E006" => Self::UnknownAgent,
+            "TUN-E007" => Self::NoClientCertificate,
+            "TUN-E008" => Self::ApplicationProtocol,
+            "TUN-E009" => Self::NameMismatch,
+            "TUN-E012" => Self::HeartbeatTimeout,
+            "TUN-E017" => Self::NotRootIssued,
+            "TUN-E018" => Self::TokenUnknown,
+            "TUN-E019" => Self::TokenExpired,
+            "TUN-E020" => Self::TokenUsed,
+            "TUN-E021" => Self::TokenGroup,
+            "TUN-E022" => Self::ProofOfPossession,
+            _ => return None,
+        })
+    }
+
     /// The stable code, e.g. `TUN-E005`.
     pub fn code(&self) -> &'static str {
         match self {
@@ -81,6 +119,11 @@ impl TunnelError {
             Self::Config(_) => "TUN-E015",
             Self::Handshake(_) => "TUN-E016",
             Self::NotRootIssued => "TUN-E017",
+            Self::TokenUnknown => "TUN-E018",
+            Self::TokenExpired => "TUN-E019",
+            Self::TokenUsed => "TUN-E020",
+            Self::TokenGroup => "TUN-E021",
+            Self::ProofOfPossession => "TUN-E022",
         }
     }
 }
@@ -149,7 +192,13 @@ impl From<ConnectionError> for TunnelError {
                 None => Self::ConnectionLost(error.to_string()),
             },
             ConnectionError::ApplicationClosed(frame) => {
-                Self::ConnectionLost(String::from_utf8_lossy(&frame.reason).into_owned())
+                let reason = String::from_utf8_lossy(&frame.reason).into_owned();
+                // The peer closed on one of our errors: keep its code.
+                reason
+                    .strip_prefix('[')
+                    .and_then(|r| r.get(..8))
+                    .and_then(Self::from_code)
+                    .unwrap_or(Self::ConnectionLost(reason))
             }
             ConnectionError::VersionMismatch => Self::Negotiation(error.to_string()),
             _ => Self::ConnectionLost(error.to_string()),
@@ -181,12 +230,31 @@ mod tests {
             TunnelError::Config("x".into()),
             TunnelError::Handshake("x".into()),
             TunnelError::NotRootIssued,
+            TunnelError::TokenUnknown,
+            TunnelError::TokenExpired,
+            TunnelError::TokenUsed,
+            TunnelError::TokenGroup,
+            TunnelError::ProofOfPossession,
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("TUN-E{:03}", i + 1);
             assert_eq!(e.code(), code);
             assert!(e.to_string().starts_with(&format!("[{code}]")), "{e}");
         }
+    }
+
+    #[test]
+    fn codes_without_detail_round_trip() {
+        for e in [
+            TunnelError::Revoked,
+            TunnelError::TokenUsed,
+            TunnelError::TokenGroup,
+            TunnelError::NotRootIssued,
+        ] {
+            assert_eq!(TunnelError::from_code(e.code()), Some(e));
+        }
+        assert_eq!(TunnelError::from_code("TUN-E010"), None);
+        assert_eq!(TunnelError::from_code("garbage"), None);
     }
 
     #[test]
