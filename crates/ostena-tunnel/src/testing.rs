@@ -11,12 +11,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256;
 use ostena_crypto::pki::testing::TestPki;
 pub use ostena_crypto::pki::testing::valid;
 use ostena_crypto::pki::{IssuingAuthority, Validity};
 use ostena_crypto::tls::{
-    self, ClientAuth, ClientAuthorizer, ClientRefusal, Identity, TrustAnchor,
+    self, ClientAuth, ClientAuthorizer, ClientRefusal, Identity, ServerConfig, TrustAnchor,
 };
 use tokio::task::JoinHandle;
 
@@ -99,11 +100,14 @@ struct State {
 pub struct TestCore {
     pki: Arc<TestPki>,
     registry: Arc<Registry>,
-    listener: Arc<CoreListener>,
+    issuer: Arc<IssuingAuthority>,
+    server_tls: Arc<ServerConfig>,
+    behaviour: Behaviour,
+    limits: Limits,
+    running: Mutex<Option<(Arc<CoreListener>, JoinHandle<()>)>>,
     enrollment: EnrollmentService,
     addr: SocketAddr,
     state: Arc<State>,
-    task: JoinHandle<()>,
 }
 
 impl std::fmt::Debug for TestCore {
@@ -146,7 +150,7 @@ impl TestCore {
         .map_err(|e| TunnelError::Config(e.to_string()))?;
         let listener = Arc::new(CoreListener::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            tls,
+            tls.clone(),
             limits,
         )?);
         let addr = listener.local_addr()?;
@@ -172,24 +176,20 @@ impl TestCore {
             DEFAULT_CERTIFICATE_LIFETIME,
             Duration::from_secs(5),
         )?;
-        let state = Arc::new(State::default());
-        let task = tokio::spawn(serve(
-            listener.clone(),
-            registry.clone(),
-            issuer,
-            state.clone(),
-            behaviour,
-            limits,
-        ));
-        Ok(Self {
+        let core = Self {
             pki,
             registry,
-            listener,
+            issuer,
+            server_tls: tls,
+            behaviour,
+            limits,
+            running: Mutex::new(None),
             enrollment,
             addr,
-            state,
-            task,
-        })
+            state: Arc::new(State::default()),
+        };
+        core.listen(listener);
+        Ok(core)
     }
 
     /// The listening address.
@@ -345,10 +345,90 @@ impl TestCore {
         }
     }
 
+    fn listen(&self, listener: Arc<CoreListener>) {
+        let task = tokio::spawn(serve(
+            listener.clone(),
+            self.registry.clone(),
+            self.issuer.clone(),
+            self.state.clone(),
+            self.behaviour,
+            self.limits,
+        ));
+        if let Ok(mut running) = self.running.lock() {
+            *running = Some((listener, task));
+        }
+    }
+
     /// Stops the core: closes the listener and every tunnel.
     pub fn stop(&self) {
-        self.task.abort();
-        self.listener.close();
+        let running = self.running.lock().ok().and_then(|mut r| r.take());
+        if let Some((listener, task)) = running {
+            task.abort();
+            listener.close();
+        }
+        // Open tunnels keep the socket alive: close and forget them.
+        let tunnels = self
+            .state
+            .tunnels
+            .lock()
+            .map(|mut t| std::mem::take(&mut *t));
+        for (_, tunnel) in tunnels.unwrap_or_default() {
+            tunnel.close(TunnelError::ConnectionLost("arrêt du core".into()));
+        }
+    }
+
+    /// Starts again on the same address, with the same PKI and registry,
+    /// after [`TestCore::stop`].
+    ///
+    /// # Errors
+    ///
+    /// If the address cannot be bound again within two seconds.
+    pub async fn restart(&self) -> Result<(), TunnelError> {
+        self.stop();
+        let mut last = TunnelError::Io("rebind".into());
+        for _ in 0..40 {
+            match CoreListener::bind(self.addr, self.server_tls.clone(), self.limits) {
+                Ok(listener) => {
+                    self.listen(Arc::new(listener));
+                    return Ok(());
+                }
+                Err(e) => last = e,
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(last)
+    }
+
+    /// An agent certificate (PEM) and key (PEM PKCS#8) for `group`, valid
+    /// `validity`, recorded in the registry: what `ostena agent enroll`
+    /// would write.
+    ///
+    /// # Errors
+    ///
+    /// If the key or the certificate cannot be created.
+    pub fn agent_files(
+        &self,
+        group: Uuid,
+        validity: Validity,
+    ) -> Result<(String, SecretBytes), TunnelError> {
+        let (key, pkcs8) =
+            p256::SigningKey::generate().map_err(|e| TunnelError::Config(e.to_string()))?;
+        let agent = Uuid::random().map_err(|e| TunnelError::Config(e.to_string()))?;
+        let cert = self
+            .issuer
+            .issue_agent(
+                &key.verifying_key(),
+                &group.to_string(),
+                &agent.to_string(),
+                validity,
+            )
+            .map_err(|e| TunnelError::Config(e.to_string()))?;
+        self.registry
+            .register(tls::fingerprint(&cert), group, agent);
+        Ok((
+            ostena_crypto::pki::pem_certificate(&cert),
+            ostena_crypto::pki::pem_private_key(&pkcs8),
+        ))
     }
 }
 
