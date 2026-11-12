@@ -1,6 +1,6 @@
 //! Sealing of the offline root key (ADR-0008, root ceremony).
 //!
-//! The root key is sealed under a **root secret** of 160 random bits, drawn
+//! The root key is sealed under a **root secret** of 256 random bits, drawn
 //! here rather than chosen by a person, so that the sealed file cannot be
 //! attacked offline by guessing (ANSSI-PG-083 `RègleSecretFaibleEntropie`).
 //!
@@ -8,7 +8,7 @@
 //! GF(256) into **three shares, any two of which rebuild it** (`vsss-rs`,
 //! an audited implementation). One share per custodian, in a sealed
 //! envelope: a lost envelope does not lose the root, and no custodian alone
-//! can open it. A share is written as 37 base32 characters (id, value, and
+//! can open it. A share is written as 56 base32 characters (id, value, and
 //! a CRC-16 that catches every mistyped character).
 //!
 //! Sealed format: `OSTSEAL2` ‖ iterations (u32, big-endian) ‖ salt (16) ‖
@@ -35,7 +35,7 @@ pub const ITERATIONS: u32 = 600_000;
 const ACCEPTED_ITERATIONS: std::ops::RangeInclusive<u32> = 600_000..=10_000_000;
 
 /// Bytes of the root secret.
-pub const SECRET_LEN: usize = 20;
+pub const SECRET_LEN: usize = 32;
 /// Shares made, and shares needed to rebuild the root secret.
 pub const SHARES: usize = 3;
 /// Shares needed to rebuild the root secret.
@@ -45,7 +45,7 @@ pub const THRESHOLD: usize = 2;
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Bytes of an encoded share: id, value, checksum.
 const SHARE_BYTES: usize = 1 + SECRET_LEN + 2;
-/// Characters of a share in base32 (184 bits, padded to 185).
+/// Characters of a share in base32 (280 bits, no padding).
 pub const SHARE_CHARS: usize = (SHARE_BYTES * 8).div_ceil(5);
 /// Domain separation of the share checksum.
 const SHARE_DOMAIN: &[u8] = b"ostena-root-share-v1";
@@ -58,7 +58,7 @@ pub enum SealError {
     #[error("fichier scellé mal formé")]
     Format,
     /// A share is mistyped or damaged (wrong length, character or checksum).
-    #[error("part mal recopiée : 37 caractères base32 attendus, somme de contrôle fausse")]
+    #[error("part mal recopiée : 56 caractères base32 attendus, somme de contrôle fausse")]
     Share,
     /// Fewer than two distinct shares.
     #[error("au moins deux parts différentes sont nécessaires")]
@@ -141,7 +141,7 @@ fn crc16<'a>(bytes: impl Iterator<Item = &'a u8>) -> u16 {
 pub struct Share(SecretBytes);
 
 impl Share {
-    /// The share as 37 base32 characters in groups of five, for the ceremony
+    /// The share as 56 base32 characters in groups of five, for the ceremony
     /// record.
     pub fn to_text(&self) -> String {
         // SECRET-EXPOSURE: shown once to its custodian during the ceremony.
@@ -225,7 +225,8 @@ impl Share {
     }
 }
 
-/// The root secret: 160 random bits. No `Debug`, never shown.
+/// The root secret: 256 random bits (PG-083 `RecoPQTailleCléSym`: at least
+/// 192 bits for post-quantum security; the root lives beyond 2030). No `Debug`, never shown.
 pub struct RootSecret(SecretBytes);
 
 impl RootSecret {
