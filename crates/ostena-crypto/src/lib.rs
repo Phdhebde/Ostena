@@ -41,3 +41,18 @@ pub enum CryptoError {
     #[error("échec de la signature")]
     Signing,
 }
+
+/// Compares two byte strings in constant time (for secrets: tokens, MACs).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    aws_lc_rs::constant_time::verify_slices_are_equal(a, b).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn constant_time_eq() {
+        assert!(super::constant_time_eq(b"abc", b"abc"));
+        assert!(!super::constant_time_eq(b"abc", b"abd"));
+        assert!(!super::constant_time_eq(b"abc", b"ab"));
+    }
+}
