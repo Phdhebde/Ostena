@@ -8,6 +8,7 @@
 mod agent;
 mod ca;
 mod control;
+mod enroll;
 mod sessions;
 
 use std::path::PathBuf;
@@ -189,6 +190,19 @@ enum AgentCommand {
         #[arg(long)]
         pid: Option<u32>,
     },
+    /// Enrol the agent with the core: generate its key, prove a single-use
+    /// token, write the certificate. Run once, before `install`.
+    Enroll {
+        /// Configuration file.
+        #[arg(long, default_value_os_t = agent::default_config())]
+        config: PathBuf,
+        /// File holding the enrolment token, or `-` for standard input.
+        #[arg(long)]
+        token_file: PathBuf,
+        /// Deadline for the exchange with the core, in seconds.
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+    },
     /// Anti-replay journal of the gateway.
     ReplayStore {
         #[command(subcommand)]
@@ -246,6 +260,14 @@ fn main() -> ExitCode {
         Some(Command::Agent {
             command: AgentCommand::Status { config, pid },
         }) => agent::status(&config, pid),
+        Some(Command::Agent {
+            command:
+                AgentCommand::Enroll {
+                    config,
+                    token_file,
+                    timeout,
+                },
+        }) => enroll::enroll_agent(&config, &token_file, timeout),
         Some(Command::Agent {
             command:
                 AgentCommand::ReplayStore {

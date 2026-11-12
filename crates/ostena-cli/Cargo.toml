@@ -17,10 +17,15 @@ ostena-common.workspace = true
 ostena-crypto.workspace = true
 ostena-grant.workspace = true
 ostena-platform.workspace = true
+ostena-tunnel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The enrolment tests run the binary against the in-process test core.
+ostena-tunnel = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true
