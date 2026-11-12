@@ -170,9 +170,9 @@ En développement, les trois sont journalisées et acceptées.
 
 **5. Cérémonie** (`ostena ca`, procédure dans `docs/exploitation/ceremonie-racine.md`) :
 - **Sur le poste isolé**, `ostena ca root init --name … --out <support A> --out <support B>` :
-  - tire la clé racine et un **secret de 160 bits**, qui scelle la clé (voir l'ADR-0009) ;
+  - tire la clé racine et un **secret de 256 bits**, qui scelle la clé (voir l'ADR-0009). La racine vit 10 ans, donc au-delà de 2030 : 256 bits respectent la recommandation post-quantique de PG-083 v3.00 (`RecoPQTailleCléSym`, § 2.1.1 : au moins 192 bits) et s'alignent sur AES-256 ;
   - partage ce secret en **trois parts dont deux quelconques suffisent** (partage de Shamir 2 sur 3), une par dépositaire : la perte d'une enveloppe ne rend pas la racine irrécupérable, et aucun dépositaire seul ne peut la rouvrir ;
-  - affiche les parts une seule fois, chacune en 37 caractères base32 avec une CRC-16 qui détecte toute faute de recopie ;
+  - affiche les parts une seule fois, chacune en 56 caractères base32 (identifiant, 32 octets de valeur, CRC-16) ; la CRC-16 détecte toute faute sur un caractère ;
   - écrit sur chaque support `root.pem`, `root.name` et `root.key.sealed`.
 - **Sur le core**, `ostena ca key new` génère chaque clé (CA émettrice, serveur). Seule la clé publique est portée à la cérémonie.
 - **À la cérémonie**, `ostena ca issuing sign` et `ostena ca server sign` certifient ces clés publiques avec la racine. Deux parts sont lues sur l'entrée standard.

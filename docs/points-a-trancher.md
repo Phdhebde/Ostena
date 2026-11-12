@@ -2,7 +2,7 @@
 
 Questions ouvertes laissées volontairement en suspens, avec le lot où elles seront traitées. Chaque point renvoie à l'ADR qui l'a soulevé. Une fois tranché, il quitte cette liste pour entrer dans un ADR.
 
-## Lot L15
+## Lot L15 — Industrialisation : HA, appliance, sauvegarde, mises à jour signées, documentation
 
 ### Révocation du certificat serveur du core
 
