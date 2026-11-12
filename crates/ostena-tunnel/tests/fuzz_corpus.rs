@@ -37,3 +37,17 @@ fn json_seeds_decode() {
     let hello = std::fs::read(dir.join("seed-hello.json")).expect("seed");
     assert!(decode::<AgentMessage>(&hello).is_ok());
 }
+
+/// The enrolment seeds are valid messages too.
+#[test]
+fn enrolment_seeds_decode() {
+    use ostena_tunnel::enroll::{decode_client, decode_server};
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/tunnel_control_decode");
+    for name in ["seed-enroll-challenge", "seed-enroll-refused"] {
+        let data = std::fs::read(dir.join(format!("{name}.json"))).expect("seed");
+        assert!(decode_server(&data).is_ok(), "{name}");
+    }
+    let request = std::fs::read(dir.join("seed-enroll-request.json")).expect("seed");
+    assert!(decode_client(&request).is_ok());
+}

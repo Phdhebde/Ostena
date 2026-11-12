@@ -68,6 +68,8 @@ fn valid_core_messages() -> Vec<CoreMessage> {
         },
         CoreMessage::Certificate {
             certificate: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into(),
+            not_before: 1,
+            not_after: 2,
         },
         CoreMessage::Shutdown {
             reason: "maintenance".into(),
@@ -330,7 +332,14 @@ fn refusal_code_and_certificate_are_checked() {
         }));
     }
     assert!(refused_core(&CoreMessage::Certificate {
-        certificate: "MIIB".into()
+        certificate: "MIIB".into(),
+        not_before: 1,
+        not_after: 2,
+    }));
+    assert!(refused_core(&CoreMessage::Certificate {
+        certificate: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".into(),
+        not_before: 2,
+        not_after: 2,
     }));
 }
 

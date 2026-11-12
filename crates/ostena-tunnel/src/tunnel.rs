@@ -74,7 +74,7 @@ impl Shared {
 #[derive(Debug)]
 pub struct Tunnel<Out: Message, In: Message> {
     shared: Arc<Shared>,
-    inbox: mpsc::Receiver<In>,
+    inbox: tokio::sync::Mutex<mpsc::Receiver<In>>,
     tasks: Vec<JoinHandle<()>>,
     endpoint: Option<Endpoint>,
     _out: PhantomData<fn(Out)>,
@@ -85,7 +85,7 @@ pub type AgentTunnel = Tunnel<AgentMessage, CoreMessage>;
 /// The core end.
 pub type CoreTunnel = Tunnel<CoreMessage, AgentMessage>;
 
-async fn read_frame(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, TunnelError> {
+pub(crate) async fn read_frame(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, TunnelError> {
     let lost = |e: quinn::ReadExactError| TunnelError::ConnectionLost(e.to_string());
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await.map_err(lost)?;
@@ -183,7 +183,7 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
 
         Self {
             shared,
-            inbox,
+            inbox: tokio::sync::Mutex::new(inbox),
             tasks: vec![reader, heart],
             endpoint,
             _out: PhantomData,
@@ -202,8 +202,8 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
 
     /// The next control message from the peer (heartbeats excluded); `None`
     /// once the tunnel is closed.
-    pub async fn recv(&mut self) -> Option<In> {
-        self.inbox.recv().await
+    pub async fn recv(&self) -> Option<In> {
+        self.inbox.lock().await.recv().await
     }
 
     /// Opens a session channel of `class`, sent with its priority.
@@ -314,7 +314,7 @@ impl<Out: Message, In: Message> Drop for Tunnel<Out, In> {
     }
 }
 
-fn peer_certificate(conn: &Connection) -> Option<CertificateDer<'static>> {
+pub(crate) fn peer_certificate(conn: &Connection) -> Option<CertificateDer<'static>> {
     conn.peer_identity()?
         .downcast::<Vec<CertificateDer<'static>>>()
         .ok()?
@@ -323,11 +323,16 @@ fn peer_certificate(conn: &Connection) -> Option<CertificateDer<'static>> {
 }
 
 fn check_alpn(conn: &Connection) -> Result<(), TunnelError> {
+    check_protocol(conn, ALPN)
+}
+
+/// The connection negotiated `expected` (ALPN), or it is closed.
+pub(crate) fn check_protocol(conn: &Connection, expected: &[u8]) -> Result<(), TunnelError> {
     let protocol = conn
         .handshake_data()
         .and_then(|d| d.downcast::<HandshakeData>().ok())
         .and_then(|d| d.protocol);
-    if protocol.as_deref() == Some(ALPN) {
+    if protocol.as_deref() == Some(expected) {
         Ok(())
     } else {
         conn.close(VarInt::from_u32(CLOSE_ERROR), b"ALPN");
@@ -335,7 +340,7 @@ fn check_alpn(conn: &Connection) -> Result<(), TunnelError> {
     }
 }
 
-async fn within<T>(
+pub(crate) async fn within<T>(
     limit: Duration,
     what: &str,
     future: impl Future<Output = Result<T, TunnelError>>,

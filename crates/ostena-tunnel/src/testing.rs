@@ -1,9 +1,10 @@
 //! In-process test core (feature `testing`). Never in a release binary:
 //! `cargo xtask check-release` refuses the feature and [`MARKER`].
 //!
-//! It plays the core side of the tunnel: its own CA, a registry of agent
-//! certificates, hello checks, heartbeat answers and echo of every session
-//! channel. Enrolment, policy and key pushes come with the next lots.
+//! It plays the core side of the tunnel: its own PKI, a registry of agent
+//! certificates, the enrolment service, hello checks, heartbeat answers,
+//! certificate renewal, revocation that closes live tunnels, and echo of every
+//! session channel. Policy and key pushes come with the next lots.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -11,18 +12,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ostena_crypto::p256;
-use ostena_crypto::pki::Validity;
 use ostena_crypto::pki::testing::TestPki;
 pub use ostena_crypto::pki::testing::valid;
+use ostena_crypto::pki::{IssuingAuthority, Validity};
 use ostena_crypto::tls::{
     self, ClientAuth, ClientAuthorizer, ClientRefusal, Identity, TrustAnchor,
 };
 use tokio::task::JoinHandle;
 
-use crate::control::{CoreMessage, PROTOCOL_VERSION};
+use crate::control::{AgentMessage, CoreMessage, PROTOCOL_VERSION};
+use crate::enroll::{
+    AgentRegistry, DEFAULT_CERTIFICATE_LIFETIME, EnrollmentService, EnrollmentToken,
+};
 use crate::error::TunnelError;
 use crate::ids::Uuid;
 use crate::limits::Limits;
+use crate::renewal;
 use crate::tunnel::{ALPN, AgentConfig, CoreListener, CoreTunnel, Hello};
 
 /// Text present in any binary that links the test core.
@@ -31,6 +36,7 @@ pub const MARKER: &str = "ostena-testing-core: never in a release build";
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     group: Uuid,
+    agent: Uuid,
     revoked: bool,
 }
 
@@ -49,8 +55,27 @@ impl ClientAuthorizer for Registry {
 }
 
 impl Registry {
+    fn entry(&self, fingerprint: &[u8; 32]) -> Option<Entry> {
+        self.0.lock().ok()?.get(fingerprint).copied()
+    }
+
     fn group(&self, fingerprint: &[u8; 32]) -> Option<Uuid> {
-        self.0.lock().ok()?.get(fingerprint).map(|e| e.group)
+        self.entry(fingerprint).map(|e| e.group)
+    }
+}
+
+impl AgentRegistry for Registry {
+    fn register(&self, fingerprint: [u8; 32], group: Uuid, agent: Uuid) {
+        if let Ok(mut r) = self.0.lock() {
+            r.insert(
+                fingerprint,
+                Entry {
+                    group,
+                    agent,
+                    revoked: false,
+                },
+            );
+        }
     }
 }
 
@@ -67,7 +92,7 @@ pub struct Behaviour {
 #[derive(Debug, Default)]
 struct State {
     errors: Mutex<Vec<TunnelError>>,
-    tunnels: Mutex<Vec<Arc<CoreTunnel>>>,
+    tunnels: Mutex<Vec<([u8; 32], Arc<CoreTunnel>)>>,
 }
 
 /// A core listening on 127.0.0.1, for tests and benchmarks.
@@ -75,6 +100,7 @@ pub struct TestCore {
     pki: Arc<TestPki>,
     registry: Arc<Registry>,
     listener: Arc<CoreListener>,
+    enrollment: EnrollmentService,
     addr: SocketAddr,
     state: Arc<State>,
     task: JoinHandle<()>,
@@ -124,10 +150,33 @@ impl TestCore {
             limits,
         )?);
         let addr = listener.local_addr()?;
+        let issuer = Arc::new(
+            IssuingAuthority::from_parts(
+                pki.issuing.common_name(),
+                &pki.issuing_key,
+                pki.issuing_certificate.clone(),
+            )
+            .map_err(config)?,
+        );
+        // The enrolment listener is bound only while a token is valid: reserve
+        // a free port now, so that the agents know where to go.
+        let enroll_port = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|s| s.local_addr())
+            .map_err(|e| TunnelError::Io(e.to_string()))?
+            .port();
+        let enrollment = EnrollmentService::new(
+            (Ipv4Addr::LOCALHOST, enroll_port).into(),
+            &server,
+            issuer.clone(),
+            registry.clone(),
+            DEFAULT_CERTIFICATE_LIFETIME,
+            Duration::from_secs(5),
+        )?;
         let state = Arc::new(State::default());
         let task = tokio::spawn(serve(
             listener.clone(),
             registry.clone(),
+            issuer,
             state.clone(),
             behaviour,
             limits,
@@ -136,6 +185,7 @@ impl TestCore {
             pki,
             registry,
             listener,
+            enrollment,
             addr,
             state,
             task,
@@ -176,25 +226,54 @@ impl TestCore {
                 validity,
             )
             .map_err(|e| TunnelError::Config(e.to_string()))?;
-        if register && let Ok(mut r) = self.registry.0.lock() {
-            r.insert(
-                tls::fingerprint(&cert),
-                Entry {
-                    group,
-                    revoked: false,
-                },
-            );
+        if register {
+            let agent = Uuid::random().map_err(|e| TunnelError::Config(e.to_string()))?;
+            self.registry
+                .register(tls::fingerprint(&cert), group, agent);
         }
         Identity::new(vec![cert], pkcs8).map_err(|e| TunnelError::Config(e.to_string()))
     }
 
-    /// Revokes an agent certificate.
+    /// Revokes an agent certificate: refused at the next handshakes, and its
+    /// open tunnels are closed at once (`TUN-E005`).
     pub fn revoke(&self, identity: &Identity) {
+        self.revoke_fingerprint(&tls::fingerprint(identity.certificate()));
+    }
+
+    /// Revokes the certificate whose SHA-256 is `fingerprint`.
+    pub fn revoke_fingerprint(&self, fingerprint: &[u8; 32]) {
         if let Ok(mut r) = self.registry.0.lock()
-            && let Some(e) = r.get_mut(&tls::fingerprint(identity.certificate()))
+            && let Some(e) = r.get_mut(fingerprint)
         {
             e.revoked = true;
         }
+        if let Ok(tunnels) = self.state.tunnels.lock() {
+            for (fp, tunnel) in tunnels.iter() {
+                if fp == fingerprint {
+                    tunnel.close(TunnelError::Revoked);
+                }
+            }
+        }
+    }
+
+    /// Issues an enrolment token for `group`, valid `ttl`; the enrolment
+    /// listener opens.
+    ///
+    /// # Errors
+    ///
+    /// See [`EnrollmentService::issue_token`].
+    pub fn issue_token(&self, group: Uuid, ttl: Duration) -> Result<EnrollmentToken, TunnelError> {
+        self.enrollment.issue_token(group, ttl)
+    }
+
+    /// The enrolment listener address.
+    pub fn enrollment_addr(&self) -> SocketAddr {
+        self.enrollment.addr()
+    }
+
+    /// Whether the enrolment listener is bound.
+    pub fn enrollment_open(&self) -> bool {
+        self.enrollment.is_open()
     }
 
     /// A ready agent configuration for `identity` and `group`.
@@ -250,7 +329,7 @@ impl TestCore {
         self.state
             .tunnels
             .lock()
-            .map_or(0, |t| t.iter().filter(|t| !t.is_closed()).count())
+            .map_or(0, |t| t.iter().filter(|(_, t)| !t.is_closed()).count())
     }
 
     /// Sends `message` on every open tunnel.
@@ -259,7 +338,7 @@ impl TestCore {
             .state
             .tunnels
             .lock()
-            .map(|t| t.clone())
+            .map(|t| t.iter().map(|(_, t)| t.clone()).collect())
             .unwrap_or_default();
         for t in tunnels {
             let _ = t.send(message).await;
@@ -282,6 +361,7 @@ impl Drop for TestCore {
 async fn serve(
     listener: Arc<CoreListener>,
     registry: Arc<Registry>,
+    issuer: Arc<IssuingAuthority>,
     state: Arc<State>,
     behaviour: Behaviour,
     limits: Limits,
@@ -321,8 +401,14 @@ async fn serve(
             tunnel.mute_for_tests();
         }
         if let Ok(mut t) = state.tunnels.lock() {
-            t.push(tunnel.clone());
+            t.push((accepted.fingerprint, tunnel.clone()));
         }
+        tokio::spawn(control(
+            tunnel.clone(),
+            accepted.fingerprint,
+            registry.clone(),
+            issuer.clone(),
+        ));
         tokio::spawn(echo_channels(tunnel));
     }
 }
@@ -338,5 +424,48 @@ async fn echo_channels(tunnel: Arc<CoreTunnel>) {
             }
             let _ = channel.send.finish();
         });
+    }
+}
+
+/// Control messages from one agent: certificate renewal.
+async fn control(
+    tunnel: Arc<CoreTunnel>,
+    fingerprint: [u8; 32],
+    registry: Arc<Registry>,
+    issuer: Arc<IssuingAuthority>,
+) {
+    while let Some(message) = tunnel.recv().await {
+        let AgentMessage::Renew { request } = message else {
+            continue;
+        };
+        let renewed = renewal::verify(&request, &fingerprint).and_then(|key| {
+            let entry = registry
+                .entry(&fingerprint)
+                .ok_or(TunnelError::UnknownAgent)?;
+            let validity = valid();
+            let cert = issuer
+                .issue_agent(
+                    &key,
+                    &entry.group.to_string(),
+                    &entry.agent.to_string(),
+                    validity,
+                )
+                .map_err(|e| TunnelError::Io(e.to_string()))?;
+            registry.register(tls::fingerprint(&cert), entry.group, entry.agent);
+            Ok(CoreMessage::Certificate {
+                certificate: ostena_crypto::pki::pem_certificate(&cert),
+                not_before: validity.not_before,
+                not_after: validity.not_after,
+            })
+        });
+        match renewed {
+            Ok(reply) => {
+                let _ = tunnel.send(&reply).await;
+            }
+            Err(e) => {
+                tunnel.close(e);
+                break;
+            }
+        }
     }
 }

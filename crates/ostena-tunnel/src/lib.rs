@@ -13,9 +13,11 @@
 
 pub mod channel;
 pub mod control;
+pub mod enroll;
 mod error;
 mod ids;
 pub mod limits;
+pub mod renewal;
 pub mod tunnel;
 
 #[cfg(feature = "testing")]
