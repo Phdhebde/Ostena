@@ -39,8 +39,8 @@ fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
-/// Runs `root init` into two media and returns the passphrase printed.
-fn init(dir: &Path) -> (PathBuf, String) {
+/// Runs `root init` into two media and returns the three shares printed.
+fn init(dir: &Path) -> (PathBuf, Vec<String>) {
     let (a, b) = (dir.join("media-a"), dir.join("media-b"));
     let out = ostena(
         &[
@@ -63,24 +63,24 @@ fn init(dir: &Path) -> (PathBuf, String) {
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("Empreinte SHA-256 du certificat racine : "));
-    let mut passphrase = String::new();
-    for line in stdout.lines().filter(|l| l.contains("Dépositaire")) {
-        passphrase.push_str(line.split(':').nth(1).unwrap().trim());
-        passphrase.push(' ');
-    }
-    assert_eq!(passphrase.split_whitespace().count(), 6, "{stdout}");
+    let shares: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with("Dépositaire"))
+        .map(|l| l.split(':').nth(1).unwrap().trim().to_owned())
+        .collect();
+    assert_eq!(shares.len(), 3, "{stdout}");
     for media in [&a, &b] {
         for file in ["root.pem", "root.name", "root.key.sealed"] {
             assert!(media.join(file).exists(), "{file}");
         }
     }
-    (a, passphrase)
+    (a, shares)
 }
 
 #[test]
 fn full_ceremony() {
     let dir = temp("full");
-    let (media, passphrase) = init(&dir);
+    let (media, shares) = init(&dir);
 
     // On the core: two keys, their public halves carried to the ceremony.
     for name in ["issuing", "server"] {
@@ -128,7 +128,8 @@ fn full_ceremony() {
             "--out",
             s(&dir.join("issuing.pem")),
         ],
-        &format!("{passphrase}\n"),
+        // Custodians 1 and 2.
+        &format!("{}\n{}\n\n", shares[0], shares[1]),
     );
     assert!(
         issuing.status.success(),
@@ -150,8 +151,12 @@ fn full_ceremony() {
             "--out",
             s(&dir.join("server.pem")),
         ],
-        // Typed back in lower case, with dashes: accepted.
-        &format!("{}\n", passphrase.to_lowercase().replace(' ', "-")),
+        // Custodians 3 and 1, typed back in lower case with spaces: accepted.
+        &format!(
+            "{}\n{}\n\n",
+            shares[2].to_lowercase().replace('-', " "),
+            shares[0]
+        ),
     );
     assert!(
         server.status.success(),
@@ -166,9 +171,10 @@ fn full_ceremony() {
 }
 
 #[test]
-fn wrong_passphrase_signs_nothing() {
+fn one_share_or_shares_of_another_root_sign_nothing() {
     let dir = temp("wrong");
-    let (media, _) = init(&dir);
+    let (media, shares) = init(&dir);
+    let (_, others) = init(&dir.join("other-root"));
     let out = ostena(
         &[
             "ca",
@@ -182,25 +188,47 @@ fn wrong_passphrase_signs_nothing() {
         "",
     );
     assert!(out.status.success());
-    let out = ostena(
-        &[
-            "ca",
-            "issuing",
-            "sign",
-            "--root",
-            s(&media),
-            "--public-key",
-            s(&dir.join("k.pub")),
-            "--name",
-            "x",
-            "--out",
-            s(&dir.join("x.pem")),
-        ],
-        &format!("{}\n", "A".repeat(30)),
-    );
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("phrase secrète fausse"));
-    assert!(!dir.join("x.pem").exists());
+    let sign = |stdin: String| {
+        ostena(
+            &[
+                "ca",
+                "issuing",
+                "sign",
+                "--root",
+                s(&media),
+                "--public-key",
+                s(&dir.join("k.pub")),
+                "--name",
+                "x",
+                "--out",
+                s(&dir.join("x.pem")),
+            ],
+            &stdin,
+        )
+    };
+    for (stdin, expected) in [
+        // A single share, whichever it is.
+        (format!("{}\n\n", shares[0]), "deux parts"),
+        (format!("{}\n\n", shares[2]), "deux parts"),
+        // Twice the same share.
+        (format!("{}\n{}\n\n", shares[1], shares[1]), "deux parts"),
+        // A share of this root and one of another root.
+        (
+            format!("{}\n{}\n\n", shares[0], others[1]),
+            "parts d'une autre racine",
+        ),
+        // A mistyped share.
+        (
+            format!("{}X\n{}\n\n", shares[0], shares[1]),
+            "part mal recopiée",
+        ),
+    ] {
+        let out = sign(stdin);
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(!dir.join("x.pem").exists());
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -243,5 +271,86 @@ fn root_init_needs_two_media_and_never_overwrites() {
         std::fs::read(media.join("root.key.sealed")).unwrap(),
         before
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reseal_gives_new_shares_and_retires_the_old_ones() {
+    let dir = temp("reseal");
+    let (media, old) = init(&dir);
+    let (a, b) = (dir.join("new-a"), dir.join("new-b"));
+    let out = ostena(
+        &[
+            "ca",
+            "root",
+            "reseal",
+            "--root",
+            s(&media),
+            "--out",
+            s(&a),
+            "--out",
+            s(&b),
+        ],
+        // The custodian of share 1 lost the envelope: shares 2 and 3.
+        &format!("{}\n{}\n\n", old[1], old[2]),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let new: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.trim_start().starts_with("Dépositaire"))
+        .map(|l| l.split(':').nth(1).unwrap().trim().to_owned())
+        .collect();
+    assert_eq!(new.len(), 3);
+    // Same root certificate, new seal.
+    assert_eq!(
+        std::fs::read(media.join("root.pem")).unwrap(),
+        std::fs::read(a.join("root.pem")).unwrap()
+    );
+    assert_ne!(
+        std::fs::read(media.join("root.key.sealed")).unwrap(),
+        std::fs::read(a.join("root.key.sealed")).unwrap()
+    );
+    let key = |name: &str| {
+        let out = ostena(
+            &[
+                "ca",
+                "key",
+                "new",
+                "--key-out",
+                s(&dir.join(format!("{name}.key"))),
+                "--public-out",
+                s(&dir.join(format!("{name}.pub"))),
+            ],
+            "",
+        );
+        assert!(out.status.success());
+    };
+    key("k");
+    let sign = |root: &Path, shares: [&str; 2], out: &str| {
+        ostena(
+            &[
+                "ca",
+                "issuing",
+                "sign",
+                "--root",
+                s(root),
+                "--public-key",
+                s(&dir.join("k.pub")),
+                "--name",
+                "x",
+                "--out",
+                s(&dir.join(out)),
+            ],
+            &format!("{}\n{}\n\n", shares[0], shares[1]),
+        )
+    };
+    // The new seal opens with the new shares, not with the old ones.
+    assert!(sign(&a, [&new[0], &new[2]], "new.pem").status.success());
+    assert!(!sign(&a, [&old[0], &old[1]], "old.pem").status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -20,6 +20,8 @@ rcgen.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
 time.workspace = true
+vsss-rs.workspace = true
+rand_core.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

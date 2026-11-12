@@ -76,6 +76,7 @@ deny = [
     { crate = "quinn-proto", wrappers = ["quinn"], reason = "only reachable through quinn" },
     { crate = "rustls-webpki", wrappers = ["rustls"], reason = "certificate verification only through rustls" },
     { crate = "rcgen", wrappers = ["ostena-crypto"], reason = "certificates are issued by ostena-crypto::pki only" },
+    { crate = "vsss-rs", wrappers = ["ostena-crypto"], reason = "secret sharing of the root secret by ostena-crypto::sealed only" },
     { crate = "ring", reason = "use ostena-crypto (aws-lc-rs)" },
 ]
 

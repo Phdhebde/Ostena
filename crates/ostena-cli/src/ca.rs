@@ -3,11 +3,12 @@
 //!
 //! On the isolated ceremony workstation:
 //!
-//! - `root init` draws the root key and the passphrase that seals it, and
+//! - `root init` draws the root key and the secret that seals it, shows the
+//!   three shares of that secret (two rebuild it), and
 //!   writes `root.pem`, `root.name` and `root.key.sealed` to every `--out`
 //!   directory (one per removable medium);
 //! - `issuing sign` and `server sign` certify a public key generated on the
-//!   core (`key new`) with the root, after reading the passphrase on
+//!   core (`key new`) with the root, after reading two shares on
 //!   standard input.
 //!
 //! Nothing is overwritten. Private key files are created with mode 0600.
@@ -21,7 +22,7 @@ use std::process::ExitCode;
 use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256;
 use ostena_crypto::pki::{self, RootAuthority, Validity};
-use ostena_crypto::sealed::{self, Passphrase};
+use ostena_crypto::sealed::{self, RootSecret, Share};
 use ostena_crypto::tls::{self, CertificateDer, TrustAnchor};
 
 const DAY: u64 = 86_400;
@@ -86,12 +87,10 @@ pub(crate) fn root_init(name: &str, days: u32, outs: &[PathBuf]) -> ExitCode {
     }
 }
 
-fn try_root_init(name: &str, days: u32, outs: &[PathBuf]) -> Result<(), String> {
+/// At least two output media, none already holding a root.
+fn check_outs(outs: &[PathBuf]) -> Result<(), String> {
     if outs.len() < 2 {
         return Err("au moins deux --out (deux supports, conservés séparément)".into());
-    }
-    if name.trim().is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
-        return Err("--name : de 1 à 64 caractères imprimables".into());
     }
     for out in outs {
         if [ROOT_CERT, ROOT_NAME, ROOT_KEY]
@@ -104,9 +103,14 @@ fn try_root_init(name: &str, days: u32, outs: &[PathBuf]) -> Result<(), String> 
             ));
         }
     }
-    let root = RootAuthority::generate(name, validity(days)).map_err(|e| e.to_string())?;
-    let passphrase = Passphrase::generate().map_err(|e| e.to_string())?;
-    let sealed = sealed::seal(&root.key_pkcs8(), &passphrase).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Seals `root` under a fresh secret, writes it to every medium of `outs`
+/// and shows the fingerprint and the three new shares.
+fn seal_and_write(root: &RootAuthority, name: &str, outs: &[PathBuf]) -> Result<(), String> {
+    let (secret, shares) = RootSecret::generate().map_err(|e| e.to_string())?;
+    let sealed = sealed::seal(&root.key_pkcs8(), &secret).map_err(|e| e.to_string())?;
     let cert_pem = root.certificate_pem();
     for out in outs {
         fs::create_dir_all(out).map_err(|e| format!("{} : {e}", out.display()))?;
@@ -115,7 +119,6 @@ fn try_root_init(name: &str, days: u32, outs: &[PathBuf]) -> Result<(), String> 
         create(&out.join(ROOT_KEY), &sealed, true)?;
     }
     let fingerprint = hex(&tls::fingerprint(root.trust_anchor().certificate()));
-    let groups = passphrase.groups();
     let _ = writeln!(io::stdout(), "Racine : {name}");
     let _ = writeln!(
         io::stdout(),
@@ -125,23 +128,46 @@ fn try_root_init(name: &str, days: u32, outs: &[PathBuf]) -> Result<(), String> 
     let _ = writeln!(io::stdout());
     let _ = writeln!(
         io::stdout(),
-        "Phrase secrète, affichée une seule fois. À recopier au procès-verbal :"
+        "Parts du secret de la racine, affichées une seule fois ; deux parts quelconques \
+         suffisent à rouvrir la racine. Chaque dépositaire recopie la sienne seulement :"
     );
-    let _ = writeln!(
-        io::stdout(),
-        "  Dépositaire A : {} {} {}",
-        groups[0],
-        groups[1],
-        groups[2]
-    );
-    let _ = writeln!(
-        io::stdout(),
-        "  Dépositaire B : {} {} {}",
-        groups[3],
-        groups[4],
-        groups[5]
-    );
+    for share in &shares {
+        let _ = writeln!(
+            io::stdout(),
+            "  Dépositaire {} : {}",
+            share.id(),
+            share.to_text()
+        );
+    }
     Ok(())
+}
+
+fn try_root_init(name: &str, days: u32, outs: &[PathBuf]) -> Result<(), String> {
+    if name.trim().is_empty() || name.len() > 64 || name.chars().any(char::is_control) {
+        return Err("--name : de 1 à 64 caractères imprimables".into());
+    }
+    check_outs(outs)?;
+    let root = RootAuthority::generate(name, validity(days)).map_err(|e| e.to_string())?;
+    seal_and_write(&root, name, outs)
+}
+
+/// `ostena ca root reseal`: reopens the root with two shares and seals it
+/// under a new secret, in three new shares, onto new media (after a lost
+/// envelope or a custodian change). The old media are then destroyed.
+pub(crate) fn root_reseal(root: &Path, outs: &[PathBuf]) -> ExitCode {
+    let result = (|| {
+        check_outs(outs)?;
+        let name = fs::read_to_string(root.join(ROOT_NAME))
+            .map_err(|e| format!("{} : {e}", root.join(ROOT_NAME).display()))?;
+        let authority = open_root(root)?;
+        seal_and_write(&authority, name.trim(), outs)?;
+        let _ = writeln!(
+            io::stdout(),
+            "\nLes anciens supports et les anciennes enveloppes doivent maintenant être détruits."
+        );
+        Ok::<(), String>(())
+    })();
+    result.map_or_else(|e| fail(&e), |()| ExitCode::SUCCESS)
 }
 
 /// `ostena ca key new`: a P-256 key generated where it will be used.
@@ -187,16 +213,21 @@ fn open_root(dir: &Path) -> Result<RootAuthority, String> {
     let sealed = read(ROOT_KEY)?;
     let _ = writeln!(
         io::stderr(),
-        "Phrase secrète de la racine (les deux moitiés, sur une ligne) :"
+        "Parts du secret de la racine : deux au moins, une par ligne, puis une ligne vide :"
     );
-    let mut line = String::new();
-    io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
-    let typed = SecretBytes::from(line.into_bytes());
-    let passphrase = Passphrase::parse(&typed).map_err(|e| e.to_string())?;
-    let pkcs8 = sealed::open(&sealed, &passphrase).map_err(|e| e.to_string())?;
+    let mut shares = Vec::new();
+    for line in io::stdin().lock().lines() {
+        let typed = SecretBytes::from(line.map_err(|e| e.to_string())?.into_bytes());
+        // SECRET-EXPOSURE: only to detect the empty line that ends the input.
+        #[expect(clippy::disallowed_methods)]
+        let empty = typed.expose_secret().iter().all(u8::is_ascii_whitespace);
+        if empty {
+            break;
+        }
+        shares.push(Share::parse(&typed).map_err(|e| e.to_string())?);
+    }
+    let secret = RootSecret::combine(&shares).map_err(|e| e.to_string())?;
+    let pkcs8 = sealed::open(&sealed, &secret).map_err(|e| e.to_string())?;
     RootAuthority::from_parts(name.trim(), &pkcs8, certificate).map_err(|e| e.to_string())
 }
 

@@ -1,23 +1,30 @@
 //! Sealing of the offline root key (ADR-0008, root ceremony).
 //!
-//! The passphrase is not chosen by a person: it is drawn here, 30 base32
-//! characters (150 bits), so that the sealed file cannot be attacked offline
-//! by guessing (ANSSI-PG-083 `RègleSecretFaibleEntropie`). It is shown once,
-//! in six groups of five, to be written in the ceremony record and split
-//! between two custodians.
+//! The root key is sealed under a **root secret** of 160 random bits, drawn
+//! here rather than chosen by a person, so that the sealed file cannot be
+//! attacked offline by guessing (ANSSI-PG-083 `RègleSecretFaibleEntropie`).
 //!
-//! Format: `OSTSEAL1` ‖ iterations (u32, big-endian) ‖ salt (16) ‖ nonce (12)
-//! ‖ AES-256-GCM(key, nonce, aad = the 40 header bytes, PKCS#8), where key =
-//! PBKDF2-HMAC-SHA256(passphrase, salt, iterations). The derivation only
-//! adds margin: the passphrase already has full entropy.
+//! The root secret is never shown: it is split with Shamir's scheme over
+//! GF(256) into **three shares, any two of which rebuild it** (`vsss-rs`,
+//! an audited implementation). One share per custodian, in a sealed
+//! envelope: a lost envelope does not lose the root, and no custodian alone
+//! can open it. A share is written as 37 base32 characters (id, value, and
+//! a CRC-16 that catches every mistyped character).
+//!
+//! Sealed format: `OSTSEAL2` ‖ iterations (u32, big-endian) ‖ salt (16) ‖
+//! nonce (12) ‖ AES-256-GCM(key, nonce, aad = the 40 header bytes, PKCS#8),
+//! where key = PBKDF2-HMAC-SHA256(root secret, salt, iterations). The
+//! derivation only adds margin: the root secret already has full entropy.
 
+use std::convert::Infallible;
 use std::num::NonZeroU32;
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::pbkdf2;
 use ostena_common::secret::SecretBytes;
+use vsss_rs::Gf256;
 
-const MAGIC: &[u8; 8] = b"OSTSEAL1";
+const MAGIC: &[u8; 8] = b"OSTSEAL2";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const HEADER_LEN: usize = MAGIC.len() + 4 + SALT_LEN + NONCE_LEN;
@@ -27,58 +34,155 @@ pub const ITERATIONS: u32 = 600_000;
 /// Iterations accepted by [`open`].
 const ACCEPTED_ITERATIONS: std::ops::RangeInclusive<u32> = 600_000..=10_000_000;
 
+/// Bytes of the root secret.
+pub const SECRET_LEN: usize = 20;
+/// Shares made, and shares needed to rebuild the root secret.
+pub const SHARES: usize = 3;
+/// Shares needed to rebuild the root secret.
+pub const THRESHOLD: usize = 2;
+
 /// Crockford base32 alphabet: no I, L, O, U.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-/// Characters of a passphrase.
-pub const PASSPHRASE_LEN: usize = 30;
+/// Bytes of an encoded share: id, value, checksum.
+const SHARE_BYTES: usize = 1 + SECRET_LEN + 2;
+/// Characters of a share in base32 (184 bits, padded to 185).
+pub const SHARE_CHARS: usize = (SHARE_BYTES * 8).div_ceil(5);
+/// Domain separation of the share checksum.
+const SHARE_DOMAIN: &[u8] = b"ostena-root-share-v1";
 
-/// Sealing errors, coarse on purpose: a wrong passphrase and a damaged file
-/// are not told apart.
+/// Sealing errors, coarse on purpose: a wrong secret and a damaged file are
+/// not told apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SealError {
     /// Not a sealed file of this format.
     #[error("fichier scellé mal formé")]
     Format,
-    /// The passphrase is not 30 base32 characters.
-    #[error("phrase secrète mal formée : 30 caractères base32 attendus")]
-    Passphrase,
-    /// Wrong passphrase or altered file.
-    #[error("ouverture impossible : phrase secrète fausse ou fichier altéré")]
+    /// A share is mistyped or damaged (wrong length, character or checksum).
+    #[error("part mal recopiée : 37 caractères base32 attendus, somme de contrôle fausse")]
+    Share,
+    /// Fewer than two distinct shares.
+    #[error("au moins deux parts différentes sont nécessaires")]
+    NotEnoughShares,
+    /// Wrong shares or altered file.
+    #[error("ouverture impossible : parts d'une autre racine ou fichier altéré")]
     Open,
     /// Random generation failed.
     #[error("échec du générateur d'aléa du système")]
     Random,
 }
 
-/// A generated passphrase. No `Debug`.
-pub struct Passphrase(SecretBytes);
+/// Serves pre-drawn system randomness to `vsss-rs`: drawing can fail, a
+/// `rand_core` generator cannot. If the buffer runs out (it is sized well
+/// above what a split uses), the flag is raised and the split is refused.
+struct DrawnRandomness {
+    bytes: Vec<u8>,
+    exhausted: bool,
+}
 
-impl Passphrase {
-    /// Draws a passphrase from the system generator.
-    ///
-    /// # Errors
-    ///
-    /// [`SealError::Random`].
-    pub fn generate() -> Result<Self, SealError> {
-        let random = crate::rand::array::<PASSPHRASE_LEN>().map_err(|_| SealError::Random)?;
-        let chars: Vec<u8> = random
-            .iter()
-            .map(|b| ALPHABET[usize::from(b & 0x1f)])
-            .collect();
-        Ok(Self(SecretBytes::from(chars)))
+impl rand_core::TryRng for DrawnRandomness {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u32::from_le_bytes(b))
     }
 
-    /// Parses a passphrase typed back: spaces and dashes are ignored, case
-    /// too, and the Crockford substitutions (O→0, I/L→1) are applied.
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        if dst.len() > self.bytes.len() {
+            self.exhausted = true;
+            dst.fill(0);
+        } else {
+            let rest = self.bytes.split_off(self.bytes.len() - dst.len());
+            dst.copy_from_slice(&rest);
+        }
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for DrawnRandomness {}
+
+impl Drop for DrawnRandomness {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.bytes);
+    }
+}
+
+/// CRC-16/CCITT (polynomial 0x1021) over the domain and the share: it
+/// detects every error burst of at most 16 bits, so every mistyped
+/// character (5 bits). An integrity check against typos, not a MAC: a
+/// forged share only yields a secret that does not open the seal.
+fn checksum(id_and_value: &[u8]) -> [u8; 2] {
+    crc16(SHARE_DOMAIN.iter().chain(id_and_value)).to_be_bytes()
+}
+
+fn crc16<'a>(bytes: impl Iterator<Item = &'a u8>) -> u16 {
+    let mut crc: u16 = 0xffff;
+    for &byte in bytes {
+        crc ^= u16::from(byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// One share of the root secret. No `Debug`.
+pub struct Share(SecretBytes);
+
+impl Share {
+    /// The share as 37 base32 characters in groups of five, for the ceremony
+    /// record.
+    pub fn to_text(&self) -> String {
+        // SECRET-EXPOSURE: shown once to its custodian during the ceremony.
+        #[expect(clippy::disallowed_methods)]
+        let bytes = self.0.expose_secret();
+        let mut bits = 0u32;
+        let mut count = 0;
+        let mut chars = Vec::with_capacity(SHARE_CHARS);
+        for &b in bytes {
+            bits = (bits << 8) | u32::from(b);
+            count += 8;
+            while count >= 5 {
+                count -= 5;
+                chars.push(ALPHABET[((bits >> count) & 0x1f) as usize]);
+            }
+        }
+        if count > 0 {
+            chars.push(ALPHABET[((bits << (5 - count)) & 0x1f) as usize]);
+        }
+        chars
+            .chunks(5)
+            .map(|g| String::from_utf8_lossy(g).into_owned())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    /// Parses a share typed back: spaces and dashes are ignored, case too,
+    /// and the Crockford substitutions (O→0, I/L→1) are applied. The
+    /// checksum must match.
     ///
     /// # Errors
     ///
-    /// [`SealError::Passphrase`].
+    /// [`SealError::Share`].
     pub fn parse(text: &SecretBytes) -> Result<Self, SealError> {
-        // SECRET-EXPOSURE: the typed passphrase is normalised into a new secret.
+        // SECRET-EXPOSURE: the typed share is decoded into a new secret.
         #[expect(clippy::disallowed_methods)]
         let typed = text.expose_secret();
-        let mut chars = Vec::with_capacity(PASSPHRASE_LEN);
+        let mut bits = 0u32;
+        let mut count = 0;
+        let mut chars = 0;
+        let mut bytes = Vec::with_capacity(SHARE_BYTES + 1);
         for &b in typed {
             let c = match b.to_ascii_uppercase() {
                 b' ' | b'-' | b'\t' | b'\r' | b'\n' => continue,
@@ -86,29 +190,111 @@ impl Passphrase {
                 b'I' | b'L' => b'1',
                 c => c,
             };
-            if !ALPHABET.contains(&c) {
-                return Err(SealError::Passphrase);
+            let v = ALPHABET
+                .iter()
+                .position(|&a| a == c)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or(SealError::Share)?;
+            chars += 1;
+            bits = (bits << 5) | v;
+            count += 5;
+            if count >= 8 {
+                count -= 8;
+                bytes.push((bits >> count).to_be_bytes()[3]);
             }
-            chars.push(c);
         }
-        if chars.len() != PASSPHRASE_LEN {
-            return Err(SealError::Passphrase);
+        let padding_is_zero = bits & ((1 << count) - 1) == 0;
+        if chars != SHARE_CHARS || bytes.len() != SHARE_BYTES || !padding_is_zero {
+            zeroize::Zeroize::zeroize(&mut bytes);
+            return Err(SealError::Share);
         }
-        Ok(Self(SecretBytes::from(chars)))
+        let (body, sum) = bytes.split_at(SHARE_BYTES - 2);
+        if checksum(body) != sum || body[0] == 0 {
+            zeroize::Zeroize::zeroize(&mut bytes);
+            return Err(SealError::Share);
+        }
+        Ok(Self(SecretBytes::from(bytes)))
     }
 
-    /// Six groups of five characters, for the ceremony record.
-    pub fn groups(&self) -> [String; 6] {
-        // SECRET-EXPOSURE: shown once to the custodians during the ceremony.
+    /// The identifier (1 to 3).
+    pub fn id(&self) -> u8 {
+        // SECRET-EXPOSURE: the identifier is not secret.
         #[expect(clippy::disallowed_methods)]
-        let chars = self.0.expose_secret();
-        std::array::from_fn(|i| String::from_utf8_lossy(&chars[i * 5..i * 5 + 5]).into_owned())
+        let id = self.0.expose_secret()[0];
+        id
+    }
+}
+
+/// The root secret: 160 random bits. No `Debug`, never shown.
+pub struct RootSecret(SecretBytes);
+
+impl RootSecret {
+    /// Draws a root secret and splits it into [`SHARES`] shares, any
+    /// [`THRESHOLD`] of which rebuild it.
+    ///
+    /// # Errors
+    ///
+    /// [`SealError::Random`].
+    pub fn generate() -> Result<(Self, [Share; SHARES]), SealError> {
+        let secret = crate::rand::array::<SECRET_LEN>().map_err(|_| SealError::Random)?;
+        let mut rng = DrawnRandomness {
+            bytes: vec![0u8; 4096],
+            exhausted: false,
+        };
+        crate::rand::fill(&mut rng.bytes).map_err(|_| SealError::Random)?;
+        let split = Gf256::split_bytes(THRESHOLD, SHARES, secret, &mut rng);
+        let secret = SecretBytes::from(secret.to_vec());
+        let mut raw = match split {
+            Ok(raw) if !rng.exhausted && raw.len() == SHARES => raw,
+            _ => return Err(SealError::Random),
+        };
+        let mut shares = Vec::with_capacity(SHARES);
+        for share in &mut raw {
+            let mut bytes = share.clone();
+            bytes.extend_from_slice(&checksum(share));
+            shares.push(Share(SecretBytes::from(bytes)));
+            zeroize::Zeroize::zeroize(share);
+        }
+        let shares: [Share; SHARES] = shares.try_into().map_err(|_| SealError::Random)?;
+        Ok((Self(secret), shares))
+    }
+
+    /// Rebuilds the root secret from at least [`THRESHOLD`] distinct shares.
+    /// Shares of another root give another secret, refused by [`open`].
+    ///
+    /// # Errors
+    ///
+    /// [`SealError::NotEnoughShares`].
+    pub fn combine(shares: &[Share]) -> Result<Self, SealError> {
+        let mut ids: Vec<u8> = shares.iter().map(Share::id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() < THRESHOLD || ids.len() != shares.len() {
+            return Err(SealError::NotEnoughShares);
+        }
+        let mut raw: Vec<Vec<u8>> = shares
+            .iter()
+            .map(|s| {
+                // SECRET-EXPOSURE: the shares are combined by vsss-rs.
+                #[expect(clippy::disallowed_methods)]
+                let bytes = s.0.expose_secret();
+                bytes[..SHARE_BYTES - 2].to_vec()
+            })
+            .collect();
+        let combined = Gf256::combine_bytes(&raw);
+        for share in &mut raw {
+            zeroize::Zeroize::zeroize(share);
+        }
+        match combined {
+            Ok(secret) if secret.len() == SECRET_LEN => Ok(Self(SecretBytes::from(secret))),
+            _ => Err(SealError::NotEnoughShares),
+        }
     }
 
     fn key(&self, salt: &[u8], iterations: u32) -> Result<LessSafeKey, SealError> {
         let iterations = NonZeroU32::new(iterations).ok_or(SealError::Format)?;
         let mut key = [0u8; 32];
-        // SECRET-EXPOSURE: the passphrase feeds the key derivation.
+        // SECRET-EXPOSURE: the root secret feeds the key derivation.
         #[expect(clippy::disallowed_methods)]
         let secret = self.0.expose_secret();
         pbkdf2::derive(
@@ -124,12 +310,12 @@ impl Passphrase {
     }
 }
 
-/// Seals `plaintext` under `passphrase`.
+/// Seals `plaintext` under `secret`.
 ///
 /// # Errors
 ///
 /// [`SealError::Random`] or [`SealError::Open`] if the library fails.
-pub fn seal(plaintext: &SecretBytes, passphrase: &Passphrase) -> Result<Vec<u8>, SealError> {
+pub fn seal(plaintext: &SecretBytes, secret: &RootSecret) -> Result<Vec<u8>, SealError> {
     let salt = crate::rand::array::<SALT_LEN>().map_err(|_| SealError::Random)?;
     let nonce = crate::rand::array::<NONCE_LEN>().map_err(|_| SealError::Random)?;
     let mut out = Vec::with_capacity(HEADER_LEN + TAG_LEN + 256);
@@ -137,7 +323,7 @@ pub fn seal(plaintext: &SecretBytes, passphrase: &Passphrase) -> Result<Vec<u8>,
     out.extend_from_slice(&ITERATIONS.to_be_bytes());
     out.extend_from_slice(&salt);
     out.extend_from_slice(&nonce);
-    let key = passphrase.key(&salt, ITERATIONS)?;
+    let key = secret.key(&salt, ITERATIONS)?;
     // SECRET-EXPOSURE: the key is encrypted in place in the output buffer.
     #[expect(clippy::disallowed_methods)]
     let mut body = plaintext.expose_secret().to_vec();
@@ -159,8 +345,8 @@ pub fn seal(plaintext: &SecretBytes, passphrase: &Passphrase) -> Result<Vec<u8>,
 /// # Errors
 ///
 /// [`SealError::Format`] for another format or out-of-range iterations,
-/// [`SealError::Open`] for a wrong passphrase or an altered file.
-pub fn open(sealed: &[u8], passphrase: &Passphrase) -> Result<SecretBytes, SealError> {
+/// [`SealError::Open`] for another secret or an altered file.
+pub fn open(sealed: &[u8], secret: &RootSecret) -> Result<SecretBytes, SealError> {
     if sealed.len() < HEADER_LEN + TAG_LEN || &sealed[..MAGIC.len()] != MAGIC {
         return Err(SealError::Format);
     }
@@ -173,7 +359,7 @@ pub fn open(sealed: &[u8], passphrase: &Passphrase) -> Result<SecretBytes, SealE
     let salt = &sealed[12..12 + SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&sealed[12 + SALT_LEN..HEADER_LEN]);
-    let key = passphrase.key(salt, iterations)?;
+    let key = secret.key(salt, iterations)?;
     let mut body = sealed[HEADER_LEN..].to_vec();
     match key.open_in_place(
         Nonce::assume_unique_for_key(nonce),
@@ -190,64 +376,4 @@ pub fn open(sealed: &[u8], passphrase: &Passphrase) -> Result<SecretBytes, SealE
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn secret(text: &str) -> SecretBytes {
-        SecretBytes::from(text.as_bytes().to_vec())
-    }
-
-    #[test]
-    fn round_trip_and_typed_back_passphrase() {
-        let p = Passphrase::generate().unwrap();
-        let sealed = seal(&secret("pkcs8 bytes"), &p).unwrap();
-        let typed = p.groups().join(" - ").to_lowercase();
-        let reparsed = Passphrase::parse(&secret(&typed)).unwrap();
-        let plain = open(&sealed, &reparsed).unwrap();
-        // SECRET-EXPOSURE: test assertion on a throwaway value.
-        #[expect(clippy::disallowed_methods)]
-        let bytes = plain.expose_secret().to_vec();
-        assert_eq!(bytes, b"pkcs8 bytes");
-    }
-
-    #[test]
-    fn passphrases_are_random_and_well_formed() {
-        let a = Passphrase::generate().unwrap().groups();
-        let b = Passphrase::generate().unwrap().groups();
-        assert_ne!(a, b);
-        assert!(
-            a.iter()
-                .all(|g| g.len() == 5 && g.bytes().all(|c| ALPHABET.contains(&c)))
-        );
-    }
-
-    #[test]
-    fn crockford_substitutions() {
-        let a = Passphrase::parse(&secret(&"O".repeat(30))).unwrap();
-        let b = Passphrase::parse(&secret(&"0".repeat(30))).unwrap();
-        assert_eq!(a.groups(), b.groups());
-        for bad in ["", "ABC", &"U".repeat(30), &"A".repeat(31)] {
-            assert_eq!(
-                Passphrase::parse(&secret(bad)).err(),
-                Some(SealError::Passphrase)
-            );
-        }
-    }
-
-    #[test]
-    fn wrong_passphrase_and_tampering_are_refused() {
-        let p = Passphrase::generate().unwrap();
-        let sealed = seal(&secret("key"), &p).unwrap();
-        let other = Passphrase::generate().unwrap();
-        assert_eq!(open(&sealed, &other).err(), Some(SealError::Open));
-        for i in [0, 9, 20, 35, sealed.len() - 1] {
-            let mut bad = sealed.clone();
-            bad[i] ^= 1;
-            assert!(open(&bad, &p).is_err(), "byte {i}");
-        }
-        assert_eq!(open(&sealed[..30], &p).err(), Some(SealError::Format));
-        let mut weak = sealed.clone();
-        weak[8..12].copy_from_slice(&1000u32.to_be_bytes());
-        assert_eq!(open(&weak, &p).err(), Some(SealError::Format));
-    }
-}
+mod tests;

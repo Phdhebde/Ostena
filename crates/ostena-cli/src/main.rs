@@ -64,7 +64,8 @@ enum CaCommand {
 
 #[derive(Debug, Subcommand)]
 enum RootCommand {
-    /// Generate the root and its passphrase; write one copy per `--out`.
+    /// Generate the root and the secret that seals it (three shares, two
+    /// rebuild it); write one copy per `--out`.
     Init {
         /// Common name of the root.
         #[arg(long)]
@@ -73,6 +74,16 @@ enum RootCommand {
         #[arg(long, default_value_t = 3650)]
         days: u32,
         /// Output directory, one per removable medium (at least two).
+        #[arg(long = "out", required = true)]
+        outs: Vec<PathBuf>,
+    },
+    /// Reopen the root with two shares and seal it under a new secret, in
+    /// three new shares, onto new media (lost envelope, custodian change).
+    Reseal {
+        /// Directory holding the current root copy.
+        #[arg(long)]
+        root: PathBuf,
+        /// New output directory, one per removable medium (at least two).
         #[arg(long = "out", required = true)]
         outs: Vec<PathBuf>,
     },
@@ -250,6 +261,9 @@ fn main() -> ExitCode {
             CaCommand::Root {
                 command: RootCommand::Init { name, days, outs },
             } => ca::root_init(&name, days, &outs),
+            CaCommand::Root {
+                command: RootCommand::Reseal { root, outs },
+            } => ca::root_reseal(&root, &outs),
             CaCommand::Key {
                 command:
                     KeyCommand::New {
