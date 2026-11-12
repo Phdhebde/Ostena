@@ -1,6 +1,6 @@
 # ADR-0008 : Tunnel entre l'agent et le core, et enrôlement
 
-- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, la reconnexion et le repli TCP viendront dans les PR suivantes.
+- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (PR 3b). La reconnexion et le repli TCP viendront dans les PR suivantes.
 - **Date** : 2026-11-11
 
 ## Contexte
@@ -99,26 +99,63 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 
 **La configuration locale est un plafond** (PR 4). La politique effective est l'intersection de la politique locale (`[agent.scope]`) et de celle du core, plus le plancher d'infrastructure. **Si la politique locale est vide, rien ne passe, quoi que pousse le core.** Un core compromis ne peut pas élargir le périmètre d'une passerelle.
 
-### Enrôlement (PR 3)
+### Enrôlement, renouvellement, révocation
 
-- **Le jeton** :
-  - émis par le core pour un groupe de passerelles ;
-  - 256 bits aléatoires, conservés hachés ;
-  - valide 15 min par défaut et 1 h au plus ;
-  - à usage unique, consommé de façon atomique avant l'émission du certificat ;
-  - remis à l'agent par fichier ou par l'entrée standard, jamais en argument.
-- **La demande** :
-  - l'agent crée sa clé ECDSA P-256 localement ; elle ne quitte jamais la machine ;
-  - il envoie une demande signée maison (clé publique, identifiant du jeton, nonce du core, empreinte de la CA, preuve de possession) ;
-  - pas de PKCS#10, donc pas d'analyseur ASN.1 exposé.
-- **Le certificat** :
-  - SAN `urn:ostena:gateway-group:<uuid>` et `urn:ostena:agent:<uuid>`, EKU clientAuth ;
-  - valide 30 jours, renouvelé aux 2/3 avec une nouvelle clé, par le tunnel.
-- **L'écouteur d'enrôlement** :
-  - port distinct, en TLS 1.3 sans certificat client ;
-  - **fermé par défaut**. Il ne s'ouvre que tant qu'au moins un jeton valide existe, et se referme ensuite ;
-  - il ne sert **que** le protocole d'enrôlement (ALPN `ostena-enroll/1`) : toute autre requête est refusée, et un test le vérifie.
-- **La révocation** : un statut dans le registre, contrôlé à chaque poignée de main ; les tunnels ouverts sont fermés immédiatement.
+**Le jeton** (`EnrollmentService::issue_token`) :
+- émis par le core pour un groupe de passerelles ;
+- un identifiant de 128 bits et un secret de 256 bits ; le core ne garde que le SHA-256 du secret, comparé en temps constant ;
+- valide 15 min par défaut, 1 h au plus ;
+- forme texte `ostena-enroll-v1.<id>.<secret>` (base64url), remise à l'agent par fichier ou par l'entrée standard, jamais en argument.
+
+**L'écouteur d'enrôlement** :
+- port distinct (`agent.enrollment_address`, par défaut l'hôte du core sur le port 8444), en TLS 1.3 avec le certificat serveur signé par la racine, sans certificat client ;
+- **fermé par défaut** : il est lié quand un jeton est émis, et fermé dès qu'il ne reste aucun jeton valide (tous utilisés ou expirés ; une tâche surveille l'échéance la plus proche) ;
+- il ne sert **que** le protocole d'enrôlement :
+  - un autre ALPN échoue à la poignée de main TLS (`TUN-E008`) ;
+  - tout message autre qu'une demande bien formée reçoit `refused` avec `TUN-E010`.
+
+Ces trois comportements sont testés.
+
+**Le protocole**, sur un flux ouvert par le core (JSON strict, 16 Kio au plus) :
+1. le core envoie `challenge` : 32 octets aléatoires ;
+2. l'agent, qui a généré sa clé ECDSA P-256 et l'a déjà écrite sur disque (fichier en `0600`), envoie `request` : identifiant et secret du jeton (protégés par TLS), groupe de sa configuration, clé publique, et une **preuve de possession**. Celle-ci est une signature de la nouvelle clé sur : un préfixe de domaine, le défi, l'identifiant du jeton, le groupe, la clé publique, et le SHA-256 du certificat du core vu par l'agent (liaison au canal) ;
+3. le core vérifie tout, dans cet ordre, et **sous un même verrou** :
+
+   | Contrôle | Refus |
+   |---|---|
+   | jeton connu et secret exact | `TUN-E018` |
+   | jeton non utilisé | `TUN-E020` |
+   | jeton non expiré | `TUN-E019` |
+   | groupe du jeton égal à celui de la demande | `TUN-E021` |
+   | preuve de possession valide | `TUN-E022` |
+
+   Puis il **consomme le jeton avant d'émettre**.
+
+   Une erreur de groupe ne consomme pas le jeton : c'est une erreur de configuration de l'agent, que l'opérateur corrige avant de recommencer.
+4. le core répond `accepted` : le certificat (30 jours, SAN `urn:ostena:gateway-group:<uuid>` et `urn:ostena:agent:<uuid>`), l'identifiant de l'agent et la validité. L'agent vérifie que le certificat porte bien sa clé publique.
+
+Pas de PKCS#10, donc aucun analyseur ASN.1 exposé côté core.
+
+**`ostena agent enroll --config … --token-file <fichier|->`** :
+- lit la configuration sans exiger la clé ni le certificat ;
+- refuse si l'un d'eux existe déjà ;
+- écrit la clé avant tout échange, et la supprime si l'enrôlement échoue ;
+- écrit ensuite le certificat.
+
+**Le renouvellement**, aux 2/3 de la validité, par le tunnel :
+- l'agent génère une **nouvelle clé** et envoie `renew` : la clé publique et une signature de cette clé sur un préfixe de domaine, le SHA-256 du certificat du tunnel courant et la clé publique ;
+- le core vérifie la preuve (`TUN-E022`), émet un certificat pour le même agent et le même groupe, l'enregistre, et répond `certificate` avec la validité. L'agent planifie ainsi le renouvellement suivant sans analyser de X.509 ;
+- l'ancien certificat reste valide jusqu'à son expiration, sauf révocation.
+
+Le déclenchement automatique côté agent arrive avec le branchement de l'agent (PR 4).
+
+**La révocation** :
+- c'est un statut dans le registre, contrôlé à chaque poignée de main (`TUN-E005`) ;
+- le core **ferme aussitôt les tunnels ouverts** sous ce certificat, avec le code `TUN-E005`, que l'agent reçoit tel quel.
+
+**Événements** :
+- côté core : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted` (agent, groupe, empreinte), `enroll.refused` (code) ;
+- côté agent : `agent.enrolled`.
 
 ### Clé de la CA du core (décidé le 2026-11-11)
 
@@ -230,6 +267,11 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E015` | configuration |
 | `TUN-E016` | autre échec de poignée de main |
 | `TUN-E017` | certificat du core non signé directement par la racine épinglée |
+| `TUN-E018` | jeton d'enrôlement inconnu ou faux |
+| `TUN-E019` | jeton d'enrôlement expiré |
+| `TUN-E020` | jeton d'enrôlement déjà utilisé |
+| `TUN-E021` | jeton émis pour un autre groupe |
+| `TUN-E022` | preuve de possession invalide |
 
 Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused`.
 

@@ -46,7 +46,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P005` | production | journaux ou audit envoyés en clair (syslog UDP/TCP) vers une autre machine |
 | `CFG-P006` | production | fichier de configuration ou son dossier modifiable par un autre compte que root ou le compte du service |
 | `CFG-V006` | cohérence | `agent.gateway_group` n'est pas un UUID |
-| `CFG-V007` | cohérence | `agent.core_address` invalide (hôte:port attendu) |
+| `CFG-V007` | cohérence | `agent.core_address` ou `agent.enrollment_address` invalide (hôte:port attendu ; l'adresse d'enrôlement vaut par défaut l'hôte du core sur le port 8444) |
 | `CFG-V008` | cohérence | chemin de l'agent non absolu |
 | `CFG-V009` | cohérence | délai d'arrêt (1 à 300 s) ou nombre de threads (1 à 64) hors bornes |
 | `CFG-V010` | cohérence | déclaration d'infrastructure invalide, ou composants Ostena placés dans `agent.scope.infrastructure` au lieu de `[[agent.infrastructure]]` |
@@ -59,7 +59,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 
 `CFG-P006` sous Windows : le propriétaire et la DACL du fichier et de son dossier sont lus par `ostena-platform` (API Win32, seul crate autorisé à contenir de l'`unsafe`). Seuls SYSTEM, les Administrateurs, TrustedInstaller et le compte du service (`NT SERVICE\OstenaAgent`) peuvent en être propriétaires ou y écrire ; les entrées de refus et celles qui ne s'appliquent qu'aux enfants sont ignorées ; une DACL nulle ou un type d'entrée inconnu est refusé. Les comptes intégrés sont identifiés par leur SID, jamais par leur nom (traduit selon la langue de Windows). La vérification est injectée par un trait (`PermissionChecker`) : `load()` garde la vérification par défaut, qui refuse sous Windows, et l'agent utilise `load_with(chemin, ostena_platform::permission_checker())`.
 
-**Section `[agent]`** (détails dans l'ADR-0007) : identifiant du groupe de passerelles, adresse du core, certificat, clé privée (chargée dans un `Secret`) et CA dédiée du core, journal anti-rejeu, délai d'arrêt, threads de travail (par défaut min(4, cœurs)), politique de périmètre et composants Ostena. Les types de données de la politique de périmètre vivent dans `ostena-common` pour que tout le fichier soit analysé en une seule passe stricte ; `ostena-scope` les réexporte et les compile. `CFG-P008` et `CFG-P009` passent par le même `PermissionChecker` : la clé privée doit être réservée au compte du service (Unix : mode 600 au plus), le dossier du journal ne doit être modifiable que par lui.
+**Section `[agent]`** (détails dans l'ADR-0007) : `ostena agent enroll` lit le fichier avec `load_for_enrollment`, qui ne vérifie que la cohérence : la clé et le certificat n'existent pas encore ; identifiant du groupe de passerelles, adresse du core, certificat, clé privée (chargée dans un `Secret`) et CA dédiée du core, journal anti-rejeu, délai d'arrêt, threads de travail (par défaut min(4, cœurs)), politique de périmètre et composants Ostena. Les types de données de la politique de périmètre vivent dans `ostena-common` pour que tout le fichier soit analysé en une seule passe stricte ; `ostena-scope` les réexporte et les compile. `CFG-P008` et `CFG-P009` passent par le même `PermissionChecker` : la clé privée doit être réservée au compte du service (Unix : mode 600 au plus), le dossier du journal ne doit être modifiable que par lui.
 
 ### Secrets et journaux
 
