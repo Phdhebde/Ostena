@@ -124,14 +124,21 @@ fn reconnects_after_the_core_comes_back() {
         let link = AgentLink::spawn(params);
         assert!(until(&link, connected).await);
         core.stop();
+        // Read the code in the same look as the state: the next attempt may
+        // start right after.
+        let mut last_code = "";
         assert!(
-            until(&link, |s| matches!(s, LinkState::Reconnecting { .. })).await,
+            until(&link, |s| match s {
+                LinkState::Reconnecting { code: c, .. } => {
+                    last_code = c;
+                    true
+                }
+                _ => false,
+            })
+            .await,
             "the loss is detected"
         );
-        let LinkState::Reconnecting { code, .. } = link.status().state else {
-            unreachable!()
-        };
-        assert_eq!(code, "TUN-E013");
+        assert_eq!(last_code, "TUN-E013");
         core.restart().await.unwrap();
         assert!(until(&link, connected).await, "{:?}", link.status());
         assert_eq!(link.status().connections, 2);

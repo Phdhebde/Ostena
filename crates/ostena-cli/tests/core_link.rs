@@ -113,7 +113,13 @@ fn agent_connects_at_startup_and_reports_it() {
 
     let text = status(&agent, &config);
     assert!(text.contains("Core : connecté (QUIC) depuis"), "{text}");
-    assert!(text.contains("Certificat : expire dans 29 j"), "{text}");
+    // 30 days of validity, rounded down to 29 or 30 depending on the second.
+    assert!(
+        text.contains("Certificat : expire dans 29 j")
+            || text.contains("Certificat : expire dans 30 j"),
+        "{text}"
+    );
+    assert!(text.contains("renouvellement automatique dans"), "{text}");
 
     // The core goes away: the agent reports it and retries.
     core.stop();
