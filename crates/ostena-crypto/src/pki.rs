@@ -381,6 +381,22 @@ pub fn pem_private_key(pkcs8: &SecretBytes) -> SecretBytes {
     SecretBytes::from(text.into_bytes())
 }
 
+/// Reads back a P-256 key written by [`pem_private_key`].
+///
+/// # Errors
+///
+/// [`PkiError::Issuance`] unless it is a PEM PKCS#8 ECDSA P-256 key.
+pub fn signing_key_from_pem(pem_text: &SecretBytes) -> Result<p256::SigningKey, PkiError> {
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    use rustls::pki_types::pem::PemObject;
+    // SECRET-EXPOSURE: the PEM document is decoded into a PKCS#8 secret.
+    #[expect(clippy::disallowed_methods)]
+    let der = PrivatePkcs8KeyDer::from_pem_slice(pem_text.expose_secret())
+        .map_err(|_| PkiError::Issuance)?;
+    p256::SigningKey::from_pkcs8(&SecretBytes::from(der.secret_pkcs8_der().to_vec()))
+        .map_err(|_| PkiError::Issuance)
+}
+
 /// First line of a public key file.
 const PUBLIC_KEY_HEADER: &str = "ostena-p256-public-key-v1";
 

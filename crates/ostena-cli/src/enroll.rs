@@ -4,7 +4,8 @@
 //! The key is generated here and written (mode 0600 on Unix) before any
 //! network exchange; only its public half and a proof of possession leave the
 //! machine. The token is read from a file or standard input, never from the
-//! command line. Existing key or certificate files are never overwritten.
+//! command line. A certificate is never overwritten; a key without a
+//! certificate, left by a failed attempt, is reused.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -99,27 +100,32 @@ fn run(agent: &AgentConfig, token: &Path, timeout: Duration) -> Result<String, S
         &fs::read(root_path).map_err(|e| format!("{} : {e}", root_path.display()))?,
     )
     .map_err(|e| e.to_string())?;
-    for path in [&agent.tls_certificate, &agent.tls_private_key] {
-        if path.exists() {
-            return Err(format!(
-                "{} existe déjà : l'agent est déjà enrôlé. Pour le ré-enrôler, retirez la clé et le \
-                 certificat après avoir révoqué l'ancien sur le core.",
-                path.display()
-            ));
-        }
+    if agent.tls_certificate.exists() {
+        return Err(format!(
+            "{} existe déjà : l'agent est déjà enrôlé. Pour le ré-enrôler, retirez la clé et le \
+             certificat après avoir révoqué l'ancien sur le core.",
+            agent.tls_certificate.display()
+        ));
     }
     let group = Uuid::parse(&agent.gateway_group).ok_or("agent.gateway_group invalide")?;
     let token = read_token(token)?;
 
-    // The key exists on disk, protected, before anything is sent.
-    let (key, pkcs8) = SigningKey::generate().map_err(|e| e.to_string())?;
-    // SECRET-EXPOSURE: written once to a new 0600 file.
-    #[expect(clippy::disallowed_methods)]
-    create(
-        &agent.tls_private_key,
-        pem_private_key(&pkcs8).expose_secret(),
-        true,
-    )?;
+    // The key exists on disk, protected, before anything is sent. A key
+    // without a certificate is left by an attempt that failed: it is reused
+    // (or recreated if unreadable), so that a new attempt is never blocked.
+    let key = if let Some(key) = reuse_key(&agent.tls_private_key) {
+        key
+    } else {
+        let (key, pkcs8) = SigningKey::generate().map_err(|e| e.to_string())?;
+        // SECRET-EXPOSURE: written once to a new 0600 file.
+        #[expect(clippy::disallowed_methods)]
+        create(
+            &agent.tls_private_key,
+            pem_private_key(&pkcs8).expose_secret(),
+            true,
+        )?;
+        key
+    };
 
     let address = agent.enrollment_address();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -140,14 +146,8 @@ fn run(agent: &AgentConfig, token: &Path, timeout: Duration) -> Result<String, S
         .await
         .map_err(|e| e.to_string())
     });
-    let enrolled = match result {
-        Ok(e) => e,
-        Err(e) => {
-            // Unused key: removed so that a new attempt starts clean.
-            let _ = fs::remove_file(&agent.tls_private_key);
-            return Err(e);
-        }
-    };
+    // On failure the key stays: the next attempt reuses it.
+    let enrolled = result?;
     create(
         &agent.tls_certificate,
         enrolled.certificate.as_bytes(),
@@ -167,4 +167,21 @@ fn run(agent: &AgentConfig, token: &Path, timeout: Duration) -> Result<String, S
         enrolled.not_after.saturating_sub(enrolled.not_before) / 86_400,
         agent.tls_private_key.display()
     ))
+}
+
+/// A key left without a certificate by a failed attempt, if readable. An
+/// unreadable one is removed, to be recreated.
+fn reuse_key(path: &Path) -> Option<SigningKey> {
+    let text = fs::read(path).ok()?;
+    if let Ok(key) = ostena_crypto::pki::signing_key_from_pem(&SecretBytes::from(text)) {
+        Some(key)
+    } else {
+        tracing::warn!(
+            event = "agent.enroll_key_recreated",
+            path = %path.display(),
+            "clé sans certificat illisible : recréée"
+        );
+        let _ = fs::remove_file(path);
+        None
+    }
 }
