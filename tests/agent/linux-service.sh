@@ -32,19 +32,22 @@ mode = "production"
 [agent]
 gateway_group = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6"
 core_address = "core.invalid:8443"
-tls_certificate = "/etc/ostena/agent.crt"
-tls_private_key = "/etc/ostena/agent.key"
+tls_certificate = "/var/lib/ostena/agent.crt"
+tls_private_key = "/var/lib/ostena/agent.key"
 tls_core_ca = "/etc/ostena/core-ca.pem"
 replay_journal = "/var/lib/ostena/replay.journal"
 shutdown_grace_secs = 5
 TOML
-echo "not a real key" | sudo tee /etc/ostena/agent.key >/dev/null
+# The identity lives in the state directory, where the service may write
+# (renewal).
+sudo install -d -m 0700 /var/lib/ostena
+echo "not a real key" | sudo tee /var/lib/ostena/agent.key >/dev/null
 sudo ostena agent install --config "$CONFIG"
 wait_for active 30 || fail "the service did not become active"
 
 echo "=== permissions"
-sudo stat -c '%U:%G %a %n' "$CONFIG" /etc/ostena/agent.key /var/lib/ostena /run/ostena /run/ostena/agent.sock
-[ "$(sudo stat -c '%U %a' /etc/ostena/agent.key)" = "ostena 600" ] || fail "private key permissions"
+sudo stat -c '%U:%G %a %n' "$CONFIG" /var/lib/ostena/agent.key /var/lib/ostena /run/ostena /run/ostena/agent.sock
+[ "$(sudo stat -c '%U %a' /var/lib/ostena/agent.key)" = "ostena 600" ] || fail "private key permissions"
 [ "$(sudo stat -c '%U %a' /run/ostena)" = "ostena 700" ] || fail "runtime directory permissions"
 [ "$(sudo stat -c '%U %a' /run/ostena/agent.sock)" = "ostena 600" ] || fail "socket permissions"
 
