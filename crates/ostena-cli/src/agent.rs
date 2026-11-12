@@ -190,6 +190,31 @@ pub(crate) fn status(config: &Path, pid: Option<u32>) -> ExitCode {
             field("config_fingerprint"),
         ),
     );
+    core_details(&answer);
+    ExitCode::SUCCESS
+}
+
+/// What the agent says about the core: pushed versions, certificate.
+fn core_details(answer: &serde_json::Value) {
+    let pushes = &answer["pushes"];
+    if pushes.is_object() {
+        let policy = pushes["policy"].as_u64().map_or_else(
+            || "non reçue (aucune session possible)".to_owned(),
+            |v| format!("version {v}"),
+        );
+        let keys = match (pushes["keyset"].as_u64(), pushes["keyset_floor"].as_u64()) {
+            (Some(v), _) => format!("version {v}"),
+            (None, Some(floor)) => format!(
+                "non reçues (dernière version acceptée : {floor}, aucune version inférieure ne \
+                 sera acceptée)"
+            ),
+            (None, None) => "non reçues (aucune session possible)".to_owned(),
+        };
+        say(
+            false,
+            &format!("Politique du core : {policy}\nClés de grant : {keys}"),
+        );
+    }
     let link = &answer["core_link"];
     if let (Some(not_after), Some(due)) = (
         link["certificate_not_after"].as_u64(),
@@ -218,7 +243,6 @@ pub(crate) fn status(config: &Path, pid: Option<u32>) -> ExitCode {
             );
         }
     }
-    ExitCode::SUCCESS
 }
 
 /// How the agent learns it must stop.
@@ -347,6 +371,7 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
         config_fingerprint: fingerprint(config_path),
         sessions: Arc::new(Sessions::new()),
         link: std::sync::OnceLock::new(),
+        gateway: std::sync::OnceLock::new(),
     });
     let grace = Duration::from_secs(agent.shutdown_grace_secs);
     let mode = loaded.config.mode;
@@ -399,9 +424,22 @@ async fn serve_until_stopped(
             return false;
         }
     };
-    let refresher = core_link::refresh_infrastructure(agent, infrastructure);
+    let refresher = core_link::refresh_infrastructure(agent, infrastructure.clone());
     match core_link::start(agent, &info.config_fingerprint) {
         Ok(link) => {
+            let link = Arc::new(link);
+            // What the core pushes; an unreadable key set state refuses the
+            // start: the rollback protection could not be guaranteed.
+            match core_link::start_gateway(agent, mode, infrastructure, link.clone()) {
+                Ok(gateway) => {
+                    let _ = info.gateway.set(gateway);
+                }
+                Err(e) => {
+                    tracing::error!(event = "agent.config_refused", code = "TUN-E015", "{e}");
+                    link.stop().await;
+                    return false;
+                }
+            }
             let _ = info.link.set(link);
         }
         Err(e) => tracing::warn!(event = "agent.core_link_disabled", "{e}"),

@@ -76,6 +76,33 @@ pub enum TunnelError {
     /// Enrolment token burned after too many failed attempts.
     #[error("[TUN-E023] jeton d'enrôlement invalidé après trois échecs ; demandez-en un nouveau")]
     TokenBurned,
+    /// A key set older than the last one accepted (persisted across restarts).
+    #[error(
+        "[TUN-E024] jeu de clés de version {got} refusé : la version {current} a déjà été acceptée"
+    )]
+    KeySetRollback {
+        /// Version pushed.
+        got: u64,
+        /// Last version accepted.
+        current: u64,
+    },
+    /// A policy older than the one applied.
+    #[error("[TUN-E025] politique de version {got} refusée : la version {current} est appliquée")]
+    PolicyRollback {
+        /// Version pushed.
+        got: u64,
+        /// Version applied.
+        current: u64,
+    },
+    /// The core has not pushed what a session needs yet: nothing passes.
+    #[error("[TUN-E026] session refusée : le core n'a pas encore envoyé {0}")]
+    NotReady(&'static str),
+    /// The core did not answer a session request in time.
+    #[error("[TUN-E027] le core n'a pas répondu à la demande de session")]
+    NoAnswer,
+    /// The core pushed a policy that does not compile here.
+    #[error("[TUN-E028] politique du core refusée : {0}")]
+    PolicyInvalid(String),
 }
 
 impl TunnelError {
@@ -99,6 +126,7 @@ impl TunnelError {
             "TUN-E021" => Self::TokenGroup,
             "TUN-E022" => Self::ProofOfPossession,
             "TUN-E023" => Self::TokenBurned,
+            "TUN-E027" => Self::NoAnswer,
             _ => return None,
         })
     }
@@ -129,6 +157,11 @@ impl TunnelError {
             Self::TokenGroup => "TUN-E021",
             Self::ProofOfPossession => "TUN-E022",
             Self::TokenBurned => "TUN-E023",
+            Self::KeySetRollback { .. } => "TUN-E024",
+            Self::PolicyRollback { .. } => "TUN-E025",
+            Self::NotReady(_) => "TUN-E026",
+            Self::NoAnswer => "TUN-E027",
+            Self::PolicyInvalid(_) => "TUN-E028",
         }
     }
 }
@@ -241,6 +274,11 @@ mod tests {
             TunnelError::TokenGroup,
             TunnelError::ProofOfPossession,
             TunnelError::TokenBurned,
+            TunnelError::KeySetRollback { got: 1, current: 2 },
+            TunnelError::PolicyRollback { got: 1, current: 2 },
+            TunnelError::NotReady("x"),
+            TunnelError::NoAnswer,
+            TunnelError::PolicyInvalid("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("TUN-E{:03}", i + 1);
@@ -256,6 +294,7 @@ mod tests {
             TunnelError::TokenUsed,
             TunnelError::TokenGroup,
             TunnelError::NotRootIssued,
+            TunnelError::NoAnswer,
         ] {
             assert_eq!(TunnelError::from_code(e.code()), Some(e));
         }

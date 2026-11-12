@@ -2,6 +2,7 @@
 //! Ostena component names (`CFG-P010`), then the tunnel kept up for the life
 //! of the agent.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -9,7 +10,8 @@ use ostena_common::config::{AgentConfig, Mode};
 use ostena_crypto::tls::TrustAnchor;
 use ostena_platform::private_file::{self, Reader};
 use ostena_scope::infrastructure::{self, Unresolved};
-use ostena_scope::{InfrastructureSpec, SystemResolver};
+use ostena_scope::{InfrastructureSpec, LocalAddresses, SharedLocalAddresses, SystemResolver};
+use ostena_tunnel::gateway::{Gateway, GatewayParams, GatewayState};
 use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, SystemClock};
 use ostena_tunnel::{Hello, Limits, Uuid};
 
@@ -143,6 +145,45 @@ pub(crate) fn start(agent: &AgentConfig, config_fingerprint: &str) -> Result<Age
         // production).
         write_key: |path, bytes| private_file::create(path, bytes, Reader::CurrentProcess),
     }))
+}
+
+/// The state file of the key set version, next to the replay journal.
+pub(crate) fn keyset_state(agent: &AgentConfig) -> PathBuf {
+    agent
+        .replay_journal
+        .parent()
+        .map_or_else(|| PathBuf::from(KEYSET_STATE), |d| d.join(KEYSET_STATE))
+}
+
+const KEYSET_STATE: &str = "keyset.version";
+
+/// Applies what the core pushes on `link`: the policy, intersected with the
+/// local one, and the grant keys, whose version never goes back.
+///
+/// # Errors
+///
+/// The key set state cannot be read, or the agent addresses cannot be
+/// listed.
+pub(crate) fn start_gateway(
+    agent: &AgentConfig,
+    mode: Mode,
+    infrastructure: Infrastructure,
+    link: Arc<AgentLink>,
+) -> Result<Gateway, String> {
+    let gateway_group = Uuid::parse(&agent.gateway_group).ok_or("agent.gateway_group invalide")?;
+    let addresses = LocalAddresses::system().map_err(|e| format!("adresses de l'agent : {e}"))?;
+    let state = GatewayState::open(GatewayParams {
+        gateway_group,
+        mode,
+        local_policy: agent.scope_policy(),
+        infrastructure,
+        local_addresses: SharedLocalAddresses::new(addresses),
+        keyset_state: keyset_state(agent),
+        write_private: |path, bytes| private_file::create(path, bytes, Reader::CurrentProcess),
+        grant_policy: ostena_grant::Policy::default(),
+    })
+    .map_err(|e| e.to_string())?;
+    Gateway::start(Arc::new(state), link).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -21,7 +21,14 @@ use ostena_crypto::tls::{
 };
 use tokio::task::JoinHandle;
 
-use crate::control::{AgentMessage, CoreMessage, PROTOCOL_VERSION};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ostena_grant::{
+    Claims, GatewayGroupId, Issuer, KeySet, Kid, MemoryReplayStore, Protocol, ResourceId, Rights,
+    SignedGrant, SubjectId, Verifier,
+};
+
+use crate::control::{AgentMessage, CoreMessage, GrantKey, PROTOCOL_VERSION, SessionProtocol};
 use crate::enroll::{
     AgentRegistry, DEFAULT_CERTIFICATE_LIFETIME, EnrollmentService, EnrollmentToken,
 };
@@ -90,10 +97,43 @@ pub struct Behaviour {
     pub rogue_server: bool,
 }
 
-#[derive(Debug, Default)]
+/// The grant side of the test core: its signing key, its replay store and a
+/// minimal inventory (resource → host, port).
+struct Grants {
+    issuer: Issuer,
+    replay: MemoryReplayStore,
+    resources: Mutex<HashMap<[u8; 16], (String, u16)>>,
+}
+
+impl std::fmt::Debug for Grants {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Grants")
+            .field("kid", &self.issuer.kid())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
 struct State {
     errors: Mutex<Vec<TunnelError>>,
     tunnels: Mutex<Vec<([u8; 32], Arc<CoreTunnel>)>>,
+    grants: Grants,
+}
+
+impl State {
+    fn new() -> Result<Self, TunnelError> {
+        let (key, _) =
+            p256::SigningKey::generate().map_err(|e| TunnelError::Config(e.to_string()))?;
+        Ok(Self {
+            errors: Mutex::default(),
+            tunnels: Mutex::default(),
+            grants: Grants {
+                issuer: Issuer::new(key),
+                replay: MemoryReplayStore::new(),
+                resources: Mutex::default(),
+            },
+        })
+    }
 }
 
 /// A core listening on 127.0.0.1, for tests and benchmarks.
@@ -186,7 +226,7 @@ impl TestCore {
             running: Mutex::new(None),
             enrollment,
             addr,
-            state: Arc::new(State::default()),
+            state: Arc::new(State::new()?),
         };
         core.listen(listener);
         Ok(core)
@@ -430,6 +470,70 @@ impl TestCore {
             ostena_crypto::pki::pem_private_key(&pkcs8),
         ))
     }
+
+    /// The public key of the grant issuer, as pushed in a key set.
+    pub fn grant_key(&self) -> GrantKey {
+        let key = self.state.grants.issuer.verifying_key();
+        GrantKey {
+            kid: Kid::of(&key).to_string(),
+            public_key: URL_SAFE_NO_PAD.encode(key.to_bytes()),
+            retire_at: None,
+        }
+    }
+
+    /// A grant for `group` to reach `host:port` with `protocol`, recorded in
+    /// the test inventory; text form.
+    ///
+    /// # Errors
+    ///
+    /// If the random generator fails.
+    pub fn issue_grant(
+        &self,
+        group: Uuid,
+        protocol: Protocol,
+        host: &str,
+        port: u16,
+    ) -> Result<String, TunnelError> {
+        let random = |e: ostena_crypto::CryptoError| TunnelError::Config(e.to_string());
+        let resource = Uuid::random().map_err(|e| TunnelError::Config(e.to_string()))?;
+        let subject = Uuid::random().map_err(|e| TunnelError::Config(e.to_string()))?;
+        if let Ok(mut resources) = self.state.grants.resources.lock() {
+            resources.insert(resource.to_bytes(), (host.to_owned(), port));
+        }
+        let claims = Claims {
+            subject: SubjectId::from_bytes(subject.to_bytes()),
+            resource: ResourceId::from_bytes(resource.to_bytes()),
+            audience: GatewayGroupId::from_bytes(group.to_bytes()),
+            protocol,
+            rights: Rights::NONE,
+            max_session_secs: 3600,
+        };
+        let now = ostena_grant::unix_now();
+        Ok(self
+            .state
+            .grants
+            .issuer
+            .issue(&claims, now)
+            .map_err(random)?
+            .to_text())
+    }
+
+    /// Sends `message` to every connected agent; returns how many.
+    pub async fn push(&self, message: &CoreMessage) -> usize {
+        let tunnels: Vec<Arc<CoreTunnel>> = self
+            .state
+            .tunnels
+            .lock()
+            .map(|t| t.iter().map(|(_, t)| t.clone()).collect())
+            .unwrap_or_default();
+        let mut sent = 0;
+        for tunnel in tunnels.iter().filter(|t| !t.is_closed()) {
+            if tunnel.send(message).await.is_ok() {
+                sent += 1;
+            }
+        }
+        sent
+    }
 }
 
 impl Drop for TestCore {
@@ -488,6 +592,7 @@ async fn serve(
             accepted.fingerprint,
             registry.clone(),
             issuer.clone(),
+            state.clone(),
         ));
         tokio::spawn(echo_channels(tunnel));
     }
@@ -507,16 +612,24 @@ async fn echo_channels(tunnel: Arc<CoreTunnel>) {
     }
 }
 
-/// Control messages from one agent: certificate renewal.
+/// Control messages from one agent: certificate renewal, session requests.
 async fn control(
     tunnel: Arc<CoreTunnel>,
     fingerprint: [u8; 32],
     registry: Arc<Registry>,
     issuer: Arc<IssuingAuthority>,
+    state: Arc<State>,
 ) {
     while let Some(message) = tunnel.recv().await {
-        let AgentMessage::Renew { request } = message else {
-            continue;
+        let request = match message {
+            AgentMessage::Renew { request } => request,
+            AgentMessage::SessionRequest { request_id, grant } => {
+                let group = registry.entry(&fingerprint).map(|e| e.group);
+                let reply = session(&state.grants, group, request_id, &grant).await;
+                let _ = tunnel.send(&reply).await;
+                continue;
+            }
+            _ => continue,
         };
         let renewed = renewal::verify(&request, &fingerprint).and_then(|key| {
             let entry = registry
@@ -547,5 +660,69 @@ async fn control(
                 break;
             }
         }
+    }
+}
+
+/// The core side of a session request: the grant verified again and its jti
+/// consumed in the core store (ADR-0004), then the target from the
+/// inventory.
+async fn session(
+    grants: &Grants,
+    group: Option<Uuid>,
+    request_id: u64,
+    grant: &str,
+) -> CoreMessage {
+    let refused = |code: &str, message: String| CoreMessage::SessionRefused {
+        request_id,
+        code: code.to_owned(),
+        message,
+    };
+    let Some(group) = group else {
+        return refused("TUN-E006", "agent inconnu".into());
+    };
+    let mut keys = KeySet::new();
+    keys.insert(grants.issuer.verifying_key());
+    let verifier = Verifier::new(
+        keys,
+        GatewayGroupId::from_bytes(group.to_bytes()),
+        ostena_grant::Policy::default(),
+    );
+    let checked = match SignedGrant::from_text(grant) {
+        Ok(signed) => {
+            verifier
+                .verify(signed.as_bytes(), ostena_grant::unix_now(), &grants.replay)
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    let accepted = match checked {
+        Ok(g) => g,
+        Err(e) => return refused(e.code(), e.to_string()),
+    };
+    let target = grants
+        .resources
+        .lock()
+        .ok()
+        .and_then(|r| r.get(&accepted.claims.resource.to_bytes()).cloned());
+    let Some((host, port)) = target else {
+        // Test core only: the real core answers from its inventory.
+        return refused("INV-E001", "ressource inconnue de l'inventaire".into());
+    };
+    let protocol = match accepted.claims.protocol {
+        Protocol::Ssh => SessionProtocol::Ssh,
+        Protocol::Rdp => SessionProtocol::Rdp,
+        Protocol::Vnc => SessionProtocol::Vnc,
+        Protocol::Web => SessionProtocol::Web,
+    };
+    let Ok(session_id) = Uuid::random() else {
+        return refused("TUN-E014", "aléa indisponible".into());
+    };
+    CoreMessage::SessionParams {
+        request_id,
+        session_id: session_id.to_string(),
+        protocol,
+        host,
+        port,
+        max_session_secs: accepted.claims.max_session_secs,
     }
 }

@@ -69,13 +69,25 @@ fn start_agent(
     );
     let file = dir.join("ostena.toml");
     std::fs::write(&file, config).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_ostena"))
+    (Agent(run_agent(&file), dir), file)
+}
+
+fn run_agent(config: &PathBuf) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_ostena"))
         .args(["agent", "run", "--config"])
-        .arg(&file)
+        .arg(config)
         .stdout(Stdio::piped())
         .spawn()
-        .unwrap();
-    (Agent(child, dir), file)
+        .unwrap()
+}
+
+impl Agent {
+    /// Stops the agent process and starts it again with the same files.
+    fn restart(&mut self, config: &PathBuf) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        self.0 = run_agent(config);
+    }
 }
 
 /// Reads the agent log until a line contains `needle`.
@@ -172,5 +184,58 @@ fn overdue_renewal_is_reported_by_status_and_event() {
     assert!(
         text.contains("AVERTISSEMENT : certificat non renouvelé à 90 % de sa validité"),
         "{text}"
+    );
+}
+
+/// The key set version survives a restart of the agent: after it, a lower
+/// version pushed by the core is refused.
+#[test]
+fn keyset_version_is_kept_across_a_restart() {
+    use ostena_tunnel::control::CoreMessage;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let core = runtime
+        .block_on(async { TestCore::start(Limits::default(), Behaviour::default()) })
+        .unwrap();
+    let (mut agent, config) = start_agent(&core, "keyset", valid(), None);
+    let log = read_until(&mut agent, "agent.core_connected");
+    assert!(log.contains("agent.core_connected"), "{log}");
+    let text = status(&agent, &config);
+    assert!(text.contains("Politique du core : non reçue"), "{text}");
+    assert!(
+        text.contains("Clés de grant : non reçues (aucune session possible)"),
+        "{text}"
+    );
+
+    let push = |version| {
+        runtime.block_on(core.push(&CoreMessage::KeySet {
+            version,
+            keys: vec![core.grant_key()],
+        }))
+    };
+    assert_eq!(push(5), 1);
+    let log = read_until(&mut agent, "agent.keyset_applied");
+    assert!(log.contains("agent.keyset_applied"), "{log}");
+    assert!(status(&agent, &config).contains("Clés de grant : version 5"));
+
+    agent.restart(&config);
+    let log = read_until(&mut agent, "agent.core_connected");
+    assert!(log.contains("agent.core_connected"), "{log}");
+    let text = status(&agent, &config);
+    assert!(
+        text.contains("Clés de grant : non reçues (dernière version acceptée : 5"),
+        "{text}"
+    );
+    // The connection of the restarted agent is the last one: push to it.
+    assert!(push(3) >= 1);
+    let log = read_until(&mut agent, "agent.keyset_refused");
+    assert!(log.contains("TUN-E024"), "{log}");
+    assert!(
+        status(&agent, &config).contains("dernière version acceptée : 5"),
+        "lower version not applied"
     );
 }

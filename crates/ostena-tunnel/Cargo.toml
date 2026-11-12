@@ -26,6 +26,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+ostena-grant.workspace = true
+ostena-scope.workspace = true
 ostena-platform.workspace = true
 # Paused time for the tests that depend on it (no tolerance margins).
 tokio = { workspace = true, features = ["test-util"] }

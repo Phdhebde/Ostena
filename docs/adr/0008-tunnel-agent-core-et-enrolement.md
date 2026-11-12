@@ -103,7 +103,21 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 | Politique | compilée comme en production : aucune exception au plancher, aucun affaiblissement non justifié |
 | Hôte de session | syntaxe vérifiée, puis de nouveau contrôlé par `ostena-scope` avant la connexion |
 
-**La configuration locale est un plafond** (PR 4). La politique effective est l'intersection de la politique locale (`[agent.scope]`) et de celle du core, plus le plancher d'infrastructure. **Si la politique locale est vide, rien ne passe, quoi que pousse le core.** Un core compromis ne peut pas élargir le périmètre d'une passerelle.
+**La configuration locale est un plafond** (`ostena_tunnel::gateway`). La politique effective est l'intersection de la politique locale (`[agent.scope]`) et de celle du core, plus le plancher d'infrastructure. **Si la politique locale est vide, rien ne passe, quoi que pousse le core.** Un core compromis ne peut pas élargir le périmètre d'une passerelle.
+
+**Ce que le core pousse** :
+- **Politique** (`policy`) : elle doit nommer le groupe de l'agent (`TUN-E028` sinon), et doit se compiler en production sur l'agent (`TUN-E028`). Une cible passe seulement si la politique locale et celle du core l'autorisent toutes les deux ; les composants Ostena résolus par l'agent (`CFG-P010`) sont ajoutés aux deux. **Tant que le core n'a pas poussé de politique, rien ne passe** (`TUN-E026`). Une version inférieure à celle appliquée est refusée (`TUN-E025`) ; la même version est ignorée. Un refus laisse la politique précédente en place.
+- **Clés de grant** (`key_set`) : le jeu poussé remplace le précédent ; une clé absente est retirée. **Sa version ne revient jamais en arrière** (`TUN-E024`), même après un redémarrage de l'agent : la dernière version acceptée est écrite dans `keyset.version`, à côté du journal anti-rejeu, **avant** d'être utilisée. Le fichier est créé avec ses droits définitifs (0600, ou une ACL protégée réservée au compte de l'agent), synchronisé, puis renommé sur l'ancien (écriture atomique). S'il ne peut pas être écrit, le jeu est refusé. S'il existe mais est illisible, l'agent refuse de démarrer (`TUN-E015`) : la protection ne pourrait plus être garantie. Après un redémarrage, l'agent n'a pas de clés tant que le core n'a pas renvoyé une version au moins égale.
+
+**Ouverture d'une session** (`Gateway::open_session`) :
+1. pas de politique ni de clés poussées : refus (`TUN-E026`) ;
+2. l'agent vérifie le grant avec les clés poussées et **consomme son jti dans son propre journal** (`GRT-E…`) ;
+3. il envoie `session_request` ; le core vérifie de nouveau le grant et **consomme le jti dans son propre registre** : un grant rejoué sur une autre passerelle du même groupe est refusé par le core (`session_refused`, `GRT-E010`) ;
+4. sans réponse sous 5 s : `TUN-E027` ;
+5. la réponse `session_params` doit correspondre au grant (protocole, durée au plus celle du grant), sinon `TUN-E010` ;
+6. l'hôte répondu est résolu une fois et épinglé par le contrôle de périmètre local, puis chaque adresse est vérifiée par la politique du core (`SCP-E…`).
+
+Événements : `agent.policy_applied`, `agent.policy_refused` (code), `agent.keyset_applied`, `agent.keyset_refused` (code), `agent.session_granted`, `agent.session_refused` (code du core), `agent.session_answer_unexpected`.
 
 ### Enrôlement, renouvellement, révocation
 
@@ -301,6 +315,11 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E021` | jeton émis pour un autre groupe |
 | `TUN-E022` | preuve de possession invalide |
 | `TUN-E023` | jeton brûlé après trois échecs |
+| `TUN-E024` | jeu de clés de version inférieure à la dernière acceptée, même avant un redémarrage |
+| `TUN-E025` | politique de version inférieure à celle appliquée |
+| `TUN-E026` | session refusée : le core n'a pas encore poussé de politique ou de clés |
+| `TUN-E027` | le core n'a pas répondu à la demande de session |
+| `TUN-E028` | politique du core refusée (autre groupe, ou ne se compile pas en production) |
 
 Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`, `agent.identity_rotated`, `agent.renewal_impossible`, `tunnel.renewal_overdue` (avertissement, répété chaque heure).
 
