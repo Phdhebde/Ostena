@@ -225,7 +225,9 @@ impl ServiceManager for Scm {
             protect(dir, &sid, "(OI)(CI)RX", true)?;
         }
         if let Some(key) = &o.private_key {
-            protect(key, &sid, "R", false)?;
+            // Read, and delete: a renewal replaces the key with a new file
+            // (created with its final rights by the agent).
+            protect(key, &sid, "(RD,REA,RA,RC,S,DE)", false)?;
         }
         if let Some(dir) = &o.state_dir {
             std::fs::create_dir_all(dir).map_err(|e| {

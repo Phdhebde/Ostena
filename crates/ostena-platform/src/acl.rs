@@ -98,6 +98,8 @@ pub fn evaluate(
 }
 
 #[cfg(windows)]
+pub(crate) use ffi::sid_string;
+#[cfg(windows)]
 pub use ffi::{WindowsPermissions, account_sid, read_security};
 
 #[cfg(windows)]
@@ -153,7 +155,7 @@ mod ffi {
     /// # Safety
     ///
     /// `sid` must point to a valid SID for the duration of the call.
-    unsafe fn sid_string(sid: PSID) -> io::Result<String> {
+    pub(crate) unsafe fn sid_string(sid: PSID) -> io::Result<String> {
         let mut out: *mut u16 = null_mut();
         // SAFETY: `sid` is valid (caller contract); `out` receives a
         // LocalAlloc'd, NUL-terminated string, freed by `Local` below.
