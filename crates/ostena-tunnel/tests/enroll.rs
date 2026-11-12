@@ -7,6 +7,8 @@
 )]
 
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ostena_common::secret::SecretBytes;
@@ -18,6 +20,7 @@ use ostena_tunnel::enroll::{
     ENROLL_ALPN, EnrollParams, EnrollServer, Enrolled, EnrollmentToken, enroll,
     testing::raw_request,
 };
+use ostena_tunnel::link::Clock;
 use ostena_tunnel::testing::{Behaviour, TestCore};
 use ostena_tunnel::{ALPN, Limits, TunnelError, Uuid, connect, renewal};
 
@@ -177,14 +180,53 @@ fn wrong_token_secret_is_refused() {
     });
 }
 
+/// A wall clock the test sets by hand.
+#[derive(Debug)]
+struct ManualClock(AtomicU64);
+
+impl Clock for ManualClock {
+    fn now(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// One thread, Tokio time paused: tasks run only when the test waits, and
+/// sleeps end as soon as everything is idle. No real delay, no margin.
+fn run_paused<F: Future<Output = ()>>(test: F) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(test);
+}
+
 #[test]
 fn listener_closes_when_its_last_token_expires() {
-    run(async {
-        let core = TestCore::start(fast(), Behaviour::default()).unwrap();
+    run_paused(async {
+        let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
+        let core = TestCore::start_with_clock(fast(), Behaviour::default(), clock.clone()).unwrap();
         core.issue_token(group(), Duration::from_secs(1)).unwrap();
-        assert!(core.enrollment_open());
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-        assert!(eventually(|| !core.enrollment_open()).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(core.enrollment_open(), "token still valid");
+        clock.0.store(1_001, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!core.enrollment_open());
+    });
+}
+
+/// A token can expire within the second it was issued, before the expiry
+/// watch first looks: the listener must close anyway.
+#[test]
+fn listener_closes_when_the_token_expired_before_the_first_look() {
+    run_paused(async {
+        let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
+        let core = TestCore::start_with_clock(fast(), Behaviour::default(), clock.clone()).unwrap();
+        core.issue_token(group(), Duration::from_secs(1)).unwrap();
+        // Nothing spawned has run yet (one thread, no await so far).
+        clock.0.store(1_001, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!core.enrollment_open());
     });
 }
 
