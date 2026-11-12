@@ -26,6 +26,14 @@ pub(crate) struct AgentInfo {
     pub gateway_group: String,
     pub config_fingerprint: String,
     pub sessions: Arc<Sessions>,
+    /// The link to the core, once started.
+    pub link: std::sync::OnceLock<ostena_tunnel::link::AgentLink>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Answer to one request (never fails: errors are answers too).
@@ -39,7 +47,11 @@ pub(crate) fn answer(info: &AgentInfo, request: &[u8]) -> Value {
             "version": ostena_common::VERSION,
             "uptime_secs": info.started.elapsed().as_secs(),
             "gateway_group": info.gateway_group,
-            "core": "non connecté",
+            "core": info.link.get().map_or_else(
+                || "lien désactivé (configuration)".to_owned(),
+                |l| l.status().summary(unix_now()),
+            ),
+            "core_link": info.link.get().map(ostena_tunnel::link::AgentLink::status),
             "sessions": info.sessions.active(),
             "resident_bytes": ostena_platform::memory::resident_bytes(),
             "config_fingerprint": info.config_fingerprint,
@@ -109,6 +121,7 @@ mod tests {
             gateway_group: "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6".into(),
             config_fingerprint: "sha256:abcd".into(),
             sessions: Arc::new(Sessions::new()),
+            link: std::sync::OnceLock::new(),
         }
     }
 

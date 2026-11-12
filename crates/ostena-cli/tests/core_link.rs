@@ -1,0 +1,134 @@
+//! `ostena agent run` connects to the core at startup and `agent status`
+//! shows it, with the real binary against the in-process test core.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers outside #[test] functions"
+)]
+
+use std::io::BufRead;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use ostena_crypto::pki::pem_certificate;
+use ostena_tunnel::testing::{Behaviour, TestCore, valid};
+use ostena_tunnel::{Limits, Uuid};
+
+const GROUP: &str = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
+
+struct Agent(Child, PathBuf);
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        let _ = std::fs::remove_dir_all(&self.1);
+    }
+}
+
+/// Starts `agent run` with an enrolled identity for `core`.
+fn start_agent(core: &TestCore) -> (Agent, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("ostena-cli-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("state")).unwrap();
+    let (cert, key) = core
+        .agent_files(Uuid::parse(GROUP).unwrap(), valid())
+        .unwrap();
+    std::fs::write(dir.join("agent.crt"), cert).unwrap();
+    // SECRET-EXPOSURE: test only, the key file `agent enroll` would write.
+    #[expect(clippy::disallowed_methods)]
+    std::fs::write(dir.join("agent.key"), key.expose_secret()).unwrap();
+    std::fs::write(
+        dir.join("root.pem"),
+        pem_certificate(core.trust_anchor().certificate()),
+    )
+    .unwrap();
+    let path = |p: &str| dir.join(p).display().to_string().replace('\\', "\\\\");
+    let endpoint = if cfg!(windows) {
+        format!(r"\\\\.\\pipe\\ostena-cli-link-{}", std::process::id())
+    } else {
+        path("run/agent.sock")
+    };
+    let config = format!(
+        "mode = \"development\"\n\n[agent]\ngateway_group = \"{GROUP}\"\ncore_address = \"{}\"\n\
+         tls_certificate = \"{}\"\ntls_private_key = \"{}\"\ntls_core_ca = \"{}\"\n\
+         replay_journal = \"{}\"\nshutdown_grace_secs = 2\ncontrol_endpoint = \"{endpoint}\"\n",
+        core.addr(),
+        path("agent.crt"),
+        path("agent.key"),
+        path("root.pem"),
+        path("state/replay.journal"),
+    );
+    let file = dir.join("ostena.toml");
+    std::fs::write(&file, config).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["agent", "run", "--config"])
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    (Agent(child, dir), file)
+}
+
+/// Reads the agent log until a line contains `needle`.
+fn read_until(agent: &mut Agent, needle: &str) -> String {
+    let stdout = agent.0.stdout.as_mut().unwrap();
+    let mut seen = String::new();
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = line.unwrap();
+        seen.push_str(&line);
+        seen.push('\n');
+        if line.contains(needle) {
+            break;
+        }
+    }
+    seen
+}
+
+fn status(agent: &Agent, config: &PathBuf) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["agent", "status", "--config"])
+        .arg(config)
+        .args(["--pid", &agent.0.id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn agent_connects_at_startup_and_reports_it() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let core = runtime
+        .block_on(async { TestCore::start(Limits::default(), Behaviour::default()) })
+        .unwrap();
+    let (mut agent, config) = start_agent(&core);
+    let log = read_until(&mut agent, "agent.core_connected");
+    assert!(log.contains("agent.core_connected"), "{log}");
+
+    let text = status(&agent, &config);
+    assert!(text.contains("Core : connecté (QUIC) depuis"), "{text}");
+    assert!(text.contains("Certificat : expire dans 29 j"), "{text}");
+
+    // The core goes away: the agent reports it and retries.
+    core.stop();
+    let mut lost = String::new();
+    for _ in 0..80 {
+        lost = status(&agent, &config);
+        if lost.contains("Core : non connecté") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        lost.contains("Core : non connecté, nouvelle tentative dans"),
+        "{lost}"
+    );
+    drop(core);
+    drop(runtime);
+}

@@ -8,6 +8,7 @@
 mod agent;
 mod ca;
 mod control;
+mod core_link;
 mod enroll;
 mod sessions;
 

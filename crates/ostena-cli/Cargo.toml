@@ -17,6 +17,7 @@ ostena-common.workspace = true
 ostena-crypto.workspace = true
 ostena-grant.workspace = true
 ostena-platform.workspace = true
+ostena-scope.workspace = true
 ostena-tunnel.workspace = true
 serde.workspace = true
 serde_json.workspace = true

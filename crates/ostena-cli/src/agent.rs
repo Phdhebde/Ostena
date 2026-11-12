@@ -12,6 +12,7 @@ use ostena_platform::control::{ControlListener, DEFAULT_ENDPOINT, ExpectedServer
 use ostena_platform::service::{InstallOptions, ServiceManager, ServiceState, service_manager};
 
 use crate::control;
+use crate::core_link;
 use crate::sessions::Sessions;
 
 /// Delay before the idle footprint is measured (`agent.idle_footprint`).
@@ -189,6 +190,24 @@ pub(crate) fn status(config: &Path, pid: Option<u32>) -> ExitCode {
             field("config_fingerprint"),
         ),
     );
+    let link = &answer["core_link"];
+    if let (Some(not_after), Some(due)) = (
+        link["certificate_not_after"].as_u64(),
+        link["renewal_due"].as_u64(),
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let days = |t: u64| t.saturating_sub(now) / 86_400;
+        say(
+            false,
+            &format!(
+                "Certificat : expire dans {} j, renouvellement automatique dans {} j",
+                days(not_after),
+                days(due)
+            ),
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -317,10 +336,12 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
         gateway_group: agent.gateway_group.clone(),
         config_fingerprint: fingerprint(config_path),
         sessions: Arc::new(Sessions::new()),
+        link: std::sync::OnceLock::new(),
     });
     let grace = Duration::from_secs(agent.shutdown_grace_secs);
+    let mode = loaded.config.mode;
     let served = runtime.block_on(serve_until_stopped(
-        &agent, &endpoint, info, grace, stop, ready,
+        &agent, mode, &endpoint, info, grace, stop, ready,
     ));
     if !served {
         return 1;
@@ -346,6 +367,7 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
 /// start (`AGT-E006`: another agent or a squat).
 async fn serve_until_stopped(
     agent: &AgentConfig,
+    mode: config::Mode,
     endpoint: &str,
     info: Arc<control::AgentInfo>,
     grace: Duration,
@@ -359,6 +381,21 @@ async fn serve_until_stopped(
             return false;
         }
     };
+    // The Ostena components must be known before anything else (CFG-P010).
+    let infrastructure = match core_link::resolve_infrastructure(agent, mode).await {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!(event = "agent.config_refused", code = "CFG-P010", "{e}");
+            return false;
+        }
+    };
+    let refresher = core_link::refresh_infrastructure(agent, infrastructure);
+    match core_link::start(agent, &info.config_fingerprint) {
+        Ok(link) => {
+            let _ = info.link.set(link);
+        }
+        Err(e) => tracing::warn!(event = "agent.core_link_disabled", "{e}"),
+    }
     let server = tokio::spawn(control::serve(Arc::clone(&listener), Arc::clone(&info)));
     let footprint = tokio::spawn(async {
         tokio::time::sleep(IDLE_FOOTPRINT_DELAY).await;
@@ -390,6 +427,10 @@ async fn serve_until_stopped(
         finished = report.finished,
         aborted = report.aborted
     );
+    if let Some(link) = info.link.get() {
+        link.stop().await;
+    }
+    refresher.abort();
     footprint.abort();
     server.abort();
     let _ = server.await;
