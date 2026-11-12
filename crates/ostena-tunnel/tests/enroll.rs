@@ -273,3 +273,21 @@ fn revocation_closes_open_tunnels_at_once() {
         assert_eq!(again.err(), Some(TunnelError::Revoked));
     });
 }
+
+#[test]
+fn token_is_burned_after_three_failures() {
+    run(async {
+        let core = TestCore::start(fast(), Behaviour::default()).unwrap();
+        let token = core.issue_token(group(), HOUR).unwrap();
+        let keep_open = core.issue_token(group(), HOUR).unwrap();
+        let other = Uuid::from_bytes([9; 16]);
+        let attempt = |g| enrol_with(&core, &token, g, Duration::from_secs(5));
+        assert_eq!(attempt(other).await.err(), Some(TunnelError::TokenGroup));
+        assert_eq!(attempt(other).await.err(), Some(TunnelError::TokenGroup));
+        assert_eq!(attempt(other).await.err(), Some(TunnelError::TokenBurned));
+        // Burned for good, even with the right group.
+        assert_eq!(attempt(group()).await.err(), Some(TunnelError::TokenBurned));
+        // The other token is untouched.
+        assert!(enrol(&core, &keep_open).await.is_ok());
+    });
+}

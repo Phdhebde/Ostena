@@ -29,6 +29,8 @@ tracing.workspace = true
 # The integration tests and the benchmark run against the test core.
 ostena-tunnel = { path = ".", features = ["testing"] }
 proptest.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "latency"

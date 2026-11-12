@@ -160,7 +160,11 @@ fn enrolment_writes_the_key_and_the_certificate_then_the_listener_closes() {
         let out = late.enroll(&late.token_file(&token), "").await;
         assert!(!out.status.success());
         assert!(stderr(&out).contains("TUN-E013"), "{}", stderr(&out));
-        assert_eq!(late.files(), (false, false), "the unused key is removed");
+        assert_eq!(
+            late.files(),
+            (true, false),
+            "the key stays for a new attempt"
+        );
     });
 }
 
@@ -182,7 +186,7 @@ fn replayed_token_is_refused() {
         let out = second.enroll(&second.token_file(&token), "").await;
         assert!(!out.status.success());
         assert!(stderr(&out).contains("TUN-E020"), "{}", stderr(&out));
-        assert_eq!(second.files(), (false, false));
+        assert_eq!(second.files(), (true, false));
     });
 }
 
@@ -197,7 +201,7 @@ fn expired_token_is_refused() {
         let out = agent.enroll(&agent.token_file(&token), "").await;
         assert!(!out.status.success());
         assert!(stderr(&out).contains("TUN-E019"), "{}", stderr(&out));
-        assert_eq!(agent.files(), (false, false));
+        assert_eq!(agent.files(), (true, false));
     });
 }
 
@@ -210,7 +214,7 @@ fn token_of_another_group_is_refused() {
         let out = agent.enroll(&agent.token_file(&token), "").await;
         assert!(!out.status.success());
         assert!(stderr(&out).contains("TUN-E021"), "{}", stderr(&out));
-        assert_eq!(agent.files(), (false, false));
+        assert_eq!(agent.files(), (true, false));
     });
 }
 
@@ -232,5 +236,42 @@ fn token_on_standard_input_and_no_overwrite() {
         assert!(!again.status.success());
         assert!(stderr(&again).contains("déjà enrôlé"), "{}", stderr(&again));
         assert_eq!(std::fs::read(agent.dir.join("agent.key")).unwrap(), before);
+    });
+}
+
+#[test]
+fn failed_attempt_leaves_a_key_that_the_next_attempt_reuses() {
+    run(async {
+        let core = core();
+        let agent = Agent::new("retry", &core, GROUP);
+        // No token issued yet: the enrolment listener is closed, the attempt
+        // fails on the network after the key is written.
+        let not_yet = EnrollmentToken::generate().unwrap();
+        let out = agent.enroll(&agent.token_file(&not_yet), "").await;
+        assert!(!out.status.success());
+        assert!(stderr(&out).contains("TUN-E013"), "{}", stderr(&out));
+        assert_eq!(agent.files(), (true, false));
+        let key = std::fs::read(agent.dir.join("agent.key")).unwrap();
+
+        // The operator gets a token and tries again: same key, certificate.
+        let token = core.issue_token(group(), HOUR).unwrap();
+        let out = agent.enroll(&agent.token_file(&token), "").await;
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(agent.files(), (true, true));
+        assert_eq!(std::fs::read(agent.dir.join("agent.key")).unwrap(), key);
+    });
+}
+
+#[test]
+fn unreadable_key_without_certificate_is_recreated() {
+    run(async {
+        let core = core();
+        let agent = Agent::new("garbage-key", &core, GROUP);
+        std::fs::write(agent.dir.join("agent.key"), b"not a key").unwrap();
+        let token = core.issue_token(group(), HOUR).unwrap();
+        let out = agent.enroll(&agent.token_file(&token), "").await;
+        assert!(out.status.success(), "{}", stderr(&out));
+        let key = std::fs::read_to_string(agent.dir.join("agent.key")).unwrap();
+        assert!(key.starts_with("-----BEGIN PRIVATE KEY-----"));
     });
 }

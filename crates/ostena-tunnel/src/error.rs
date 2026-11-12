@@ -73,6 +73,9 @@ pub enum TunnelError {
     /// The proof of possession of the private key is invalid.
     #[error("[TUN-E022] preuve de possession de la clé invalide")]
     ProofOfPossession,
+    /// Enrolment token burned after too many failed attempts.
+    #[error("[TUN-E023] jeton d'enrôlement invalidé après trois échecs ; demandez-en un nouveau")]
+    TokenBurned,
 }
 
 impl TunnelError {
@@ -95,6 +98,7 @@ impl TunnelError {
             "TUN-E020" => Self::TokenUsed,
             "TUN-E021" => Self::TokenGroup,
             "TUN-E022" => Self::ProofOfPossession,
+            "TUN-E023" => Self::TokenBurned,
             _ => return None,
         })
     }
@@ -124,6 +128,7 @@ impl TunnelError {
             Self::TokenUsed => "TUN-E020",
             Self::TokenGroup => "TUN-E021",
             Self::ProofOfPossession => "TUN-E022",
+            Self::TokenBurned => "TUN-E023",
         }
     }
 }
@@ -235,6 +240,7 @@ mod tests {
             TunnelError::TokenUsed,
             TunnelError::TokenGroup,
             TunnelError::ProofOfPossession,
+            TunnelError::TokenBurned,
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("TUN-E{:03}", i + 1);

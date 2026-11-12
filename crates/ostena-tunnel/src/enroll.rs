@@ -48,6 +48,8 @@ pub const MAX_ENROLL_MESSAGE: usize = 16 * 1024;
 pub const DEFAULT_TOKEN_TTL: Duration = Duration::from_mins(15);
 /// Longest token lifetime.
 pub const MAX_TOKEN_TTL: Duration = Duration::from_hours(1);
+/// Failed attempts after which a token is burned, whatever their cause.
+pub const MAX_TOKEN_FAILURES: u8 = 3;
 /// Default validity of an agent certificate.
 pub const DEFAULT_CERTIFICATE_LIFETIME: Duration = Duration::from_hours(30 * 24);
 
@@ -480,12 +482,49 @@ struct TokenEntry {
     group: Uuid,
     expires_at: u64,
     used: bool,
+    failures: u8,
+    burned: bool,
 }
 
 impl TokenEntry {
     fn valid_at(&self, now: u64) -> bool {
-        !self.used && now < self.expires_at
+        !self.used && !self.burned && now < self.expires_at
     }
+}
+
+/// Counts a failed attempt on a known token, whatever its cause, and burns
+/// the token at the third; raises `tunnel.enrollment_suspicious` for a token
+/// of another group, an invalid proof or a burned token. Never logs the
+/// secret.
+fn record_failure(
+    entry: &mut TokenEntry,
+    mut error: TunnelError,
+    peer: SocketAddr,
+    group: Uuid,
+    token_id: &[u8; 16],
+) -> TunnelError {
+    if !matches!(error, TunnelError::TokenBurned | TunnelError::TokenUsed) {
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= MAX_TOKEN_FAILURES {
+            entry.burned = true;
+            error = TunnelError::TokenBurned;
+        }
+    }
+    if matches!(
+        error,
+        TunnelError::TokenGroup | TunnelError::ProofOfPossession | TunnelError::TokenBurned
+    ) {
+        tracing::warn!(
+            event = "tunnel.enrollment_suspicious",
+            peer = %peer,
+            requested_group = %group,
+            token_id = %hex(token_id),
+            failures = entry.failures,
+            code = error.code(),
+            "{error}"
+        );
+    }
+    error
 }
 
 struct Inner {
@@ -587,6 +626,8 @@ impl EnrollmentService {
             group,
             expires_at: now() + ttl.as_secs().max(1),
             used: false,
+            failures: 0,
+            burned: false,
         };
         if let Ok(mut tokens) = self.inner.tokens.lock() {
             tokens.insert(token.id, entry);
@@ -754,7 +795,7 @@ impl EnrollmentService {
         let decided = read_frame(&mut recv, MAX_ENROLL_MESSAGE)
             .await
             .and_then(|f| decode_client(&f))
-            .and_then(|request| self.decide(&nonce, &request));
+            .and_then(|request| self.decide(&nonce, &request, conn.remote_address()));
         let (reply, outcome) = match decided {
             Ok(v) => v,
             Err(e) => (
@@ -778,6 +819,7 @@ impl EnrollmentService {
         &self,
         nonce: &[u8; 32],
         request: &EnrollClient,
+        peer: SocketAddr,
     ) -> Result<(EnrollServer, Outcome), TunnelError> {
         let EnrollClient::Request {
             token_id,
@@ -801,30 +843,38 @@ impl EnrollmentService {
                 .lock()
                 .map_err(|_| TunnelError::Io("verrou empoisonné".into()))?;
             let entry = tokens.get_mut(&token_id).ok_or(TunnelError::TokenUnknown)?;
-            if !ostena_crypto::constant_time_eq(
-                &ostena_crypto::sha256::digest(&secret),
-                &entry.digest,
-            ) {
-                return Err(TunnelError::TokenUnknown);
+            let checked = (|| {
+                if entry.burned {
+                    return Err(TunnelError::TokenBurned);
+                }
+                if !ostena_crypto::constant_time_eq(
+                    &ostena_crypto::sha256::digest(&secret),
+                    &entry.digest,
+                ) {
+                    return Err(TunnelError::TokenUnknown);
+                }
+                if entry.used {
+                    return Err(TunnelError::TokenUsed);
+                }
+                if now() >= entry.expires_at {
+                    return Err(TunnelError::TokenExpired);
+                }
+                if entry.group != group {
+                    return Err(TunnelError::TokenGroup);
+                }
+                let proof = proof_message(
+                    nonce,
+                    &token_id,
+                    group,
+                    &key_bytes,
+                    &self.inner.server_fingerprint,
+                );
+                key.verify(&proof, &signature)
+                    .map_err(|_| TunnelError::ProofOfPossession)
+            })();
+            if let Err(error) = checked {
+                return Err(record_failure(entry, error, peer, group, &token_id));
             }
-            if entry.used {
-                return Err(TunnelError::TokenUsed);
-            }
-            if now() >= entry.expires_at {
-                return Err(TunnelError::TokenExpired);
-            }
-            if entry.group != group {
-                return Err(TunnelError::TokenGroup);
-            }
-            let proof = proof_message(
-                nonce,
-                &token_id,
-                group,
-                &key_bytes,
-                &self.inner.server_fingerprint,
-            );
-            key.verify(&proof, &signature)
-                .map_err(|_| TunnelError::ProofOfPossession)?;
             // Every check passed: the token is spent before anything is issued.
             entry.used = true;
         }

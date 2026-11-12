@@ -131,7 +131,9 @@ Ces trois comportements sont testés.
 
    Puis il **consomme le jeton avant d'émettre**.
 
-   Une erreur de groupe ne consomme pas le jeton : c'est une erreur de configuration de l'agent, que l'opérateur corrige avant de recommencer.
+   Une erreur de groupe ne consomme pas le jeton : c'est une erreur de configuration de l'agent, que l'opérateur corrige avant de recommencer. En revanche :
+   - **chaque échec sur un jeton connu compte, quel qu'en soit le motif** (secret faux, expiré, autre groupe, preuve invalide). Au **troisième**, le jeton est **brûlé** définitivement (`TUN-E023`), même pour le bon groupe ;
+   - un jeton présenté pour un autre groupe, une preuve de possession invalide ou un jeton brûlé émettent l'événement de sécurité **`tunnel.enrollment_suspicious`** : adresse de l'appelant, groupe demandé, identifiant du jeton, nombre d'échecs et code. **Jamais le secret.**
 4. le core répond `accepted` : le certificat (30 jours, SAN `urn:ostena:gateway-group:<uuid>` et `urn:ostena:agent:<uuid>`), l'identifiant de l'agent et la validité. L'agent vérifie que le certificat porte bien sa clé publique.
 
 Pas de PKCS#10, donc aucun analyseur ASN.1 exposé côté core.
@@ -139,7 +141,7 @@ Pas de PKCS#10, donc aucun analyseur ASN.1 exposé côté core.
 **`ostena agent enroll --config … --token-file <fichier|->`** :
 - lit la configuration sans exiger la clé ni le certificat ;
 - refuse si l'un d'eux existe déjà ;
-- écrit la clé avant tout échange, et la supprime si l'enrôlement échoue ;
+- écrit la clé avant tout échange. Si l'enrôlement échoue, la clé reste : une **clé sans certificat** est réutilisée à la tentative suivante (ou recréée si elle est illisible), si bien qu'une nouvelle tentative n'est jamais bloquée. Une clé accompagnée d'un certificat n'est jamais écrasée ;
 - écrit ensuite le certificat.
 
 **Le renouvellement**, aux 2/3 de la validité, par le tunnel :
@@ -154,7 +156,7 @@ Le déclenchement automatique côté agent arrive avec le branchement de l'agent
 - le core **ferme aussitôt les tunnels ouverts** sous ce certificat, avec le code `TUN-E005`, que l'agent reçoit tel quel.
 
 **Événements** :
-- côté core : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted` (agent, groupe, empreinte), `enroll.refused` (code) ;
+- côté core : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted` (agent, groupe, empreinte), `enroll.refused` (code), `tunnel.enrollment_suspicious` (sécurité) ;
 - côté agent : `agent.enrolled`.
 
 ### Clé de la CA du core (décidé le 2026-11-11)
@@ -272,6 +274,7 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E020` | jeton d'enrôlement déjà utilisé |
 | `TUN-E021` | jeton émis pour un autre groupe |
 | `TUN-E022` | preuve de possession invalide |
+| `TUN-E023` | jeton brûlé après trois échecs |
 
 Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused`.
 
