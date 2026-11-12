@@ -187,3 +187,35 @@ fn private_key_pem_is_read_back_by_identity() {
             .unwrap();
     assert_eq!(id.certificate(), &cert);
 }
+
+#[test]
+fn validity_is_read_back_from_the_certificate() {
+    let pki = TestPki::new("t").unwrap();
+    let cert = pki
+        .issuing
+        .issue_agent(&key(), "g", "a", validity())
+        .unwrap();
+    assert_eq!(
+        certificate_validity(&cert),
+        Some((validity().not_before, validity().not_after))
+    );
+    // Dates after 2049 are encoded as GeneralizedTime.
+    let far = Validity {
+        not_before: 2_600_000_000,
+        not_after: 2_700_000_000,
+    };
+    let cert = pki.issuing.issue_agent(&key(), "g", "a", far).unwrap();
+    assert_eq!(
+        certificate_validity(&cert),
+        Some((far.not_before, far.not_after))
+    );
+    assert_eq!(certificate_validity(&cert[..cert.len() / 2]), None);
+    assert_eq!(certificate_validity(b""), None);
+}
+
+proptest::proptest! {
+    #[test]
+    fn prop_validity_never_panics(data in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)) {
+        let _ = certificate_validity(&data);
+    }
+}
