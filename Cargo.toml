@@ -42,6 +42,9 @@ rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"
 time = { version = "0.3.55", default-features = false }
 # QUIC transport of the agent-core tunnel (ADR-0008); TLS comes from ostena-crypto::tls.
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+# Shamir secret sharing of the offline root secret (2 of 3), audited; used by ostena-crypto only.
+vsss-rs = { version = "6.0.1", default-features = false, features = ["alloc"] }
+rand_core = { version = "0.10.1", default-features = false }
 # Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
 windows-service = "0.8.1"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Services", "Win32_System_Threading"] }
