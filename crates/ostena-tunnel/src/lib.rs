@@ -17,6 +17,7 @@ pub mod enroll;
 mod error;
 mod ids;
 pub mod limits;
+pub mod link;
 pub mod renewal;
 pub mod tunnel;
 

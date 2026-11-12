@@ -53,7 +53,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P007` | production | pas de CA dédiée au certificat du core (`agent.tls_core_ca`) |
 | `CFG-P008` | production | clé privée de l'agent lisible ou modifiable par un autre compte que le service ou les administrateurs |
 | `CFG-P009` | production | dossier du journal anti-rejeu modifiable par un autre compte |
-| `CFG-P010` | production | nom d'infrastructure impossible à résoudre au démarrage |
+| `CFG-P010` | production | nom d'infrastructure impossible à résoudre au démarrage de l'agent (vérifié avant le lien avec le core ; rafraîchi toutes les 5 minutes, un échec garde les adresses précédentes) |
 
 `CFG-P006` sous Unix : le fichier (après résolution des liens symboliques) et son dossier doivent appartenir à root ou au compte du service, sans droit d'écriture pour le groupe ni pour les autres. Le compte du service est le propriétaire de `/proc/self`, ce qui évite un appel FFI `unsafe`. S'il est indisponible, seul root est accepté.
 

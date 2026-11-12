@@ -768,6 +768,7 @@ dependencies = [
  "ostena-crypto",
  "ostena-grant",
  "ostena-platform",
+ "ostena-scope",
  "ostena-tunnel",
  "serde",
  "serde_json",

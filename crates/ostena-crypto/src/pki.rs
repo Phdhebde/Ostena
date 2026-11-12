@@ -441,3 +441,94 @@ mod tests;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+
+/// Validity of a DER certificate, in Unix seconds: `(not_before, not_after)`.
+///
+/// A minimal DER walk to `tbsCertificate.validity` (RFC 5280 section 4.1),
+/// for the agent to schedule the renewal of its own certificate. It reads
+/// lengths and tags strictly and returns `None` on anything unexpected; it
+/// does not verify the certificate.
+pub fn certificate_validity(der: &[u8]) -> Option<(u64, u64)> {
+    let (certificate, _) = der_element(der, 0x30)?;
+    let (tbs, _) = der_element(certificate, 0x30)?;
+    // Optional [0] EXPLICIT version.
+    let mut rest = tbs;
+    if rest.first() == Some(&0xa0) {
+        rest = der_element(rest, 0xa0)?.1;
+    }
+    let (_, rest) = der_element(rest, 0x02)?; // serialNumber
+    let (_, rest) = der_element(rest, 0x30)?; // signature
+    let (_, rest) = der_element(rest, 0x30)?; // issuer
+    let (validity, _) = der_element(rest, 0x30)?;
+    let (not_before, after) = der_time(validity)?;
+    let (not_after, _) = der_time(after)?;
+    Some((not_before, not_after))
+}
+
+/// `(content, rest)` of the element at the start of `input` with `tag`.
+fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (&first, input) = input.split_first()?;
+    if first != tag {
+        return None;
+    }
+    let (&len0, mut input) = input.split_first()?;
+    let len = if len0 < 0x80 {
+        usize::from(len0)
+    } else {
+        let count = usize::from(len0 & 0x7f);
+        if count == 0 || count > 4 || input.len() < count {
+            return None;
+        }
+        let mut len = 0usize;
+        for &b in &input[..count] {
+            len = len.checked_mul(256)?.checked_add(usize::from(b))?;
+        }
+        input = &input[count..];
+        len
+    };
+    (input.len() >= len).then(|| input.split_at(len))
+}
+
+/// A `UTCTime` (`YYMMDDHHMMSSZ`) or `GeneralizedTime` (`YYYYMMDDHHMMSSZ`), in
+/// Unix seconds, and what follows it.
+fn der_time(input: &[u8]) -> Option<(u64, &[u8])> {
+    let (tag, (text, rest)) = match input.first()? {
+        0x17 => (0x17, der_element(input, 0x17)?),
+        0x18 => (0x18, der_element(input, 0x18)?),
+        _ => return None,
+    };
+    let (year, text) = if tag == 0x17 {
+        let yy = digits(text.get(..2)?)?;
+        (if yy < 50 { 2000 + yy } else { 1900 + yy }, text.get(2..)?)
+    } else {
+        (digits(text.get(..4)?)?, text.get(4..)?)
+    };
+    if text.len() != 11 || text[10] != b'Z' {
+        return None;
+    }
+    let month = digits(&text[0..2])?;
+    let day = digits(&text[2..4])?;
+    let hour = digits(&text[4..6])?;
+    let minute = digits(&text[6..8])?;
+    let second = digits(&text[8..10])?;
+    let month = time::Month::try_from(u8::try_from(month).ok()?).ok()?;
+    let date =
+        time::Date::from_calendar_date(i32::try_from(year).ok()?, month, u8::try_from(day).ok()?)
+            .ok()?;
+    let time = time::Time::from_hms(
+        u8::try_from(hour).ok()?,
+        u8::try_from(minute).ok()?,
+        u8::try_from(second).ok()?,
+    )
+    .ok()?;
+    let at = time::PrimitiveDateTime::new(date, time)
+        .assume_utc()
+        .unix_timestamp();
+    Some((u64::try_from(at).ok()?, rest))
+}
+
+fn digits(text: &[u8]) -> Option<u32> {
+    text.iter().try_fold(0u32, |acc, b| {
+        b.is_ascii_digit().then(|| acc * 10 + u32::from(b - b'0'))
+    })
+}

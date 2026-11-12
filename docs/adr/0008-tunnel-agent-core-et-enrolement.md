@@ -73,7 +73,13 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 - **Détection de coupure** :
   - keep-alive QUIC toutes les 5 s, délai d'inactivité de 15 s (`TUN-E013`) ;
   - **heartbeat applicatif** sur le flux de contrôle : Ping toutes les 10 s au plus (l'intervalle est annoncé par le core dans `HelloAck`), et pair déclaré muet sans Pong pendant 30 s (`TUN-E012`). Il détecte un core dont QUIC répond mais dont l'application est bloquée.
-- **Reconnexion** (PR 4) : backoff exponentiel de 1 s à 60 s avec une gigue complète, remis à zéro après 60 s de connexion stable.
+- **Reconnexion** (`ostena_tunnel::link::AgentLink`, démarré avec l'agent) :
+  - backoff exponentiel de 1 s à 60 s, avec une **gigue complète** : un délai tiré au hasard entre zéro et la borne, pour que des agents coupés ensemble ne reviennent pas ensemble ;
+  - la séquence repart de zéro après une connexion restée stable 60 s ;
+  - l'adresse du core est résolue à chaque tentative ;
+  - la clé et le certificat sont **relus à chaque connexion**, si bien qu'un certificat renouvelé sert dès la suivante ;
+  - l'état est partagé avec le plan de contrôle : `ostena agent status` affiche « connecté (QUIC) depuis N s, RTT … » ou « non connecté, nouvelle tentative dans N s (code : cause) », et l'échéance du certificat.
+- **Démarrage** : les noms des composants Ostena sont résolus **avant** le lien. En production, un nom introuvable refuse le démarrage (`CFG-P010`). Les noms sont résolus de nouveau toutes les 5 minutes ; un échec garde les adresses précédentes, et l'union garde les anciennes adresses une période de plus. Sans `tls_core_ca` (développement), le lien n'est pas démarré et `status` le dit.
 - **État de l'agent** : la clé, le certificat et le journal anti-rejeu sont sur disque. La politique et le jeu de clés sont repoussés par le core à chaque connexion. Les sessions en cours sont fermées à la coupure (v1).
 
 ### Messages de contrôle v1
@@ -149,7 +155,12 @@ Pas de PKCS#10, donc aucun analyseur ASN.1 exposé côté core.
 - le core vérifie la preuve (`TUN-E022`), émet un certificat pour le même agent et le même groupe, l'enregistre, et répond `certificate` avec la validité. L'agent planifie ainsi le renouvellement suivant sans analyser de X.509 ;
 - l'ancien certificat reste valide jusqu'à son expiration, sauf révocation.
 
-Le déclenchement automatique côté agent arrive avec le branchement de l'agent (PR 4).
+**Côté agent, le renouvellement est automatique** :
+- au démarrage de chaque connexion, l'agent lit la validité de son certificat (lecture DER minimale, `pki::certificate_validity`) et arme une échéance aux 2/3 ;
+- à l'échéance, il envoie `renew` avec une nouvelle clé ;
+- à la réception de `certificate`, il vérifie que le certificat porte bien sa nouvelle clé, écrit la clé et le certificat à côté des actuels (`.new`), renomme la clé, puis le certificat, et réarme l'échéance.
+
+Un arrêt entre les deux renommages laisse la nouvelle clé et `agent.crt.new` : la connexion suivante termine le renommage avant de lire l'identité.
 
 **La révocation** :
 - c'est un statut dans le registre, contrôlé à chaque poignée de main (`TUN-E005`) ;
@@ -276,7 +287,7 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E022` | preuve de possession invalide |
 | `TUN-E023` | jeton brûlé après trois échecs |
 
-Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused`.
+Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`.
 
 ## Conséquences
 
