@@ -32,6 +32,8 @@ client() {
 
 sleep 1
 echo "idle: $(rss) (anonymous $(anon))"
+# Each open session holds one more socket in the server.
+base=$(ls "/proc/$server_pid/fd" | wc -l)
 [ "$(client ok)" = ok ] || { echo "session failed"; exit 1; }
 
 for n in 1 50; do
@@ -39,9 +41,10 @@ for n in 1 50; do
   for _ in $(seq $((started + 1)) "$n"); do client hold >/dev/null 2>&1 & done
   for _ in $(seq 1 100); do
     open=$(ls "/proc/$server_pid/fd" | wc -l)
-    [ "$open" -ge $((n + 8)) ] && break
+    [ "$open" -ge $((base + n)) ] && break
     sleep 0.1
   done
+  [ "$open" -ge $((base + n)) ] || { echo "only $((open - base)) of $n sessions opened"; exit 1; }
   sleep 2
   echo "$n session(s): $(rss) (anonymous $(anon))"
 done
