@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Resident memory of the SSH server of ostena-ssh (frozen list, pre-check):
+# idle, then with 1 and 50 sessions opened by the OpenSSH client. Linux only
+# (reads /proc). Needs ssh and ssh-keygen. Usage: tests/ssh/footprint.sh
+set -euo pipefail
+
+work="$(mktemp -d)"
+server_pid=""
+cleanup() {
+  jobs -p | xargs -r kill 2>/dev/null || true
+  [ -n "$server_pid" ] && kill "$server_pid" 2>/dev/null || true
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+cargo build --quiet --release --locked -p ostena-ssh --example footprint_server
+ssh-keygen -q -t ecdsa -b 256 -N "" -f "$work/host"
+ssh-keygen -q -t ecdsa -b 256 -N "" -f "$work/client"
+
+target/release/examples/footprint_server "$work/host" "$work/client.pub" > "$work/out" &
+server_pid=$!
+for _ in $(seq 1 50); do grep -q listening "$work/out" 2>/dev/null && break; sleep 0.1; done
+port="$(sed -n 's/^listening 127.0.0.1://p' "$work/out")"
+echo "[127.0.0.1]:$port $(cut -d' ' -f1-2 "$work/host.pub")" > "$work/known_hosts"
+
+rss() { awk '/^VmRSS/ {printf "%.1f MiB", $2 / 1024}' "/proc/$server_pid/status"; }
+anon() { awk '/^RssAnon/ {printf "%.1f MiB", $2 / 1024}' "/proc/$server_pid/status"; }
+client() {
+  ssh -F none -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$work/known_hosts" \
+    -o IdentitiesOnly=yes -i "$work/client" -p "$port" tester@127.0.0.1 "$@"
+}
+
+sleep 1
+echo "idle: $(rss) (anonymous $(anon))"
+[ "$(client ok)" = ok ] || { echo "session failed"; exit 1; }
+
+for n in 1 50; do
+  started=$(jobs -p | wc -l)
+  for _ in $(seq $((started + 1)) "$n"); do client hold >/dev/null 2>&1 & done
+  for _ in $(seq 1 100); do
+    open=$(ls "/proc/$server_pid/fd" | wc -l)
+    [ "$open" -ge $((n + 8)) ] && break
+    sleep 0.1
+  done
+  sleep 2
+  echo "$n session(s): $(rss) (anonymous $(anon))"
+done
