@@ -189,6 +189,25 @@ jobs:
           path: fuzz/artifacts/
           retention-days: 30
 
+  # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
+  # our server behind the pre-check (sessions, refusals, audit), then our
+  # client against a Debian 12 OpenSSH server in Docker, with the agent key
+  # installed as `restrict,from=`.
+  ssh-interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+      - run: ssh -V
+      - run: cargo test --locked -p ostena-ssh --test interop
+        env:
+          OSTENA_REQUIRE_OPENSSH: "1"
+      - run: bash tests/ssh/debian12-target.sh
+
   # Agent service lifecycle under systemd (install, status, permissions,
   # hardening score, clean stop, bounded restarts, uninstall), the unit on
   # systemd 252 (Debian 12), and the idle footprint.
