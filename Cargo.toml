@@ -10,6 +10,7 @@ members = [
     "crates/ostena-frame",
     "crates/ostena-platform",
     "crates/ostena-tunnel",
+    "crates/ostena-ssh",
     "crates/ostena-cli",
     "xtask",
 ]
@@ -28,6 +29,7 @@ ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 ostena-platform = { path = "crates/ostena-platform" }
 ostena-scope = { path = "crates/ostena-scope" }
+ostena-ssh = { path = "crates/ostena-ssh" }
 ostena-tunnel = { path = "crates/ostena-tunnel" }
 
 # Third-party dependencies. Each one is justified in the PR that adds it.
@@ -42,6 +44,14 @@ rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs"
 time = { version = "0.3.55", default-features = false }
 # QUIC transport of the agent-core tunnel (ADR-0008); TLS comes from ostena-crypto::tls.
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+# SSH server (agent) and client (driver to the targets), ADR-0010. Exact version:
+# its own cryptography is an accepted exception, confined to ostena-ssh
+# (ADR-0009, deny.toml); aws-lc-rs backend, no RSA, DSA or compression.
+russh = { version = "=0.65.1", default-features = false, features = ["aws-lc-rs"] }
+# Pinned with russh (which requires this release candidate); no feature of our
+# own. Review: ssh-key 0.7 stable, a RustSec advisory, or the end of M1 at
+# the latest (ADR-0009).
+ssh-key = { version = "=0.7.0-rc.11", default-features = false }
 # Shamir secret sharing of the offline root secret (2 of 3), audited; used by ostena-crypto only.
 vsss-rs = { version = "6.0.1", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.10.1", default-features = false }

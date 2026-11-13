@@ -1,0 +1,25 @@
+[package]
+name = "ostena-ssh"
+description = "Native SSH access: frozen algorithms, pre-check of the peer, SSH library configuration (ADR-0010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Brings aws-lc-rs with prebuilt-nasm (offline Windows build, ADR-0002) when
+# this crate is built alone; the agent keys come from it in the next lots.
+ostena-crypto.workspace = true
+russh.workspace = true
+ssh-key.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

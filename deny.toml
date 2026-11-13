@@ -58,7 +58,12 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 # Duplicates that cannot be avoided go here, each with a reason.
-skip = []
+skip = [
+    # Build-time only (procedural macros): clap_derive and futures-macro use
+    # syn 3, the derives of russh and of its dependencies still use syn 2.
+    # Nothing of it is linked into the binary.
+    { crate = "syn@2.0.119", reason = "proc-macro dependency of russh (delegate, enum_dispatch) and curve25519-dalek, build time only" },
+]
 skip-tree = []
 deny = [
     # TLS and crypto go through rustls / aws-lc-rs in ostena-crypto only.
@@ -68,7 +73,7 @@ deny = [
     # Cryptography goes through ostena-crypto only (ADR-0009): aws-lc-rs,
     # rustls and rcgen may be direct dependencies of ostena-crypto, and of the
     # libraries ostena-crypto drives, nothing else. ring is refused everywhere.
-    { crate = "aws-lc-rs", wrappers = ["ostena-crypto", "rustls", "rustls-webpki", "rcgen", "quinn-proto"], reason = "only ostena-crypto may call aws-lc-rs" },
+    { crate = "aws-lc-rs", wrappers = ["ostena-crypto", "rustls", "rustls-webpki", "rcgen", "quinn-proto", "russh"], reason = "only ostena-crypto may call aws-lc-rs" },
     { crate = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "only reachable through aws-lc-rs" },
     { crate = "rustls", wrappers = ["ostena-crypto", "quinn", "quinn-proto"], reason = "TLS configurations are built by ostena-crypto::tls only; quinn only carries them" },
     # QUIC is the tunnel's business only (ADR-0008).
@@ -78,6 +83,41 @@ deny = [
     { crate = "rcgen", wrappers = ["ostena-crypto"], reason = "certificates are issued by ostena-crypto::pki only" },
     { crate = "vsss-rs", wrappers = ["ostena-crypto"], reason = "secret sharing of the root secret by ostena-crypto::sealed only" },
     { crate = "ring", reason = "use ostena-crypto (aws-lc-rs)" },
+    # The SSH library brings its own cryptography: an exception confined to
+    # ostena-ssh (ADR-0009, section écarts). Each crate below is reachable only
+    # through russh, ssh-key and their own internal chain, never from our code.
+    { crate = "russh", wrappers = ["ostena-ssh"], reason = "SSH is ostena-ssh business only (ADR-0010)" },
+    { crate = "ssh-key", wrappers = ["ostena-ssh", "russh"], reason = "SSH keys only through ostena-ssh and russh" },
+    { crate = "ssh-cipher", wrappers = ["ssh-key"], reason = "russh exception (ADR-0009)" },
+    { crate = "p256", wrappers = ["russh", "ssh-key"], reason = "russh exception (ADR-0009); P-256 goes through ostena-crypto" },
+    { crate = "p384", wrappers = ["russh", "ssh-key"], reason = "russh exception (ADR-0009)" },
+    { crate = "p521", wrappers = ["russh", "ssh-key"], reason = "russh exception (ADR-0009)" },
+    { crate = "ecdsa", wrappers = ["p256", "p384", "p521", "russh"], reason = "russh exception (ADR-0009); ECDSA goes through ostena-crypto" },
+    { crate = "elliptic-curve", wrappers = ["ecdsa", "p256", "p384", "p521", "primeorder", "russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "ed25519-dalek", wrappers = ["russh", "ssh-key"], reason = "russh exception (ADR-0009); Ed25519 is outside the frozen list" },
+    { crate = "curve25519-dalek", wrappers = ["ed25519-dalek", "russh"], reason = "russh exception (ADR-0009); X25519 is outside the frozen list" },
+    { crate = "aes", wrappers = ["aes-gcm", "pkcs5", "russh", "ssh-cipher"], reason = "russh exception (ADR-0009); AES goes through ostena-crypto" },
+    { crate = "aes-gcm", wrappers = ["pkcs5", "ssh-cipher"], reason = "russh exception (ADR-0009)" },
+    { crate = "ctr", wrappers = ["aes-gcm", "russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "cbc", wrappers = ["pkcs5", "russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "ghash", wrappers = ["aes-gcm", "russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "polyval", wrappers = ["ghash", "russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "poly1305", wrappers = ["ssh-cipher"], reason = "russh exception (ADR-0009)" },
+    { crate = "salsa20", wrappers = ["russh", "scrypt"], reason = "russh exception (ADR-0009)" },
+    { crate = "sha1", wrappers = ["russh", "ssh-key"], reason = "russh exception (ADR-0009)" },
+    { crate = "sha2", wrappers = ["bcrypt-pbkdf", "ed25519-dalek", "p256", "p384", "p521", "pageant", "pkcs5", "russh", "scrypt", "ssh-key"], reason = "russh exception (ADR-0009); SHA-2 goes through ostena-crypto" },
+    { crate = "sha3", wrappers = ["ml-kem", "russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "hmac", wrappers = ["hkdf", "pbkdf2", "rfc6979", "russh", "ssh-key"], reason = "russh exception (ADR-0009); HMAC goes through ostena-crypto" },
+    { crate = "hkdf", wrappers = ["elliptic-curve"], reason = "russh exception (ADR-0009)" },
+    { crate = "md5", wrappers = ["russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "ml-kem", wrappers = ["russh"], reason = "russh exception (ADR-0009); ML-KEM goes through ostena-crypto" },
+    { crate = "pbkdf2", wrappers = ["bcrypt-pbkdf", "pkcs5", "russh", "scrypt"], reason = "russh exception (ADR-0009); PBKDF2 goes through ostena-crypto" },
+    { crate = "scrypt", wrappers = ["pkcs5", "russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "argon2", wrappers = ["ssh-key"], reason = "russh exception (ADR-0009)" },
+    { crate = "bcrypt-pbkdf", wrappers = ["ssh-key"], reason = "russh exception (ADR-0009)" },
+    { crate = "blowfish", wrappers = ["bcrypt-pbkdf"], reason = "russh exception (ADR-0009)" },
+    { crate = "des", reason = "outside the frozen list" },
+    { crate = "rand", wrappers = ["num-bigint", "pageant", "proptest", "quinn-proto", "russh"], reason = "randomness goes through ostena-crypto::rand; russh and quinn-proto draw their own, proptest is test only" },
 ]
 
 [sources]
