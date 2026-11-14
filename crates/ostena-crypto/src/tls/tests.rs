@@ -363,7 +363,8 @@ fn revoked_agent_certificate_is_refused() {
 fn unreadable_registry_refuses_the_agent() {
     let f = fixture();
     let agent = agent(&f.pki, valid());
-    f.registry.set(agent.certificate(), ClientRefusal::Unavailable);
+    f.registry
+        .set(agent.certificate(), ClientRefusal::Unavailable);
     let client = client_config(&f.pki.root_anchor(), Some(&agent), &[ALPN]).unwrap();
     let o = handshake(
         client,

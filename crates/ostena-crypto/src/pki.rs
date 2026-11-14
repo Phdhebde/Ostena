@@ -281,6 +281,26 @@ impl IssuingAuthority {
         })
     }
 
+    /// Loads the issuing CA from its PKCS#8 key and the certificate the root
+    /// signed: the common name is read from the certificate, and the key must
+    /// be the one it certifies.
+    ///
+    /// # Errors
+    ///
+    /// [`PkiError::Issuance`] if the certificate cannot be read, the key is
+    /// not ECDSA P-256, or it is not the certified key.
+    pub fn from_certificate(
+        pkcs8: &SecretBytes,
+        certificate: CertificateDer<'static>,
+    ) -> Result<Self, PkiError> {
+        let subject = certificate_subject(&certificate).ok_or(PkiError::Issuance)?;
+        let key = p256::SigningKey::from_pkcs8(pkcs8).map_err(|_| PkiError::Issuance)?;
+        if subject.public_key != key.verifying_key().to_bytes() {
+            return Err(PkiError::Issuance);
+        }
+        Self::from_parts(&subject.common_name, pkcs8, certificate)
+    }
+
     /// Its common name.
     pub fn common_name(&self) -> &str {
         &self.common_name
@@ -387,14 +407,22 @@ pub fn pem_private_key(pkcs8: &SecretBytes) -> SecretBytes {
 ///
 /// [`PkiError::Issuance`] unless it is a PEM PKCS#8 ECDSA P-256 key.
 pub fn signing_key_from_pem(pem_text: &SecretBytes) -> Result<p256::SigningKey, PkiError> {
+    p256::SigningKey::from_pkcs8(&pkcs8_from_pem(pem_text)?).map_err(|_| PkiError::Issuance)
+}
+
+/// Decodes a PEM PKCS#8 private key (as written by [`pem_private_key`]).
+///
+/// # Errors
+///
+/// [`PkiError::Issuance`] unless it is a PEM PKCS#8 document.
+pub fn pkcs8_from_pem(pem_text: &SecretBytes) -> Result<SecretBytes, PkiError> {
     use rustls::pki_types::PrivatePkcs8KeyDer;
     use rustls::pki_types::pem::PemObject;
     // SECRET-EXPOSURE: the PEM document is decoded into a PKCS#8 secret.
     #[expect(clippy::disallowed_methods)]
     let der = PrivatePkcs8KeyDer::from_pem_slice(pem_text.expose_secret())
         .map_err(|_| PkiError::Issuance)?;
-    p256::SigningKey::from_pkcs8(&SecretBytes::from(der.secret_pkcs8_der().to_vec()))
-        .map_err(|_| PkiError::Issuance)
+    Ok(SecretBytes::from(der.secret_pkcs8_der().to_vec()))
 }
 
 /// First line of a public key file.
@@ -463,6 +491,54 @@ pub fn certificate_validity(der: &[u8]) -> Option<(u64, u64)> {
     let (not_before, after) = der_time(validity)?;
     let (not_after, _) = der_time(after)?;
     Some((not_before, not_after))
+}
+
+/// The subject common name and the P-256 public key of a certificate.
+struct Subject {
+    common_name: String,
+    public_key: [u8; p256::PUBLIC_KEY_LEN],
+}
+
+/// Reads `tbsCertificate.subject` (its common name, `UTF8String` or
+/// `PrintableString`) and `subjectPublicKeyInfo` (an uncompressed P-256 point),
+/// with the same strict walk as [`certificate_validity`].
+fn certificate_subject(der: &[u8]) -> Option<Subject> {
+    const COMMON_NAME: &[u8] = &[0x55, 0x04, 0x03];
+    let (certificate, _) = der_element(der, 0x30)?;
+    let (tbs, _) = der_element(certificate, 0x30)?;
+    let mut rest = tbs;
+    if rest.first() == Some(&0xa0) {
+        rest = der_element(rest, 0xa0)?.1;
+    }
+    let (_, rest) = der_element(rest, 0x02)?; // serialNumber
+    let (_, rest) = der_element(rest, 0x30)?; // signature
+    let (_, rest) = der_element(rest, 0x30)?; // issuer
+    let (_, rest) = der_element(rest, 0x30)?; // validity
+    let (mut names, rest) = der_element(rest, 0x30)?; // subject
+    let mut common_name = None;
+    while !names.is_empty() {
+        let (set, next) = der_element(names, 0x31)?;
+        names = next;
+        let (attribute, _) = der_element(set, 0x30)?;
+        let (oid, value) = der_element(attribute, 0x06)?;
+        if oid == COMMON_NAME {
+            let text = der_element(value, 0x0c)
+                .or_else(|| der_element(value, 0x13))?
+                .0;
+            common_name = Some(std::str::from_utf8(text).ok()?.to_owned());
+        }
+    }
+    let (spki, _) = der_element(rest, 0x30)?;
+    let (_, spki) = der_element(spki, 0x30)?; // algorithm
+    let (bits, _) = der_element(spki, 0x03)?;
+    // No unused bits, then the point.
+    let (&0, point) = bits.split_first()? else {
+        return None;
+    };
+    Some(Subject {
+        common_name: common_name?,
+        public_key: point.try_into().ok()?,
+    })
 }
 
 /// `(content, rest)` of the element at the start of `input` with `tag`.
