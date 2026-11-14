@@ -11,7 +11,7 @@ work="$(mktemp -d)"
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$work"; }
 trap cleanup EXIT
 
-# ssh-key 0.7.0-rc.11 refuses about one P-256 key in 256 (ADR-0010): make the
+# ssh-key 0.7.0-rc.11 refuses about one P-256 key in 512 (ADR-0010): make the
 # key again until it can be loaded.
 cargo build --quiet --locked -p ostena-ssh --example footprint_server
 for _ in $(seq 1 16); do

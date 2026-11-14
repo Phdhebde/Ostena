@@ -76,7 +76,7 @@ pub fn dir(name: &str) -> Dir {
 /// the public key line.
 ///
 /// ssh-key 0.7.0-rc.11 refuses a P-256 private key whose scalar OpenSSH
-/// encodes on 31 bytes (about one key in 256; ADR-0010): such a key is made
+/// encodes on 31 bytes (about one key in 512; ADR-0010): such a key is made
 /// again, so that the tests do not fail at random.
 pub fn keygen(keygen: &Path, dir: &Path, name: &str) -> (PathBuf, String) {
     let path = dir.join(name);

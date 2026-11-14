@@ -10,6 +10,7 @@
 pub mod algorithms;
 #[cfg(feature = "russh")]
 pub mod config;
+pub mod keys;
 pub mod precheck;
 
 #[doc(hidden)]

@@ -1357,6 +1357,8 @@ dependencies = [
 name = "ostena-ssh"
 version = "0.0.0"
 dependencies = [
+ "base64",
+ "ostena-common",
  "ostena-crypto",
  "proptest",
  "russh",

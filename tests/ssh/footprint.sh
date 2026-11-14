@@ -14,7 +14,7 @@ cleanup() {
 trap cleanup EXIT
 
 cargo build --quiet --release --locked -p ostena-ssh --example footprint_server
-# ssh-key 0.7.0-rc.11 refuses about one P-256 key in 256 (ADR-0010): make the
+# ssh-key 0.7.0-rc.11 refuses about one P-256 key in 512 (ADR-0010): make the
 # key again until the server can load it.
 key() {
   for _ in $(seq 1 16); do
