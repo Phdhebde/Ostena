@@ -10,6 +10,7 @@ mod ca;
 mod control;
 mod core_link;
 mod enroll;
+mod keyset_state;
 mod sessions;
 
 use std::path::PathBuf;
@@ -209,6 +210,26 @@ enum AgentCommand {
         #[command(subcommand)]
         command: ReplayStoreCommand,
     },
+    /// State file of the grant key set version.
+    KeysetState {
+        #[command(subcommand)]
+        command: KeysetStateCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeysetStateCommand {
+    /// Reset an unreadable state file, after confirmation. The original is
+    /// kept as `<file>.corrupt-<time>`; the agent then accepts the version the
+    /// core pushes at the next connection. The agent must be stopped.
+    Repair {
+        /// Configuration file.
+        #[arg(long, default_value_os_t = agent::default_config())]
+        config: PathBuf,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -280,6 +301,12 @@ fn main() -> ExitCode {
                         },
                 },
         }) => repair_replay_store(&path, max_ttl_secs, clock_skew_secs),
+        Some(Command::Agent {
+            command:
+                AgentCommand::KeysetState {
+                    command: KeysetStateCommand::Repair { config, yes },
+                },
+        }) => keyset_state::repair(&config, yes),
         Some(Command::Ca { command }) => match command {
             CaCommand::Root {
                 command: RootCommand::Init { name, days, outs },
