@@ -54,6 +54,15 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P008` | production | clé privée de l'agent lisible ou modifiable par un autre compte que le service ou les administrateurs |
 | `CFG-P009` | production | dossier du journal anti-rejeu modifiable par un autre compte |
 | `CFG-P010` | production | nom d'infrastructure impossible à résoudre au démarrage de l'agent (vérifié avant le lien avec le core ; rafraîchi toutes les 5 minutes, un échec garde les adresses précédentes) |
+| `CFG-V011` | cohérence | point de contrôle local de l'agent invalide |
+| `CFG-V012` | cohérence | section `[core]` : valeur hors bornes (validité des certificats d'agent 1 à 90 jours, threads 1 à 64, pool 1 à 64, délai de connexion 1 à 60 s, port nul) ou adresse d'enrôlement égale à celle du tunnel |
+| `CFG-V013` | cohérence | nom de base, rôle ou hôte PostgreSQL invalide (minuscules, chiffres et `_`, 63 octets au plus) |
+| `CFG-V014` | cohérence | nom de credential systemd invalide pour une clé du core |
+| `CFG-P011` | production | clé de la CA émettrice ou du serveur lisible au-delà du compte du service (ADR-0008) |
+| `CFG-P012` | production, **dérogation datée** | clé du core lue en clair dans un fichier au lieu d'un credential systemd chiffré : accepté et journalisé (`config.waiver`) jusqu'au 2027-04-30 inclus, refusé ensuite (ADR-0011) |
+| `CFG-P014` | production | PostgreSQL joint en TCP au lieu du socket Unix local avec l'authentification `peer` (ADR-0011) |
+
+`CFG-P013` (credential non lié au TPM 2.0, ADR-0008) est réservé : il n'est pas encore contrôlé, ce qui sera fait avec la lecture des credentials chiffrés après M1.
 
 `CFG-P006` sous Unix : le fichier (après résolution des liens symboliques) et son dossier doivent appartenir à root ou au compte du service, sans droit d'écriture pour le groupe ni pour les autres. Le compte du service est le propriétaire de `/proc/self`, ce qui évite un appel FFI `unsafe`. S'il est indisponible, seul root est accepté.
 

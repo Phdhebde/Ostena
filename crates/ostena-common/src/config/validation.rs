@@ -68,11 +68,25 @@ pub enum Code {
     InfrastructureUnresolved,
     /// Agent: invalid control endpoint.
     ControlEndpoint,
+    /// Core: value out of bounds or conflicting addresses.
+    CoreBounds,
+    /// Core: invalid database identifier or host.
+    DatabaseIdentifier,
+    /// Core: invalid key source.
+    CoreKeySource,
+    /// Core: CA or server key readable beyond the service account, or its
+    /// directory writable by another account.
+    CoreKeyExposed,
+    /// Core: CA or server key read in clear from a file instead of an
+    /// encrypted systemd credential (tolerated until 2027-04-30).
+    CoreKeyInFile,
+    /// Core: PostgreSQL reached over TCP instead of the local Unix socket.
+    DatabaseOverTcp,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 29] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -96,6 +110,12 @@ impl Code {
         Self::ReplayJournalExposed,
         Self::InfrastructureUnresolved,
         Self::ControlEndpoint,
+        Self::CoreBounds,
+        Self::DatabaseIdentifier,
+        Self::CoreKeySource,
+        Self::CoreKeyExposed,
+        Self::CoreKeyInFile,
+        Self::DatabaseOverTcp,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -124,6 +144,12 @@ impl Code {
             Self::ReplayJournalExposed => "CFG-P009",
             Self::InfrastructureUnresolved => "CFG-P010",
             Self::ControlEndpoint => "CFG-V011",
+            Self::CoreBounds => "CFG-V012",
+            Self::DatabaseIdentifier => "CFG-V013",
+            Self::CoreKeySource => "CFG-V014",
+            Self::CoreKeyExposed => "CFG-P011",
+            Self::CoreKeyInFile => "CFG-P012",
+            Self::DatabaseOverTcp => "CFG-P014",
         }
     }
 
@@ -132,6 +158,9 @@ impl Code {
         matches!(
             self,
             Self::SshHostKeyNotStrict
+                | Self::CoreKeyExposed
+                | Self::CoreKeyInFile
+                | Self::DatabaseOverTcp
                 | Self::RdpCertificateNotValidated
                 | Self::NtlmWithPasswordDelegation
                 | Self::GrantAlgorithmNotEcdsaP256
@@ -217,6 +246,9 @@ pub(crate) fn consistency(config: &Config) -> Vec<Violation> {
     if let Some(agent) = &config.agent {
         super::agent::consistency(agent, &mut out);
     }
+    if let Some(core) = &config.core {
+        super::core::consistency(core, &mut out);
+    }
     let rdp = &config.rdp;
 
     match (rdp.certificate_validation, &rdp.pki_ca_bundle) {
@@ -270,11 +302,15 @@ pub(crate) fn consistency(config: &Config) -> Vec<Violation> {
     out
 }
 
-/// Production refusals that do not depend on the file system (`CFG-P001` to `CFG-P005`).
-pub(crate) fn weakenings(config: &Config) -> Vec<Violation> {
+/// Production refusals that do not depend on the file system, at `now`
+/// (Unix seconds) for the dated waivers.
+pub(crate) fn weakenings(config: &Config, now: u64) -> Vec<Violation> {
     let mut out = Vec::new();
     if let Some(agent) = &config.agent {
         super::agent::weakenings(agent, &mut out);
+    }
+    if let Some(core) = &config.core {
+        super::core::weakenings(core, now, &mut out);
     }
 
     if config.ssh.host_key_verification != HostKeyVerification::Strict {
@@ -383,4 +419,14 @@ pub(crate) fn is_local_address(address: &str) -> bool {
         parse_host_port(address),
         Some((Host::Ip(ip), _)) if ip.to_canonical().is_loopback()
     )
+}
+
+/// Weakenings tolerated in production until a date, at `now` (Unix
+/// seconds): accepted, and logged at every start.
+pub(crate) fn tolerated(config: &Config, now: u64) -> Vec<Violation> {
+    let mut out = Vec::new();
+    if let Some(core) = &config.core {
+        super::core::tolerated(core, now, &mut out);
+    }
+    out
 }

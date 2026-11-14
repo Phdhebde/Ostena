@@ -124,7 +124,8 @@ fn codes_are_stable_and_unique() {
         "CFG-E001", "CFG-E002", "CFG-V001", "CFG-V002", "CFG-V003", "CFG-V004", "CFG-V005",
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
-        "CFG-P010", "CFG-V011",
+        "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
+        "CFG-P014",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -543,6 +544,7 @@ fn config() -> impl Strategy<Value = Config> {
                 },
                 audit: AuditConfig { outputs: audit },
                 agent: None,
+                core: None,
             },
         )
 }
@@ -953,4 +955,161 @@ fn enrollment_loader_does_not_need_the_key() {
     std::fs::write(&file, AGENT.replace("core_address", "core_addres")).unwrap();
     assert!(load_for_enrollment(&file).is_err());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------- core
+
+const CORE: &str = r#"
+[core]
+tunnel_listen = "0.0.0.0:8443"
+tls_root_ca = "/etc/ostena/ca/root.pem"
+tls_certificate = "/etc/ostena/ca/server.pem"
+tls_private_key = { credential = "server.key" }
+issuing_certificate = "/etc/ostena/ca/issuing.pem"
+issuing_private_key = { credential = "issuing.key" }
+"#;
+
+fn core_with(extra: &str) -> Config {
+    parse(&format!("{CORE}{extra}"))
+}
+
+fn core_codes(c: &Config) -> Vec<Code> {
+    c.validate().err().map(|v| v.codes()).unwrap_or_default()
+}
+
+#[test]
+fn core_section_defaults_are_safe() {
+    let c = parse(CORE);
+    assert_eq!(production_codes(&c), Vec::new());
+    assert_eq!(c.tolerated(), Vec::new());
+    let core = c.core.unwrap();
+    assert_eq!(core.enrollment_listen(), "0.0.0.0:8444".parse().unwrap());
+    assert_eq!(core.agent_certificate_days, 30);
+    let db = &core.database;
+    assert_eq!(db.socket_dir, PathBuf::from("/var/run/postgresql"));
+    assert_eq!((db.name.as_str(), db.user.as_str()), ("ostena", "ostena"));
+    assert_eq!(db.max_connections, 8);
+    assert!(db.tcp.is_none());
+}
+
+#[test]
+fn core_section_rejects_unknown_fields_and_key_kinds() {
+    for extra in [
+        "unknown = 1\n",
+        "[core.database]\npassword = \"x\"\n",
+        "[core.database.tcp]\nhost = \"db\"\npassword = \"x\"\n",
+    ] {
+        let err = Config::from_toml_str(&format!("{CORE}{extra}")).unwrap_err();
+        assert_eq!(err.codes(), vec![Code::Parse], "accepted: {extra}");
+    }
+    let text = CORE.replace("{ credential = \"server.key\" }", "{ env = \"KEY\" }");
+    assert_eq!(
+        Config::from_toml_str(&text).unwrap_err().codes(),
+        vec![Code::Parse]
+    );
+}
+
+#[test]
+fn v012_core_bounds() {
+    let c = core_with(
+        "agent_certificate_days = 91\nworker_threads = 0\nenrollment_listen = \"0.0.0.0:8443\"\n[core.database]\nmax_connections = 0\nconnect_timeout_secs = 61\nport = 0\n",
+    );
+    let codes = core_codes(&c);
+    assert_eq!(
+        codes.iter().filter(|c| **c == Code::CoreBounds).count(),
+        6,
+        "{codes:?}"
+    );
+}
+
+#[test]
+fn v013_database_identifiers() {
+    let c = core_with("[core.database]\nname = \"Ostena\"\nuser = \"a;drop\"\n");
+    assert_eq!(
+        core_codes(&c),
+        vec![Code::DatabaseIdentifier, Code::DatabaseIdentifier]
+    );
+}
+
+#[test]
+fn v014_credential_names_and_v008_relative_paths() {
+    let text = CORE
+        .replace(
+            "{ credential = \"server.key\" }",
+            "{ credential = \"../server.key\" }",
+        )
+        .replace(
+            "{ credential = \"issuing.key\" }",
+            "{ file = \"issuing.key\" }",
+        );
+    assert_eq!(
+        core_codes(&parse(&text)),
+        vec![Code::CoreKeySource, Code::RelativePath]
+    );
+}
+
+#[test]
+fn p014_tcp_refused_in_production_only() {
+    let c = core_with("[core.database.tcp]\nhost = \"127.0.0.1\"\n");
+    assert!(c.validate().is_ok());
+    assert_eq!(production_codes(&c), vec![Code::DatabaseOverTcp]);
+}
+
+#[test]
+fn p012_key_files_are_waived_until_2027_04_30_then_refused() {
+    let text = CORE
+        .replace(
+            "{ credential = \"server.key\" }",
+            "{ file = \"/var/lib/ostena/ca/server.key\" }",
+        )
+        .replace(
+            "{ credential = \"issuing.key\" }",
+            "{ file = \"/var/lib/ostena/ca/issuing.key\" }",
+        );
+    let c = parse(&text);
+    let last_second = core::KEY_FILE_WAIVER_END - 1;
+    assert_eq!(c.weakenings_at(last_second), Vec::new());
+    let waived = c.tolerated_at(last_second);
+    assert_eq!(
+        waived.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::CoreKeyInFile, Code::CoreKeyInFile]
+    );
+    assert!(waived[0].message.contains("2027-04-30"));
+    assert_eq!(c.tolerated_at(core::KEY_FILE_WAIVER_END), Vec::new());
+    assert_eq!(
+        c.weakenings_at(core::KEY_FILE_WAIVER_END)
+            .iter()
+            .map(|v| v.code)
+            .collect::<Vec<_>>(),
+        vec![Code::CoreKeyInFile, Code::CoreKeyInFile]
+    );
+}
+
+#[test]
+fn p011_key_files_through_the_injected_checker() {
+    let dir = TempDir::new("core-perms");
+    let text = CORE.replace(
+        "{ credential = \"issuing.key\" }",
+        "{ file = \"/var/lib/ostena/ca/issuing.key\" }",
+    );
+    let path = dir.write(&text);
+    let bad = FakeChecker {
+        writable: vec![],
+        exposed: vec![PathBuf::from("/var/lib/ostena/ca/issuing.key")],
+    };
+    assert_eq!(
+        load_with(&path, &bad).unwrap_err().codes(),
+        vec![Code::CoreKeyExposed]
+    );
+    let ok = FakeChecker {
+        writable: vec![],
+        exposed: vec![],
+    };
+    let loaded = load_with(&path, &ok).unwrap();
+    assert_eq!(loaded.weakenings, Vec::new());
+    // Until the end of the waiver: accepted in production, and logged.
+    assert_eq!(
+        loaded.tolerated.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::CoreKeyInFile]
+    );
 }
