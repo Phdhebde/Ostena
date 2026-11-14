@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.fingerprint, a.id::text AS \"agent!\", a.gateway_group::text AS \"group!\",\n                      (c.revoked_at IS NOT NULL OR a.revoked_at IS NOT NULL) AS \"revoked!\"\n               FROM agent_certificate c JOIN agent a ON a.id = c.agent_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "fingerprint",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "agent_certificate",
+            "name": "fingerprint"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "agent!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "group!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "revoked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "8fb2f1039b154f119422d4606c0b0236b374f42b089413c5c0ccfcc46022a6e0"
+}

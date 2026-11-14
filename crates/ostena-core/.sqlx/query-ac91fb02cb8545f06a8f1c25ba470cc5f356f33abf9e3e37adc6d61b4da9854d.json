@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE enrollment_token SET used = $2, failures = $3, burned = $4 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bool",
+        "Int2",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ac91fb02cb8545f06a8f1c25ba470cc5f356f33abf9e3e37adc6d61b4da9854d"
+}
