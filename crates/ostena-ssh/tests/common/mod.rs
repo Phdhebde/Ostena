@@ -8,6 +8,7 @@
     unreachable_pub,
     clippy::unused_async_trait_impl,
     clippy::print_stderr,
+    clippy::panic,
     reason = "test helpers, not every test binary uses every helper; the SSH handler methods are async by trait; skip notices go to stderr"
 )]
 
@@ -73,20 +74,30 @@ pub fn dir(name: &str) -> Dir {
 
 /// An ECDSA P-256 key pair made by `ssh-keygen`: the private key file and
 /// the public key line.
+///
+/// ssh-key 0.7.0-rc.11 refuses a P-256 private key whose scalar OpenSSH
+/// encodes on 31 bytes (about one key in 256; ADR-0010): such a key is made
+/// again, so that the tests do not fail at random.
 pub fn keygen(keygen: &Path, dir: &Path, name: &str) -> (PathBuf, String) {
     let path = dir.join(name);
-    let status = Command::new(keygen)
-        .args([
-            "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-C", "test", "-f",
-        ])
-        .arg(&path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let public = std::fs::read_to_string(path.with_extension("pub"))
-        .or_else(|_| std::fs::read_to_string(format!("{}.pub", path.display())))
-        .unwrap();
-    (path, public.trim().to_owned())
+    let public_path = PathBuf::from(format!("{}.pub", path.display()));
+    for _ in 0..16 {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&public_path);
+        let status = Command::new(keygen)
+            .args([
+                "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-C", "test", "-f",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        if russh::keys::load_secret_key(&path, None).is_ok() {
+            let public = std::fs::read_to_string(&public_path).unwrap();
+            return (path, public.trim().to_owned());
+        }
+    }
+    panic!("no loadable key in 16 attempts")
 }
 
 /// Loads a private key written by `ssh-keygen`.

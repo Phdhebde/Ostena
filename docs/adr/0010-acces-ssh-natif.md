@@ -87,6 +87,14 @@ Une cible doit donc avoir une clé hôte ECDSA P-256. C'est le cas par défaut d
 
 L'analyseur est testé par propriétés et par une cible `cargo-fuzz` (`ssh_precheck`), dont le corpus part d'offres réelles capturées d'OpenSSH 9.5 (client) et 9.2 (serveur Debian 12).
 
+### Défaut amont : clés P-256 à scalaire court
+
+`ssh-key 0.7.0-rc.11`, imposée par russh, refuse une clé privée P-256 dont OpenSSH encode le scalaire sur **31 octets**, quand il commence par un octet nul : `Encoding(Length)`. Cela concerne environ une clé sur 256 produite par `ssh-keygen`. Constaté sur 600 clés générées (une refusée), et vérifié par décodage de la clé fautive. Les clés à 32 ou 33 octets passent.
+
+- **L'agent génère et stocke lui-même ses clés** (clé hôte, clé pour les cibles), par `ostena-crypto`, avec un scalaire de 32 octets fixes. Il ne charge pas de clé produite par `ssh-keygen`.
+- Les tests et les scripts qui passent par `ssh-keygen` régénèrent une clé que russh ne sait pas lire.
+- À signaler en amont, et à revérifier avec `ssh-key` 0.7 stable : c'est l'un des critères de réexamen de l'ADR-0009.
+
 ## Conséquences
 
 - **Interopérabilité vérifiée** :

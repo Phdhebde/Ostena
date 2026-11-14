@@ -4,7 +4,11 @@
 //! prints `listening <address>` then serves until killed. Not part of
 //! `ostena`.
 //!
-//! `footprint_server <host key> <authorized public key line file>`
+//! `footprint_server <host key> <authorized public key line file>`, or
+//! `footprint_server --check <private key>`, which exits with 0 if the key
+//! can be loaded (ssh-key 0.7.0-rc.11 refuses about one P-256 key in 256
+//! from `ssh-keygen`, see ADR-0010).
+//!
 
 #![allow(
     clippy::expect_used,
@@ -71,6 +75,12 @@ impl russh::server::Handler for Server {
 
 fn main() {
     let mut args = std::env::args().skip(1);
+    if std::env::args().nth(1).as_deref() == Some("--check") {
+        let key = std::env::args()
+            .nth(2)
+            .expect("usage: footprint_server --check <key>");
+        std::process::exit(i32::from(russh::keys::load_secret_key(key, None).is_err()));
+    }
     let host_key = args
         .next()
         .expect("usage: footprint_server <host key> <public key file>");

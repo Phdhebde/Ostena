@@ -14,8 +14,18 @@ cleanup() {
 trap cleanup EXIT
 
 cargo build --quiet --release --locked -p ostena-ssh --example footprint_server
-ssh-keygen -q -t ecdsa -b 256 -N "" -f "$work/host"
-ssh-keygen -q -t ecdsa -b 256 -N "" -f "$work/client"
+# ssh-key 0.7.0-rc.11 refuses about one P-256 key in 256 (ADR-0010): make the
+# key again until the server can load it.
+key() {
+  for _ in $(seq 1 16); do
+    rm -f "$1" "$1.pub"
+    ssh-keygen -q -t ecdsa -b 256 -N "" -f "$1"
+    target/release/examples/footprint_server --check "$1" && return 0
+  done
+  return 1
+}
+key "$work/host"
+key "$work/client"
 
 target/release/examples/footprint_server "$work/host" "$work/client.pub" > "$work/out" &
 server_pid=$!

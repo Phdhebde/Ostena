@@ -11,7 +11,16 @@ work="$(mktemp -d)"
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$work"; }
 trap cleanup EXIT
 
-ssh-keygen -q -t ecdsa -b 256 -N "" -C ostena-agent -f "$work/agent"
+# ssh-key 0.7.0-rc.11 refuses about one P-256 key in 256 (ADR-0010): make the
+# key again until it can be loaded.
+cargo build --quiet --locked -p ostena-ssh --example footprint_server
+for _ in $(seq 1 16); do
+  rm -f "$work/agent" "$work/agent.pub"
+  ssh-keygen -q -t ecdsa -b 256 -N "" -C ostena-agent -f "$work/agent"
+  check="$work/agent"
+  if command -v cygpath >/dev/null 2>&1; then check="$(cygpath -w "$check")"; fi
+  target/debug/examples/footprint_server --check "$check" && break
+done
 public="$(cat "$work/agent.pub")"
 
 docker run -d --name "$name" -p "127.0.0.1:${port}:22" -e AGENT_KEY="$public" debian:12 sh -c '
