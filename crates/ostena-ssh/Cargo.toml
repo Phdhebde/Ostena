@@ -11,15 +11,34 @@ repository.workspace = true
 # Brings aws-lc-rs with prebuilt-nasm (offline Windows build, ADR-0002) when
 # this crate is built alone; the agent keys come from it in the next lots.
 ostena-crypto.workspace = true
-russh.workspace = true
-ssh-key.workspace = true
+russh = { workspace = true, optional = true }
+ssh-key = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+[features]
+# The SSH library and its configuration. Off for the fuzz workspace: the
+# pre-check depends on nothing of it, and russh does not build with the
+# pinned fuzzing nightly.
+default = ["russh"]
+russh = ["dep:russh", "dep:ssh-key"]
+
 [dev-dependencies]
 proptest.workspace = true
 tracing-subscriber.workspace = true
+
+[[test]]
+name = "interop"
+required-features = ["russh"]
+
+[[test]]
+name = "target"
+required-features = ["russh"]
+
+[[example]]
+name = "footprint_server"
+required-features = ["russh"]
 
 [lints]
 workspace = true

@@ -15,7 +15,7 @@ libfuzzer-sys = "0.4.13"
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
 ostena-scope = { path = "../crates/ostena-scope" }
-ostena-ssh = { path = "../crates/ostena-ssh" }
+ostena-ssh = { path = "../crates/ostena-ssh", default-features = false }
 ostena-tunnel = { path = "../crates/ostena-tunnel" }
 
 [[bin]]

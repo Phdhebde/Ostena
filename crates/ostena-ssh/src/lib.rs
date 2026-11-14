@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod algorithms;
+#[cfg(feature = "russh")]
 pub mod config;
 pub mod precheck;
 
