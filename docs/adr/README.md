@@ -14,3 +14,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0008](0008-tunnel-agent-core-et-enrolement.md) | Tunnel entre l'agent et le core, et enrôlement | Accepté en partie |
 | [0009](0009-choix-cryptographiques.md) | Choix cryptographiques et conformité aux guides ANSSI | Accepté |
 | [0010](0010-acces-ssh-natif.md) | Accès SSH natif | Accepté en partie |
+| [0011](0011-socle-du-core-et-postgresql.md) | Socle du core et base PostgreSQL | Accepté, une exception de licence en attente |
