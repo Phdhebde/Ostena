@@ -61,7 +61,7 @@ fn fail(text: &str) -> ExitCode {
 
 /// Reads the configuration without the startup checks, to install or to set
 /// up logging before the full load.
-fn read(path: &Path) -> Result<Config, String> {
+pub(crate) fn read(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{} : {e}", path.display()))?;
     Config::from_toml_str(&text).map_err(|e| e.to_string())
 }
@@ -266,7 +266,7 @@ impl StopSource {
 }
 
 #[cfg(unix)]
-async fn wait_for_signals() {
+pub(crate) async fn wait_for_signals() {
     use std::sync::Arc;
     use tokio::signal::unix::{SignalKind, signal};
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -286,7 +286,7 @@ async fn wait_for_signals() {
 }
 
 #[cfg(not(unix))]
-async fn wait_for_signals() {
+pub(crate) async fn wait_for_signals() {
     if let Err(e) = tokio::signal::ctrl_c().await {
         tracing::error!(event = "agent.signal_failed", "Ctrl-C non installé : {e}");
     }

@@ -9,5 +9,7 @@ mod error;
 pub mod schema;
 pub mod server;
 pub mod store;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use error::CoreError;
