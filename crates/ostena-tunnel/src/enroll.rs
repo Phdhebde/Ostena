@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -137,7 +138,13 @@ impl EnrollmentToken {
         })
     }
 
-    fn secret_digest(&self) -> [u8; 32] {
+    /// The token identifier (not secret).
+    pub fn id(&self) -> [u8; 16] {
+        self.id
+    }
+
+    /// The SHA-256 of the secret: all the core keeps.
+    pub fn secret_digest(&self) -> [u8; 32] {
         // SECRET-EXPOSURE: hashed; the core keeps only the digest.
         #[expect(clippy::disallowed_methods)]
         let secret = self.secret.expose_secret();
@@ -471,25 +478,118 @@ async fn exchange(conn: &Connection, params: &EnrollParams<'_>) -> Result<Enroll
 
 // ------------------------------------------------------------------- core
 
+/// What the core stores return: a boxed future, so that the traits stay
+/// usable as `dyn` (the real core answers from PostgreSQL).
+pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, TunnelError>> + Send + 'a>>;
+
 /// Where the core records enrolled agents (its registry).
 pub trait AgentRegistry: Send + Sync {
-    /// Records the certificate `fingerprint` of `agent` in `group`.
-    fn register(&self, fingerprint: [u8; 32], group: Uuid, agent: Uuid);
+    /// Records the certificate `fingerprint` of `agent` in `group`. Nothing
+    /// is handed to the agent unless it succeeds.
+    fn register(&self, fingerprint: [u8; 32], group: Uuid, agent: Uuid) -> StoreFuture<'_, ()>;
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TokenEntry {
-    digest: [u8; 32],
-    group: Uuid,
-    expires_at: u64,
-    used: bool,
-    failures: u8,
-    burned: bool,
+/// An enrolment token as the core keeps it: never the secret, only its
+/// SHA-256.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenRecord {
+    /// SHA-256 of the secret.
+    pub digest: [u8; 32],
+    /// Gateway group the token enrols into.
+    pub group: Uuid,
+    /// Expiry, Unix seconds.
+    pub expires_at: u64,
+    /// Spent by a successful enrolment.
+    pub used: bool,
+    /// Failed attempts so far.
+    pub failures: u8,
+    /// Invalidated after [`MAX_TOKEN_FAILURES`] failures.
+    pub burned: bool,
 }
 
-impl TokenEntry {
-    fn valid_at(&self, now: u64) -> bool {
+impl TokenRecord {
+    /// A fresh token for `group`, expiring at `expires_at`.
+    pub fn new(digest: [u8; 32], group: Uuid, expires_at: u64) -> Self {
+        Self {
+            digest,
+            group,
+            expires_at,
+            used: false,
+            failures: 0,
+            burned: false,
+        }
+    }
+
+    /// Whether the token can still enrol an agent at `now`.
+    pub fn valid_at(&self, now: u64) -> bool {
         !self.used && !self.burned && now < self.expires_at
+    }
+}
+
+/// The checks on one token, run while the store holds it.
+pub type TokenDecision = Box<dyn FnOnce(&mut TokenRecord) -> Result<(), TunnelError> + Send>;
+
+/// Where the core keeps the enrolment tokens.
+pub trait TokenStore: Send + Sync {
+    /// Stores a new token.
+    fn insert(&self, id: [u8; 16], record: TokenRecord) -> StoreFuture<'_, ()>;
+
+    /// Runs `decide` on token `id` while no other attempt can read it, then
+    /// stores the record as `decide` left it, whether it succeeded or not
+    /// (spent token, failure counter). Returns what `decide` returned, or
+    /// [`TunnelError::TokenUnknown`] if there is no such token.
+    fn decide(&self, id: [u8; 16], decide: TokenDecision) -> StoreFuture<'_, ()>;
+
+    /// The earliest expiry among the tokens still valid at `now`.
+    fn next_expiry(&self, now: u64) -> StoreFuture<'_, Option<u64>>;
+}
+
+/// Tokens in memory: the test core, and any core that does not need them to
+/// outlive the process.
+#[derive(Debug, Default)]
+pub struct MemoryTokenStore(Mutex<HashMap<[u8; 16], TokenRecord>>);
+
+fn poisoned() -> TunnelError {
+    TunnelError::Io("verrou empoisonné".into())
+}
+
+impl TokenStore for MemoryTokenStore {
+    fn insert(&self, id: [u8; 16], record: TokenRecord) -> StoreFuture<'_, ()> {
+        let stored = self
+            .0
+            .lock()
+            .map(|mut tokens| {
+                tokens.insert(id, record);
+            })
+            .map_err(|_| poisoned());
+        Box::pin(std::future::ready(stored))
+    }
+
+    fn decide(&self, id: [u8; 16], decide: TokenDecision) -> StoreFuture<'_, ()> {
+        let decided = self
+            .0
+            .lock()
+            .map_err(|_| poisoned())
+            .and_then(|mut tokens| {
+                let record = tokens.get_mut(&id).ok_or(TunnelError::TokenUnknown)?;
+                decide(record)
+            });
+        Box::pin(std::future::ready(decided))
+    }
+
+    fn next_expiry(&self, now: u64) -> StoreFuture<'_, Option<u64>> {
+        let next = self
+            .0
+            .lock()
+            .map(|tokens| {
+                tokens
+                    .values()
+                    .filter(|t| t.valid_at(now))
+                    .map(|t| t.expires_at)
+                    .min()
+            })
+            .map_err(|_| poisoned());
+        Box::pin(std::future::ready(next))
     }
 }
 
@@ -498,7 +598,7 @@ impl TokenEntry {
 /// of another group, an invalid proof or a burned token. Never logs the
 /// secret.
 fn record_failure(
-    entry: &mut TokenEntry,
+    entry: &mut TokenRecord,
     mut error: TunnelError,
     peer: SocketAddr,
     group: Uuid,
@@ -536,7 +636,7 @@ struct Inner {
     registry: Arc<dyn AgentRegistry>,
     lifetime: Duration,
     handshake_timeout: Duration,
-    tokens: Mutex<HashMap<[u8; 16], TokenEntry>>,
+    tokens: Arc<dyn TokenStore>,
     listener: Mutex<Option<(Endpoint, JoinHandle<()>)>>,
     clock: Arc<dyn Clock>,
 }
@@ -585,6 +685,7 @@ impl EnrollmentService {
         server: &Identity,
         issuer: Arc<IssuingAuthority>,
         registry: Arc<dyn AgentRegistry>,
+        tokens: Arc<dyn TokenStore>,
         lifetime: Duration,
         handshake_timeout: Duration,
     ) -> Result<Self, TunnelError> {
@@ -599,7 +700,7 @@ impl EnrollmentService {
                 registry,
                 lifetime,
                 handshake_timeout,
-                tokens: Mutex::new(HashMap::new()),
+                tokens,
                 listener: Mutex::new(None),
                 clock: Arc::new(SystemClock),
             }),
@@ -620,38 +721,66 @@ impl EnrollmentService {
         self.inner.clock.now()
     }
 
-    /// Issues a token for `group`, valid `ttl` (at most one hour), and opens
-    /// the listener if it is closed.
+    /// A new token for `group`, valid `ttl` (at most one hour) from `now`,
+    /// and the record the core stores for it. Nothing is stored.
     ///
     /// # Errors
     ///
-    /// [`TunnelError::Config`] for a lifetime out of bounds, or if the
-    /// listener cannot be bound.
-    ///
-    /// # Panics
-    ///
-    /// Outside a Tokio runtime.
-    pub fn issue_token(&self, group: Uuid, ttl: Duration) -> Result<EnrollmentToken, TunnelError> {
+    /// [`TunnelError::Config`] for a lifetime out of bounds, or if the random
+    /// generator fails.
+    pub fn new_token(
+        group: Uuid,
+        ttl: Duration,
+        now: u64,
+    ) -> Result<(EnrollmentToken, TokenRecord), TunnelError> {
         if ttl.is_zero() || ttl > MAX_TOKEN_TTL {
             return Err(TunnelError::Config(
                 "durée du jeton hors de 1 s..=1 h".into(),
             ));
         }
         let token = EnrollmentToken::generate()?;
-        let entry = TokenEntry {
-            digest: token.secret_digest(),
-            group,
-            expires_at: self.now() + ttl.as_secs().max(1),
-            used: false,
-            failures: 0,
-            burned: false,
-        };
-        if let Ok(mut tokens) = self.inner.tokens.lock() {
-            tokens.insert(token.id, entry);
-        }
+        let record = TokenRecord::new(token.secret_digest(), group, now + ttl.as_secs().max(1));
+        Ok((token, record))
+    }
+
+    /// Issues a token for `group`, valid `ttl` (at most one hour), and opens
+    /// the listener if it is closed.
+    ///
+    /// # Errors
+    ///
+    /// [`TunnelError::Config`] for a lifetime out of bounds, a store error,
+    /// or if the listener cannot be bound.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime.
+    pub async fn issue_token(
+        &self,
+        group: Uuid,
+        ttl: Duration,
+    ) -> Result<EnrollmentToken, TunnelError> {
+        let (token, record) = Self::new_token(group, ttl, self.now())?;
+        self.inner.tokens.insert(token.id, record).await?;
         self.open()?;
         tracing::info!(event = "enroll.token_issued", group = %group, ttl_secs = ttl.as_secs());
         Ok(token)
+    }
+
+    /// Opens the listener if the store holds a valid token: a token issued
+    /// by another process (`ostena core agent token`).
+    ///
+    /// # Errors
+    ///
+    /// A store error, or if the listener cannot be bound.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime.
+    pub async fn wake(&self) -> Result<(), TunnelError> {
+        if self.inner.tokens.next_expiry(self.now()).await?.is_some() {
+            self.open()?;
+        }
+        Ok(())
     }
 
     /// Whether the listener is bound.
@@ -697,13 +826,13 @@ impl EnrollmentService {
                         // No valid token left, even before the first look (a
                         // token can expire within the second it was issued):
                         // close now rather than leave the listener open.
-                        let Some(at) = service.next_expiry() else {
-                            service.refresh();
+                        let Some(at) = service.next_expiry().await else {
+                            service.refresh().await;
                             break;
                         };
                         let wait = at.saturating_sub(service.now());
                         tokio::time::sleep(Duration::from_secs(wait.max(1))).await;
-                        if !service.refresh() {
+                        if !service.refresh().await {
                             break;
                         }
                     }
@@ -714,7 +843,7 @@ impl EnrollmentService {
                 tokio::spawn(async move {
                     let outcome = service.handle(incoming).await;
                     Self::audit(&outcome);
-                    service.refresh();
+                    service.refresh().await;
                 });
             }
             watcher.abort();
@@ -724,28 +853,22 @@ impl EnrollmentService {
         Ok(())
     }
 
-    fn next_expiry(&self) -> Option<u64> {
-        let now = self.now();
-        self.inner
-            .tokens
-            .lock()
-            .ok()?
-            .values()
-            .filter(|t| t.valid_at(now))
-            .map(|t| t.expires_at)
-            .min()
+    /// The earliest expiry of a valid token; none if the store cannot be
+    /// read, which closes the listener (the safe side).
+    async fn next_expiry(&self) -> Option<u64> {
+        match self.inner.tokens.next_expiry(self.now()).await {
+            Ok(next) => next,
+            Err(e) => {
+                tracing::warn!(event = "enroll.store_unavailable", code = e.code(), "{e}");
+                None
+            }
+        }
     }
 
     /// Closes the listener if no valid token is left. Returns whether it is
     /// still open.
-    fn refresh(&self) -> bool {
-        let now = self.now();
-        let any_valid = self
-            .inner
-            .tokens
-            .lock()
-            .is_ok_and(|t| t.values().any(|e| e.valid_at(now)));
-        if any_valid {
+    async fn refresh(&self) -> bool {
+        if self.next_expiry().await.is_some() {
             return true;
         }
         if let Ok(mut listener) = self.inner.listener.lock()
@@ -814,10 +937,13 @@ impl EnrollmentService {
             nonce: URL_SAFE_NO_PAD.encode(nonce),
         };
         send.write_all(&frame(&challenge)?).await.map_err(lost)?;
-        let decided = read_frame(&mut recv, MAX_ENROLL_MESSAGE)
+        let decided = match read_frame(&mut recv, MAX_ENROLL_MESSAGE)
             .await
             .and_then(|f| decode_client(&f))
-            .and_then(|request| self.decide(&nonce, &request, conn.remote_address()));
+        {
+            Ok(request) => self.decide(&nonce, &request, conn.remote_address()).await,
+            Err(e) => Err(e),
+        };
         let (reply, outcome) = match decided {
             Ok(v) => v,
             Err(e) => (
@@ -837,7 +963,7 @@ impl EnrollmentService {
 
     /// Checks the request and, if every check passes, consumes the token
     /// atomically and issues the certificate.
-    fn decide(
+    async fn decide(
         &self,
         nonce: &[u8; 32],
         request: &EnrollClient,
@@ -858,48 +984,51 @@ impl EnrollmentService {
         let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| invalid("public_key"))?;
         let signature =
             Signature::from_bytes(&b64::<{ p256::SIGNATURE_LEN }>("signature", signature)?);
-        {
-            let mut tokens = self
-                .inner
-                .tokens
-                .lock()
-                .map_err(|_| TunnelError::Io("verrou empoisonné".into()))?;
-            let entry = tokens.get_mut(&token_id).ok_or(TunnelError::TokenUnknown)?;
-            let checked = (|| {
-                if entry.burned {
-                    return Err(TunnelError::TokenBurned);
-                }
-                if !ostena_crypto::constant_time_eq(
-                    &ostena_crypto::sha256::digest(&secret),
-                    &entry.digest,
-                ) {
-                    return Err(TunnelError::TokenUnknown);
-                }
-                if entry.used {
-                    return Err(TunnelError::TokenUsed);
-                }
-                if self.now() >= entry.expires_at {
-                    return Err(TunnelError::TokenExpired);
-                }
-                if entry.group != group {
-                    return Err(TunnelError::TokenGroup);
-                }
-                let proof = proof_message(
-                    nonce,
-                    &token_id,
-                    group,
-                    &key_bytes,
-                    &self.inner.server_fingerprint,
-                );
-                key.verify(&proof, &signature)
-                    .map_err(|_| TunnelError::ProofOfPossession)
-            })();
-            if let Err(error) = checked {
-                return Err(record_failure(entry, error, peer, group, &token_id));
-            }
-            // Every check passed: the token is spent before anything is issued.
-            entry.used = true;
-        }
+        let token_now = self.now();
+        let proof = proof_message(
+            nonce,
+            &token_id,
+            group,
+            &key_bytes,
+            &self.inner.server_fingerprint,
+        );
+        self.inner
+            .tokens
+            .decide(
+                token_id,
+                Box::new(move |entry: &mut TokenRecord| {
+                    let checked = (|| {
+                        if entry.burned {
+                            return Err(TunnelError::TokenBurned);
+                        }
+                        if !ostena_crypto::constant_time_eq(
+                            &ostena_crypto::sha256::digest(&secret),
+                            &entry.digest,
+                        ) {
+                            return Err(TunnelError::TokenUnknown);
+                        }
+                        if entry.used {
+                            return Err(TunnelError::TokenUsed);
+                        }
+                        if token_now >= entry.expires_at {
+                            return Err(TunnelError::TokenExpired);
+                        }
+                        if entry.group != group {
+                            return Err(TunnelError::TokenGroup);
+                        }
+                        key.verify(&proof, &signature)
+                            .map_err(|_| TunnelError::ProofOfPossession)
+                    })();
+                    if let Err(error) = checked {
+                        return Err(record_failure(entry, error, peer, group, &token_id));
+                    }
+                    // Every check passed: the token is spent before anything
+                    // is issued.
+                    entry.used = true;
+                    Ok(())
+                }),
+            )
+            .await?;
         let agent = Uuid::random().map_err(|e| TunnelError::Io(e.to_string()))?;
         // The certificate follows the real time, whatever clock the tokens use.
         let now = now();
@@ -913,7 +1042,10 @@ impl EnrollmentService {
             .issue_agent(&key, &group.to_string(), &agent.to_string(), validity)
             .map_err(|e| TunnelError::Io(e.to_string()))?;
         let fingerprint = tls::fingerprint(&cert);
-        self.inner.registry.register(fingerprint, group, agent);
+        self.inner
+            .registry
+            .register(fingerprint, group, agent)
+            .await?;
         Ok((
             EnrollServer::Accepted {
                 certificate: ostena_crypto::pki::pem_certificate(&cert),

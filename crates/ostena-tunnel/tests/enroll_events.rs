@@ -51,6 +51,7 @@ fn suspicious_attempts_raise_a_security_event() {
             let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
             let token = core
                 .issue_token(Uuid::from_bytes([1; 16]), Duration::from_secs(3600))
+                .await
                 .unwrap();
             let (key, _) = SigningKey::generate().unwrap();
             let root = core.trust_anchor();
