@@ -6,7 +6,7 @@
 //!
 //! `footprint_server <host key> <authorized public key line file>`, or
 //! `footprint_server --check <private key>`, which exits with 0 if the key
-//! can be loaded (ssh-key 0.7.0-rc.11 refuses about one P-256 key in 256
+//! can be loaded (ssh-key 0.7.0-rc.11 refuses about one P-256 key in 512
 //! from `ssh-keygen`, see ADR-0010).
 //!
 

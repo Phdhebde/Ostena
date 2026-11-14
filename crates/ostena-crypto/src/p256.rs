@@ -10,6 +10,7 @@
 //!
 //! These checks run before the library verification.
 
+use aws_lc_rs::encoding::AsBigEndian;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::{
     ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair,
@@ -92,6 +93,59 @@ impl SigningKey {
         let pair =
             EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.expose_secret())
                 .map_err(|_| CryptoError::InvalidKey)?;
+        Ok(Self(pair))
+    }
+
+    /// The private scalar, big-endian on exactly 32 bytes (leading zeros
+    /// kept), for formats that carry it bare (an OpenSSH private key).
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::InvalidKey`] if the library cannot export it.
+    pub fn scalar(&self) -> Result<SecretBytes, CryptoError> {
+        let bin = self
+            .0
+            .private_key()
+            .as_be_bytes()
+            .map_err(|_| CryptoError::InvalidKey)?;
+        let bytes: &[u8] = bin.as_ref();
+        if bytes.len() != 32 {
+            return Err(CryptoError::InvalidKey);
+        }
+        Ok(SecretBytes::from(bytes.to_vec()))
+    }
+
+    /// Rebuilds a key from its private scalar (32 bytes, big-endian); the
+    /// public key is computed.
+    ///
+    /// # Errors
+    ///
+    /// [`CryptoError::InvalidKey`] if it is not 32 bytes, zero, or not below
+    /// the group order.
+    pub fn from_scalar(scalar: &SecretBytes) -> Result<Self, CryptoError> {
+        // SECRET-EXPOSURE: the scalar is copied once into an RFC 5915
+        // structure parsed by aws-lc-rs, then the copy is dropped.
+        #[expect(clippy::disallowed_methods)]
+        let bytes: &[u8] = scalar.expose_secret();
+        let fixed: &[u8; 32] = bytes.try_into().map_err(|_| CryptoError::InvalidKey)?;
+        if !is_scalar(fixed) {
+            return Err(CryptoError::InvalidKey);
+        }
+        // ECPrivateKey ::= SEQUENCE { version 1, privateKey OCTET STRING,
+        //   [0] parameters prime256v1 }
+        let mut der = vec![0x30, 0x31, 0x02, 0x01, 0x01, 0x04, 0x20];
+        der.extend_from_slice(fixed);
+        der.extend_from_slice(&[
+            0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+        ]);
+        let der = SecretBytes::from(der);
+        // SECRET-EXPOSURE: parsed by aws-lc-rs.
+        #[expect(clippy::disallowed_methods)]
+        let pair = EcdsaKeyPair::from_private_key_der(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            der.expose_secret(),
+        )
+        .map_err(|_| CryptoError::InvalidKey)?;
         Ok(Self(pair))
     }
 

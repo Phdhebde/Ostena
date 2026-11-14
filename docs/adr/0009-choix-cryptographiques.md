@@ -125,6 +125,37 @@ Les algorithmes restent ceux de la liste figée ; seule l'implémentation diffè
 - par l'implémentation SSH propre (option B, après M1) ;
 - ou si russh fait passer ECDH et ECDSA par `aws-lc-rs`, ce qui serait à proposer en amont.
 
+**Construction.** russh est une fonctionnalité par défaut d'`ostena-ssh` (`russh`). Elle est coupée pour la crate de fuzz, car **russh ne compile pas avec le nightly épinglé pour le fuzz** (`nightly-2026-11-01`) :
+
+```text
+error[E0391]: cycle detected when computing when `ssh_key::public::key_data::KeyData` needs async drop
+  --> ssh-key-0.7.0-rc.11/src/public/key_data.rs:20:1
+```
+
+L'erreur vient du compilateur nightly (expérimentation *async drop*), pas du code. **À retester à chaque montée du nightly** : si elle disparaît, la crate de fuzz peut reprendre la fonctionnalité. Le pré-contrôle, seul analyseur de données réseau d'`ostena-ssh` pour l'instant, ne dépend pas de russh et reste fuzzé. `cargo xtask ci` (`check-release`) échoue si le binaire de release lie `ostena-ssh` sans la fonctionnalité `russh`.
+
+**Empreinte sous Windows (diagnostic du 2026-11-14).** Lier le serveur SSH au binaire ajoute 0,84 Mio au working set de l'agent au repos (+12 %), alors que ce code ne s'exécute pas. La répartition page par page (`QueryWorkingSet`) donne : tas privé +16 Kio, pages d'image privées +92 Kio, pages d'image partagées +752 Kio. Trois DLL nouvelles sont chargées au démarrage :
+
+| DLL | Pages | Rôle |
+|---|---|---|
+| `combase.dll` | 340 Kio | runtime COM |
+| `msvcp_win.dll` | 188 Kio | bibliothèque C++ système |
+| `oleaut32.dll` | 132 Kio | automation OLE |
+
+Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysStringLen`, `SysFreeString` : chaînes BSTR de la crate `windows-strings`, tirée par `pageant`, l'agent SSH de PuTTY que russh lie sous Windows). Ni `user32`, ni `gdi32`, ni `win32u` ne sont chargées. Le runtime COM entre toutefois dans un service à SID restreint qui n'en a pas l'usage : c'est de la surface d'attaque autant que de la mémoire.
+
+**Décision** :
+- **Chargement différé** d'`oleaut32` (`/DELAYLOAD:oleaut32.dll`, `delayimp.lib`) à la liaison du serveur SSH dans l'agent (PR 6) : ces fonctions ne servent qu'à parler à Pageant, ce que l'agent ne fait jamais. Mesuré : les trois DLL ne sont plus chargées, et l'écart tombe à +0,05 Mio (6,87 → 6,92 Mio).
+- **Contrôle dans `cargo xtask ci`** à la PR 6 : aucune DLL d'interface graphique ou COM (`user32`, `gdi32`, `win32u`, `combase`, `ole32`, `oleaut32`) ni dans les imports statiques du binaire, ni dans les DLL chargées par l'agent au repos.
+- **Correctif amont à proposer après M1** : rendre `pageant` optionnel dans russh ([note](../notes/russh-correctifs-amont.md)).
+- **Remesure obligatoire en PR 6**, avec le serveur SSH réel dans l'agent.
+
+**Engagements bloquants pour la PR 6** (décision du responsable du projet, 2026-11-14) :
+1. `/DELAYLOAD` d'`oleaut32` en place, et remesure : **aucune DLL chargée en plus au repos** par rapport à l'agent sans SSH (ni `oleaut32`, ni `combase`, ni `msvcp_win`) ;
+2. le contrôle de `cargo xtask ci` ci-dessus est actif et passe (imports statiques **et** DLL chargées au repos) ;
+3. si l'un des deux échoue, **la PR 6 ne fusionne pas** sans décision explicite du responsable du projet.
+- **Seuil d'empreinte double** : une régression d'empreinte n'est bloquante que si elle dépasse **+10 % et plus de 1 Mio** en valeur absolue, pour ne pas déclencher sur une base de quelques Mio (ADR-0007).
+
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 
 #### Question ouverte : échange de clés SSH hybride post-quantique

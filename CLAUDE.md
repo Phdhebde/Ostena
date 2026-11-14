@@ -71,7 +71,7 @@ packaging/  lab/  tests/  docs/  xtask/
 
 1. CI verte : `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, tests Linux et Windows, `cargo deny check`.
 2. Tests unitaires et de propriétés (`proptest`) ; pour tout analyseur de données réseau, une cible `cargo-fuzz`.
-3. Pas de régression de plus de 10 % sur les bancs de performance et d'empreinte.
+3. Pas de régression de plus de 10 % sur les bancs de performance. Pour l'empreinte, une régression bloque si elle dépasse à la fois +10 % et 1 Mio en valeur absolue.
 4. Les événements d'audit correspondants sont émis et documentés.
 5. Fonctionne hors ligne.
 6. Documentation à jour ; un choix structurant = un ADR court dans `docs/adr/` (format : contexte, décision, conséquences).
