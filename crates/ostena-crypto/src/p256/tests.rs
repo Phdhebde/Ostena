@@ -219,3 +219,37 @@ proptest! {
         prop_assert!(k.verifying_key().verify(&msg, &Signature::from_bytes(&sig)).is_err());
     }
 }
+
+#[test]
+fn scalar_round_trips_on_32_bytes() {
+    for _ in 0..64 {
+        let (key, _) = SigningKey::generate().unwrap();
+        let scalar = key.scalar().unwrap();
+        // SECRET-EXPOSURE: test only.
+        #[expect(clippy::disallowed_methods)]
+        let len = scalar.expose_secret().len();
+        assert_eq!(len, 32);
+        let again = SigningKey::from_scalar(&scalar).unwrap();
+        assert_eq!(again.verifying_key(), key.verifying_key());
+        let signature = again.sign(b"message").unwrap();
+        key.verifying_key().verify(b"message", &signature).unwrap();
+    }
+}
+
+#[test]
+fn scalar_with_leading_zeros_is_kept_on_32_bytes() {
+    let mut bytes = [0u8; 32];
+    bytes[31] = 7;
+    let key = SigningKey::from_scalar(&SecretBytes::from(bytes.to_vec())).unwrap();
+    // SECRET-EXPOSURE: test only.
+    #[expect(clippy::disallowed_methods)]
+    let back = key.scalar().unwrap().expose_secret().to_vec();
+    assert_eq!(back, bytes);
+}
+
+#[test]
+fn invalid_scalars_are_refused() {
+    for bad in [vec![0u8; 32], N.to_vec(), vec![1u8; 31], vec![1u8; 33]] {
+        assert!(SigningKey::from_scalar(&SecretBytes::from(bad)).is_err());
+    }
+}
