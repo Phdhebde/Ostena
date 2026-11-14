@@ -419,6 +419,17 @@ fn check_release(binary: Option<&str>) -> Result<()> {
         .into());
     }
     eprintln!("no test-only feature in the release build of ostena-cli");
+    match ssh_without_library(&String::from_utf8_lossy(&out.stdout)) {
+        SshLink::Absent => eprintln!("ostena-ssh not linked into ostena-cli yet"),
+        SshLink::WithLibrary => eprintln!("ostena-ssh linked with its SSH library (feature russh)"),
+        SshLink::WithoutLibrary => {
+            return Err(
+                "ostena-ssh is linked without its feature `russh`: the release binary would \
+                 have no SSH server (ADR-0009)"
+                    .into(),
+            );
+        }
+    }
     if let Some(path) = binary {
         let bytes = fs::read(path)?;
         if contains(&bytes, TESTING_MARKER) {
@@ -441,6 +452,32 @@ fn testing_features(tree: &str) -> Vec<String> {
     found.sort();
     found.dedup();
     found
+}
+
+/// How `ostena-ssh` is linked into the release build.
+#[derive(Debug, PartialEq, Eq)]
+enum SshLink {
+    /// Not a dependency (yet).
+    Absent,
+    /// With the `russh` feature, as the agent needs it.
+    WithLibrary,
+    /// Without it: only the pre-check, no SSH server. Refused.
+    WithoutLibrary,
+}
+
+/// Reads a `cargo tree -e normal,features --prefix none` output.
+fn ssh_without_library(tree: &str) -> SshLink {
+    let lines: Vec<&str> = tree.lines().map(str::trim).collect();
+    if !lines.iter().any(|l| l.starts_with("ostena-ssh v")) {
+        SshLink::Absent
+    } else if lines
+        .iter()
+        .any(|l| l.starts_with("ostena-ssh feature \"russh\""))
+    {
+        SshLink::WithLibrary
+    } else {
+        SshLink::WithoutLibrary
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -576,6 +613,18 @@ mod tests {
                 "ostena-tunnel feature \"testing\""
             ]
         );
+    }
+
+    #[test]
+    fn release_build_needs_the_ssh_library() {
+        assert_eq!(
+            ssh_without_library("ostena-cli v0.0.0 (C:\\x)\n"),
+            SshLink::Absent
+        );
+        let with = "ostena-ssh v0.0.0 (C:\\x)\nostena-ssh feature \"default\"\nostena-ssh feature \"russh\"\n";
+        assert_eq!(ssh_without_library(with), SshLink::WithLibrary);
+        let without = "ostena-ssh v0.0.0 (C:\\x)\nrussh feature \"aws-lc-rs\"\n";
+        assert_eq!(ssh_without_library(without), SshLink::WithoutLibrary);
     }
 
     #[test]
