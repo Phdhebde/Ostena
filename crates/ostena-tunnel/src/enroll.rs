@@ -793,6 +793,17 @@ impl EnrollmentService {
         self.inner.addr
     }
 
+    /// Closes the listener now, whatever the tokens (core shutdown).
+    pub fn close(&self) {
+        if let Ok(mut listener) = self.inner.listener.lock()
+            && let Some((endpoint, task)) = listener.take()
+        {
+            endpoint.close(VarInt::from_u32(0), b"");
+            task.abort();
+            tracing::info!(event = "enroll.listener_closed", addr = %self.inner.addr);
+        }
+    }
+
     fn open(&self) -> Result<(), TunnelError> {
         let mut listener = self
             .inner

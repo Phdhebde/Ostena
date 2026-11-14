@@ -7,6 +7,7 @@ pub mod cache;
 pub mod db;
 mod error;
 pub mod schema;
+pub mod server;
 pub mod store;
 
 pub use error::CoreError;
