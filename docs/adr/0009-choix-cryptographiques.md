@@ -146,9 +146,14 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 
 **Décision** :
 - **Chargement différé** d'`oleaut32` (`/DELAYLOAD:oleaut32.dll`, `delayimp.lib`) à la liaison du serveur SSH dans l'agent (PR 6) : ces fonctions ne servent qu'à parler à Pageant, ce que l'agent ne fait jamais. Mesuré : les trois DLL ne sont plus chargées, et l'écart tombe à +0,05 Mio (6,87 → 6,92 Mio).
-- **Contrôle dans `check-release`** à la PR 6 : aucune DLL d'interface graphique ou COM (`user32`, `gdi32`, `win32u`, `combase`, `ole32`, `oleaut32`) dans les imports statiques du binaire.
+- **Contrôle dans `cargo xtask ci`** à la PR 6 : aucune DLL d'interface graphique ou COM (`user32`, `gdi32`, `win32u`, `combase`, `ole32`, `oleaut32`) ni dans les imports statiques du binaire, ni dans les DLL chargées par l'agent au repos.
 - **Correctif amont à proposer après M1** : rendre `pageant` optionnel dans russh ([note](../notes/russh-correctifs-amont.md)).
 - **Remesure obligatoire en PR 6**, avec le serveur SSH réel dans l'agent.
+
+**Engagements bloquants pour la PR 6** (décision du responsable du projet, 2026-11-14) :
+1. `/DELAYLOAD` d'`oleaut32` en place, et remesure : **aucune DLL chargée en plus au repos** par rapport à l'agent sans SSH (ni `oleaut32`, ni `combase`, ni `msvcp_win`) ;
+2. le contrôle de `cargo xtask ci` ci-dessus est actif et passe (imports statiques **et** DLL chargées au repos) ;
+3. si l'un des deux échoue, **la PR 6 ne fusionne pas** sans décision explicite du responsable du projet.
 - **Seuil d'empreinte double** : une régression d'empreinte n'est bloquante que si elle dépasse **+10 % et plus de 1 Mio** en valeur absolue, pour ne pas déclencher sur une base de quelques Mio (ADR-0007).
 
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
