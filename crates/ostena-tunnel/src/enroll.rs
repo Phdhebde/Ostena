@@ -36,6 +36,7 @@ use tokio::task::JoinHandle;
 use crate::error::TunnelError;
 use crate::ids::Uuid;
 use crate::limits::Limits;
+use crate::link::{Clock, SystemClock};
 use crate::tunnel::{check_protocol, peer_certificate, read_frame, within};
 
 /// Application protocol of the enrolment listener.
@@ -537,6 +538,7 @@ struct Inner {
     handshake_timeout: Duration,
     tokens: Mutex<HashMap<[u8; 16], TokenEntry>>,
     listener: Mutex<Option<(Endpoint, JoinHandle<()>)>>,
+    clock: Arc<dyn Clock>,
 }
 
 /// The core enrolment service: tokens, listener lifecycle, issuance.
@@ -599,8 +601,23 @@ impl EnrollmentService {
                 handshake_timeout,
                 tokens: Mutex::new(HashMap::new()),
                 listener: Mutex::new(None),
+                clock: Arc::new(SystemClock),
             }),
         })
+    }
+
+    /// The same service on another wall clock (tests). Call it before any
+    /// token is issued.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.clock = clock;
+        }
+        self
+    }
+
+    fn now(&self) -> u64 {
+        self.inner.clock.now()
     }
 
     /// Issues a token for `group`, valid `ttl` (at most one hour), and opens
@@ -624,7 +641,7 @@ impl EnrollmentService {
         let entry = TokenEntry {
             digest: token.secret_digest(),
             group,
-            expires_at: now() + ttl.as_secs().max(1),
+            expires_at: self.now() + ttl.as_secs().max(1),
             used: false,
             failures: 0,
             burned: false,
@@ -677,9 +694,14 @@ impl EnrollmentService {
                 let service = service.clone();
                 tokio::spawn(async move {
                     loop {
-                        let next = service.next_expiry();
-                        let Some(at) = next else { break };
-                        let wait = at.saturating_sub(now());
+                        // No valid token left, even before the first look (a
+                        // token can expire within the second it was issued):
+                        // close now rather than leave the listener open.
+                        let Some(at) = service.next_expiry() else {
+                            service.refresh();
+                            break;
+                        };
+                        let wait = at.saturating_sub(service.now());
                         tokio::time::sleep(Duration::from_secs(wait.max(1))).await;
                         if !service.refresh() {
                             break;
@@ -703,7 +725,7 @@ impl EnrollmentService {
     }
 
     fn next_expiry(&self) -> Option<u64> {
-        let now = now();
+        let now = self.now();
         self.inner
             .tokens
             .lock()
@@ -717,7 +739,7 @@ impl EnrollmentService {
     /// Closes the listener if no valid token is left. Returns whether it is
     /// still open.
     fn refresh(&self) -> bool {
-        let now = now();
+        let now = self.now();
         let any_valid = self
             .inner
             .tokens
@@ -856,7 +878,7 @@ impl EnrollmentService {
                 if entry.used {
                     return Err(TunnelError::TokenUsed);
                 }
-                if now() >= entry.expires_at {
+                if self.now() >= entry.expires_at {
                     return Err(TunnelError::TokenExpired);
                 }
                 if entry.group != group {
@@ -879,6 +901,7 @@ impl EnrollmentService {
             entry.used = true;
         }
         let agent = Uuid::random().map_err(|e| TunnelError::Io(e.to_string()))?;
+        // The certificate follows the real time, whatever clock the tokens use.
         let now = now();
         let validity = Validity {
             not_before: now.saturating_sub(300),

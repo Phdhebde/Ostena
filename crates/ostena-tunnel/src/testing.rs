@@ -35,6 +35,7 @@ use crate::enroll::{
 use crate::error::TunnelError;
 use crate::ids::Uuid;
 use crate::limits::Limits;
+use crate::link::{Clock, SystemClock};
 use crate::renewal;
 use crate::tunnel::{ALPN, AgentConfig, CoreListener, CoreTunnel, Hello};
 
@@ -169,6 +170,23 @@ impl TestCore {
     ///
     /// Outside a Tokio runtime (it spawns the accept loop).
     pub fn start(limits: Limits, behaviour: Behaviour) -> Result<Self, TunnelError> {
+        Self::start_with_clock(limits, behaviour, Arc::new(SystemClock))
+    }
+
+    /// [`TestCore::start`], with `clock` for the enrolment tokens.
+    ///
+    /// # Errors
+    ///
+    /// If the certificates or the listener cannot be created.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime (it spawns the accept loop).
+    pub fn start_with_clock(
+        limits: Limits,
+        behaviour: Behaviour,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, TunnelError> {
         tracing::debug!(marker = MARKER);
         let config = |e: ostena_crypto::pki::PkiError| TunnelError::Config(e.to_string());
         let pki = Arc::new(TestPki::new("Ostena test core").map_err(config)?);
@@ -215,7 +233,8 @@ impl TestCore {
             registry.clone(),
             DEFAULT_CERTIFICATE_LIFETIME,
             Duration::from_secs(5),
-        )?;
+        )?
+        .with_clock(clock);
         let core = Self {
             pki,
             registry,
