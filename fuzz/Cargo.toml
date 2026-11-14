@@ -15,11 +15,19 @@ libfuzzer-sys = "0.4.13"
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
 ostena-scope = { path = "../crates/ostena-scope" }
+ostena-ssh = { path = "../crates/ostena-ssh", default-features = false }
 ostena-tunnel = { path = "../crates/ostena-tunnel" }
 
 [[bin]]
 name = "grant_decode"
 path = "fuzz_targets/grant_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh_precheck"
+path = "fuzz_targets/ssh_precheck.rs"
 test = false
 doc = false
 bench = false

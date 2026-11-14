@@ -642,6 +642,7 @@ dependencies = [
  "ostena-frame",
  "ostena-grant",
  "ostena-scope",
+ "ostena-ssh",
  "ostena-tunnel",
 ]
 
@@ -663,6 +664,16 @@ dependencies = [
  "ostena-common",
  "serde",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "ostena-ssh"
+version = "0.0.0"
+dependencies = [
+ "ostena-crypto",
+ "thiserror",
+ "tokio",
  "tracing",
 ]
 

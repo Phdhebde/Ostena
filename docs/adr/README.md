@@ -13,3 +13,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0007](0007-service-agent-et-plan-de-controle.md) | Service de l'agent passerelle et plan de contrôle local | Accepté |
 | [0008](0008-tunnel-agent-core-et-enrolement.md) | Tunnel entre l'agent et le core, et enrôlement | Accepté en partie |
 | [0009](0009-choix-cryptographiques.md) | Choix cryptographiques et conformité aux guides ANSSI | Accepté |
+| [0010](0010-acces-ssh-natif.md) | Accès SSH natif | Accepté en partie |

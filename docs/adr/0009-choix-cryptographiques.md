@@ -3,6 +3,7 @@
 - **Statut** : Accepté
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-11, algorithmes du coffre-fort décidés (P-256 + ML-KEM-768, ECDSA P-256 + ML-DSA-65)
+- **Révision** : 2026-11-13, écart SSH : cryptographie de russh dans `ostena-ssh`
 
 ## Contexte
 
@@ -94,6 +95,41 @@ CLAUDE.md prévoyait pour le coffre-fort « X25519 + ML-KEM-768, Ed25519 + ML-DS
 - **Signatures** (têtes de chaîne d'audit, mises à jour, futurs grants hybrides) : ECDSA P-256 + ML-DSA-65, hybridées par concaténation : ML-DSA signe le message, puis ECDSA signe le couple (message, signature ML-DSA). La signature n'est valide que si les deux le sont (§ 2.2.3).
 
 Les bloquants d'outillage notés pour l'authentification hybride (ML-DSA derrière une fonctionnalité instable d'`aws-lc-rs`) s'appliqueront au lot du coffre-fort.
+
+### Écarts
+
+#### SSH : la cryptographie de russh dans `ostena-ssh` (décidé le 2026-11-13)
+
+**L'écart.** L'accès SSH natif (ADR-0010) s'appuie sur la bibliothèque russh, qui apporte sa propre cryptographie au lieu de passer par `ostena-crypto`. Pour la liste figée :
+
+| Mécanisme | Implémentation | Conforme au choix d'`ostena-crypto` ? |
+|---|---|---|
+| Échange de clés ECDH P-256 | `p256` / `elliptic-curve` (RustCrypto) | non : même algorithme, autre implémentation |
+| Signatures ECDSA P-256 (clés hôte et utilisateur, certificats) | `ecdsa` / `p256` (RustCrypto), via `ssh-key` | non : même algorithme, autre implémentation |
+| Chiffrement AES-256-GCM | `aws-lc-rs` | oui |
+| Aléa (clés éphémères, signatures) | `rand` (générateur par thread, réensemencé par le système) | non : `ostena-crypto::rand` lit directement le système |
+
+Les algorithmes restent ceux de la liste figée ; seule l'implémentation diffère.
+
+**Pourquoi.** Interopérer avec OpenSSH côté client et côté cible, avec une bibliothèque maintenue, dans le calendrier du jalon M1. L'alternative, une implémentation SSH propre limitée à la liste figée et entièrement sur `ostena-crypto`, est estimée à 4 à 5 semaines ; elle est notée comme chantier après M1 ([note](../notes/ssh-implementation-propre.md)).
+
+**Confinement.**
+- russh n'est dépendance que d'`ostena-ssh`. Les crates cryptographiques qu'il tire (`p256`, `p384`, `p521`, `ecdsa`, `elliptic-curve`, `ed25519-dalek`, `curve25519-dalek`, `aes`, `aes-gcm`, `sha1`, `sha2`, `sha3`, `hmac`, `ml-kem`, `pbkdf2`, `scrypt`, `argon2`, `rand`…) sont interdites partout ailleurs par `deny.toml`, qui n'admet que leurs parents directs dans la chaîne de russh. Une autre crate ne peut ni les déclarer ni les importer ; `cargo deny`, lancé par `cargo xtask ci`, le vérifie.
+- **Liste figée, non négociable** : échange `ecdh-sha2-nistp256` seul, chiffrement `aes256-gcm@openssh.com` seul (donc pas de MAC séparé), clés et certificats `ecdsa-sha2-nistp256` seuls. X25519 (`curve25519-sha256`, `mlkem768x25519-sha256`) est désactivé : hors des mécanismes conformes de [PG-083].
+- **Strict KEX obligatoire** (CVE-2023-48795). russh ne sait pas l'exiger : il ne l'active que si les deux côtés l'annoncent, sans exposer le résultat. Un **pré-contrôle** propre à `ostena-ssh`, sans dépendance à russh, lit en clair l'identification et le premier `KEXINIT` du pair, refuse sans marqueur strict KEX ou sans algorithme commun avec la liste figée, puis rejoue les octets à russh. La configuration de russh est figée elle aussi, en défense en profondeur.
+- **Versions épinglées exactement** : `russh = "=0.65.1"` et `ssh-key = "=0.7.0-rc.11"`, une version préliminaire imposée par russh.
+
+**Impact CSPN.** L'évaluateur doit examiner deux implémentations de P-256 : aws-lc pour le tunnel et les grants, RustCrypto pour SSH. Il doit aussi examiner une dépendance en version préliminaire, et un aléa qui ne passe pas par la façade. Le périmètre de la cible de sécurité doit le dire. Le risque résiduel tient à la qualité d'implémentation de RustCrypto pour ECDH et ECDSA (temps constant, gestion des points), non à l'algorithme.
+
+**Conditions de sortie.** Retour à la règle « toute la cryptographie passe par `ostena-crypto` » :
+- par l'implémentation SSH propre (option B, après M1) ;
+- ou si russh fait passer ECDH et ECDSA par `aws-lc-rs`, ce qui serait à proposer en amont.
+
+**Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
+
+#### Question ouverte : échange de clés SSH hybride post-quantique
+
+russh 0.65.1 ne propose qu'un hybride X25519 + ML-KEM-768 (`mlkem768x25519-sha256`), hors liste. Une variante P-256 + ML-KEM-768 est décrite par un brouillon de l'IETF (`mlkem768nistp256-sha256`). Sa prise en charge par russh et par OpenSSH reste à vérifier. En attendant, l'échange SSH reste classique (ECDH P-256), comme l'authentification du tunnel (voir le risque accepté plus haut).
 
 ## Conséquences
 
