@@ -46,9 +46,12 @@ echo "idle: $(rss) (anonymous $(anon))"
 base=$(ls "/proc/$server_pid/fd" | wc -l)
 [ "$(client ok)" = ok ] || { echo "session failed"; exit 1; }
 
+opened=0
 for n in 1 50; do
-  started=$(jobs -p | wc -l)
-  for _ in $(seq $((started + 1)) "$n"); do client hold >/dev/null 2>&1 & done
+  while [ "$opened" -lt "$n" ]; do
+    client hold >/dev/null 2>&1 &
+    opened=$((opened + 1))
+  done
   for _ in $(seq 1 100); do
     open=$(ls "/proc/$server_pid/fd" | wc -l)
     [ "$open" -ge $((base + n)) ] && break
