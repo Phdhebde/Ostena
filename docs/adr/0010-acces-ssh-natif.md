@@ -84,14 +84,19 @@ Une cible doit donc avoir une clé hôte ECDSA P-256. C'est le cas par défaut d
 | `SSH-E004` | pas de strict KEX |
 | `SSH-E005` | aucun algorithme commun avec la liste figée (le type d'algorithme est précisé) |
 | `SSH-E006` | connexion interrompue avant la négociation |
+| `SSH-E007` | clé P-256 dont le scalaire est encodé sur moins de 32 octets (défaut amont, voir plus bas) |
+| `SSH-E008` | clé privée SSH invalide (format, algorithme hors liste) |
+| `SSH-E009` | génération de clé impossible |
 
 L'analyseur est testé par propriétés et par une cible `cargo-fuzz` (`ssh_precheck`), dont le corpus part d'offres réelles capturées d'OpenSSH 9.5 (client) et 9.2 (serveur Debian 12).
 
 ### Défaut amont : clés P-256 à scalaire court
 
-`ssh-key 0.7.0-rc.11`, imposée par russh, refuse une clé privée P-256 dont OpenSSH encode le scalaire sur **31 octets**, quand il commence par un octet nul : `Encoding(Length)`. Cela concerne environ une clé sur 256 produite par `ssh-keygen`. Constaté sur 600 clés générées (une refusée), et vérifié par décodage de la clé fautive. Les clés à 32 ou 33 octets passent.
+`ssh-key 0.7.0-rc.11`, imposée par russh, refuse une clé privée P-256 dont OpenSSH encode le scalaire sur **31 octets ou moins** : `Encoding(Length)`. OpenSSH écrit le scalaire en `mpint` minimal. Il tombe à 31 octets quand son premier octet est nul et que le deuxième est inférieur à 0x80, soit environ **une clé sur 512** produite par `ssh-keygen`. Constaté sur 600 clés générées (une refusée), confirmé par décodage de la clé fautive et par un test qui fabrique une telle clé. OpenSSH l'accepte ; seul `ssh-key` la refuse. Les clés à 32 ou 33 octets passent.
 
-- **L'agent génère et stocke lui-même ses clés** (clé hôte, clé pour les cibles), par `ostena-crypto`, avec un scalaire de 32 octets fixes. Il ne charge pas de clé produite par `ssh-keygen`.
+- **Les clés de l'agent et celles d'`ostena login`** sont générées par `ostena-crypto` (aws-lc-rs), jamais par `ssh-key` ni par `rand` (`ostena_ssh::keys`). Le scalaire occupe 32 octets : un scalaire dont le premier octet est nul est tiré à nouveau, ce qui coûte moins de 0,006 bit sur 256. Imposer un `mpint` de 32 octets avec un zéro de tête superflu n'est pas possible : il ne serait pas canonique, et OpenSSH le refuse.
+- **Une clé importée par un administrateur et touchée par le défaut** est refusée avec un message explicite (`SSH-E007` : « clé P-256 refusée : son scalaire privé est encodé sur 31 octets… générez-en une nouvelle, ou laissez Ostena générer la clé ») plutôt qu'une erreur de format.
+- **Tests** : un test par propriétés vérifie que toute clé générée est relue par `ssh-key` et acceptée par OpenSSH (`ssh-keygen -y`). Un test documente le défaut (clé à 31 octets refusée par `ssh-key`, acceptée par OpenSSH) ; il échouera quand `ssh-key` sera corrigé, signal pour retirer le contournement.
 - Les tests et les scripts qui passent par `ssh-keygen` régénèrent une clé que russh ne sait pas lire.
 - À signaler en amont, et à revérifier avec `ssh-key` 0.7 stable : c'est l'un des critères de réexamen de l'ADR-0009.
 
