@@ -8,7 +8,8 @@
 //!
 //! Events: `ssh.target_host_key_mismatch` (`SSH-E014`),
 //! `ssh.target_auth_failed` (`SSH-E015`), `ssh.target_unreachable`
-//! (`SSH-E016`).
+//! (`SSH-E016`), `ssh.target_channel_refused` (`SSH-E017`: a channel opened
+//! by the target, which the library would accept by default).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +31,7 @@ use crate::precheck::stream::Prechecked;
 struct Pinned {
     host_key: [u8; ostena_crypto::p256::PUBLIC_KEY_LEN],
     mismatch: Arc<AtomicBool>,
+    label: String,
 }
 
 /// The SEC1 point of an ECDSA P-256 public key, if it is one.
@@ -39,6 +41,10 @@ pub fn sec1_point(key: &russh::keys::PublicKey) -> Option<&[u8]> {
         .map(ssh_key::public::EcdsaPublicKey::as_sec1_bytes)
 }
 
+#[allow(
+    clippy::unused_async_trait_impl,
+    reason = "the SSH handler methods are async by trait"
+)]
 impl client::Handler for Pinned {
     type Error = russh::Error;
 
@@ -57,6 +63,118 @@ impl client::Handler for Pinned {
             self.mismatch.store(true, Ordering::Relaxed);
         }
         async move { Ok(matches) }
+    }
+
+    // The library accepts the channels a server opens by default: a target
+    // must never open one towards the agent (forwarded ports, agent, X11,
+    // sessions). Each is refused and audited.
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("forwarded-tcpip", reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("forwarded-streamlocal", reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("agent", reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_unknown(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("inconnu", reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("session", reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("direct-tcpip", reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("direct-streamlocal", reply);
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        self.refuse("x11", reply);
+        Ok(())
+    }
+}
+
+impl Pinned {
+    /// Refuses a channel opened by the target (dropping the handle sends the
+    /// refusal) and audits it.
+    fn refuse(&self, kind: &str, reply: client::ChannelOpenHandle) {
+        drop(reply);
+        let error = SshError::Refused("canal ouvert par la cible");
+        tracing::warn!(
+            event = "ssh.target_channel_refused",
+            code = error.code(),
+            target = %self.label,
+            kind,
+            "{error}"
+        );
     }
 }
 
@@ -151,6 +269,7 @@ pub async fn connect(
         let handler = Pinned {
             host_key: host_key.to_bytes(),
             mismatch: mismatch.clone(),
+            label: label.to_owned(),
         };
         let mut handle = match client::connect_stream(config::client(), stream, handler).await {
             Ok(handle) => handle,

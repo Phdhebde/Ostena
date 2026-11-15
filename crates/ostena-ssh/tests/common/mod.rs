@@ -493,6 +493,18 @@ impl russh::server::Handler for EchoTarget {
         if data == b"hold" {
             return Ok(());
         }
+        if data == b"open-channels" {
+            // A hostile target opens channels towards the agent.
+            let handle = session.handle();
+            tokio::spawn(async move {
+                let _ = handle.channel_open_x11("10.0.0.1", 6000).await;
+                let _ = handle
+                    .channel_open_forwarded_tcpip("127.0.0.1", 80, "10.0.0.1", 4000)
+                    .await;
+                let _ = handle.channel_open_agent().await;
+                let _ = handle.channel_open_session().await;
+            });
+        }
         let mut out = b"ran:".to_vec();
         out.extend_from_slice(data);
         out.push(b'\n');

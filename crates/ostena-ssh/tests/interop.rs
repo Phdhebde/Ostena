@@ -792,3 +792,56 @@ fn agent_identifies_without_a_version() {
     std::io::Read::read_exact(&mut tcp, &mut line).unwrap();
     assert_eq!(&line, b"SSH-2.0-Ostena\r\n");
 }
+
+#[test]
+fn driver_refuses_channels_opened_by_the_target() {
+    let runtime = runtime();
+    events();
+    let Some(keygen_bin) = openssh("ssh-keygen") else {
+        return;
+    };
+    let dir = dir("driver-channels");
+    let (agent_path, agent_public) = keygen(&keygen_bin, &dir.0, "agent");
+    let (target_host_path, target_host_public) = keygen(&keygen_bin, &dir.0, "target_host");
+    runtime.block_on(async {
+        let addr = serve_handler(
+            load(&target_host_path),
+            EchoTarget {
+                allowed: public(&agent_public),
+            },
+            "driver-channels-target",
+        )
+        .await;
+        let session = driver::connect(
+            &loopback(addr.port()).await,
+            &point(&public(&target_host_public)),
+            "ostena",
+            Arc::new(load(&agent_path)),
+            std::time::Duration::from_secs(5),
+            "driver-channels",
+        )
+        .await
+        .unwrap();
+        let mut channel = session.open_session().await.unwrap();
+        channel.exec(true, "open-channels").await.unwrap();
+        while let Some(message) = channel.wait().await {
+            if matches!(message, russh::ChannelMsg::Close) {
+                break;
+            }
+        }
+        let mut kinds = Vec::new();
+        for _ in 0..100 {
+            kinds = events_with("ssh.target_channel_refused", "target", "driver-channels")
+                .iter()
+                .map(|e| e.field("kind").to_owned())
+                .collect();
+            if kinds.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        kinds.sort();
+        assert_eq!(kinds, ["agent", "forwarded-tcpip", "session", "x11"]);
+        session.close().await;
+    });
+}
