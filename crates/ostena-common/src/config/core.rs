@@ -56,6 +56,46 @@ pub struct CoreConfig {
     /// The PostgreSQL database.
     #[serde(default)]
     pub database: DatabaseConfig,
+    /// The audit chain (ADR-0012): its head signing key and cadence.
+    pub audit: CoreAuditConfig,
+}
+
+/// Default interval between two heads while the chain moves, seconds.
+pub const DEFAULT_HEAD_INTERVAL_SECS: u32 = 60;
+/// Default heartbeat: a head at least this often, even without change.
+pub const DEFAULT_HEARTBEAT_SECS: u32 = 300;
+/// Default number of records after which a head is signed at once.
+pub const DEFAULT_HEAD_MAX_RECORDS: u32 = 1000;
+
+const fn default_head_interval() -> u32 {
+    DEFAULT_HEAD_INTERVAL_SECS
+}
+
+const fn default_heartbeat() -> u32 {
+    DEFAULT_HEARTBEAT_SECS
+}
+
+const fn default_head_max_records() -> u32 {
+    DEFAULT_HEAD_MAX_RECORDS
+}
+
+/// `[core.audit]`: the audit chain of the core (ADR-0012).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreAuditConfig {
+    /// The P-256 key that signs the heads of the chain.
+    pub signing_key: KeySource,
+    /// Interval between two heads while the chain moves, 1 to 3600 s.
+    #[serde(default = "default_head_interval")]
+    pub head_interval_secs: u32,
+    /// A head at least this often, even without change: from
+    /// `head_interval_secs` to 86400 s. Written in every head, it bounds
+    /// how stale an export may look before the verifier warns.
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_secs: u32,
+    /// A head as soon as this many records are not covered, 1 to 100000.
+    #[serde(default = "default_head_max_records")]
+    pub head_max_records: u32,
 }
 
 /// Where a private key of the core is read.
@@ -136,11 +176,12 @@ impl CoreConfig {
         })
     }
 
-    /// The two private keys, with their field names.
-    pub fn keys(&self) -> [(&'static str, &KeySource); 2] {
+    /// The three private keys, with their field names.
+    pub fn keys(&self) -> [(&'static str, &KeySource); 3] {
         [
             ("core.tls_private_key", &self.tls_private_key),
             ("core.issuing_private_key", &self.issuing_private_key),
+            ("core.audit.signing_key", &self.audit.signing_key),
         ]
     }
 }
@@ -167,6 +208,31 @@ fn bounds(out: &mut Vec<Violation>, field: &str, value: u64, min: u64, max: u64)
             format!("{field} = {value} : attendu de {min} à {max}."),
         ));
     }
+}
+
+/// Bounds of `[core.audit]` (`CFG-V012`).
+fn audit_bounds(audit: &CoreAuditConfig, out: &mut Vec<Violation>) {
+    bounds(
+        out,
+        "core.audit.head_interval_secs",
+        u64::from(audit.head_interval_secs),
+        1,
+        3600,
+    );
+    bounds(
+        out,
+        "core.audit.heartbeat_secs",
+        u64::from(audit.heartbeat_secs),
+        u64::from(audit.head_interval_secs),
+        86_400,
+    );
+    bounds(
+        out,
+        "core.audit.head_max_records",
+        u64::from(audit.head_max_records),
+        1,
+        100_000,
+    );
 }
 
 /// Consistency rules of the core section (`CFG-V008`, `CFG-V012` to
@@ -212,6 +278,7 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
             64,
         );
     }
+    audit_bounds(&core.audit, out);
     let db = &core.database;
     path_rule(out, "core.database.socket_dir", &db.socket_dir);
     for (field, value) in [
