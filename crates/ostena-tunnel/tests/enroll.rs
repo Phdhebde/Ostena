@@ -94,7 +94,7 @@ fn enrolled_agent_opens_a_tunnel_and_the_listener_closes() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
         assert!(!core.enrollment_open(), "closed by default");
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         assert!(core.enrollment_open());
         let (enrolled, identity) = enrol(&core, &token).await.unwrap();
         assert!(enrolled.not_after > enrolled.not_before);
@@ -119,8 +119,8 @@ fn enrolled_agent_opens_a_tunnel_and_the_listener_closes() {
 fn replayed_token_is_refused() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let token = core.issue_token(group(), HOUR).unwrap();
-        let _keep_open = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
+        let _keep_open = core.issue_token(group(), HOUR).await.unwrap();
         enrol(&core, &token).await.unwrap();
         assert_eq!(
             enrol(&core, &token).await.err(),
@@ -133,8 +133,11 @@ fn replayed_token_is_refused() {
 fn expired_token_is_refused() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let token = core.issue_token(group(), Duration::from_secs(1)).unwrap();
-        let _keep_open = core.issue_token(group(), HOUR).unwrap();
+        let token = core
+            .issue_token(group(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let _keep_open = core.issue_token(group(), HOUR).await.unwrap();
         tokio::time::sleep(Duration::from_millis(2100)).await;
         assert_eq!(
             enrol(&core, &token).await.err(),
@@ -147,7 +150,7 @@ fn expired_token_is_refused() {
 fn token_of_another_group_is_refused_and_not_spent() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         let other = Uuid::from_bytes([9; 16]);
         assert_eq!(
             enrol_with(&core, &token, other, Duration::from_secs(5))
@@ -164,7 +167,7 @@ fn token_of_another_group_is_refused_and_not_spent() {
 fn wrong_token_secret_is_refused() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         // SECRET-EXPOSURE: test only, forges a token with the same id.
         #[expect(clippy::disallowed_methods)]
         let text = String::from_utf8(token.to_text().expose_secret().to_vec()).unwrap();
@@ -206,7 +209,9 @@ fn listener_closes_when_its_last_token_expires() {
     run_paused(async {
         let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
         let core = TestCore::start_with_clock(fast(), Behaviour::default(), clock.clone()).unwrap();
-        core.issue_token(group(), Duration::from_secs(1)).unwrap();
+        core.issue_token(group(), Duration::from_secs(1))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(core.enrollment_open(), "token still valid");
         clock.0.store(1_001, Ordering::SeqCst);
@@ -222,7 +227,9 @@ fn listener_closes_when_the_token_expired_before_the_first_look() {
     run_paused(async {
         let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
         let core = TestCore::start_with_clock(fast(), Behaviour::default(), clock.clone()).unwrap();
-        core.issue_token(group(), Duration::from_secs(1)).unwrap();
+        core.issue_token(group(), Duration::from_secs(1))
+            .await
+            .unwrap();
         // Nothing spawned has run yet (one thread, no await so far).
         clock.0.store(1_001, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -234,7 +241,7 @@ fn listener_closes_when_the_token_expired_before_the_first_look() {
 fn listener_serves_the_enrolment_protocol_only() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let _token = core.issue_token(group(), HOUR).unwrap();
+        let _token = core.issue_token(group(), HOUR).await.unwrap();
         let root = core.trust_anchor();
         // Another protocol: refused by TLS.
         let tunnel_alpn = raw_request(core.enrollment_addr(), &root, ALPN, b"{}").await;
@@ -261,7 +268,7 @@ fn listener_serves_the_enrolment_protocol_only() {
 fn renewal_issues_a_certificate_for_a_new_key() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         let (_, identity) = enrol(&core, &token).await.unwrap();
         let (tunnel, _) = connect(&core.agent_config(&identity, group(), fast()).unwrap())
             .await
@@ -301,7 +308,7 @@ fn renewal_issues_a_certificate_for_a_new_key() {
 fn revocation_closes_open_tunnels_at_once() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         let (_, identity) = enrol(&core, &token).await.unwrap();
         let (tunnel, _) = connect(&core.agent_config(&identity, group(), fast()).unwrap())
             .await
@@ -320,8 +327,8 @@ fn revocation_closes_open_tunnels_at_once() {
 fn token_is_burned_after_three_failures() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();
-        let token = core.issue_token(group(), HOUR).unwrap();
-        let keep_open = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
+        let keep_open = core.issue_token(group(), HOUR).await.unwrap();
         let other = Uuid::from_bytes([9; 16]);
         let attempt = |g| enrol_with(&core, &token, g, Duration::from_secs(5));
         assert_eq!(attempt(other).await.err(), Some(TunnelError::TokenGroup));

@@ -84,6 +84,9 @@ pub enum HandshakeFailure {
     /// The core presented a chain: its certificate is not signed directly
     /// by the pinned root (for example, issued by the online issuing CA).
     NotRootIssued,
+    /// The core cannot read its registry of agents: it refuses rather than
+    /// trust a stale copy.
+    RegistryUnavailable,
     /// Anything else (signature, encoding, peer misbehaviour, I/O).
     Other,
 }
@@ -109,6 +112,27 @@ impl fmt::Display for NotRootIssued {
 }
 
 impl std::error::Error for NotRootIssued {}
+
+/// Text of the refusal while the core registry cannot be read; it travels in
+/// the QUIC close reason, like [`NOT_ROOT_ISSUED`].
+pub const REGISTRY_UNAVAILABLE: &str = "agent registry of the core unavailable";
+
+/// Its `Debug` form is the refusal text (see [`NotRootIssued`]).
+struct RegistryUnavailable;
+
+impl fmt::Debug for RegistryUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REGISTRY_UNAVAILABLE)
+    }
+}
+
+impl fmt::Display for RegistryUnavailable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REGISTRY_UNAVAILABLE)
+    }
+}
+
+impl std::error::Error for RegistryUnavailable {}
 
 /// Classifies a handshake error, seen from either side.
 pub fn classify(error: &rustls::Error) -> HandshakeFailure {
@@ -142,6 +166,11 @@ pub fn classify(error: &rustls::Error) -> HandshakeFailure {
             CertificateError::ApplicationVerificationFailure => HandshakeFailure::UnknownClient,
             CertificateError::Other(other) if other.0.downcast_ref::<NotRootIssued>().is_some() => {
                 HandshakeFailure::NotRootIssued
+            }
+            CertificateError::Other(other)
+                if other.0.downcast_ref::<RegistryUnavailable>().is_some() =>
+            {
+                HandshakeFailure::RegistryUnavailable
             }
             _ => HandshakeFailure::Other,
         },
@@ -334,6 +363,9 @@ pub enum ClientRefusal {
     Unknown,
     /// Revoked.
     Revoked,
+    /// The registry cannot be read: refused, never accepted from a stale
+    /// copy.
+    Unavailable,
 }
 
 /// The core registry of agent certificates, consulted at every handshake.
@@ -388,6 +420,10 @@ impl ClientCertVerifier for RegistryClientVerifier {
             Err(ClientRefusal::Unknown) => {
                 Err(CertificateError::ApplicationVerificationFailure.into())
             }
+            Err(ClientRefusal::Unavailable) => Err(CertificateError::Other(rustls::OtherError(
+                Arc::new(RegistryUnavailable),
+            ))
+            .into()),
         }
     }
 

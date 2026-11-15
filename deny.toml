@@ -42,6 +42,12 @@ exceptions = [
     # dependency of every procedural macro (serde_derive, thiserror) and is not
     # linked into the shipped binary. Scoped to this crate only.
     { crate = "unicode-ident", allow = ["Unicode-3.0"] },
+    # PENDING DECISION (ADR-0011): stringprep, an unconditional dependency of
+    # sqlx-postgres (SASLprep for SCRAM, never used with peer), pulls these
+    # two Unicode tables, linked into the core binary on Linux. No sqlx
+    # without them, short of a fork.
+    { crate = "unicode-normalization", allow = ["Unicode-3.0"] },
+    { crate = "unicode-properties", allow = ["Unicode-3.0"] },
     # libfuzzer-sys bundles LLVM libFuzzer (NCSA). Only used by the fuzz/ crate,
     # which has its own workspace and is never shipped. cargo-fuzz itself is a
     # tool (MIT OR Apache-2.0), not a dependency.
@@ -63,6 +69,17 @@ skip = [
     # syn 3, the derives of russh and of its dependencies still use syn 2.
     # Nothing of it is linked into the binary.
     { crate = "syn@2.0.119", reason = "proc-macro dependency of russh (delegate, enum_dispatch) and curve25519-dalek, build time only" },
+    # sqlx 0.9 straddles two generations of its dependencies: sha2 0.10 in
+    # sqlx-core (migration checksums) and 0.11 in sqlx-postgres (SCRAM), base64
+    # 0.22, and hashlink on hashbrown 0.16. Linked into the core binary only.
+    { crate = "sha2@0.10.9", reason = "sqlx-core (ADR-0011)" },
+    { crate = "digest@0.10.7", reason = "sha2 0.10, through sqlx-core (ADR-0011)" },
+    { crate = "block-buffer@0.10.4", reason = "sha2 0.10, through sqlx-core (ADR-0011)" },
+    { crate = "crypto-common@0.1.6", reason = "sha2 0.10, through sqlx-core (ADR-0011)" },
+    { crate = "generic-array@0.14.9", reason = "sha2 0.10, through sqlx-core (ADR-0011)" },
+    { crate = "cpufeatures@0.2.17", reason = "sha2 0.10, through sqlx-core (ADR-0011)" },
+    { crate = "base64@0.22.1", reason = "sqlx-core (ADR-0011)" },
+    { crate = "hashbrown@0.16.1", reason = "hashlink, through sqlx-core (ADR-0011)" },
 ]
 skip-tree = []
 deny = [
@@ -105,11 +122,12 @@ deny = [
     { crate = "poly1305", wrappers = ["ssh-cipher"], reason = "russh exception (ADR-0009)" },
     { crate = "salsa20", wrappers = ["russh", "scrypt"], reason = "russh exception (ADR-0009)" },
     { crate = "sha1", wrappers = ["russh", "ssh-key"], reason = "russh exception (ADR-0009)" },
-    { crate = "sha2", wrappers = ["bcrypt-pbkdf", "ed25519-dalek", "p256", "p384", "p521", "pageant", "pkcs5", "russh", "scrypt", "ssh-key"], reason = "russh exception (ADR-0009); SHA-2 goes through ostena-crypto" },
+    { crate = "sha2", wrappers = ["bcrypt-pbkdf", "ed25519-dalek", "p256", "p384", "p521", "pageant", "pkcs5", "russh", "scrypt", "sqlx-core", "sqlx-macros-core", "sqlx-postgres", "ssh-key"], reason = "russh and sqlx-postgres exceptions (ADR-0009); SHA-2 goes through ostena-crypto" },
     { crate = "sha3", wrappers = ["ml-kem", "russh"], reason = "russh exception (ADR-0009)" },
-    { crate = "hmac", wrappers = ["hkdf", "pbkdf2", "rfc6979", "russh", "ssh-key"], reason = "russh exception (ADR-0009); HMAC goes through ostena-crypto" },
-    { crate = "hkdf", wrappers = ["elliptic-curve"], reason = "russh exception (ADR-0009)" },
+    { crate = "hmac", wrappers = ["hkdf", "pbkdf2", "rfc6979", "russh", "sqlx-postgres", "ssh-key"], reason = "russh and sqlx-postgres exceptions (ADR-0009); HMAC goes through ostena-crypto" },
+    { crate = "hkdf", wrappers = ["elliptic-curve", "sqlx-postgres"], reason = "russh and sqlx-postgres exceptions (ADR-0009)" },
     { crate = "md5", wrappers = ["russh"], reason = "russh exception (ADR-0009)" },
+    { crate = "md-5", wrappers = ["sqlx-postgres"], reason = "sqlx-postgres exception (ADR-0009): MD5 password authentication, never used (peer only, CORE-E003)" },
     { crate = "ml-kem", wrappers = ["russh"], reason = "russh exception (ADR-0009); ML-KEM goes through ostena-crypto" },
     { crate = "pbkdf2", wrappers = ["bcrypt-pbkdf", "pkcs5", "russh", "scrypt"], reason = "russh exception (ADR-0009); PBKDF2 goes through ostena-crypto" },
     { crate = "scrypt", wrappers = ["pkcs5", "russh"], reason = "russh exception (ADR-0009)" },
@@ -117,7 +135,24 @@ deny = [
     { crate = "bcrypt-pbkdf", wrappers = ["ssh-key"], reason = "russh exception (ADR-0009)" },
     { crate = "blowfish", wrappers = ["bcrypt-pbkdf"], reason = "russh exception (ADR-0009)" },
     { crate = "des", reason = "outside the frozen list" },
-    { crate = "rand", wrappers = ["num-bigint", "pageant", "proptest", "quinn-proto", "russh"], reason = "randomness goes through ostena-crypto::rand; russh and quinn-proto draw their own, proptest is test only" },
+    { crate = "rand", wrappers = ["num-bigint", "pageant", "proptest", "quinn-proto", "russh", "sqlx-postgres"], reason = "randomness goes through ostena-crypto::rand; russh, quinn-proto and sqlx-postgres (SCRAM nonce) draw their own, proptest is test only" },
+    # PostgreSQL is the business of ostena-core only (ADR-0011). Its own
+    # cryptography (SCRAM and MD5 authentication) is an exception confined to
+    # sqlx-postgres (ADR-0009, above); production authenticates by peer only.
+    { crate = "sqlx", wrappers = ["ostena-core"], reason = "PostgreSQL is ostena-core business only (ADR-0011)" },
+    { crate = "sqlx-core", wrappers = ["sqlx", "sqlx-macros", "sqlx-macros-core", "sqlx-postgres"], reason = "only reachable through sqlx" },
+    { crate = "sqlx-postgres", wrappers = ["sqlx", "sqlx-macros-core"], reason = "only reachable through sqlx" },
+    # The TLS of sqlx adds the public roots to the configured CA: it is not
+    # built (tls-none), and the public root bundle is refused everywhere.
+    { crate = "webpki-roots", reason = "public root bundle: never trusted (ADR-0011)" },
+    { crate = "rustls-native-certs", reason = "system roots: never trusted (ADR-0011)" },
+    # Unicode tables of url (idna): idna_adapter is pinned to its ASCII-only
+    # release, so none of them is linked (Unicode-3.0, ADR-0011).
+    { crate = "icu_normalizer", reason = "IDNA tables refused: idna_adapter is pinned to 1.0.0 (ADR-0011)" },
+    { crate = "icu_properties", reason = "IDNA tables refused: idna_adapter is pinned to 1.0.0 (ADR-0011)" },
+    { crate = "icu_collections", reason = "IDNA tables refused: idna_adapter is pinned to 1.0.0 (ADR-0011)" },
+    { crate = "icu_provider", reason = "IDNA tables refused: idna_adapter is pinned to 1.0.0 (ADR-0011)" },
+    { crate = "icu_locale_core", reason = "IDNA tables refused: idna_adapter is pinned to 1.0.0 (ADR-0011)" },
 ]
 
 [sources]

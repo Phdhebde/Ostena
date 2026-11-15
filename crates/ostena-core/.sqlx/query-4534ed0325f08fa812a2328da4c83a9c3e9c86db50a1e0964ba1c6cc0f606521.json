@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent SET revoked_at = coalesce(revoked_at, now()) WHERE id = $1::text::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4534ed0325f08fa812a2328da4c83a9c3e9c86db50a1e0964ba1c6cc0f606521"
+}

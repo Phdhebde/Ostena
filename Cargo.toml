@@ -11,6 +11,7 @@ members = [
     "crates/ostena-platform",
     "crates/ostena-tunnel",
     "crates/ostena-ssh",
+    "crates/ostena-core",
     "crates/ostena-cli",
     "xtask",
 ]
@@ -24,6 +25,7 @@ repository = "https://github.com/Phdhebde/Ostena"
 
 [workspace.dependencies]
 ostena-common = { path = "crates/ostena-common" }
+ostena-core = { path = "crates/ostena-core" }
 ostena-frame = { path = "crates/ostena-frame" }
 ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
@@ -52,6 +54,14 @@ russh = { version = "=0.65.1", default-features = false, features = ["aws-lc-rs"
 # own. Review: ssh-key 0.7 stable, a RustSec advisory, or the end of M1 at
 # the latest (ADR-0009).
 ssh-key = { version = "=0.7.0-rc.11", default-features = false }
+# PostgreSQL of the core (ADR-0011), in ostena-core only. Exact version. No TLS
+# (tls-none): its root store adds the public roots to ours; production goes
+# through the Unix socket with peer authentication. Its SCRAM and MD5 code
+# brings RustCrypto: an exception confined to sqlx-postgres (ADR-0009).
+sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "tls-none"] }
+# Not used directly: pinned to the ASCII-only IDNA backend of url (pulled by
+# sqlx-core), so that no Unicode table (icu_*, Unicode-3.0) is linked.
+idna_adapter = "=1.0.0"
 # Shamir secret sharing of the offline root secret (2 of 3), audited; used by ostena-crypto only.
 vsss-rs = { version = "6.0.1", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.10.1", default-features = false }

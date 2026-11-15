@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_certificate (fingerprint, agent_id)\n                 SELECT $1, id FROM agent\n                 WHERE id = $2::text::uuid AND gateway_group = $3::text::uuid\n                   AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6f34fa96ca06a2ea1297f27e361a535d33d3dce5b8c9194cd29bde093bafa27b"
+}

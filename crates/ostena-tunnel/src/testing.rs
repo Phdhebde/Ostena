@@ -31,6 +31,7 @@ use ostena_grant::{
 use crate::control::{AgentMessage, CoreMessage, GrantKey, PROTOCOL_VERSION, SessionProtocol};
 use crate::enroll::{
     AgentRegistry, DEFAULT_CERTIFICATE_LIFETIME, EnrollmentService, EnrollmentToken,
+    MemoryTokenStore, StoreFuture,
 };
 use crate::error::TunnelError;
 use crate::ids::Uuid;
@@ -74,7 +75,14 @@ impl Registry {
 }
 
 impl AgentRegistry for Registry {
-    fn register(&self, fingerprint: [u8; 32], group: Uuid, agent: Uuid) {
+    fn register(&self, fingerprint: [u8; 32], group: Uuid, agent: Uuid) -> StoreFuture<'_, ()> {
+        self.insert(fingerprint, group, agent);
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+impl Registry {
+    fn insert(&self, fingerprint: [u8; 32], group: Uuid, agent: Uuid) {
         if let Ok(mut r) = self.0.lock() {
             r.insert(
                 fingerprint,
@@ -231,6 +239,7 @@ impl TestCore {
             &server,
             issuer.clone(),
             registry.clone(),
+            Arc::new(MemoryTokenStore::default()),
             DEFAULT_CERTIFICATE_LIFETIME,
             Duration::from_secs(5),
         )?
@@ -287,8 +296,7 @@ impl TestCore {
             .map_err(|e| TunnelError::Config(e.to_string()))?;
         if register {
             let agent = Uuid::random().map_err(|e| TunnelError::Config(e.to_string()))?;
-            self.registry
-                .register(tls::fingerprint(&cert), group, agent);
+            self.registry.insert(tls::fingerprint(&cert), group, agent);
         }
         Identity::new(vec![cert], pkcs8).map_err(|e| TunnelError::Config(e.to_string()))
     }
@@ -321,8 +329,12 @@ impl TestCore {
     /// # Errors
     ///
     /// See [`EnrollmentService::issue_token`].
-    pub fn issue_token(&self, group: Uuid, ttl: Duration) -> Result<EnrollmentToken, TunnelError> {
-        self.enrollment.issue_token(group, ttl)
+    pub async fn issue_token(
+        &self,
+        group: Uuid,
+        ttl: Duration,
+    ) -> Result<EnrollmentToken, TunnelError> {
+        self.enrollment.issue_token(group, ttl).await
     }
 
     /// The enrolment listener address.
@@ -482,8 +494,7 @@ impl TestCore {
                 validity,
             )
             .map_err(|e| TunnelError::Config(e.to_string()))?;
-        self.registry
-            .register(tls::fingerprint(&cert), group, agent);
+        self.registry.insert(tls::fingerprint(&cert), group, agent);
         Ok((
             ostena_crypto::pki::pem_certificate(&cert),
             ostena_crypto::pki::pem_private_key(&pkcs8),
@@ -663,7 +674,7 @@ async fn control(
                     validity,
                 )
                 .map_err(|e| TunnelError::Io(e.to_string()))?;
-            registry.register(tls::fingerprint(&cert), entry.group, entry.agent);
+            registry.insert(tls::fingerprint(&cert), entry.group, entry.agent);
             Ok(CoreMessage::Certificate {
                 certificate: ostena_crypto::pki::pem_certificate(&cert),
                 not_before: validity.not_before,

@@ -85,6 +85,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check
 cargo xtask <tâche>        # build reproductible, SBOM, etc.
+# Requêtes du core : après une migration ou une requête modifiée, régénérer le
+# cache hors ligne contre une base de développement migrée.
+(cd crates/ostena-core && DATABASE_URL=postgres://… cargo sqlx prepare -- --all-targets)
+# Tests qui demandent PostgreSQL (sautés sinon) : OSTENA_TEST_DB_SOCKET ou
+# OSTENA_TEST_DB_TCP, avec OSTENA_TEST_DB_USER (voir ostena_core::testing).
 ```
 
 (À compléter au fil de l'eau quand des commandes s'ajoutent.)

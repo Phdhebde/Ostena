@@ -8,6 +8,8 @@
 mod agent;
 mod ca;
 mod control;
+#[cfg(target_os = "linux")]
+mod core;
 mod core_link;
 mod enroll;
 mod keyset_state;
@@ -38,6 +40,79 @@ enum Command {
     Ca {
         #[command(subcommand)]
         command: CaCommand,
+    },
+    /// The core (Linux): run it, migrate its database, administer the agents.
+    #[cfg(target_os = "linux")]
+    Core {
+        #[command(subcommand)]
+        command: CoreCommand,
+    },
+}
+
+#[cfg(target_os = "linux")]
+const CORE_CONFIG: &str = "/etc/ostena/ostena.toml";
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreCommand {
+    /// Run the core (in the foreground, or as started by systemd): apply
+    /// the embedded migrations, then serve the tunnel and enrolment
+    /// listeners.
+    Run {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+    /// Apply the embedded migrations, or only check them (exit code 1 if
+    /// some are pending).
+    Migrate {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Check only, change nothing.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Administer the agents (the running core applies changes at once).
+    Agent {
+        #[command(subcommand)]
+        command: CoreAgentCommand,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreAgentCommand {
+    /// Issue a single-use enrolment token for a gateway group; it opens the
+    /// enrolment listener of the running core.
+    Token {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Gateway group (UUID).
+        #[arg(long)]
+        group: String,
+        /// Lifetime in minutes (1 to 60).
+        #[arg(long, default_value_t = 15)]
+        ttl_mins: u64,
+        /// File to create (mode 0600, never overwritten), or `-` for
+        /// standard output.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// List the agents and their certificates.
+    List {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+    /// Revoke an agent and all its certificates; its tunnels are closed.
+    Revoke {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Agent identifier (UUID).
+        agent: String,
     },
 }
 
@@ -307,6 +382,8 @@ fn main() -> ExitCode {
                     command: KeysetStateCommand::Repair { config, yes },
                 },
         }) => keyset_state::repair(&config, yes),
+        #[cfg(target_os = "linux")]
+        Some(Command::Core { command }) => run_core(command),
         Some(Command::Ca { command }) => match command {
             CaCommand::Root {
                 command: RootCommand::Init { name, days, outs },
@@ -341,6 +418,24 @@ fn main() -> ExitCode {
                         out,
                     },
             } => ca::server_sign(&root, &public_key, &names, days, &out),
+        },
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_core(command: CoreCommand) -> ExitCode {
+    match command {
+        CoreCommand::Run { config } => core::run(&config),
+        CoreCommand::Migrate { config, check } => core::migrate(&config, check),
+        CoreCommand::Agent { command } => match command {
+            CoreAgentCommand::Token {
+                config,
+                group,
+                ttl_mins,
+                out,
+            } => core::agent_token(&config, &group, ttl_mins, &out),
+            CoreAgentCommand::List { config } => core::agent_list(&config),
+            CoreAgentCommand::Revoke { config, agent } => core::agent_revoke(&config, &agent),
         },
     }
 }

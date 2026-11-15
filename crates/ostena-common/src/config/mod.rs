@@ -13,6 +13,7 @@
 //! [`Secret`](crate::secret::Secret) where they are used. See ADR-0003.
 
 pub mod agent;
+pub mod core;
 mod permissions;
 pub mod scope;
 mod validation;
@@ -22,6 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+pub use self::core::{CoreConfig, DatabaseConfig, DatabaseTcp, KeySource};
 pub use agent::{AgentConfig, InfrastructureEndpoint};
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{
@@ -46,6 +48,8 @@ pub struct Config {
     pub audit: AuditConfig,
     /// Gateway agent (only on gateway hosts).
     pub agent: Option<AgentConfig>,
+    /// The core (only on the core host).
+    pub core: Option<CoreConfig>,
 }
 
 /// Run mode. Production refuses every weakening option.
@@ -267,11 +271,28 @@ impl Config {
         Violations::into_result(validation::consistency(self))
     }
 
-    /// Options that lower security (`CFG-P001` to `CFG-P005`).
+    /// Options that lower security (`CFG-P…`), refused in production.
     ///
-    /// `CFG-P006` depends on the file system and is checked by [`load`].
+    /// The rules on files (`CFG-P006`, `CFG-P008`, `CFG-P009`, `CFG-P011`)
+    /// depend on the file system and are checked by [`load`].
     pub fn weakenings(&self) -> Vec<Violation> {
-        validation::weakenings(self)
+        self.weakenings_at(unix_now())
+    }
+
+    /// [`Config::weakenings`] at `now` (Unix seconds).
+    pub fn weakenings_at(&self, now: u64) -> Vec<Violation> {
+        validation::weakenings(self, now)
+    }
+
+    /// Weakenings tolerated in production until a date (`CFG-P012` until
+    /// 2027-04-30), logged at every start.
+    pub fn tolerated(&self) -> Vec<Violation> {
+        self.tolerated_at(unix_now())
+    }
+
+    /// [`Config::tolerated`] at `now` (Unix seconds).
+    pub fn tolerated_at(&self, now: u64) -> Vec<Violation> {
+        validation::tolerated(self, now)
     }
 
     /// Consistency rules plus refusal of every weakening option.
@@ -281,9 +302,16 @@ impl Config {
     /// Every rule broken, at once.
     pub fn validate_for_production(&self) -> Result<(), Violations> {
         let mut all = validation::consistency(self);
-        all.extend(validation::weakenings(self));
+        all.extend(validation::weakenings(self, unix_now()));
         Violations::into_result(all)
     }
+}
+
+/// The wall clock, Unix seconds (0 before 1970).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A configuration ready for startup.
@@ -295,6 +323,8 @@ pub struct LoadedConfig {
     pub path: PathBuf,
     /// Weakening options accepted because the mode is development.
     pub weakenings: Vec<Violation>,
+    /// Weakenings tolerated in production until a date.
+    pub tolerated: Vec<Violation>,
 }
 
 impl LoadedConfig {
@@ -304,6 +334,14 @@ impl LoadedConfig {
         for w in &self.weakenings {
             tracing::warn!(
                 event = "config.weakening",
+                code = w.code.as_str(),
+                "{}",
+                w.message
+            );
+        }
+        for w in &self.tolerated {
+            tracing::warn!(
+                event = "config.waiver",
                 code = w.code.as_str(),
                 "{}",
                 w.message
@@ -347,12 +385,14 @@ pub fn load_with(
     if config.mode == Mode::Production {
         errors.append(&mut weakenings);
     }
+    let tolerated = config.tolerated();
     Violations::into_result(errors).map_err(ConfigError::Invalid)?;
 
     Ok(LoadedConfig {
         config,
         path: path.to_path_buf(),
         weakenings,
+        tolerated,
     })
 }
 
@@ -374,8 +414,8 @@ pub fn load_for_enrollment(path: &Path) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
-/// Rules that need the file system: `CFG-P006`, and for an agent `CFG-P008`
-/// and `CFG-P009`.
+/// Rules that need the file system: `CFG-P006`, for an agent `CFG-P008` and
+/// `CFG-P009`, for the core `CFG-P011`.
 fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> Vec<Violation> {
     let mut out = Vec::new();
     if let Err(reason) = checker.not_writable_by_others(path) {
@@ -407,6 +447,16 @@ fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> 
                     agent.replay_journal.display()
                 ),
             ));
+        }
+    }
+    if let Some(core) = &config.core {
+        for (field, key) in core::key_paths(core) {
+            if let Err(reason) = checker.private(key) {
+                out.push(Violation::new(
+                    Code::CoreKeyExposed,
+                    format!("{field} {} : {reason}", key.display()),
+                ));
+            }
         }
     }
     out

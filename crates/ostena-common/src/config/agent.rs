@@ -140,7 +140,7 @@ fn is_address_like(s: &str) -> bool {
     prefix_ok && addr_ok
 }
 
-fn path_rule(out: &mut Vec<Violation>, field: &str, path: &Path) {
+pub(crate) fn path_rule(out: &mut Vec<Violation>, field: &str, path: &Path) {
     if path.as_os_str().is_empty() {
         out.push(Violation::new(
             Code::EmptyPath,

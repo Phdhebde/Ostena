@@ -219,3 +219,37 @@ proptest::proptest! {
         let _ = certificate_validity(&data);
     }
 }
+
+#[test]
+fn issuing_ca_loads_from_its_certificate_and_refuses_another_key() {
+    let pki = TestPki::new("Ostena é").unwrap();
+    let loaded =
+        IssuingAuthority::from_certificate(&pki.issuing_key, pki.issuing_certificate.clone())
+            .unwrap();
+    assert_eq!(loaded.common_name(), "Ostena é issuing");
+    // What it issues chains to the same CA as the original.
+    let cert = loaded
+        .issue_agent(
+            &key(),
+            "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6",
+            "a1",
+            validity(),
+        )
+        .unwrap();
+    assert!(contains(&cert, b"Ostena \xc3\xa9 issuing"));
+
+    let (_, other) = p256::SigningKey::generate().unwrap();
+    assert!(matches!(
+        IssuingAuthority::from_certificate(&other, pki.issuing_certificate.clone()),
+        Err(PkiError::Issuance)
+    ));
+    let garbage = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
+    assert!(IssuingAuthority::from_certificate(&pki.issuing_key, garbage).is_err());
+}
+
+proptest::proptest! {
+    #[test]
+    fn certificate_subject_never_panics(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..512)) {
+        let _ = certificate_subject(&bytes);
+    }
+}

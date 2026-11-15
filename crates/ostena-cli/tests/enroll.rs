@@ -128,7 +128,7 @@ fn enrolment_writes_the_key_and_the_certificate_then_the_listener_closes() {
     run(async {
         let core = core();
         let agent = Agent::new("ok", &core, GROUP);
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         let out = agent.enroll(&agent.token_file(&token), "").await;
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(String::from_utf8_lossy(&out.stdout).contains("Agent enrôlé"));
@@ -172,8 +172,8 @@ fn enrolment_writes_the_key_and_the_certificate_then_the_listener_closes() {
 fn replayed_token_is_refused() {
     run(async {
         let core = core();
-        let token = core.issue_token(group(), HOUR).unwrap();
-        let _keep_open = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
+        let _keep_open = core.issue_token(group(), HOUR).await.unwrap();
         let first = Agent::new("first", &core, GROUP);
         assert!(
             first
@@ -194,8 +194,11 @@ fn replayed_token_is_refused() {
 fn expired_token_is_refused() {
     run(async {
         let core = core();
-        let token = core.issue_token(group(), Duration::from_secs(1)).unwrap();
-        let _keep_open = core.issue_token(group(), HOUR).unwrap();
+        let token = core
+            .issue_token(group(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        let _keep_open = core.issue_token(group(), HOUR).await.unwrap();
         tokio::time::sleep(Duration::from_millis(2100)).await;
         let agent = Agent::new("expired", &core, GROUP);
         let out = agent.enroll(&agent.token_file(&token), "").await;
@@ -209,7 +212,7 @@ fn expired_token_is_refused() {
 fn token_of_another_group_is_refused() {
     run(async {
         let core = core();
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         let agent = Agent::new("other-group", &core, "11111111-2222-4333-8444-555555555555");
         let out = agent.enroll(&agent.token_file(&token), "").await;
         assert!(!out.status.success());
@@ -222,8 +225,8 @@ fn token_of_another_group_is_refused() {
 fn token_on_standard_input_and_no_overwrite() {
     run(async {
         let core = core();
-        let token = core.issue_token(group(), HOUR).unwrap();
-        let _keep_open = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
+        let _keep_open = core.issue_token(group(), HOUR).await.unwrap();
         let agent = Agent::new("stdin", &core, GROUP);
         // SECRET-EXPOSURE: test only, the token typed on standard input.
         #[expect(clippy::disallowed_methods)]
@@ -254,7 +257,7 @@ fn failed_attempt_leaves_a_key_that_the_next_attempt_reuses() {
         let key = std::fs::read(agent.dir.join("agent.key")).unwrap();
 
         // The operator gets a token and tries again: same key, certificate.
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         let out = agent.enroll(&agent.token_file(&token), "").await;
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(agent.files(), (true, true));
@@ -268,7 +271,7 @@ fn unreadable_key_without_certificate_is_recreated() {
         let core = core();
         let agent = Agent::new("garbage-key", &core, GROUP);
         std::fs::write(agent.dir.join("agent.key"), b"not a key").unwrap();
-        let token = core.issue_token(group(), HOUR).unwrap();
+        let token = core.issue_token(group(), HOUR).await.unwrap();
         let out = agent.enroll(&agent.token_file(&token), "").await;
         assert!(out.status.success(), "{}", stderr(&out));
         let key = std::fs::read_to_string(agent.dir.join("agent.key")).unwrap();

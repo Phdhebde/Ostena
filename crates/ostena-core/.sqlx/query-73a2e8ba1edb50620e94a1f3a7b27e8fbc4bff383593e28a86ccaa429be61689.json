@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent (id, gateway_group) VALUES ($1::text::uuid, $2::text::uuid)\n                 ON CONFLICT (id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "73a2e8ba1edb50620e94a1f3a7b27e8fbc4bff383593e28a86ccaa429be61689"
+}

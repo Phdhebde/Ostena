@@ -320,6 +320,7 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E026` | session refusée : le core n'a pas encore poussé de politique ou de clés |
 | `TUN-E027` | le core n'a pas répondu à la demande de session |
 | `TUN-E028` | politique du core refusée (autre groupe, ou ne se compile pas en production) |
+| `TUN-E029` | registre des agents (ou magasin des jetons) du core illisible : refus plutôt que copie périmée (ADR-0011) |
 
 Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`, `agent.identity_rotated`, `agent.renewal_impossible`, `tunnel.renewal_overdue` (avertissement, répété chaque heure).
 

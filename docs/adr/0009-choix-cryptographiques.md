@@ -158,6 +158,17 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 
+#### PostgreSQL : la cryptographie de `sqlx-postgres` dans `ostena-core` (décidé le 2026-11-14)
+
+**Constat.** Le pilote PostgreSQL de sqlx implémente lui-même l'authentification SCRAM-SHA-256 et MD5, avec `sha2`, `hmac`, `hkdf`, `md-5` et `rand` (RustCrypto). Ces dépendances sont inconditionnelles, et aucun pilote en Rust pur n'y échappe (`tokio-postgres` fait pareil).
+
+**Décision : exception acceptée, confinée et neutralisée.**
+- **Confinement** : `deny.toml` n'admet ces crates que sous `sqlx-postgres` (et `sqlx-core` pour le `sha2` des sommes de contrôle des migrations). sqlx n'est admis que sous `ostena-core`.
+- **Neutralisation** : en production, le core ne joint PostgreSQL que par le socket Unix avec l'authentification `peer`. Aucun mot de passe n'est configurable : si le serveur demande SCRAM ou MD5, la connexion échoue. Le core vérifie aussi `system_user` au démarrage et refuse toute autre méthode (`CORE-E003`, ADR-0011). Ce code n'est donc jamais exécuté en production.
+- **Pas de TLS vers la base** : celle de sqlx ajoute les racines publiques à la CA configurée (ADR-0011).
+
+**Réexamen** : avec la base distante en TLS épinglée (après M1), qui ramènera SCRAM en production.
+
 #### Question ouverte : échange de clés SSH hybride post-quantique
 
 russh 0.65.1 ne propose qu'un hybride X25519 + ML-KEM-768 (`mlkem768x25519-sha256`), hors liste. Une variante P-256 + ML-KEM-768 est décrite par un brouillon de l'IETF (`mlkem768nistp256-sha256`). Sa prise en charge par russh et par OpenSSH reste à vérifier. En attendant, l'échange SSH reste classique (ECDH P-256), comme l'authentification du tunnel (voir le risque accepté plus haut).
