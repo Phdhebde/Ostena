@@ -123,6 +123,17 @@ impl TestDb {
         db::connect(&self.config, self.mode).await.unwrap()
     }
 
+    /// Runs SQL statements on the test database as its owner: what a
+    /// database administrator could do behind the core.
+    pub async fn execute(&self, sql: &str) {
+        let pool = self.pool().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
     /// Drops the database (connections closed first).
     pub async fn drop_database(self) {
         let pool = db::connect(&self.admin, self.mode).await.unwrap();
