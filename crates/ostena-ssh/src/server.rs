@@ -277,11 +277,48 @@ impl<A> Clone for SshServer<A> {
     }
 }
 
-/// Printable, bounded text from the peer, for events.
+/// A Unicode format character (category Cf): bidirectional controls
+/// (U+202A–202E, U+2066–2069), zero-width characters, tags… They can
+/// disguise a logged text.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Printable, bounded text from the peer, for events: control and format
+/// characters are replaced.
 fn sanitize(text: &str) -> String {
     text.chars()
         .take(64)
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| {
+            if c.is_control() || is_format(c) {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -1239,4 +1276,23 @@ async fn connection<A: Authorizer>(
         "session SSH terminée"
     );
     shared.authorizer.closed(summary);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_replaces_control_and_format_characters() {
+        assert_eq!(sanitize("root"), "root");
+        assert_eq!(sanitize(r"CORP\Jean Dupont"), r"CORP\Jean Dupont");
+        assert_eq!(sanitize("a\nb\tc\u{7f}"), "a?b?c?");
+        // Bidirectional overrides and isolates, zero-width, BOM, tags.
+        assert_eq!(
+            sanitize("adm\u{202E}nimda\u{2066}x\u{2069}\u{200B}\u{FEFF}\u{E0041}"),
+            "adm?nimda?x????"
+        );
+        assert_eq!(sanitize("é€日本"), "é€日本");
+        assert_eq!(sanitize(&"x".repeat(100)).len(), 64);
+    }
 }
