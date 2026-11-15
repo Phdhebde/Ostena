@@ -48,6 +48,7 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
 
 ### Clés du core
 
+- **Trois clés** : celle du certificat serveur (`tls_private_key`), celle de la CA émettrice (`issuing_private_key`) et celle qui signe les têtes de la chaîne d'audit (`[core.audit] signing_key`, ADR-0012). Les règles ci-dessous valent pour les trois.
 - **Lecture** depuis un credential systemd (`LoadCredentialEncrypted=`, lu dans `$CREDENTIALS_DIRECTORY`) ou depuis un fichier PKCS#8.
 - **Fichier en clair** (`CFG-P012`) : **dérogation datée**, accepté en production et journalisé à chaque démarrage (`config.waiver`) **jusqu'au 2027-04-30 inclus**, refusé ensuite.
 - **Droits** : une clé en fichier lisible au-delà du compte du service est refusée (`CFG-P011`).
@@ -67,16 +68,19 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
 | `CORE-E007` | démarrage impossible (écouteur, paramètre hors bornes) |
 | `CORE-E008` | `PGPASSWORD` ou `PGOPTIONS` dans l'environnement |
 | `CORE-E009` | agent inconnu |
+| `CORE-E010` | écriture d'audit impossible (chaîne ou export) : l'opération auditée est refusée, sauf si elle ne fait que retirer des droits (ADR-0012) |
+| `CORE-E011` | chaîne d'audit incohérente : le core cesse de signer et refuse de démarrer (ADR-0012) |
 
 Côté tunnel, `TUN-E029` signale un registre illisible (ADR-0008).
 
 ### Événements
 
-Journal structuré, en attendant la chaîne d'audit (PR 3) :
+Les événements qui engagent une décision du core sont écrits dans la chaîne d'audit, avec leur classe d'échec d'écriture (accordant, protecteur, au mieux) : voir l'[ADR-0012](0012-chaine-d-audit-du-core.md). Le journal structuré reçoit aussi :
 - **démarrage** : `core.started`, `core.stopped`, `core.database_connected` (méthode d'authentification), `core.database_not_peer` (développement), `core.migrated`, `config.waiver` ;
-- **registre** : `core.registry_unavailable`, `core.registry_error`, `core.notices_interrupted` ;
+- **registre** : `core.registry_unavailable`, `core.registry_restored`, `core.registry_error`, `core.notices_interrupted` ;
 - **agents** : `tunnel.agent_connected`, `tunnel.refused`, `agent.certificate_renewed`, `agent.renewal_refused`, `agent.revoked`, `agent.revocation_applied` (tunnels fermés) ;
-- **enrôlement** (ADR-0008) : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted`, `enroll.refused`, `enroll.store_unavailable`.
+- **enrôlement** (ADR-0008) : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted`, `enroll.refused`, `enroll.store_unavailable` ;
+- **chaîne d'audit** (ADR-0012) : `audit.chain_started`, `audit.head_signed` (tête sous forme texte), `audit.chain_broken`, `audit.break_accepted`, `audit.break_acknowledged`, `audit.append_failed`, `audit.event_dropped`, `audit.events_lost`, `audit.head_failed`.
 
 ### Écarts
 

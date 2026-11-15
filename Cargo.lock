@@ -1539,6 +1539,7 @@ name = "ostena-core"
 version = "0.0.0"
 dependencies = [
  "idna_adapter",
+ "ostena-audit",
  "ostena-common",
  "ostena-core",
  "ostena-crypto",

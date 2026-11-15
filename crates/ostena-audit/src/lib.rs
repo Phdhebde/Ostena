@@ -34,7 +34,8 @@ pub use export::{ExportReader, ExportWriter, Frame};
 pub use head::{HEAD_LEN, Head, MAX_TRUSTED_KEYS, TrustedKeys, UnsignedHead};
 pub use ids::{ChainId, Kid};
 pub use record::{
-    ActorKind, Digest, Field, MAX_RECORD_LEN, Outcome, Record, Value, ZERO_DIGEST, record_hash,
+    ActorKind, Digest, Field, MAX_RECORD_LEN, MIN_RECORD_LEN, Outcome, Record, Value, ZERO_DIGEST,
+    record_hash,
 };
 pub use verify::{Finding, Options, Report, Severity, Verifier, verify_export};
 

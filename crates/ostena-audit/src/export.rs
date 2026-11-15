@@ -133,6 +133,20 @@ impl<W: Write> ExportWriter<W> {
         Ok(())
     }
 
+    /// Writes a head as stored, without decoding it: a head that does not
+    /// decode any more (altered in the database) stays in the export, where
+    /// the verifier reports it.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::MalformedRecord`] above [`MAX_RECORD_LEN`],
+    /// [`AuditError::Io`] if writing fails.
+    pub fn head_bytes(&mut self, head: &[u8]) -> Result<(), AuditError> {
+        self.frame(FRAME_HEAD, head)?;
+        self.heads += 1;
+        Ok(())
+    }
+
     /// Writes the end frame, flushes, and returns the writer.
     ///
     /// # Errors
@@ -364,6 +378,32 @@ mod tests {
         );
         assert_ne!(head.prev_head_hash(), [1; 32]);
         assert_eq!(head.prev_head_hash(), ZERO_DIGEST);
+    }
+
+    #[test]
+    fn raw_head_frames_match_decoded_ones_and_are_checked_by_the_reader() {
+        let (chain, bytes, head) = sample();
+        let reader = ExportReader::new(bytes.as_slice()).unwrap();
+        let mut writer = ExportWriter::new(Vec::new(), chain, 3, 1).unwrap();
+        for frame in reader {
+            match frame.unwrap() {
+                Frame::Record(body) => writer.record(&body).unwrap(),
+                Frame::Head(head) => writer.head_bytes(&head.encode()).unwrap(),
+                Frame::End { .. } => {}
+            }
+        }
+        assert_eq!(writer.finish().unwrap(), bytes);
+        let mut writer = ExportWriter::new(Vec::new(), chain, 3, 1).unwrap();
+        let mut broken = head.encode();
+        broken[0] = 9;
+        writer.head_bytes(&broken).unwrap();
+        let rewritten = writer.finish().unwrap();
+        assert!(matches!(
+            read_all(&rewritten),
+            Err(AuditError::Unsupported { .. })
+        ));
+        let mut writer = ExportWriter::new(Vec::new(), chain, 3, 1).unwrap();
+        assert!(writer.head_bytes(&[0; MAX_RECORD_LEN + 1]).is_err());
     }
 
     #[test]

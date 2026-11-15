@@ -421,6 +421,13 @@ impl Verifier {
         self.expected_first = Some(first_seq);
     }
 
+    /// Reports an element that could not even be decoded where the caller
+    /// read it (a head stored in a database): an [`Finding::Invalid`] error;
+    /// the state of the verifier is unchanged.
+    pub fn push_malformed(&mut self, seq: Option<u64>, error: AuditError) {
+        self.report(Finding::Invalid { seq, error });
+    }
+
     fn report(&mut self, finding: Finding) {
         match finding.severity() {
             Severity::Error => self.errors += 1,

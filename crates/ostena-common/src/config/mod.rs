@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub use self::core::{CoreConfig, DatabaseConfig, DatabaseTcp, KeySource};
+pub use self::core::{CoreAuditConfig, CoreConfig, DatabaseConfig, DatabaseTcp, KeySource};
 pub use agent::{AgentConfig, InfrastructureEndpoint};
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{

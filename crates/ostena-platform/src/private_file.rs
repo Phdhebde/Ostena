@@ -33,6 +33,16 @@ pub fn create(path: &Path, bytes: &[u8], reader: Reader) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Creates `path` with its final rights and returns it open for writing,
+/// for a content written as a stream (an audit export). The caller syncs.
+///
+/// # Errors
+///
+/// The file exists (`AlreadyExists`), or any creation error.
+pub fn create_new(path: &Path, reader: Reader) -> io::Result<std::fs::File> {
+    imp::create(path, reader)
+}
+
 #[cfg(unix)]
 mod imp {
     use std::fs::{File, OpenOptions};

@@ -362,6 +362,30 @@ fn enforces_the_size_limit() {
 }
 
 #[test]
+fn smallest_record_is_min_record_len() {
+    let raw = Raw::valid().with(|r| {
+        r.actor.clear();
+        r.event = b"a.b".to_vec();
+        r.fields.clear();
+    });
+    let bytes = raw.bytes();
+    assert_eq!(bytes.len(), MIN_RECORD_LEN);
+    assert_eq!(MIN_RECORD_LEN, 73);
+    let record = Record::decode(&bytes).unwrap();
+    assert_eq!(record.encode().unwrap(), bytes);
+    // Anything shorter is refused, whatever it holds.
+    for len in 0..MIN_RECORD_LEN {
+        assert!(Record::decode(&bytes[..len]).is_err(), "{len}");
+    }
+    let shorter = Raw::valid().with(|r| {
+        r.actor.clear();
+        r.event = b"ab".to_vec();
+        r.fields.clear();
+    });
+    assert!(Record::decode(&shorter.bytes()).is_err());
+}
+
+#[test]
 fn encoder_applies_the_same_rules() {
     let mut record = vector();
     record.fields.reverse();

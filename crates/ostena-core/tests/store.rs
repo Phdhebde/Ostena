@@ -35,6 +35,8 @@ async fn migrated(test: &str) -> Option<(TestDb, PgStore)> {
     let db = TestDb::create(test).await?;
     let pool = db.pool().await;
     schema::migrate(&pool).await.unwrap();
+    // As `ostena core run` does before anything is audited.
+    ostena_core::audit::ensure_genesis(&pool).await.unwrap();
     Some((db, PgStore::new(pool, Arc::new(AgentCache::default()))))
 }
 

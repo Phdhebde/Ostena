@@ -30,6 +30,9 @@ use crate::ids::ChainId;
 pub const RECORD_VERSION: u8 = 1;
 /// Largest encoded record.
 pub const MAX_RECORD_LEN: usize = 8192;
+/// Smallest encoded record: the fixed part (67 bytes), an empty actor, a
+/// 3-byte event name and no field. The core's table checks it.
+pub const MIN_RECORD_LEN: usize = 67 + 1 + 1 + MIN_EVENT_LEN + 1;
 /// Largest actor, in bytes.
 pub const MAX_ACTOR_LEN: usize = 128;
 /// Shortest event name.

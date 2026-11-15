@@ -84,6 +84,12 @@ enum CoreCommand {
         #[command(subcommand)]
         command: CoreAgentCommand,
     },
+    /// The audit chain: export, last head, online verification, break
+    /// acknowledgement.
+    Audit {
+        #[command(subcommand)]
+        command: CoreAuditCommand,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -119,6 +125,53 @@ enum CoreAgentCommand {
         config: PathBuf,
         /// Agent identifier (UUID).
         agent: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreAuditCommand {
+    /// Export the audit chain (records and signed heads) to a file, for
+    /// `ostena audit verify` on another workstation.
+    Export {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// File to create (mode 0600, never overwritten).
+        #[arg(long)]
+        out: PathBuf,
+        /// Export only what follows this head (partial export anchored on it).
+        #[arg(long)]
+        from_head: Option<u64>,
+    },
+    /// Print the last signed head, in text form, to keep outside the bastion.
+    Head {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+    /// Verify the chain in the database with the public keys of the head
+    /// signer. Exit codes of `ostena audit verify`.
+    Verify {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Public key file of the head signer, once per trusted key.
+        #[arg(long = "key", required = true)]
+        keys: Vec<PathBuf>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record that an administrator acknowledged a break of the chain from
+    /// record `--seq`, so that the core signs heads again.
+    AcknowledgeBreak {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// First record of the break.
+        #[arg(long)]
+        seq: u64,
     },
 }
 
@@ -366,9 +419,13 @@ fn main() -> ExitCode {
         Err(e) => {
             // Help and version also arrive here, with exit code 0.
             let _ = e.print();
-            let first = std::env::args_os().nth(1);
-            let first = first.as_deref().and_then(std::ffi::OsStr::to_str);
-            return ExitCode::from(usage_exit_code(&e, first));
+            let args: Vec<String> = std::env::args_os()
+                .skip(1)
+                .take(2)
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            return ExitCode::from(usage_exit_code(&e, &args));
         }
     };
     match cli.command {
@@ -461,11 +518,13 @@ fn main() -> ExitCode {
 }
 
 /// Exit code of a command line that does not parse: clap's (2 for a usage
-/// error, 0 for help and version), except under `ostena audit`, where 2
-/// means "warnings only" and a usage error is 3.
-fn usage_exit_code(error: &clap::Error, first_arg: Option<&str>) -> u8 {
+/// error, 0 for help and version), except under `ostena audit` and `ostena
+/// core audit`, where 2 means "warnings only" and a usage error is 3.
+/// `args` are the first two arguments.
+fn usage_exit_code(error: &clap::Error, args: &[&str]) -> u8 {
     let code = u8::try_from(error.exit_code()).unwrap_or(2);
-    if code != 0 && first_arg == Some("audit") {
+    let audit = matches!(args, ["audit", ..] | ["core", "audit", ..]);
+    if code != 0 && audit {
         audit::USAGE_ERROR
     } else {
         code
@@ -506,6 +565,20 @@ fn run_core(command: CoreCommand) -> ExitCode {
             } => core::agent_token(&config, &group, ttl_mins, &out),
             CoreAgentCommand::List { config } => core::agent_list(&config),
             CoreAgentCommand::Revoke { config, agent } => core::agent_revoke(&config, &agent),
+        },
+        CoreCommand::Audit { command } => match command {
+            CoreAuditCommand::Export {
+                config,
+                out,
+                from_head,
+            } => core::audit_export(&config, &out, from_head),
+            CoreAuditCommand::Head { config } => core::audit_head(&config),
+            CoreAuditCommand::Verify { config, keys, json } => {
+                core::audit_verify(&config, &keys, json)
+            }
+            CoreAuditCommand::AcknowledgeBreak { config, seq } => {
+                core::audit_acknowledge_break(&config, seq)
+            }
         },
     }
 }
@@ -553,10 +626,21 @@ fn repair_replay_store(
 mod tests {
     use clap::CommandFactory;
 
-    use super::Cli;
+    use super::{Cli, usage_exit_code};
 
     #[test]
     fn command_line_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn audit_usage_errors_exit_with_3() {
+        let error = Cli::command().error(clap::error::ErrorKind::UnknownArgument, "x");
+        assert_eq!(usage_exit_code(&error, &["audit", "verify"]), 3);
+        assert_eq!(usage_exit_code(&error, &["core", "audit"]), 3);
+        assert_eq!(usage_exit_code(&error, &["core", "agent"]), 2);
+        assert_eq!(usage_exit_code(&error, &[]), 2);
+        let help = Cli::command().error(clap::error::ErrorKind::DisplayHelp, "x");
+        assert_eq!(usage_exit_code(&help, &["core", "audit"]), 0);
     }
 }

@@ -18,11 +18,12 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use ostena_audit::{ExportReader, Frame, Record};
 use ostena_common::config::Mode;
 use ostena_core::testing::{TestDb, block_on};
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::testing::{TestPki, valid};
-use ostena_crypto::pki::{pem_certificate, pem_private_key};
+use ostena_crypto::pki::{encode_public_key, pem_certificate, pem_private_key};
 
 const GROUP: &str = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
 const WAIT: Duration = Duration::from_secs(20);
@@ -106,6 +107,24 @@ impl Process {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// Sends SIGTERM (what systemd does) and waits for a clean exit.
+    fn terminate(&mut self) {
+        let status = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "{status} ; journal :\n{}", self.seen);
+                return;
+            }
+            assert!(Instant::now() < deadline, "pas d'arrêt après SIGTERM");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 impl Drop for Process {
@@ -179,6 +198,20 @@ fn lab(db: &TestDb) -> Lab {
         &dir.join("credentials/issuing.key"),
         pem_private_key(&pki.issuing_key).expose_secret(),
     );
+    // The head signing key of the audit chain, and its public key for the
+    // auditor (what `ostena ca key new` writes).
+    let (audit_key, audit_pkcs8) = SigningKey::generate().unwrap();
+    // SECRET-EXPOSURE: test only, the key files `ostena ca key new` writes.
+    #[expect(clippy::disallowed_methods)]
+    write_private(
+        &dir.join("credentials/audit.key"),
+        pem_private_key(&audit_pkcs8).expose_secret(),
+    );
+    std::fs::write(
+        dir.join("audit.pub"),
+        encode_public_key(&audit_key.verifying_key()),
+    )
+    .unwrap();
 
     let (tunnel, enrollment) = (free_port(), free_port());
     let p = |name: &str| dir.join(name).display().to_string();
@@ -206,6 +239,8 @@ fn lab(db: &TestDb) -> Lab {
              enrollment_listen = \"127.0.0.1:{enrollment}\"\ntls_root_ca = \"{}\"\n\
              tls_certificate = \"{}\"\ntls_private_key = {{ credential = \"server.key\" }}\n\
              issuing_certificate = \"{}\"\nissuing_private_key = {{ credential = \"issuing.key\" }}\n\n\
+             [core.audit]\nsigning_key = {{ credential = \"audit.key\" }}\nhead_interval_secs = 1\n\
+             heartbeat_secs = 60\n\n\
              [core.database]\nport = {}\nname = \"{}\"\nuser = \"{}\"\n{connection}",
             p("root.pem"),
             p("server.pem"),
@@ -311,9 +346,129 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     assert!(!refused.contains("agent.core_connected"), "{refused}");
     let list = command(&["core", "agent", "list"], &lab.core_config);
     assert!(!list.lines().nth(1).unwrap().ends_with("\t-"), "{list}");
-
     agent.stop();
+
+    audit_chain_is_exported_and_verified(&lab, &db, &mut core);
+
     core.stop();
     drop(lab);
     block_on(db.drop_database());
+}
+
+/// `ostena audit verify <export> --key audit.pub`: exit code and report.
+fn verify(lab: &Lab, export: &Path) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["audit", "verify"])
+        .arg(export)
+        .arg("--key")
+        .arg(lab.dir.join("audit.pub"))
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// The audit chain of the demonstration: exported, then verified offline
+/// with the public key only; a graceful stop ends it with `core.stopped`
+/// and a last head; an edit by the database owner is found.
+fn audit_chain_is_exported_and_verified(lab: &Lab, db: &TestDb, core: &mut Process) {
+    let mut attempt = 0;
+    let deadline = Instant::now() + WAIT;
+    let report = loop {
+        attempt += 1;
+        let export = lab.dir.join(format!("audit-{attempt}.ostaud"));
+        let out = command(
+            &["core", "audit", "export", "--out", export.to_str().unwrap()],
+            &lab.core_config,
+        );
+        assert!(out.contains("enregistrements"), "{out}");
+        let (exit, report) = verify(lab, &export);
+        if exit == 0 || Instant::now() > deadline {
+            assert_eq!(exit, 0, "{report}");
+            break report;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    assert!(report.contains("Résultat : chaîne intacte"), "{report}");
+    let again = lab.dir.join("audit-1.ostaud");
+    let refused = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["core", "audit", "export", "--out", again.to_str().unwrap()])
+        .arg("--config")
+        .arg(&lab.core_config)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(), "an export was overwritten");
+    let head = command(&["core", "audit", "head"], &lab.core_config);
+    assert!(head.starts_with("ostena-audit-head-v1:"), "{head}");
+    let online = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["core", "audit", "verify", "--key"])
+        .arg(lab.dir.join("audit.pub"))
+        .arg("--config")
+        .arg(&lab.core_config)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(online.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&online.stdout)
+    );
+
+    // SIGTERM: the core writes core.stopped, then signs a last head over it.
+    core.terminate();
+    let stopped = lab.dir.join("audit-stopped.ostaud");
+    command(
+        &[
+            "core",
+            "audit",
+            "export",
+            "--out",
+            stopped.to_str().unwrap(),
+        ],
+        &lab.core_config,
+    );
+    let (exit, report) = verify(lab, &stopped);
+    assert_eq!(exit, 0, "{report}");
+    let frames: Vec<Frame> = ExportReader::new(std::fs::File::open(&stopped).unwrap())
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let last = frames
+        .iter()
+        .rposition(|f| matches!(f, Frame::Record(_)))
+        .unwrap();
+    let Frame::Record(body) = &frames[last] else {
+        unreachable!()
+    };
+    let record = Record::decode(body).unwrap();
+    assert_eq!(record.event, "core.stopped");
+    assert!(
+        matches!(&frames[last + 1], Frame::Head(h) if h.record_seq() == record.seq),
+        "{:?}",
+        &frames[last + 1..]
+    );
+
+    // The owner of the database edits a record behind the triggers: the
+    // next export does not verify.
+    block_on(db.execute(
+        "ALTER TABLE audit_record DISABLE TRIGGER USER;
+         UPDATE audit_record SET body = overlay(body placing '\\xffff'::bytea from 60 for 2)
+             WHERE seq = 2;
+         ALTER TABLE audit_record ENABLE TRIGGER USER;",
+    ));
+    let tampered = lab.dir.join("audit-tampered.ostaud");
+    command(
+        &[
+            "core",
+            "audit",
+            "export",
+            "--out",
+            tampered.to_str().unwrap(),
+        ],
+        &lab.core_config,
+    );
+    let (exit, report) = verify(lab, &tampered);
+    assert_eq!(exit, 1, "{report}");
+    assert!(report.contains("AUD-E007"), "{report}");
 }

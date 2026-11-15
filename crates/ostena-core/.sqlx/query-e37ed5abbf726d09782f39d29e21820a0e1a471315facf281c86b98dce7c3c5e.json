@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT head_no, record_seq, body FROM audit_head ORDER BY head_no DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "head_no",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "head_no"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "record_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "record_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "body",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "body"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e37ed5abbf726d09782f39d29e21820a0e1a471315facf281c86b98dce7c3c5e"
+}

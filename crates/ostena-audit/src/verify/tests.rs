@@ -132,6 +132,22 @@ fn intact_and_covered_chain_passes() {
 }
 
 #[test]
+fn malformed_elements_pushed_by_the_caller_are_errors() {
+    let (chain, items) = Chain::build(2, &[2]);
+    let mut verifier = Verifier::new(chain.keys(), Options::default());
+    for item in &items {
+        match item {
+            Item::Record(body) => verifier.push_record(body).unwrap(),
+            Item::Head(head) => verifier.push_head(head).map(|()| [0; 32]).unwrap(),
+        };
+    }
+    verifier.push_malformed(None, AuditError::MalformedHead("x"));
+    let report = verifier.finish(None);
+    assert_eq!(codes(&report), ["AUD-E003"]);
+    assert_eq!((report.errors, report.covered_seq), (1, Some(2)));
+}
+
+#[test]
 fn several_heads_on_the_same_record_are_fine() {
     let (mut chain, mut items) = Chain::build(3, &[3]);
     items.push(chain.head());

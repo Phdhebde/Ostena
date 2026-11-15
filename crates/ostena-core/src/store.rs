@@ -3,11 +3,18 @@
 //! Every change is committed with a notification on [`CHANNEL`]: the core
 //! that did not make it (an administration command runs in another process)
 //! updates its copy of the registry or opens its enrolment listener.
+//!
+//! Every change is also written to the audit chain (ADR-0012), in the same
+//! transaction: enrolment, renewal, token issuance and consumption are
+//! refused if their record cannot be written (granting); a revocation and a
+//! refused token commit anyway (protective).
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
 use ostena_tunnel::enroll::{
     AgentRegistry, EnrollmentService, EnrollmentToken, StoreFuture, TokenDecision, TokenRecord,
     TokenStore,
@@ -15,6 +22,7 @@ use ostena_tunnel::enroll::{
 use ostena_tunnel::{TunnelError, Uuid};
 use sqlx::PgPool;
 
+use crate::audit::{self, Appended, Recorder};
 use crate::cache::{AgentCache, CertEntry};
 use crate::error::CoreError;
 
@@ -30,6 +38,9 @@ pub enum Notice {
     Registered,
     /// An agent was revoked: close its tunnels.
     Revoked(Uuid),
+    /// The audit chain changed (an administration command appended to it):
+    /// the head signer looks at the tip.
+    Audit,
 }
 
 impl Notice {
@@ -39,6 +50,7 @@ impl Notice {
             Self::Token => "token".into(),
             Self::Registered => "registered".into(),
             Self::Revoked(agent) => format!("revoked:{agent}"),
+            Self::Audit => "audit".into(),
         }
     }
 
@@ -47,6 +59,7 @@ impl Notice {
         match payload {
             "token" => Some(Self::Token),
             "registered" => Some(Self::Registered),
+            "audit" => Some(Self::Audit),
             _ => payload
                 .strip_prefix("revoked:")
                 .and_then(Uuid::parse)
@@ -84,17 +97,45 @@ fn i64_of(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// A granting audit record could not be written: the operation is refused
+/// with the registry error (`TUN-E029`).
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used as map_err(audit_error)"
+)]
+fn audit_error(e: CoreError) -> TunnelError {
+    tracing::error!(
+        event = "audit.append_failed",
+        code = e.code(),
+        "enregistrement d'audit impossible : opération refusée ; {e}"
+    );
+    TunnelError::RegistryUnavailable
+}
+
+pub(crate) fn agent_event(kind: EventKind, outcome: Outcome, agent: Uuid) -> Event {
+    Event::new(kind, outcome, ActorKind::Agent, agent.to_string())
+        .uuid(field::AGENT_ID, agent.to_bytes())
+}
+
 /// The registry and the tokens of one core.
 #[derive(Debug, Clone)]
 pub struct PgStore {
     pool: PgPool,
     cache: Arc<AgentCache>,
+    recorder: Arc<Recorder>,
+    /// The copy of the registry could not be reloaded last time.
+    registry_down: Arc<AtomicBool>,
 }
 
 impl PgStore {
     /// A store on `pool`, keeping `cache` in step with what it commits.
     pub fn new(pool: PgPool, cache: Arc<AgentCache>) -> Self {
-        Self { pool, cache }
+        Self {
+            pool,
+            cache,
+            recorder: Arc::new(Recorder::new()),
+            registry_down: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// The pool.
@@ -105,6 +146,11 @@ impl PgStore {
     /// The copy of the registry it keeps in step.
     pub fn cache(&self) -> Arc<AgentCache> {
         self.cache.clone()
+    }
+
+    /// What links its audit records to the head signer.
+    pub fn recorder(&self) -> Arc<Recorder> {
+        self.recorder.clone()
     }
 
     /// Reads every agent certificate, for a full reload of the copy.
@@ -144,14 +190,36 @@ impl PgStore {
         match self.certificates().await {
             Ok(entries) => {
                 self.cache.replace(entries);
+                if self.registry_down.swap(false, Ordering::AcqRel) {
+                    tracing::info!(
+                        event = "core.registry_restored",
+                        "registre de nouveau lisible"
+                    );
+                    self.recorder.emit(Event::new(
+                        EventKind::CoreRegistryRestored,
+                        Outcome::Success,
+                        ActorKind::Core,
+                        audit::CORE_ACTOR,
+                    ));
+                }
                 Ok(())
             }
             Err(e) => {
-                if self.cache.is_available() {
+                if !self.registry_down.swap(true, Ordering::AcqRel) {
                     tracing::error!(
                         event = "core.registry_unavailable",
                         code = e.code(),
                         "registre illisible : nouveaux agents refusés (TUN-E029) jusqu'au prochain rechargement réussi ; {e}"
+                    );
+                    self.recorder.emit(
+                        Event::new(
+                            EventKind::CoreRegistryUnavailable,
+                            Outcome::Failure,
+                            ActorKind::Core,
+                            audit::CORE_ACTOR,
+                        )
+                        .text(field::CODE, e.code())
+                        .text(field::REASON, truncate(&e.to_string())),
                     );
                 }
                 self.cache.invalidate();
@@ -165,7 +233,8 @@ impl AgentRegistry for PgStore {
     fn register(&self, fingerprint: [u8; 32], group: Uuid, agent: Uuid) -> StoreFuture<'_, ()> {
         Box::pin(async move {
             let mut tx = self.pool.begin().await.map_err(store_error)?;
-            sqlx::query!(
+            // A new row: an enrolment; none: a renewal of a known agent.
+            let enrolled = sqlx::query!(
                 "INSERT INTO agent (id, gateway_group) VALUES ($1::text::uuid, $2::text::uuid)
                  ON CONFLICT (id) DO NOTHING",
                 agent.to_string(),
@@ -173,7 +242,9 @@ impl AgentRegistry for PgStore {
             )
             .execute(&mut *tx)
             .await
-            .map_err(store_error)?;
+            .map_err(store_error)?
+            .rows_affected()
+                == 1;
             // A renewal adds a certificate to a known agent: only if the group
             // matches and the agent is not revoked.
             let inserted = sqlx::query!(
@@ -195,7 +266,18 @@ impl AgentRegistry for PgStore {
             notify(&mut tx, &Notice::Registered)
                 .await
                 .map_err(store_error)?;
+            let kind = if enrolled {
+                EventKind::AgentEnrolled
+            } else {
+                EventKind::AgentCertificateRenewed
+            };
+            let event = agent_event(kind, Outcome::Success, agent)
+                .uuid(field::GROUP_ID, group.to_bytes())
+                .bytes(field::FINGERPRINT, fingerprint);
+            // Granting, last statement before the commit.
+            let appended = audit::append(&mut tx, event).await.map_err(audit_error)?;
             tx.commit().await.map_err(store_error)?;
+            self.recorder.critical(&[appended]);
             self.cache.insert(
                 fingerprint,
                 CertEntry {
@@ -212,9 +294,11 @@ impl AgentRegistry for PgStore {
 impl TokenStore for PgStore {
     fn insert(&self, id: [u8; 16], record: TokenRecord) -> StoreFuture<'_, ()> {
         Box::pin(async move {
-            insert_token(&self.pool, id, &record)
+            let appended = insert_token(&self.pool, id, &record)
                 .await
-                .map_err(store_error)
+                .map_err(audit_error)?;
+            self.recorder.critical(&[appended]);
+            Ok(())
         })
     }
 
@@ -257,7 +341,38 @@ impl TokenStore for PgStore {
             .execute(&mut *tx)
             .await
             .map_err(store_error)?;
+            let event = |kind, outcome| {
+                Event::new(kind, outcome, ActorKind::Peer, "")
+                    .bytes(field::ENROLLMENT_ID, id)
+                    .uuid(field::GROUP_ID, record.group.to_bytes())
+            };
+            // Last statement before the commit in both cases.
+            let appended = match &decided {
+                // Granting: the token is spent only if its record is written.
+                Ok(()) => Some(
+                    audit::append(
+                        &mut tx,
+                        event(EventKind::EnrollTokenConsumed, Outcome::Success),
+                    )
+                    .await
+                    .map_err(audit_error)?,
+                ),
+                // Protective: the failure counter is kept whatever happens.
+                Err(e) => {
+                    audit::append_protective(
+                        &mut tx,
+                        event(EventKind::EnrollTokenRejected, Outcome::Refused)
+                            .u64(field::FAILURES, u64::from(record.failures))
+                            .bool(field::BURNED, record.burned)
+                            .text(field::CODE, e.code()),
+                    )
+                    .await
+                }
+            };
             tx.commit().await.map_err(store_error)?;
+            if let Some(appended) = appended {
+                self.recorder.critical(&[appended]);
+            }
             decided
         })
     }
@@ -277,12 +392,15 @@ impl TokenStore for PgStore {
     }
 }
 
+/// Stores a token and its granting `enroll.token_issued` record, in one
+/// transaction; the actor is the database user (`system_user`).
 async fn insert_token(
     pool: &PgPool,
     id: [u8; 16],
     record: &TokenRecord,
-) -> Result<(), sqlx::Error> {
+) -> Result<Appended, CoreError> {
     let mut tx = pool.begin().await?;
+    let actor = audit::admin_actor(&mut tx).await?;
     sqlx::query!(
         "INSERT INTO enrollment_token (id, digest, gateway_group, expires_at)
          VALUES ($1, $2, $3::text::uuid, $4)",
@@ -294,7 +412,20 @@ async fn insert_token(
     .execute(&mut *tx)
     .await?;
     notify(&mut tx, &Notice::Token).await?;
-    tx.commit().await
+    let event = Event::new(
+        EventKind::EnrollTokenIssued,
+        Outcome::Success,
+        ActorKind::Admin,
+        actor,
+    )
+    .bytes(field::ENROLLMENT_ID, id)
+    .uuid(field::GROUP_ID, record.group.to_bytes())
+    .u64(field::EXPIRES_AT, record.expires_at);
+    let appended = audit::append(&mut tx, event).await?;
+    tx.commit()
+        .await
+        .map_err(|e| CoreError::AuditWrite(e.to_string()))?;
+    Ok(appended)
 }
 
 async fn notify(
@@ -305,6 +436,30 @@ async fn notify(
         .execute(&mut **tx)
         .await
         .map(|_| ())
+}
+
+/// Notifies the running core that the audit chain changed (an
+/// administration command appended to it).
+///
+/// # Errors
+///
+/// [`CoreError::Database`].
+pub(crate) async fn notify_audit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), CoreError> {
+    notify(tx, &Notice::Audit).await.map_err(CoreError::from)
+}
+
+/// Text of at most 1024 bytes (an audit text field), cut on a character
+/// boundary, without control characters.
+pub(crate) fn truncate(text: &str) -> String {
+    let mut out: String = text.chars().filter(|c| !c.is_control()).collect();
+    let mut end = out.len().min(ostena_audit::record::MAX_TEXT_LEN);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out
 }
 
 // ------------------------------------------------------------ administration
@@ -331,7 +486,8 @@ pub struct AgentRow {
 /// # Errors
 ///
 /// [`CoreError::Startup`] for a lifetime out of bounds,
-/// [`CoreError::Database`] otherwise.
+/// [`CoreError::AuditWrite`] if its audit record cannot be written (the
+/// token is then not issued), [`CoreError::Database`] otherwise.
 pub async fn issue_token(
     pool: &PgPool,
     group: Uuid,
@@ -381,6 +537,7 @@ pub async fn list_agents(pool: &PgPool) -> Result<Vec<AgentRow>, CoreError> {
 /// otherwise.
 pub async fn revoke_agent(pool: &PgPool, agent: Uuid) -> Result<(), CoreError> {
     let mut tx = pool.begin().await?;
+    let actor = audit::admin_actor(&mut tx).await?;
     let found = sqlx::query!(
         "UPDATE agent SET revoked_at = coalesce(revoked_at, now()) WHERE id = $1::text::uuid",
         agent.to_string(),
@@ -399,6 +556,19 @@ pub async fn revoke_agent(pool: &PgPool, agent: Uuid) -> Result<(), CoreError> {
     .execute(&mut *tx)
     .await?;
     notify(&mut tx, &Notice::Revoked(agent)).await?;
+    // Protective, last statement before the commit: the revocation stands
+    // even if its record cannot be written.
+    audit::append_protective(
+        &mut tx,
+        Event::new(
+            EventKind::AgentRevoked,
+            Outcome::Success,
+            ActorKind::Admin,
+            actor,
+        )
+        .uuid(field::AGENT_ID, agent.to_bytes()),
+    )
+    .await;
     tx.commit().await?;
     tracing::warn!(event = "agent.revoked", agent = %agent, "agent révoqué");
     Ok(())
@@ -411,7 +581,12 @@ mod tests {
     #[test]
     fn notices_round_trip() {
         let agent = Uuid::from_bytes([7; 16]);
-        for n in [Notice::Token, Notice::Registered, Notice::Revoked(agent)] {
+        for n in [
+            Notice::Token,
+            Notice::Registered,
+            Notice::Revoked(agent),
+            Notice::Audit,
+        ] {
             assert_eq!(Notice::parse(&n.payload()), Some(n));
         }
         for bad in ["", "revoked:", "revoked:x", "token ", "other"] {

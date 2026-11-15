@@ -46,14 +46,20 @@ pub(crate) fn verify(args: &VerifyArgs<'_>) -> ExitCode {
     }
 }
 
-fn run(args: &VerifyArgs<'_>) -> Result<Report, String> {
+/// The trusted keys, from public key files (`ostena-p256-public-key-v1`).
+pub(crate) fn read_keys(paths: &[PathBuf]) -> Result<TrustedKeys, String> {
     let mut keys = TrustedKeys::new();
-    for path in args.keys {
+    for path in paths {
         let text =
             std::fs::read_to_string(path).map_err(|e| format!("{} : {e}", path.display()))?;
         let key = pki::decode_public_key(&text).map_err(|e| format!("{} : {e}", path.display()))?;
         keys.insert(key).map_err(|e| e.to_string())?;
     }
+    Ok(keys)
+}
+
+fn run(args: &VerifyArgs<'_>) -> Result<Report, String> {
+    let keys = read_keys(args.keys)?;
     let mut external_heads = Vec::with_capacity(args.heads.len());
     for head in args.heads {
         external_heads.push(read_head(head)?);
@@ -83,7 +89,7 @@ fn seq(value: Option<u64>) -> String {
 }
 
 /// The French summary.
-fn summary(export: &Path, report: &Report) -> String {
+pub(crate) fn summary(export: &Path, report: &Report) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Export : {}", export.display());
     let _ = writeln!(
@@ -120,7 +126,7 @@ fn summary(export: &Path, report: &Report) -> String {
 }
 
 /// The report as one JSON object.
-fn json(export: &Path, report: &Report) -> String {
+pub(crate) fn json(export: &Path, report: &Report) -> String {
     let findings: Vec<serde_json::Value> = report
         .findings
         .iter()

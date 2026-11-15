@@ -37,6 +37,17 @@ pub enum CoreError {
     /// An agent, a group or a token is unknown.
     #[error("[CORE-E009] {0} inconnu")]
     NotFound(String),
+    /// An audit record or head cannot be written: the operation it audits
+    /// is refused, unless it only reduces privileges (ADR-0012).
+    #[error("[CORE-E010] écriture dans la chaîne d'audit impossible : {0}")]
+    AuditWrite(String),
+    /// The audit chain in the database is not consistent: the core stops
+    /// signing heads and refuses to start (ADR-0012).
+    #[error(
+        "[CORE-E011] chaîne d'audit incohérente : {0} ; voir la procédure de rupture \
+         (docs/exploitation/audit-verification.md)"
+    )]
+    AuditChain(String),
 }
 
 impl CoreError {
@@ -52,6 +63,8 @@ impl CoreError {
             Self::Startup(_) => "CORE-E007",
             Self::Environment(_) => "CORE-E008",
             Self::NotFound(_) => "CORE-E009",
+            Self::AuditWrite(_) => "CORE-E010",
+            Self::AuditChain(_) => "CORE-E011",
         }
     }
 }
@@ -78,6 +91,8 @@ mod tests {
             CoreError::Startup("x".into()),
             CoreError::Environment("PGOPTIONS".into()),
             CoreError::NotFound("agent".into()),
+            CoreError::AuditWrite("x".into()),
+            CoreError::AuditChain("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("CORE-E{:03}", i + 1);

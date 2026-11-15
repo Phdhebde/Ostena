@@ -122,6 +122,22 @@ pub mod field {
     pub const OPTION: &str = "option";
     /// Number of closed tunnels.
     pub const CLOSED_TUNNELS: &str = "closed_tunnels";
+    /// Failed attempts of an enrolment token so far.
+    pub const FAILURES: &str = "failures";
+    /// Whether an enrolment token is burned (too many failures).
+    pub const BURNED: &str = "burned";
+    /// Expiry, Unix seconds.
+    pub const EXPIRES_AT: &str = "expires_at";
+    /// Version announced by an agent.
+    pub const AGENT_VERSION: &str = "agent_version";
+    /// Versions of the migrations applied, comma separated.
+    pub const MIGRATIONS: &str = "migrations";
+    /// Time of the first event of a range, Unix ms.
+    pub const FIRST_MS: &str = "first_ms";
+    /// Time of the last event of a range, Unix ms.
+    pub const LAST_MS: &str = "last_ms";
+    /// Number of heads (in an export).
+    pub const HEAD_COUNT: &str = "head_count";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -145,6 +161,14 @@ pub mod field {
         VERSION,
         OPTION,
         CLOSED_TUNNELS,
+        FAILURES,
+        BURNED,
+        EXPIRES_AT,
+        AGENT_VERSION,
+        MIGRATIONS,
+        FIRST_MS,
+        LAST_MS,
+        HEAD_COUNT,
     ];
 }
 

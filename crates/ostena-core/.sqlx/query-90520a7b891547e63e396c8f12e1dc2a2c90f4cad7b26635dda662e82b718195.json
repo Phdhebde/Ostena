@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT head_no, record_seq, body FROM audit_head\n                 WHERE (record_seq, head_no) > ($1, $2)\n                 ORDER BY record_seq, head_no LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "head_no",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "head_no"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "record_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "record_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "body",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "body"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "90520a7b891547e63e396c8f12e1dc2a2c90f4cad7b26635dda662e82b718195"
+}

@@ -967,6 +967,7 @@ tls_certificate = "/etc/ostena/ca/server.pem"
 tls_private_key = { credential = "server.key" }
 issuing_certificate = "/etc/ostena/ca/issuing.pem"
 issuing_private_key = { credential = "issuing.key" }
+audit = { signing_key = { credential = "audit.key" } }
 "#;
 
 fn core_with(extra: &str) -> Config {
@@ -990,6 +991,96 @@ fn core_section_defaults_are_safe() {
     assert_eq!((db.name.as_str(), db.user.as_str()), ("ostena", "ostena"));
     assert_eq!(db.max_connections, 8);
     assert!(db.tcp.is_none());
+    let audit = &core.audit;
+    assert_eq!(audit.signing_key, KeySource::Credential("audit.key".into()));
+    assert_eq!(
+        (
+            audit.head_interval_secs,
+            audit.heartbeat_secs,
+            audit.head_max_records
+        ),
+        (60, 300, 1000)
+    );
+    assert_eq!(core.keys()[2].0, "core.audit.signing_key");
+}
+
+/// [`CORE`] with its `audit` table replaced by `audit`.
+fn core_audit(audit: &str) -> String {
+    CORE.replace(
+        "audit = { signing_key = { credential = \"audit.key\" } }",
+        audit,
+    )
+}
+
+#[test]
+fn core_audit_section_is_required_and_strict() {
+    for text in [
+        core_audit(""),
+        core_audit("audit = {}"),
+        core_audit("audit = { signing_key = { credential = \"a\" }, unknown = 1 }"),
+        core_audit("audit = { signing_key = { env = \"A\" } }"),
+    ] {
+        assert_eq!(
+            Config::from_toml_str(&text).unwrap_err().codes(),
+            vec![Code::Parse],
+            "accepted: {text}"
+        );
+    }
+}
+
+#[test]
+fn v012_core_audit_bounds() {
+    let ok = parse(&core_audit(
+        "audit = { signing_key = { credential = \"a\" }, head_interval_secs = 3600, \
+         heartbeat_secs = 3600, head_max_records = 100000 }",
+    ));
+    assert_eq!(core_codes(&ok), Vec::new());
+    let ok = parse(&core_audit(
+        "audit = { signing_key = { credential = \"a\" }, head_interval_secs = 1, \
+         heartbeat_secs = 86400, head_max_records = 1 }",
+    ));
+    assert_eq!(core_codes(&ok), Vec::new());
+    for audit in [
+        "head_interval_secs = 0",
+        "head_interval_secs = 3601, heartbeat_secs = 7200",
+        "heartbeat_secs = 59",
+        "heartbeat_secs = 86401",
+        "head_max_records = 0",
+        "head_max_records = 100001",
+    ] {
+        let c = parse(&core_audit(&format!(
+            "audit = {{ signing_key = {{ credential = \"a\" }}, {audit} }}"
+        )));
+        assert_eq!(core_codes(&c), vec![Code::CoreBounds], "{audit}");
+    }
+}
+
+#[test]
+fn core_audit_key_follows_the_key_rules() {
+    let c = parse(&core_audit(
+        "audit = { signing_key = { credential = \"../audit.key\" } }",
+    ));
+    assert_eq!(core_codes(&c), vec![Code::CoreKeySource]);
+    let c = parse(&core_audit(
+        "audit = { signing_key = { file = \"audit.key\" } }",
+    ));
+    assert_eq!(core_codes(&c), vec![Code::RelativePath]);
+    let c = parse(&core_audit(
+        "audit = { signing_key = { file = \"/var/lib/ostena/audit.key\" } }",
+    ));
+    let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END - 1);
+    assert_eq!(
+        waived.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::CoreKeyInFile]
+    );
+    assert!(waived[0].message.contains("core.audit.signing_key"));
+    assert_eq!(
+        c.weakenings_at(core::KEY_FILE_WAIVER_END)
+            .iter()
+            .map(|v| v.code)
+            .collect::<Vec<_>>(),
+        vec![Code::CoreKeyInFile]
+    );
 }
 
 #[test]
