@@ -39,7 +39,11 @@ pub const MAX_PRINCIPALS: usize = 16;
 pub const NONCE_LEN: std::ops::RangeInclusive<usize> = 16..=64;
 /// Longest key identifier, principal or option name.
 const MAX_TEXT: usize = 256;
-/// Clock skew tolerated on the start of validity of a user certificate.
+/// Clock skew tolerated on the start of validity by [`check_user`] and
+/// [`check_host`]. Defence in depth only: on the agent server, the SSH
+/// library refuses a certificate whose start of validity is still ahead
+/// before this check runs, so there is no skew tolerance there in
+/// practice (ADR-0010).
 pub const CLOCK_SKEW_SECS: u64 = 60;
 /// Longest validity of a user certificate: the 8 hours of a login session,
 /// plus a margin.
