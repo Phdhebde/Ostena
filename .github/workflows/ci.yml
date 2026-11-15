@@ -95,14 +95,18 @@ jobs:
           cargo bench --locked -p ostena-scope
           cargo bench --locked -p ostena-frame
           cargo bench --locked -p ostena-tunnel
+          cargo bench --locked -p ostena-ssh --bench relay
 
   # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
-  # our server behind the pre-check (sessions, refusals, audit), then our
-  # client against a Debian 12 OpenSSH server in Docker, with the agent key
-  # installed as `restrict,from=`. Needs Docker: GitHub-hosted runner.
+  # our server behind the pre-check (sessions, refusals, audit) and, with a
+  # certificate, through the agent server to a target; the SSH access through
+  # the gateway against the test core; our client against a Debian 12
+  # OpenSSH server in Docker, with the agent key installed as
+  # `restrict,from=`; then the native access end to end to that target.
+  # Needs Docker: GitHub-hosted runner.
   ssh-interop:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -112,10 +116,11 @@ jobs:
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: ssh -V
-      - run: cargo test --locked -p ostena-ssh --test interop
+      - run: cargo test --locked -p ostena-ssh --test interop --test gateway
         env:
           OSTENA_REQUIRE_OPENSSH: "1"
       - run: bash tests/ssh/debian12-target.sh
+      - run: bash tests/ssh/native-e2e.sh
 
   # The core against PostgreSQL 16 as in production (ADR-0011): Unix socket,
   # `peer` authentication, a role named after the runner account. Tests that
