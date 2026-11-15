@@ -1,0 +1,1 @@
+{"type":"ssh_grant_request","request_id":3,"subject":"2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6","login_session":"7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d","certificate_sha256":"abababababababababababababababababababababababababababababababab","account":"admin@corp.local","resource":"srv-lab01","client_address":"10.1.2.3:51000"}

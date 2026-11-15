@@ -107,6 +107,9 @@ pub enum TunnelError {
     /// it refuses rather than serve a stale copy.
     #[error("[TUN-E029] registre des agents du core indisponible ; nouvelle tentative plus tard")]
     RegistryUnavailable,
+    /// The SSH trust pushed by the core is refused (older version).
+    #[error("[TUN-E030] confiance SSH du core refusée : {0}")]
+    SshTrust(String),
 }
 
 impl TunnelError {
@@ -168,6 +171,7 @@ impl TunnelError {
             Self::NoAnswer => "TUN-E027",
             Self::PolicyInvalid(_) => "TUN-E028",
             Self::RegistryUnavailable => "TUN-E029",
+            Self::SshTrust(_) => "TUN-E030",
         }
     }
 }
@@ -289,6 +293,7 @@ mod tests {
             TunnelError::NoAnswer,
             TunnelError::PolicyInvalid("x".into()),
             TunnelError::RegistryUnavailable,
+            TunnelError::SshTrust("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("TUN-E{:03}", i + 1);
