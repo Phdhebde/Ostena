@@ -845,3 +845,106 @@ fn driver_refuses_channels_opened_by_the_target() {
         session.close().await;
     });
 }
+
+/// Waits until the authoriser has seen `count` requests.
+fn wait_requests(n: &Native, count: usize) -> bool {
+    for _ in 0..200 {
+        if n.agent.authorizer.requests.lock().unwrap().len() >= count {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+fn wait_closed(n: &Native, count: usize) -> Vec<ostena_ssh::server::SessionSummary> {
+    for _ in 0..300 {
+        let closed = n.agent.authorizer.closed.lock().unwrap().clone();
+        if closed.len() >= count {
+            return closed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    n.agent.authorizer.closed.lock().unwrap().clone()
+}
+
+#[test]
+fn a_revocation_during_the_authorisation_cuts_the_session() {
+    let runtime = runtime();
+    let Some(n) = native(&runtime, "native-revoke-race", ServerSettings::default()) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    *n.agent.authorizer.delay.lock().unwrap() = Some(std::time::Duration::from_secs(2));
+    let child = std::thread::spawn({
+        let ssh = n.ssh.clone();
+        let args = n.args_for(&certificate);
+        move || Command::new(ssh).args(args).output().unwrap()
+    });
+    assert!(wait_requests(&n, 1));
+    // The core revokes while it is still deciding.
+    let login = ostena_ssh::cert::parse_uuid(common::LOGIN).unwrap();
+    assert_eq!(n.agent.server.revoke_login(login), 1);
+    assert!(!child.join().unwrap().status.success());
+    let closed = wait_closed(&n, 1);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].reason, "révoquée");
+    assert!(!wait_event(n.agent.addr, "ssh.session_revoked").is_empty());
+}
+
+#[test]
+fn a_client_gone_right_after_the_authorisation_still_closes_the_session() {
+    let runtime = runtime();
+    let Some(n) = native(&runtime, "native-gone", ServerSettings::default()) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    *n.agent.authorizer.delay.lock().unwrap() = Some(std::time::Duration::from_secs(2));
+    let mut child = Command::new(&n.ssh)
+        .args(n.args_for(&certificate))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(wait_requests(&n, 1));
+    child.kill().unwrap();
+    let _ = child.wait();
+    // The grant was consumed: the session is closed once, audited.
+    let closed = wait_closed(&n, 1);
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].reason, "fermée");
+    let events = wait_event(n.agent.addr, "ssh.session_closed");
+    assert_eq!(events.len(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert_eq!(n.agent.authorizer.closed.lock().unwrap().len(), 1);
+    assert_eq!(n.agent.server.sessions(), 0);
+}
+
+#[test]
+fn unauthenticated_connections_are_bounded_per_source_address() {
+    let runtime = runtime();
+    let settings = ServerSettings {
+        max_unauthenticated_per_source: 2,
+        ..ServerSettings::default()
+    };
+    let Some(n) = native(&runtime, "native-per-source", settings) else {
+        return;
+    };
+    // Two silent connections hold their slots (the pre-check waits).
+    let held: Vec<_> = (0..2)
+        .map(|_| std::net::TcpStream::connect(n.agent.addr).unwrap())
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let third = std::net::TcpStream::connect(n.agent.addr).unwrap();
+    let limited = wait_event(n.agent.addr, "ssh.connection_limited");
+    assert_eq!(limited.len(), 1, "{limited:?}");
+    assert_eq!(limited[0].code, "SSH-E019");
+    assert!(limited[0].field("message").contains("cette adresse"));
+    drop(third);
+    // Once released, a new connection gets through to a session.
+    drop(held);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let certificate = n.certify(|_| {});
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["hello"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}

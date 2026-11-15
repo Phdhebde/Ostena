@@ -591,6 +591,7 @@ pub struct TestAuthorizer {
     pub targets: Mutex<Targets>,
     pub refuse: Mutex<Option<ostena_ssh::server::Refusal>>,
     pub max_session: Mutex<Option<Duration>>,
+    pub delay: Mutex<Option<Duration>>,
     pub requests: Mutex<Vec<ostena_ssh::server::AccessRequest>>,
     pub closed: Mutex<Vec<ostena_ssh::server::SessionSummary>>,
 }
@@ -601,6 +602,10 @@ impl ostena_ssh::server::Authorizer for TestAuthorizer {
         request: ostena_ssh::server::AccessRequest,
     ) -> Result<ostena_ssh::server::Authorized, ostena_ssh::server::Refusal> {
         self.requests.lock().unwrap().push(request.clone());
+        let delay = *self.delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if let Some(refusal) = self.refuse.lock().unwrap().clone() {
             return Err(refusal);
         }
