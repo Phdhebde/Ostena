@@ -1,0 +1,198 @@
+//! The driver to the targets (ADR-0010): the agent joins a target with its
+//! own key, behind the pre-check, and verifies the target host key against
+//! the one pinned in the inventory, exactly.
+//!
+//! Only a [`PinnedTarget`] can be dialled: its addresses passed the scope
+//! control (anti-SSRF by type, no name resolution here). They are tried in
+//! order within the deadline.
+//!
+//! Events: `ssh.target_host_key_mismatch` (`SSH-E014`),
+//! `ssh.target_auth_failed` (`SSH-E015`), `ssh.target_unreachable`
+//! (`SSH-E016`).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use ostena_crypto::p256::VerifyingKey;
+use ostena_scope::PinnedTarget;
+use russh::client::{self, Handle};
+use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+use russh::{Channel, Disconnect};
+use tokio::net::TcpStream;
+
+use crate::config;
+use crate::error::SshError;
+use crate::precheck::Role;
+use crate::precheck::stream::Prechecked;
+
+/// The client side: trusts the pinned host key only, as a bare key.
+struct Pinned {
+    host_key: [u8; ostena_crypto::p256::PUBLIC_KEY_LEN],
+    mismatch: Arc<AtomicBool>,
+}
+
+/// The SEC1 point of an ECDSA P-256 public key, if it is one.
+pub fn sec1_point(key: &russh::keys::PublicKey) -> Option<&[u8]> {
+    key.key_data()
+        .ecdsa()
+        .map(ssh_key::public::EcdsaPublicKey::as_sec1_bytes)
+}
+
+impl client::Handler for Pinned {
+    type Error = russh::Error;
+
+    #[allow(clippy::manual_async_fn, reason = "the trait asks for a Send future")]
+    fn check_server_key(
+        &mut self,
+        server: &PublicKeyOrCertificate,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        let matches = match server {
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                sec1_point(key) == Some(self.host_key.as_slice())
+            }
+            PublicKeyOrCertificate::Certificate(_) => false,
+        };
+        if !matches {
+            self.mismatch.store(true, Ordering::Relaxed);
+        }
+        async move { Ok(matches) }
+    }
+}
+
+/// An authenticated connection to a target.
+pub struct TargetSession {
+    handle: Handle<Pinned>,
+    label: String,
+}
+
+impl std::fmt::Debug for TargetSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TargetSession")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TargetSession {
+    /// Opens the session channel on the target.
+    ///
+    /// # Errors
+    ///
+    /// [`SshError::TargetUnreachable`] if the target refuses or the
+    /// connection is gone.
+    pub async fn open_session(&self) -> Result<Channel<client::Msg>, SshError> {
+        self.handle
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::TargetUnreachable(format!("canal refusé par la cible : {e}")))
+    }
+
+    /// Closes the connection.
+    pub async fn close(&self) {
+        let _ = self
+            .handle
+            .disconnect(Disconnect::ByApplication, "", "fr")
+            .await;
+    }
+
+    /// Whether the connection is closed.
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_closed()
+    }
+}
+
+fn unreachable(label: &str, error: SshError) -> SshError {
+    tracing::warn!(
+        event = "ssh.target_unreachable",
+        code = error.code(),
+        target = label,
+        "{error}"
+    );
+    error
+}
+
+async fn dial(target: &PinnedTarget) -> Result<TcpStream, SshError> {
+    let mut last = String::from("aucune adresse");
+    for addr in target.addrs() {
+        match TcpStream::connect(addr).await {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = format!("{addr} : {e}"),
+        }
+    }
+    Err(SshError::TargetUnreachable(last))
+}
+
+/// Connects to `target` behind the pre-check, checks that its host key is
+/// exactly `host_key`, and authenticates as `account` with `agent_key`,
+/// all within `timeout`. `label` names the target in events.
+///
+/// # Errors
+///
+/// [`SshError::TargetHostKey`] (`SSH-E014`), [`SshError::TargetAuth`]
+/// (`SSH-E015`), [`SshError::TargetUnreachable`] (`SSH-E016`), each with
+/// its event.
+pub async fn connect(
+    target: &PinnedTarget,
+    host_key: &VerifyingKey,
+    account: &str,
+    agent_key: Arc<PrivateKey>,
+    timeout: Duration,
+    label: &str,
+) -> Result<TargetSession, SshError> {
+    let attempt = async {
+        let tcp = dial(target).await?;
+        let stream = Prechecked::new(tcp, Role::Client, label, timeout);
+        let mismatch = Arc::new(AtomicBool::new(false));
+        let handler = Pinned {
+            host_key: host_key.to_bytes(),
+            mismatch: mismatch.clone(),
+        };
+        let mut handle = match client::connect_stream(config::client(), stream, handler).await {
+            Ok(handle) => handle,
+            Err(_) if mismatch.load(Ordering::Relaxed) => {
+                let error = SshError::TargetHostKey;
+                tracing::warn!(
+                    event = "ssh.target_host_key_mismatch",
+                    code = error.code(),
+                    target = label,
+                    "{error}"
+                );
+                return Err(error);
+            }
+            Err(e) => {
+                return Err(SshError::TargetUnreachable(format!(
+                    "négociation impossible : {e}"
+                )));
+            }
+        };
+        let auth = handle
+            .authenticate_publickey(account, PrivateKeyWithHashAlg::new(agent_key, None))
+            .await
+            .map_err(|e| SshError::TargetUnreachable(e.to_string()))?;
+        if !auth.success() {
+            let error = SshError::TargetAuth;
+            tracing::warn!(
+                event = "ssh.target_auth_failed",
+                code = error.code(),
+                target = label,
+                "{error}"
+            );
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "fr").await;
+            return Err(error);
+        }
+        Ok(TargetSession {
+            handle,
+            label: label.to_owned(),
+        })
+    };
+    match tokio::time::timeout(timeout, attempt).await {
+        Ok(Ok(session)) => Ok(session),
+        Ok(Err(e @ SshError::TargetUnreachable(_))) => Err(unreachable(label, e)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(unreachable(
+            label,
+            SshError::TargetUnreachable(format!("pas de session en {} s", timeout.as_secs())),
+        )),
+    }
+}

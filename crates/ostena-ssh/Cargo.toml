@@ -15,6 +15,8 @@ ostena-common.workspace = true
 ostena-crypto.workspace = true
 # Kid of a certificate authority, computed as for the grant keys.
 ostena-grant.workspace = true
+# PinnedTarget: the driver dials nothing else (anti-SSRF by type).
+ostena-scope = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
 ssh-key = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -26,7 +28,9 @@ tracing.workspace = true
 # pre-check depends on nothing of it, and russh does not build with the
 # pinned fuzzing nightly.
 default = ["russh"]
-russh = ["dep:russh", "dep:ssh-key"]
+# tokio/macros (select!) is already enabled by russh-util, a dependency of
+# russh: declared here rather than relied upon.
+russh = ["dep:russh", "dep:ssh-key", "dep:ostena-scope", "tokio/macros"]
 
 [dev-dependencies]
 proptest.workspace = true

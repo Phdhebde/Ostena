@@ -14,10 +14,14 @@ pub mod algorithms;
 pub mod cert;
 #[cfg(feature = "russh")]
 pub mod config;
+#[cfg(feature = "russh")]
+pub mod driver;
 mod error;
 pub mod keys;
 pub mod login;
 pub mod precheck;
+#[cfg(feature = "russh")]
+pub mod server;
 
 pub use error::SshError;
 
