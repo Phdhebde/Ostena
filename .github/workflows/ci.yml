@@ -117,6 +117,43 @@ jobs:
           OSTENA_REQUIRE_OPENSSH: "1"
       - run: bash tests/ssh/debian12-target.sh
 
+  # The core against PostgreSQL 16 as in production (ADR-0011): Unix socket,
+  # `peer` authentication, a role named after the runner account. Tests that
+  # need a database are mandatory here (OSTENA_REQUIRE_DB). Then the offline
+  # query cache (crates/ostena-core/.sqlx) is checked against the migrations.
+  # Needs sudo for the preinstalled PostgreSQL: GitHub-hosted runner.
+  core-db:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      OSTENA_TEST_DB_SOCKET: /var/run/postgresql
+      OSTENA_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: sqlx-cli@0.9.0
+      - name: PostgreSQL 16, local connections by peer only
+        run: |
+          sudo systemctl start postgresql.service
+          psql --version | grep -q ' 16\.'
+          sudo -u postgres createuser --createdb "$USER"
+          echo "OSTENA_TEST_DB_USER=$USER" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p ostena-core -p ostena-cli
+      - name: The offline query cache matches the migrations
+        working-directory: crates/ostena-core
+        run: |
+          createdb -h /var/run/postgresql ostena_prepare
+          export DATABASE_URL="postgres:///ostena_prepare?host=/var/run/postgresql"
+          cargo sqlx migrate run
+          cargo sqlx prepare --check -- --all-targets
+
   # Static release binary, then the agent service lifecycle under systemd
   # (install, status, permissions, hardening score, clean stop, bounded
   # restarts, uninstall), the unit on systemd 252 (Debian 12), and the idle
