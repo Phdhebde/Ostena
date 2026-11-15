@@ -6,6 +6,7 @@ members = [
     "crates/ostena-common",
     "crates/ostena-crypto",
     "crates/ostena-grant",
+    "crates/ostena-audit",
     "crates/ostena-scope",
     "crates/ostena-frame",
     "crates/ostena-platform",
@@ -24,6 +25,7 @@ publish = false
 repository = "https://github.com/Phdhebde/Ostena"
 
 [workspace.dependencies]
+ostena-audit = { path = "crates/ostena-audit" }
 ostena-common = { path = "crates/ostena-common" }
 ostena-core = { path = "crates/ostena-core" }
 ostena-frame = { path = "crates/ostena-frame" }
