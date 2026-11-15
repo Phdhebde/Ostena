@@ -116,7 +116,11 @@ async fn dial(target: &PinnedTarget) -> Result<TcpStream, SshError> {
     let mut last = String::from("aucune adresse");
     for addr in target.addrs() {
         match TcpStream::connect(addr).await {
-            Ok(tcp) => return Ok(tcp),
+            Ok(tcp) => {
+                // The library sets it only on the sockets it opens itself.
+                let _ = tcp.set_nodelay(true);
+                return Ok(tcp);
+            }
             Err(e) => last = format!("{addr} : {e}"),
         }
     }

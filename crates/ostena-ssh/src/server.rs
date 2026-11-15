@@ -1058,6 +1058,9 @@ async fn connection<A: Authorizer>(
     let Ok(listener) = tcp.local_addr() else {
         return;
     };
+    // The library sets it only on the sockets it accepts itself: without it,
+    // Nagle and delayed acknowledgements stall the handshake.
+    let _ = tcp.set_nodelay(true);
     let Ok(unauthenticated) = shared.unauthenticated.clone().try_acquire_owned() else {
         limited(peer, listener, "connexions non authentifiées");
         return;
