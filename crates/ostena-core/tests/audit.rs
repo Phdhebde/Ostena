@@ -40,12 +40,20 @@ fn cadence() -> Cadence {
     }
 }
 
-/// A migrated test database and a store on it.
-async fn migrated(test: &str) -> Option<(TestDb, PgStore)> {
+/// A migrated test database, without any chain yet, and a store on it.
+async fn migrated_empty(test: &str) -> Option<(TestDb, PgStore)> {
     let db = TestDb::create(test).await?;
     let pool = db.pool().await;
     schema::migrate(&pool).await.unwrap();
     Some((db, PgStore::new(pool, Arc::new(AgentCache::default()))))
+}
+
+/// A migrated test database whose chain is started, as `ostena core run`
+/// does, and a store on it.
+async fn migrated(test: &str) -> Option<(TestDb, PgStore)> {
+    let (db, store) = migrated_empty(test).await?;
+    audit::ensure_genesis(store.pool()).await.unwrap();
+    Some((db, store))
 }
 
 struct Fixture {
@@ -167,7 +175,8 @@ async fn as_owner(pool: &PgPool, sql: &str) {
 #[test]
 fn genesis_is_written_once_even_concurrently() {
     block_on(async {
-        let Some((db, store)) = migrated("genesis_is_written_once_even_concurrently").await else {
+        let Some((db, store)) = migrated_empty("genesis_is_written_once_even_concurrently").await
+        else {
             return;
         };
         let tasks: Vec<_> = (0..8)
@@ -464,7 +473,8 @@ fn granting_operations_fail_closed_protective_ones_do_not() {
 #[test]
 fn heads_cover_the_tip_and_follow_the_heartbeat() {
     block_on(async {
-        let Some((db, store)) = migrated("heads_cover_the_tip_and_follow_the_heartbeat").await
+        let Some((db, store)) =
+            migrated_empty("heads_cover_the_tip_and_follow_the_heartbeat").await
         else {
             return;
         };
@@ -472,6 +482,7 @@ fn heads_cover_the_tip_and_follow_the_heartbeat() {
         let signer = Fixture::new(&pool, store.recorder(), now_ms());
         // Empty chain: nothing to sign.
         assert_eq!(signer.signer.sign_now().await.unwrap(), None);
+        audit::ensure_genesis(&pool).await.unwrap();
         for n in 0..3 {
             let appended = append(&pool, n).await;
             store.recorder().critical(&[appended]);
@@ -883,6 +894,53 @@ fn measure_registration_latency() {
              first head over {} records: {first_head:?}",
             3 * n + 1
         );
+        drop(store);
+        db.drop_database().await;
+    });
+}
+
+#[test]
+fn only_the_core_starts_a_chain_and_never_over_signed_heads() {
+    block_on(async {
+        let Some((db, store)) =
+            migrated_empty("only_the_core_starts_a_chain_and_never_over_signed_heads").await
+        else {
+            return;
+        };
+        let pool = store.pool().clone();
+        // No chain yet: appends are refused, granting operations fail closed.
+        let mut tx = pool.begin().await.unwrap();
+        let e = audit::append(&mut tx, event(1)).await.unwrap_err();
+        drop(tx);
+        assert_eq!(e.code(), "CORE-E010");
+        assert!(e.to_string().contains(audit::NOT_INITIALISED), "{e}");
+        assert_eq!(
+            store
+                .register([1; 32], group(), Uuid::from_bytes([1; 16]))
+                .await,
+            Err(TunnelError::RegistryUnavailable)
+        );
+        let Err(e) = store::issue_token(&pool, group(), Duration::from_mins(15)).await else {
+            panic!("jeton émis sans chaîne d'audit");
+        };
+        assert_eq!(e.code(), "CORE-E010");
+        assert_eq!(count(&pool, "SELECT count(*) FROM audit_record").await, 0);
+        assert_eq!(count(&pool, "SELECT count(*) FROM agent").await, 0);
+
+        // The chain is started, signed, then its records wiped by the owner.
+        audit::ensure_genesis(&pool).await.unwrap();
+        append(&pool, 1).await;
+        let signer = Fixture::new(&pool, store.recorder(), now_ms());
+        signer.signer.sign_now().await.unwrap().unwrap();
+        as_owner(
+            &pool,
+            "ALTER TABLE audit_head DROP CONSTRAINT audit_head_record_seq_fkey;
+             DELETE FROM audit_record;",
+        )
+        .await;
+        let e = audit::ensure_genesis(&pool).await.unwrap_err();
+        assert_eq!(e.code(), "CORE-E011", "{e}");
+        assert_eq!(count(&pool, "SELECT count(*) FROM audit_record").await, 0);
         drop(store);
         db.drop_database().await;
     });

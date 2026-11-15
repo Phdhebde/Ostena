@@ -190,21 +190,29 @@ async fn genesis(conn: &mut PgConnection) -> Result<ChainTip, CoreError> {
     .text(field::VERSION, env!("CARGO_PKG_VERSION"));
     let (kind, encoded) = encode(&mut tip, event)?;
     insert(conn, kind, &encoded).await?;
-    tracing::info!(event = "audit.chain_started", chain = %chain_id, "chaîne d'audit créée");
+    // Warn level: a new chain where one was expected must be visible.
+    tracing::warn!(
+        event = "audit.chain_started",
+        chain = %chain_id,
+        "nouvelle chaîne d'audit créée : attendu à la première installation seulement"
+    );
     Ok(tip)
 }
 
-/// Appends `events` in order under the lock; starts the chain if it is
-/// empty.
+/// Message of an append on an empty chain: only `ostena core run`
+/// ([`ensure_genesis`]) starts a chain, never an append, so that wiped
+/// tables are never silently replaced by a fresh chain.
+pub const NOT_INITIALISED: &str = "chaîne d'audit non initialisée : démarrez le core";
+
+/// Appends `events` in order under the lock; refuses an empty chain.
 async fn append_locked(
     conn: &mut PgConnection,
     events: Vec<Event>,
 ) -> Result<Vec<Appended>, CoreError> {
     lock(conn).await?;
-    let mut tip = match read_tip(conn).await? {
-        Some(tip) => tip,
-        None => genesis(conn).await?,
-    };
+    let mut tip = read_tip(conn)
+        .await?
+        .ok_or_else(|| CoreError::AuditWrite(NOT_INITIALISED.into()))?;
     let mut out = Vec::with_capacity(events.len());
     for event in events {
         let (kind, encoded) = encode(&mut tip, event)?;
@@ -223,8 +231,9 @@ async fn append_locked(
 ///
 /// # Errors
 ///
-/// [`CoreError::AuditWrite`], or [`CoreError::AuditChain`] if the tip does
-/// not match its content.
+/// [`CoreError::AuditWrite`] (also for a chain not started yet:
+/// [`NOT_INITIALISED`]), or [`CoreError::AuditChain`] if the tip does not
+/// match its content.
 pub async fn append(tx: &mut Tx<'_>, event: Event) -> Result<Appended, CoreError> {
     let mut appended = append_locked(tx, vec![event]).await?;
     appended
@@ -309,17 +318,28 @@ pub async fn admin_actor(tx: &mut Tx<'_>) -> Result<String, CoreError> {
 
 /// Starts the chain if it is empty (`audit.chain_started` at seq 1) and
 /// returns its identifier. Idempotent, and safe when several processes
-/// call it together (advisory lock).
+/// call it together (advisory lock). Only `ostena core run` calls it.
 ///
 /// # Errors
 ///
-/// [`CoreError::AuditWrite`], [`CoreError::AuditChain`].
+/// [`CoreError::AuditChain`] if heads exist without any record (the records
+/// were removed), [`CoreError::AuditWrite`].
 pub async fn ensure_genesis(pool: &PgPool) -> Result<ChainId, CoreError> {
     let mut tx = pool.begin().await.map_err(write_error)?;
     lock(&mut tx).await?;
-    let tip = match read_tip(&mut tx).await? {
-        Some(tip) => tip,
-        None => genesis(&mut tx).await?,
+    let tip = if let Some(tip) = read_tip(&mut tx).await? {
+        tip
+    } else {
+        let heads = sqlx::query_scalar!(r#"SELECT count(*) AS "n!" FROM audit_head"#)
+            .fetch_one(&mut *tx)
+            .await?;
+        if heads > 0 {
+            return Err(chain_error(format!(
+                "{heads} tête(s) signée(s) mais aucun enregistrement : les enregistrements \
+                 ont été supprimés, aucune nouvelle chaîne n'est créée"
+            )));
+        }
+        genesis(&mut tx).await?
     };
     tx.commit().await.map_err(write_error)?;
     Ok(tip.chain_id)

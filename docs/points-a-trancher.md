@@ -33,6 +33,12 @@ Points soulevés par l'[ADR-0012](adr/0012-chaine-d-audit-du-core.md) (chaîne d
 
 **Pistes :** horodater périodiquement le hash de tête auprès d'une autorité interne du client (fonctionne hors ligne si elle est sur site), stocker les jetons en base et les placer dans l'export ; le vérificateur v2 les contrôle avec la chaîne de l'autorité.
 
+### État de la chaîne hors de la base
+
+**Situation en M1.** Si les deux tables d'audit sont vidées par le propriétaire de la base, le redémarrage du core crée une nouvelle chaîne ; seuls les têtes conservées hors du bastion et l'identifiant de chaîne noté par l'auditeur le révèlent.
+
+**Piste (durcissement ultérieur) :** conserver sur la machine du core, hors de la base, un fichier d'état (identifiant de chaîne, dernier numéro de tête signé), écrit à chaque tête et contrôlé au démarrage : une chaîne absente ou plus courte que l'état refuse le démarrage (`CORE-E011`) au lieu d'en créer une nouvelle. À trancher : droits et emplacement du fichier, procédure de réinitialisation légitime (restauration de sauvegarde).
+
 ### Troncature sous la dernière tête
 
 **Situation en M1.** Si des enregistrements sont supprimés sous la dernière tête signée (tête conservée), les nouveaux ajouts réutilisent leurs seq, et l'acquittement de la rupture n'est accepté qu'une fois la chaîne repassée au-delà du seq couvert par cette tête. À trancher : démarrer une nouvelle chaîne (nouvel identifiant) liée à l'ancienne par un enregistrement dédié ?
