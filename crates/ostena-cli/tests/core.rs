@@ -57,10 +57,12 @@ struct Process {
 
 impl Process {
     fn spawn(args: &[&str], config: &Path) -> Self {
+        let credentials = config.parent().unwrap().join("credentials");
         let mut child = Command::new(env!("CARGO_BIN_EXE_ostena"))
             .args(args)
             .arg("--config")
             .arg(config)
+            .env("CREDENTIALS_DIRECTORY", credentials)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -162,16 +164,19 @@ fn lab(db: &TestDb) -> Lab {
         pem_certificate(&pki.issuing_certificate),
     )
     .unwrap();
+    // The keys as systemd hands them over (LoadCredentialEncrypted=): files
+    // in $CREDENTIALS_DIRECTORY, which the core is started with.
+    std::fs::create_dir_all(dir.join("credentials")).unwrap();
     // SECRET-EXPOSURE: test only, the key files `ostena ca key new` writes.
     #[expect(clippy::disallowed_methods)]
     write_private(
-        &dir.join("server.key"),
+        &dir.join("credentials/server.key"),
         pem_private_key(&server_pkcs8).expose_secret(),
     );
     // SECRET-EXPOSURE: test only, the key files `ostena ca key new` writes.
     #[expect(clippy::disallowed_methods)]
     write_private(
-        &dir.join("issuing.key"),
+        &dir.join("credentials/issuing.key"),
         pem_private_key(&pki.issuing_key).expose_secret(),
     );
 
@@ -199,14 +204,12 @@ fn lab(db: &TestDb) -> Lab {
         format!(
             "mode = \"{mode}\"\n\n[core]\ntunnel_listen = \"127.0.0.1:{tunnel}\"\n\
              enrollment_listen = \"127.0.0.1:{enrollment}\"\ntls_root_ca = \"{}\"\n\
-             tls_certificate = \"{}\"\ntls_private_key = {{ file = \"{}\" }}\n\
-             issuing_certificate = \"{}\"\nissuing_private_key = {{ file = \"{}\" }}\n\n\
+             tls_certificate = \"{}\"\ntls_private_key = {{ credential = \"server.key\" }}\n\
+             issuing_certificate = \"{}\"\nissuing_private_key = {{ credential = \"issuing.key\" }}\n\n\
              [core.database]\nport = {}\nname = \"{}\"\nuser = \"{}\"\n{connection}",
             p("root.pem"),
             p("server.pem"),
-            p("server.key"),
             p("issuing.pem"),
-            p("issuing.key"),
             database.port,
             database.name,
             database.user,
