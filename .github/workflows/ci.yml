@@ -150,7 +150,8 @@ jobs:
         working-directory: crates/ostena-core
         run: |
           createdb -h /var/run/postgresql ostena_prepare
-          export DATABASE_URL="postgres:///ostena_prepare?host=/var/run/postgresql"
+          # sqlx wants a user and a host name; `host=` then selects the socket.
+          export DATABASE_URL="postgres://$USER@localhost/ostena_prepare?host=/var/run/postgresql"
           cargo sqlx migrate run
           cargo sqlx prepare --check -- --all-targets
 
