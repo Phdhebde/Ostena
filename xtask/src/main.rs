@@ -577,28 +577,32 @@ mod tests {
     }
 
     #[test]
-    fn ci_matrices_list_every_fuzz_target() {
-        let root = workspace_root().unwrap();
-        for workflow in ["ci.yml", "fuzz-nightly.yml"] {
-            let text = fs::read_to_string(root.join(".github/workflows").join(workflow)).unwrap();
-            let line = text
-                .lines()
-                .map(str::trim)
-                .find_map(|l| l.strip_prefix("target: ["))
-                .unwrap_or_else(|| panic!("no fuzz matrix in {workflow}"));
-            let mut listed: Vec<&str> = line
-                .trim_end_matches(']')
-                .split(',')
-                .map(str::trim)
-                .collect();
-            let mut expected = FUZZ_TARGETS.to_vec();
-            listed.sort_unstable();
-            expected.sort_unstable();
-            assert_eq!(
-                listed, expected,
-                "{workflow} is out of sync with FUZZ_TARGETS"
-            );
-        }
+    fn ci_runs_every_fuzz_target() {
+        let workflows = workspace_root().unwrap().join(".github/workflows");
+        let text = fs::read_to_string(workflows.join("fuzz-nightly.yml")).unwrap();
+        let line = text
+            .lines()
+            .map(str::trim)
+            .find_map(|l| l.strip_prefix("target: ["))
+            .expect("no fuzz matrix in fuzz-nightly.yml");
+        let mut listed: Vec<&str> = line
+            .trim_end_matches(']')
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let mut expected = FUZZ_TARGETS.to_vec();
+        listed.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            listed, expected,
+            "fuzz-nightly.yml is out of sync with FUZZ_TARGETS"
+        );
+        // The smoke run names no target, so it runs all of them.
+        let ci = fs::read_to_string(workflows.join("ci.yml")).unwrap();
+        assert!(
+            ci.lines().any(|l| l.trim() == "- run: cargo xtask fuzz 30"),
+            "ci.yml must run `cargo xtask fuzz 30` without a target list"
+        );
     }
 
     #[test]

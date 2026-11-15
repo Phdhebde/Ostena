@@ -1,11 +1,16 @@
 name: Fuzz (nightly)
 
-# One hour per fuzz target, every night, in parallel. Crashes are published
-# as artifacts. Keep the list in sync with FUZZ_TARGETS in xtask (checked by
-# its tests).
+# Each fuzz target in parallel; crashes are published as artifacts. Keep the
+# list in sync with FUZZ_TARGETS in xtask (checked by its tests).
+#
+# Six hours of GitHub-hosted runners a night is three times the monthly
+# budget. Without a self-hosted runner (`vars.LINUX_RUNNER` unset): once a
+# week, 10 minutes per target. With one: every night, `vars.FUZZ_SECONDS`
+# per target (3600 suggested).
 on:
   schedule:
-    - cron: "17 1 * * *"
+    - cron: "17 1 * * 1-6"
+    - cron: "17 1 * * 0"
   workflow_dispatch:
 
 permissions:
@@ -21,11 +26,12 @@ env:
 
 jobs:
   fuzz:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 1 * * 0' || vars.LINUX_RUNNER != ''
     strategy:
       fail-fast: false
       matrix:
         target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, ssh_precheck]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 80
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,7 +51,7 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> target
-      - run: cargo xtask fuzz 3600 ${{ matrix.target }}
+      - run: cargo xtask fuzz ${{ vars.LINUX_RUNNER != '' && vars.FUZZ_SECONDS || '600' }} ${{ matrix.target }}
       # Crash inputs (crash-*, leak-*, timeout-*, oom-*), to reproduce with
       # `cargo fuzz run <target> <file>` and add to the corpus once fixed.
       - if: failure()
