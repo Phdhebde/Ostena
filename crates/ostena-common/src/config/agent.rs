@@ -69,6 +69,9 @@ pub struct AgentConfig {
 pub const DEFAULT_SSH_MAX_SESSIONS: u32 = 64;
 /// Default bound of the SSH connections not yet authenticated.
 pub const DEFAULT_SSH_MAX_UNAUTHENTICATED: u32 = 16;
+/// Default bound of the SSH connections not yet authenticated from one
+/// source address.
+pub const DEFAULT_SSH_MAX_UNAUTHENTICATED_PER_SOURCE: u32 = 4;
 /// Default delay to authenticate, in seconds.
 pub const DEFAULT_SSH_LOGIN_GRACE_SECS: u64 = 30;
 /// Default delay to reach a target, in seconds.
@@ -86,6 +89,9 @@ const fn default_ssh_max_sessions() -> u32 {
 }
 const fn default_ssh_max_unauthenticated() -> u32 {
     DEFAULT_SSH_MAX_UNAUTHENTICATED
+}
+const fn default_ssh_max_unauthenticated_per_source() -> u32 {
+    DEFAULT_SSH_MAX_UNAUTHENTICATED_PER_SOURCE
 }
 const fn default_ssh_login_grace() -> u64 {
     DEFAULT_SSH_LOGIN_GRACE_SECS
@@ -119,6 +125,10 @@ pub struct AgentSshConfig {
     /// Connections not yet authenticated, 1 to 256.
     #[serde(default = "default_ssh_max_unauthenticated")]
     pub max_unauthenticated: u32,
+    /// Connections not yet authenticated from one source address, 1 to 256
+    /// (within `max_unauthenticated` anyway).
+    #[serde(default = "default_ssh_max_unauthenticated_per_source")]
+    pub max_unauthenticated_per_source: u32,
     /// Delay to authenticate, 5 to 120 s.
     #[serde(default = "default_ssh_login_grace")]
     pub login_grace_secs: u64,
@@ -230,11 +240,16 @@ fn ssh_consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
             ));
         }
     }
-    let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 4] = [
+    let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 5] = [
         ("max_sessions", u64::from(ssh.max_sessions), 1..=256),
         (
             "max_unauthenticated",
             u64::from(ssh.max_unauthenticated),
+            1..=256,
+        ),
+        (
+            "max_unauthenticated_per_source",
+            u64::from(ssh.max_unauthenticated_per_source),
             1..=256,
         ),
         ("login_grace_secs", ssh.login_grace_secs, 5..=120),

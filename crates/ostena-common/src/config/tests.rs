@@ -815,6 +815,7 @@ fn ssh_section_parses_with_safe_defaults() {
     assert_eq!(ssh.listen, ["0.0.0.0:2222", "[::]:2222"]);
     assert_eq!(ssh.max_sessions, 64);
     assert_eq!(ssh.max_unauthenticated, 16);
+    assert_eq!(ssh.max_unauthenticated_per_source, 4);
     assert_eq!(ssh.login_grace_secs, 30);
     assert_eq!(ssh.target_connect_timeout_secs, 5);
     let paths = a.ssh_paths().unwrap();
@@ -853,6 +854,8 @@ fn v015_ssh_addresses_bounds_and_keys() {
         ("max_sessions", 257, 1),
         ("max_unauthenticated", 0, 256),
         ("max_unauthenticated", 257, 1),
+        ("max_unauthenticated_per_source", 0, 256),
+        ("max_unauthenticated_per_source", 257, 1),
         ("login_grace_secs", 4, 5),
         ("login_grace_secs", 121, 120),
         ("target_connect_timeout_secs", 0, 1),
