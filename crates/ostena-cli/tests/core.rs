@@ -329,8 +329,31 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     assert!(!list.lines().nth(1).unwrap().ends_with("\t-"), "{list}");
     agent.stop();
 
-    // The audit chain: exported, then verified offline with the public key
-    // only. The core signs a head within a second or two of each change.
+    audit_chain_is_exported_and_verified(&lab, &db);
+
+    core.stop();
+    drop(lab);
+    block_on(db.drop_database());
+}
+
+/// `ostena audit verify <export> --key audit.pub`: exit code and report.
+fn verify(lab: &Lab, export: &Path) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["audit", "verify"])
+        .arg(export)
+        .arg("--key")
+        .arg(lab.dir.join("audit.pub"))
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+/// The audit chain of the demonstration: exported, then verified offline
+/// with the public key only; an edit by the database owner is found.
+fn audit_chain_is_exported_and_verified(lab: &Lab, db: &TestDb) {
     let mut attempt = 0;
     let deadline = Instant::now() + WAIT;
     let report = loop {
@@ -341,9 +364,9 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
             &lab.core_config,
         );
         assert!(out.contains("enregistrements"), "{out}");
-        let (code, report) = verify(&lab, &export);
-        if code == 0 || Instant::now() > deadline {
-            assert_eq!(code, 0, "{report}");
+        let (exit, report) = verify(lab, &export);
+        if exit == 0 || Instant::now() > deadline {
+            assert_eq!(exit, 0, "{report}");
             break report;
         }
         std::thread::sleep(Duration::from_millis(300));
@@ -391,26 +414,7 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
         ],
         &lab.core_config,
     );
-    let (code, report) = verify(&lab, &tampered);
-    assert_eq!(code, 1, "{report}");
+    let (exit, report) = verify(lab, &tampered);
+    assert_eq!(exit, 1, "{report}");
     assert!(report.contains("AUD-E007"), "{report}");
-
-    core.stop();
-    drop(lab);
-    block_on(db.drop_database());
-}
-
-/// `ostena audit verify <export> --key audit.pub`: exit code and report.
-fn verify(lab: &Lab, export: &Path) -> (i32, String) {
-    let out = Command::new(env!("CARGO_BIN_EXE_ostena"))
-        .args(["audit", "verify"])
-        .arg(export)
-        .arg("--key")
-        .arg(lab.dir.join("audit.pub"))
-        .output()
-        .unwrap();
-    (
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-    )
 }
