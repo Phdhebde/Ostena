@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use common::{TestDb, block_on};
 use ostena_audit::{
-    ActorKind, ChainId, Event, EventKind, Head, Options, Outcome, Record, Report, TrustedKeys,
-    verify_export,
+    ActorKind, ChainId, Event, EventKind, Finding, Head, Options, Outcome, Record, Report,
+    TrustedKeys, verify_export,
 };
 use ostena_core::audit::{self, Cadence, HeadSigner, ManualClock, Recorder};
 use ostena_core::cache::AgentCache;
@@ -48,13 +48,13 @@ async fn migrated(test: &str) -> Option<(TestDb, PgStore)> {
     Some((db, PgStore::new(pool, Arc::new(AgentCache::default()))))
 }
 
-struct Signer {
+struct Fixture {
     signer: HeadSigner,
     key: Arc<SigningKey>,
     clock: Arc<ManualClock>,
 }
 
-impl Signer {
+impl Fixture {
     fn new(pool: &PgPool, recorder: Arc<Recorder>, start_ms: u64) -> Self {
         let key = Arc::new(SigningKey::generate().unwrap().0);
         Self::with_key(pool, recorder, start_ms, key)
@@ -128,8 +128,16 @@ async fn export_and_verify(
     verify_export(bytes.as_slice(), keys, options).unwrap()
 }
 
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 fn codes(report: &Report) -> Vec<&'static str> {
-    report.findings.iter().map(|f| f.code()).collect()
+    report.findings.iter().map(Finding::code).collect()
 }
 
 /// Runs `sql` as the owner with the user triggers of both tables disabled:
@@ -210,7 +218,7 @@ fn concurrent_appends_are_contiguous_and_verify_online() {
         }
         seqs.sort_unstable();
         assert_eq!(seqs, (2..=17).collect::<Vec<u64>>());
-        let signer = Signer::new(store.pool(), store.recorder(), now_ms());
+        let signer = Fixture::new(store.pool(), store.recorder(), now_ms());
         let head = signer.signer.sign_now().await.unwrap().unwrap();
         assert_eq!((head.head_no(), head.record_seq()), (1, 17));
         let report = audit::verify_online(store.pool(), signer.keys())
@@ -231,7 +239,7 @@ fn triggers_refuse_changes_and_wrong_numbers() {
         };
         let pool = store.pool();
         append(pool, 1).await;
-        let signer = Signer::new(pool, store.recorder(), now_ms());
+        let signer = Fixture::new(pool, store.recorder(), now_ms());
         signer.signer.sign_now().await.unwrap().unwrap();
         for sql in [
             "UPDATE audit_record SET event = 'x' WHERE seq = 1",
@@ -461,7 +469,7 @@ fn heads_cover_the_tip_and_follow_the_heartbeat() {
             return;
         };
         let pool = store.pool().clone();
-        let signer = Signer::new(&pool, store.recorder(), now_ms());
+        let signer = Fixture::new(&pool, store.recorder(), now_ms());
         // Empty chain: nothing to sign.
         assert_eq!(signer.signer.sign_now().await.unwrap(), None);
         for n in 0..3 {
@@ -497,7 +505,7 @@ fn heads_cover_the_tip_and_follow_the_heartbeat() {
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        let next = Signer::new(&pool, store.recorder(), now_ms());
+        let next = Fixture::new(&pool, store.recorder(), now_ms());
         let rotated = next.signer.sign_now().await.unwrap().unwrap();
         assert_eq!(rotated.head_no(), 4);
         drop(store);
@@ -506,11 +514,11 @@ fn heads_cover_the_tip_and_follow_the_heartbeat() {
 }
 
 /// A chain of 8 records with head 1 on record 3; the signer, a pool.
-async fn chain_with_uncovered_tail(test: &str) -> Option<(TestDb, PgStore, Signer, ChainId)> {
+async fn chain_with_uncovered_tail(test: &str) -> Option<(TestDb, PgStore, Fixture, ChainId)> {
     let (db, store) = migrated(test).await?;
     let pool = store.pool().clone();
     let chain = audit::ensure_genesis(&pool).await.unwrap();
-    let signer = Signer::new(&pool, store.recorder(), now_ms());
+    let signer = Fixture::new(&pool, store.recorder(), now_ms());
     for n in 0..2 {
         append(&pool, n).await;
     }
@@ -558,7 +566,6 @@ fn tampering_stops_the_signer_and_is_found_by_the_verifier() {
                     .encode()
                     .unwrap();
                 let hash = ostena_audit::record_hash(&body);
-                let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
                 as_owner(
                     &pool,
                     &format!(
@@ -615,7 +622,6 @@ fn records_written_by_the_core_are_checked_before_signing() {
             .encode()
             .unwrap();
         let hash = ostena_audit::record_hash(&body);
-        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
         as_owner(
             &pool,
             &format!(
@@ -650,7 +656,7 @@ fn an_acknowledged_break_lets_the_signer_resume() {
         );
         // An acknowledgement before the break does not count.
         let ack = audit::acknowledge_break(&pool, 7).await.unwrap();
-        let fresh = Signer::with_key(
+        let fresh = Fixture::with_key(
             &pool,
             Arc::new(Recorder::new()),
             now_ms(),
@@ -662,7 +668,7 @@ fn an_acknowledged_break_lets_the_signer_resume() {
         );
         let ack2 = audit::acknowledge_break(&pool, 5).await.unwrap();
         assert!(ack2.seq > ack.seq);
-        let fresh = Signer::with_key(
+        let fresh = Fixture::with_key(
             &pool,
             Arc::new(Recorder::new()),
             now_ms(),
@@ -688,7 +694,7 @@ fn tail_truncation_needs_an_external_head_or_freshness() {
         };
         let pool = store.pool().clone();
         // Heads signed an hour ago (heartbeat 60 s).
-        let signer = Signer::new(&pool, store.recorder(), now_ms() - 3_600_000);
+        let signer = Fixture::new(&pool, store.recorder(), now_ms() - 3_600_000);
         for n in 0..3 {
             append(&pool, n).await;
         }
@@ -725,7 +731,7 @@ fn partial_export_verifies_from_its_anchor() {
             return;
         };
         let pool = store.pool().clone();
-        let signer = Signer::new(&pool, store.recorder(), now_ms());
+        let signer = Fixture::new(&pool, store.recorder(), now_ms());
         for n in 0..3 {
             append(&pool, n).await;
         }
@@ -801,10 +807,10 @@ fn best_effort_events_are_written_and_losses_reported() {
         // Genesis, the lost-events record, the queued events.
         assert_eq!(
             count(&pool, "SELECT count(*) FROM audit_record").await,
-            2 + audit::QUEUE_CAPACITY as i64
+            2 + i64::try_from(audit::QUEUE_CAPACITY).unwrap()
         );
         writer.abort();
-        let signer = Signer::new(&pool, Arc::new(Recorder::new()), now_ms());
+        let signer = Fixture::new(&pool, Arc::new(Recorder::new()), now_ms());
         signer.signer.sign_now().await.unwrap().unwrap();
         let report = audit::verify_online(&pool, signer.keys()).await.unwrap();
         assert_eq!(report.exit_code(), 0, "{:?}", codes(&report));
@@ -867,7 +873,7 @@ fn measure_registration_latency() {
             append(&pool, u64::from(i)).await;
         }
         let append_only = start.elapsed() / n;
-        let signer = Signer::new(&pool, store.recorder(), now_ms());
+        let signer = Fixture::new(&pool, store.recorder(), now_ms());
         let start = Instant::now();
         signer.signer.sign_now().await.unwrap().unwrap();
         let first_head = start.elapsed();
