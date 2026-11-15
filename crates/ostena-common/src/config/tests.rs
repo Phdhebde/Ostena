@@ -125,7 +125,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
-        "CFG-P014",
+        "CFG-P014", "CFG-V015",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -798,6 +798,104 @@ fn p007_core_ca_required_in_production() {
     let c = agent_with("tls_core_ca = \"/etc/ostena/core-ca.pem\"\n", "");
     assert!(c.validate().is_ok());
     assert_eq!(production_codes(&c), vec![Code::CoreCaMissing]);
+}
+
+const SSH: &str = "\n[agent.ssh]\nlisten = [\"0.0.0.0:2222\", \"[::]:2222\"]\n";
+
+fn agent_ssh(extra: &str) -> Config {
+    parse(&format!("{AGENT}{SSH}{extra}"))
+}
+
+#[test]
+fn ssh_section_parses_with_safe_defaults() {
+    let c = agent_ssh("");
+    assert!(c.validate_for_production().is_ok());
+    let a = c.agent.as_ref().unwrap();
+    let ssh = a.ssh.as_ref().unwrap();
+    assert_eq!(ssh.listen, ["0.0.0.0:2222", "[::]:2222"]);
+    assert_eq!(ssh.max_sessions, 64);
+    assert_eq!(ssh.max_unauthenticated, 16);
+    assert_eq!(ssh.login_grace_secs, 30);
+    assert_eq!(ssh.target_connect_timeout_secs, 5);
+    let paths = a.ssh_paths().unwrap();
+    let state = Path::new("/var/lib/ostena");
+    assert_eq!(paths.host_key, state.join("ssh_host_key"));
+    assert_eq!(paths.target_key, state.join("ssh_target_key"));
+    assert_eq!(paths.host_certificate, state.join("ssh_host_certificate"));
+    // Without the section: no SSH server.
+    assert_eq!(parse(AGENT).agent.unwrap().ssh_paths(), None);
+}
+
+#[test]
+fn ssh_section_refuses_unknown_fields_and_requires_listen() {
+    let text = format!("{AGENT}{SSH}unknown = 1\n");
+    assert_eq!(
+        Config::from_toml_str(&text).unwrap_err().codes(),
+        vec![Code::Parse]
+    );
+    let text = format!("{AGENT}\n[agent.ssh]\nmax_sessions = 8\n");
+    assert_eq!(
+        Config::from_toml_str(&text).unwrap_err().codes(),
+        vec![Code::Parse]
+    );
+}
+
+#[test]
+fn v015_ssh_addresses_bounds_and_keys() {
+    let c = parse(&format!("{AGENT}\n[agent.ssh]\nlisten = []\n"));
+    assert_eq!(agent_codes(&c), vec![Code::AgentSsh]);
+    let c = parse(&format!(
+        "{AGENT}\n[agent.ssh]\nlisten = [\"2222\", \"bastion:0\", \"h:22\"]\n"
+    ));
+    assert_eq!(agent_codes(&c), vec![Code::AgentSsh, Code::AgentSsh]);
+    for (field, bad, good) in [
+        ("max_sessions", 0, 256),
+        ("max_sessions", 257, 1),
+        ("max_unauthenticated", 0, 256),
+        ("max_unauthenticated", 257, 1),
+        ("login_grace_secs", 4, 5),
+        ("login_grace_secs", 121, 120),
+        ("target_connect_timeout_secs", 0, 1),
+        ("target_connect_timeout_secs", 31, 30),
+    ] {
+        let c = agent_ssh(&format!("{field} = {bad}\n"));
+        assert_eq!(agent_codes(&c), vec![Code::AgentSsh], "{field} = {bad}");
+        let c = agent_ssh(&format!("{field} = {good}\n"));
+        assert!(c.validate().is_ok(), "{field} = {good}");
+    }
+    let c = agent_ssh("host_key = \"/etc/ostena/ssh.key\"\ntarget_key = \"/etc/ostena/ssh.key\"\n");
+    assert_eq!(agent_codes(&c), vec![Code::AgentSsh]);
+    // The same file through the default.
+    let c = agent_ssh("target_key = \"/var/lib/ostena/ssh_host_key\"\n");
+    assert_eq!(agent_codes(&c), vec![Code::AgentSsh]);
+    let c = agent_ssh("host_certificate = \"ssh.crt\"\n");
+    assert_eq!(agent_codes(&c), vec![Code::RelativePath]);
+}
+
+#[test]
+fn p008_ssh_keys_through_the_injected_checker() {
+    let dir = TempDir::new("agent-ssh-perms");
+    let host = dir.0.join("ssh_host");
+    let target = dir.0.join("ssh_target");
+    let text = format!(
+        "{AGENT}{SSH}host_key = '{}'\ntarget_key = '{}'\n",
+        host.display(),
+        target.display()
+    );
+    let path = dir.write(&text);
+    let bad = FakeChecker {
+        writable: vec![],
+        exposed: vec![host.clone(), target.clone()],
+    };
+    // Not created yet: the agent creates them with private rights.
+    assert!(load_with(&path, &bad).is_ok());
+    std::fs::write(&host, b"k").unwrap();
+    std::fs::write(&target, b"k").unwrap();
+    let codes = load_with(&path, &bad).unwrap_err().codes();
+    assert_eq!(
+        codes,
+        vec![Code::PrivateKeyExposed, Code::PrivateKeyExposed]
+    );
 }
 
 /// Refuses the paths it is told to refuse.
