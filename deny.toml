@@ -42,10 +42,11 @@ exceptions = [
     # dependency of every procedural macro (serde_derive, thiserror) and is not
     # linked into the shipped binary. Scoped to this crate only.
     { crate = "unicode-ident", allow = ["Unicode-3.0"] },
-    # PENDING DECISION (ADR-0011): stringprep, an unconditional dependency of
-    # sqlx-postgres (SASLprep for SCRAM, never used with peer), pulls these
+    # Accepted 2026-11-15 (ADR-0011): stringprep, an unconditional dependency
+    # of sqlx-postgres (SASLprep for SCRAM, never used with peer), pulls these
     # two Unicode tables, linked into the core binary on Linux. No sqlx
-    # without them, short of a fork.
+    # without them, short of a fork. Only through that path (bans below);
+    # any other crate under Unicode-3.0 stays refused.
     { crate = "unicode-normalization", allow = ["Unicode-3.0"] },
     { crate = "unicode-properties", allow = ["Unicode-3.0"] },
     # libfuzzer-sys bundles LLVM libFuzzer (NCSA). Only used by the fuzz/ crate,
@@ -142,6 +143,9 @@ deny = [
     { crate = "sqlx", wrappers = ["ostena-core"], reason = "PostgreSQL is ostena-core business only (ADR-0011)" },
     { crate = "sqlx-core", wrappers = ["sqlx", "sqlx-macros", "sqlx-macros-core", "sqlx-postgres"], reason = "only reachable through sqlx" },
     { crate = "sqlx-postgres", wrappers = ["sqlx", "sqlx-macros-core"], reason = "only reachable through sqlx" },
+    { crate = "stringprep", wrappers = ["sqlx-postgres"], reason = "Unicode-3.0 exception, only through sqlx-postgres (ADR-0011)" },
+    { crate = "unicode-normalization", wrappers = ["stringprep"], reason = "Unicode-3.0 exception, only through stringprep (ADR-0011)" },
+    { crate = "unicode-properties", wrappers = ["stringprep"], reason = "Unicode-3.0 exception, only through stringprep (ADR-0011)" },
     # The TLS of sqlx adds the public roots to the configured CA: it is not
     # built (tls-none), and the public root bundle is refused everywhere.
     { crate = "webpki-roots", reason = "public root bundle: never trusted (ADR-0011)" },

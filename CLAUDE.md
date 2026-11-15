@@ -64,7 +64,9 @@ packaging/  lab/  tests/  docs/  xtask/
 - Contrôle de périmètre (CIDR + épinglage de l'IP résolue + blocage des adresses de métadonnées cloud et locales) appliqué à **tous** les drivers.
 - Pas de `unwrap()`/`expect()` hors tests et hors invariants documentés. Erreurs typées (`thiserror`), `anyhow` seulement dans les binaires et `xtask`.
 - Dépendances : licences MIT, Apache 2.0, BSD, ISC, Zlib, MPL 2.0 uniquement, contrôlées par `cargo-deny`. Préférer peu de dépendances, bien maintenues. Toute nouvelle dépendance se justifie dans la PR.
-  Seule exception : `Unicode-3.0`, admise uniquement pour la crate `unicode-ident` (tables Unicode, dépendance de compilation des macros procédurales, non liée au binaire), déclarée dans `deny.toml`.
+  Seule exception : `Unicode-3.0`, admise uniquement pour les crates suivantes, déclarées dans `deny.toml` :
+  - `unicode-ident` (tables Unicode, dépendance de compilation des macros procédurales, non liée au binaire) ;
+  - `unicode-normalization` et `unicode-properties`, liées au binaire du core, et seulement par le chemin `sqlx-postgres` → `stringprep` (ADR-0011). Les crates `icu_*` et toute autre crate sous Unicode-3.0 restent refusées.
 - Exclu en production : JVM, Node, Python, Redis, Kafka, Elasticsearch, Kubernetes obligatoire, FreeRDP/guacd.
 
 ## Définition de « terminé »

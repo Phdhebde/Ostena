@@ -1,6 +1,6 @@
 # ADR-0011 : Socle du core et base PostgreSQL
 
-- **Statut** : Accepté, sauf l'exception de licence Unicode-3.0 de `stringprep`, en attente de décision (section « Écarts »). Implémenté dans le lot M1, PR 2.
+- **Statut** : Accepté, y compris l'exception de licence Unicode-3.0 de `stringprep`, acceptée le 2026-11-15 (section « Écarts »). Implémenté dans le lot M1, PR 2.
 - **Date** : 2026-11-14
 
 ## Contexte
@@ -85,7 +85,7 @@ Les événements qui engagent une décision du core sont écrits dans la chaîne
 ### Écarts
 
 1. **Cryptographie de `sqlx-postgres`** : l'authentification SCRAM et MD5 tire `sha2`, `hmac`, `hkdf`, `md-5` et `rand` (RustCrypto), sans condition. Aucun pilote PostgreSQL en Rust pur n'y échappe (`tokio-postgres` fait pareil). Exception acceptée, limitée à `sqlx-postgres` comme parent autorisé dans `deny.toml` et consignée dans l'ADR-0009. Avec `peer`, ce code n'est jamais exécuté.
-2. **Licence Unicode-3.0 : décision attendue.** `stringprep` (SASLprep du SCRAM, dépendance inconditionnelle de `sqlx-postgres`) tire `unicode-normalization` et `unicode-properties`, sous `(MIT OR Apache-2.0) AND Unicode-3.0`, et elles seraient liées au binaire du core. CLAUDE.md n'admet Unicode-3.0 que pour `unicode-ident`. Une exception limitée à ces deux crates figure dans `deny.toml`, marquée comme en attente. Sans elle, il n'y a pas de sqlx sans fork.
+2. **Licence Unicode-3.0 : exception acceptée le 2026-11-15.** `stringprep` (SASLprep du SCRAM, dépendance inconditionnelle de `sqlx-postgres`) tire `unicode-normalization` et `unicode-properties`, sous `(MIT OR Apache-2.0) AND Unicode-3.0`, liées au binaire du core. Sans elles, il n'y a pas de sqlx sans fork. L'exception est limitée à ces deux crates et à ce seul chemin : `deny.toml` les admet sous Unicode-3.0 et interdit qu'elles soient tirées par autre chose que `stringprep`, lui-même tiré par `sqlx-postgres` seulement. CLAUDE.md la mentionne. Toute autre crate sous Unicode-3.0 reste refusée.
    - Les tables ICU tirées par `url` (via `idna`) sont évitées : `idna_adapter` est épinglé à sa version 1.0.0, qui n'accepte que l'ASCII, et les crates `icu_*` sont bannies.
 3. **Doublons de versions** : sqlx 0.9 mêle deux générations de dépendances (`sha2` 0.10 et 0.11, `base64` 0.22, `hashbrown` 0.16). Ils sont déclarés dans `deny.toml`, et liés au seul binaire Linux.
 
