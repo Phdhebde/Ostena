@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use self::core::{CoreAuditConfig, CoreConfig, DatabaseConfig, DatabaseTcp, KeySource};
-pub use agent::{AgentConfig, InfrastructureEndpoint};
+pub use agent::{AgentConfig, AgentSshConfig, InfrastructureEndpoint, SshPaths};
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{
     Code, GRANT_SIGNATURE_ALGORITHM, KNOWN_SIGNATURE_ALGORITHMS, Violation, Violations,
@@ -433,6 +433,23 @@ fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> 
                     agent.tls_private_key.display()
                 ),
             ));
+        }
+        // The SSH keys are created by the agent with private rights at its
+        // first start (ADR-0010): checked once they exist.
+        if let Some(paths) = agent.ssh_paths() {
+            for (field, key) in [
+                ("agent.ssh.host_key", &paths.host_key),
+                ("agent.ssh.target_key", &paths.target_key),
+            ] {
+                if key.exists()
+                    && let Err(reason) = checker.private(key)
+                {
+                    out.push(Violation::new(
+                        Code::PrivateKeyExposed,
+                        format!("{field} {} : {reason}", key.display()),
+                    ));
+                }
+            }
         }
         // The journal may not exist yet: its directory must.
         let dir = agent

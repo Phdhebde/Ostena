@@ -683,6 +683,7 @@ dependencies = [
  "base64",
  "ostena-common",
  "ostena-crypto",
+ "ostena-grant",
  "thiserror",
  "tokio",
  "tracing",

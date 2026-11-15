@@ -82,11 +82,14 @@ pub enum Code {
     CoreKeyInFile,
     /// Core: PostgreSQL reached over TCP instead of the local Unix socket.
     DatabaseOverTcp,
+    /// Agent: invalid `[agent.ssh]` (address, bound, host key used as the
+    /// target key).
+    AgentSsh,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -116,6 +119,7 @@ impl Code {
         Self::CoreKeyExposed,
         Self::CoreKeyInFile,
         Self::DatabaseOverTcp,
+        Self::AgentSsh,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -150,6 +154,7 @@ impl Code {
             Self::CoreKeyExposed => "CFG-P011",
             Self::CoreKeyInFile => "CFG-P012",
             Self::DatabaseOverTcp => "CFG-P014",
+            Self::AgentSsh => "CFG-V015",
         }
     }
 

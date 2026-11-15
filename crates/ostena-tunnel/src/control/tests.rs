@@ -60,6 +60,8 @@ fn valid_core_messages() -> Vec<CoreMessage> {
             host: "srv-01.example.test".into(),
             port: 3389,
             max_session_secs: 3600,
+            account: None,
+            target_p256_public: None,
         },
         CoreMessage::SessionRefused {
             request_id: 7,
@@ -306,6 +308,8 @@ fn session_params_are_checked() {
         host: host.into(),
         port,
         max_session_secs: max,
+        account: Some("root".into()),
+        target_p256_public: Some(point()),
     };
     assert!(params("10.0.0.1", 22, 60, GROUP).validate().is_ok());
     assert!(refused_core(&params("", 22, 60, GROUP)));
@@ -356,5 +360,239 @@ proptest! {
     fn prop_ping_round_trip(seq in any::<u64>()) {
         let m = CoreMessage::Ping { seq };
         prop_assert_eq!(decode::<CoreMessage>(&payload(&m)), Ok(m));
+    }
+}
+
+fn point() -> String {
+    URL_SAFE_NO_PAD.encode(SigningKey::generate().unwrap().0.verifying_key().to_bytes())
+}
+
+/// A blob that passes the structural check of a host certificate.
+fn host_certificate_blob() -> String {
+    let name = b"ecdsa-sha2-nistp256-cert-v01@openssh.com";
+    let mut blob = u32::try_from(name.len()).unwrap().to_be_bytes().to_vec();
+    blob.extend_from_slice(name);
+    blob.extend_from_slice(&[0u8; 200]);
+    URL_SAFE_NO_PAD.encode(blob)
+}
+
+fn ssh_grant_request() -> AgentMessage {
+    AgentMessage::SshGrantRequest {
+        request_id: 3,
+        subject: GROUP.into(),
+        login_session: "7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d".into(),
+        certificate_sha256: "ab".repeat(32),
+        account: "admin@corp.local".into(),
+        resource: "srv-lab01".into(),
+        client_address: "10.1.2.3:51000".into(),
+    }
+}
+
+#[test]
+fn ssh_messages_round_trip() {
+    let agent = [
+        ssh_grant_request(),
+        crate::ssh::host_key_message(&SigningKey::generate().unwrap().0, &[1; 32]).unwrap(),
+    ];
+    for m in agent {
+        assert_eq!(decode::<AgentMessage>(&payload(&m)), Ok(m.clone()), "{m:?}");
+    }
+    let core = [
+        CoreMessage::SshTrust {
+            version: 1,
+            user_ca_p256_public: vec![point(), point()],
+            host_certificate: Some(host_certificate_blob()),
+        },
+        CoreMessage::SshTrust {
+            version: 2,
+            user_ca_p256_public: vec![point()],
+            host_certificate: None,
+        },
+        CoreMessage::SshGrant {
+            request_id: 3,
+            grant: "A".repeat(224),
+        },
+        CoreMessage::LoginRevoked {
+            login_session: GROUP.into(),
+        },
+        CoreMessage::SessionParams {
+            request_id: 3,
+            session_id: GROUP.into(),
+            protocol: SessionProtocol::Ssh,
+            host: "10.0.0.1".into(),
+            port: 22,
+            max_session_secs: 60,
+            account: Some("root".into()),
+            target_p256_public: Some(point()),
+        },
+    ];
+    for m in core {
+        assert_eq!(decode::<CoreMessage>(&payload(&m)), Ok(m.clone()), "{m:?}");
+    }
+    // Absent optional fields are not written.
+    let json = String::from_utf8(payload(&valid_core_messages()[5])).unwrap();
+    assert!(!json.contains("account"), "{json}");
+}
+
+/// Account, resource and client address of an SSH grant request.
+fn field(m: &mut AgentMessage) -> (&mut String, &mut String, &mut String) {
+    let AgentMessage::SshGrantRequest {
+        account,
+        resource,
+        client_address,
+        ..
+    } = m
+    else {
+        unreachable!()
+    };
+    (account, resource, client_address)
+}
+
+#[test]
+fn ssh_grant_request_values_are_checked() {
+    let refused = |change: fn(&mut AgentMessage)| {
+        let mut m = ssh_grant_request();
+        change(&mut m);
+        matches!(m.validate(), Err(TunnelError::Protocol(_)))
+    };
+    assert!(ssh_grant_request().validate().is_ok());
+    assert!(refused(|m| *field(m).0 = String::new()));
+    assert!(refused(|m| *field(m).0 = " root".into()));
+    assert!(refused(|m| *field(m).0 = "ro\not".into()));
+    assert!(refused(|m| *field(m).0 = "x".repeat(257)));
+    assert!(refused(|m| *field(m).1 = "Srv".into()));
+    assert!(refused(|m| *field(m).1 = "a".repeat(64)));
+    assert!(refused(|m| *field(m).1 = "-srv".into()));
+    assert!(refused(|m| *field(m).2 = "10.1.2.3".into()));
+    assert!(refused(|m| {
+        let AgentMessage::SshGrantRequest { subject, .. } = m else {
+            unreachable!()
+        };
+        *subject = "root".into();
+    }));
+    assert!(refused(|m| {
+        let AgentMessage::SshGrantRequest {
+            certificate_sha256, ..
+        } = m
+        else {
+            unreachable!()
+        };
+        *certificate_sha256 = "AB".repeat(32);
+    }));
+}
+
+#[test]
+fn ssh_trust_and_host_key_are_checked() {
+    let trust = |cas: Vec<String>, certificate: Option<String>| CoreMessage::SshTrust {
+        version: 1,
+        user_ca_p256_public: cas,
+        host_certificate: certificate,
+    };
+    let p = point();
+    assert!(refused_core(&trust(vec![], None)));
+    assert!(refused_core(&trust(vec![point(); 5], None)));
+    assert!(refused_core(&trust(vec![p.clone(), p], None)));
+    assert!(refused_core(&trust(
+        vec![URL_SAFE_NO_PAD.encode([4u8; 65])],
+        None
+    )));
+    assert!(refused_core(&trust(vec![point()], Some("AAAA".into()))));
+    assert!(refused_core(&trust(
+        vec![point()],
+        Some(URL_SAFE_NO_PAD.encode([0u8; 5000]))
+    )));
+    assert!(refused_core(&CoreMessage::SshTrust {
+        version: 0,
+        user_ca_p256_public: vec![point()],
+        host_certificate: None,
+    }));
+    assert!(refused_core(&CoreMessage::LoginRevoked {
+        login_session: "x".into()
+    }));
+    assert!(refused_core(&CoreMessage::SshGrant {
+        request_id: 1,
+        grant: "x".into()
+    }));
+    for (p256_public, proof) in [
+        (point(), URL_SAFE_NO_PAD.encode([1u8; 63])),
+        ("AAAA".to_owned(), URL_SAFE_NO_PAD.encode([1u8; 64])),
+    ] {
+        let m = AgentMessage::SshHostKey { p256_public, proof };
+        assert!(matches!(m.validate(), Err(TunnelError::Protocol(_))));
+    }
+}
+
+#[test]
+fn ssh_session_params_need_account_and_host_key() {
+    let params =
+        |protocol, account: Option<&str>, target: Option<String>| CoreMessage::SessionParams {
+            request_id: 1,
+            session_id: GROUP.into(),
+            protocol,
+            host: "10.0.0.1".into(),
+            port: 22,
+            max_session_secs: 60,
+            account: account.map(str::to_owned),
+            target_p256_public: target,
+        };
+    assert!(
+        params(SessionProtocol::Ssh, Some("root"), Some(point()))
+            .validate()
+            .is_ok()
+    );
+    assert!(refused_core(&params(
+        SessionProtocol::Ssh,
+        None,
+        Some(point())
+    )));
+    assert!(refused_core(&params(
+        SessionProtocol::Ssh,
+        Some("root"),
+        None
+    )));
+    assert!(refused_core(&params(
+        SessionProtocol::Ssh,
+        Some(" root"),
+        Some(point())
+    )));
+    assert!(refused_core(&params(
+        SessionProtocol::Ssh,
+        Some("root"),
+        Some(URL_SAFE_NO_PAD.encode([4u8; 65]))
+    )));
+    assert!(refused_core(&params(
+        SessionProtocol::Rdp,
+        Some("root"),
+        Some(point())
+    )));
+    assert!(params(SessionProtocol::Rdp, None, None).validate().is_ok());
+    // A missing field decodes as absent, then is refused for SSH.
+    let json = br#"{"type":"session_params","request_id":1,"session_id":"2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6","protocol":"ssh","host":"10.0.0.1","port":22,"max_session_secs":60}"#;
+    assert!(matches!(
+        decode::<CoreMessage>(json),
+        Err(TunnelError::Protocol(_))
+    ));
+}
+
+#[test]
+fn ssh_field_names_are_not_redacted() {
+    for name in [
+        "p256_public",
+        "proof",
+        "subject",
+        "login_session",
+        "certificate_sha256",
+        "account",
+        "resource",
+        "client_address",
+        "user_ca_p256_public",
+        "host_certificate",
+        "target_p256_public",
+        "authorities",
+    ] {
+        assert!(
+            !ostena_common::logging::is_sensitive_field(name),
+            "{name} would be redacted"
+        );
     }
 }

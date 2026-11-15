@@ -1,6 +1,6 @@
 [package]
 name = "ostena-ssh"
-description = "Native SSH access: frozen algorithms, pre-check of the peer, SSH library configuration (ADR-0010)."
+description = "Native SSH access: frozen algorithms, pre-check of the peer, certificates, agent server and driver to the targets (ADR-0010)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,10 @@ ostena-common.workspace = true
 # Generates the SSH keys (ADR-0010); also brings aws-lc-rs with
 # prebuilt-nasm (offline Windows build, ADR-0002) when built alone.
 ostena-crypto.workspace = true
+# Kid of a certificate authority, computed as for the grant keys.
+ostena-grant.workspace = true
+# PinnedTarget: the driver dials nothing else (anti-SSRF by type).
+ostena-scope = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
 ssh-key = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -24,9 +28,14 @@ tracing.workspace = true
 # pre-check depends on nothing of it, and russh does not build with the
 # pinned fuzzing nightly.
 default = ["russh"]
-russh = ["dep:russh", "dep:ssh-key"]
+# tokio/macros (select!) is already enabled by russh-util, a dependency of
+# russh: declared here rather than relied upon.
+russh = ["dep:russh", "dep:ssh-key", "dep:ostena-scope", "tokio/macros"]
 
 [dev-dependencies]
+# The gateway tests and the end-to-end example run against the in-process
+# test core: never in a release binary (dev-dependency only).
+ostena-tunnel = { workspace = true, features = ["testing"] }
 proptest.workspace = true
 tracing-subscriber.workspace = true
 
@@ -42,8 +51,25 @@ required-features = ["russh"]
 name = "keys"
 required-features = ["russh"]
 
+[[test]]
+name = "certificates"
+required-features = ["russh"]
+
+[[test]]
+name = "gateway"
+required-features = ["russh"]
+
+[[bench]]
+name = "relay"
+harness = false
+required-features = ["russh"]
+
 [[example]]
 name = "footprint_server"
+required-features = ["russh"]
+
+[[example]]
+name = "gateway_e2e"
 required-features = ["russh"]
 
 [lints]

@@ -30,12 +30,18 @@ fn json_seeds_decode() {
         "seed-session-params",
         "seed-refused",
         "seed-ping",
+        "seed-ssh-trust",
+        "seed-ssh-grant",
+        "seed-login-revoked",
+        "seed-session-params-ssh",
     ] {
         let data = std::fs::read(dir.join(format!("{name}.json"))).expect("seed");
         assert!(decode::<CoreMessage>(&data).is_ok(), "{name}");
     }
-    let hello = std::fs::read(dir.join("seed-hello.json")).expect("seed");
-    assert!(decode::<AgentMessage>(&hello).is_ok());
+    for name in ["seed-hello", "seed-ssh-host-key", "seed-ssh-grant-request"] {
+        let data = std::fs::read(dir.join(format!("{name}.json"))).expect("seed");
+        assert!(decode::<AgentMessage>(&data).is_ok(), "{name}");
+    }
 }
 
 /// The enrolment seeds are valid messages too.

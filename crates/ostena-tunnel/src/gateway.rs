@@ -22,19 +22,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ostena_common::config::Mode;
+use ostena_crypto::p256::VerifyingKey;
 use ostena_grant::{GatewayGroupId, Grant, GrantError, KeySet, ReplayStore, SignedGrant, Verifier};
 use ostena_scope::{
     CompiledPolicy, InfrastructureSpec, PinnedTarget, PolicySpec, Scope, ScopeError,
     SharedLocalAddresses, SystemResolver,
 };
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::control::{AgentMessage, CoreMessage, GrantKey, SessionProtocol};
+use crate::control::{AgentMessage, CoreMessage, GrantKey, SessionProtocol, p256_point};
 use crate::error::TunnelError;
 use crate::ids::Uuid;
 use crate::link::{AgentLink, KeyWriter};
+use crate::ssh::SshTrust;
 
 /// How long the agent waits for the core to answer a session request.
 pub const SESSION_ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +72,8 @@ pub struct Versions {
     pub keyset: Option<u64>,
     /// Last key set version accepted, possibly before a restart.
     pub keyset_floor: Option<u64>,
+    /// SSH trust applied.
+    pub ssh_trust: Option<u64>,
 }
 
 /// What a push changed.
@@ -94,11 +98,12 @@ struct Inner {
     keyset_floor: Option<u64>,
 }
 
-/// Policy and keys pushed by the core.
+/// Policy, keys and SSH trust pushed by the core.
 pub struct GatewayState {
     params: GatewayParams,
     audience: GatewayGroupId,
     inner: Mutex<Inner>,
+    ssh_trust: watch::Sender<Option<Arc<SshTrust>>>,
 }
 
 impl std::fmt::Debug for GatewayState {
@@ -174,6 +179,7 @@ impl GatewayState {
                 keyset_floor,
                 ..Inner::default()
             }),
+            ssh_trust: watch::Sender::new(None),
         })
     }
 
@@ -190,7 +196,64 @@ impl GatewayState {
             policy: inner.policy.as_ref().map(|p| p.version),
             keyset: inner.keys.as_ref().map(|k| k.0),
             keyset_floor: inner.keyset_floor,
+            ssh_trust: self.ssh_trust.borrow().as_ref().map(|t| t.version),
         }
+    }
+
+    /// The SSH trust applied, if the core has pushed one.
+    pub fn ssh_trust(&self) -> Option<Arc<SshTrust>> {
+        self.ssh_trust.borrow().clone()
+    }
+
+    /// Follows the SSH trust: the agent SSH server rebuilds its identity
+    /// from it (ADR-0010).
+    pub fn subscribe_ssh_trust(&self) -> watch::Receiver<Option<Arc<SshTrust>>> {
+        self.ssh_trust.subscribe()
+    }
+
+    /// Applies the SSH trust pushed by the core: the user certificate
+    /// authorities and the host certificate of the agent. The host
+    /// certificate is checked by the SSH server before use (`SSH-E018`).
+    ///
+    /// # Errors
+    ///
+    /// [`TunnelError::SshTrust`] for a version lower than the one applied, or
+    /// the same version with another content (the same push again is
+    /// ignored);
+    /// [`TunnelError::Protocol`] for an invalid value. The previous trust
+    /// stays.
+    pub fn apply_ssh_trust(
+        &self,
+        version: u64,
+        user_cas: &[String],
+        host_certificate: Option<&str>,
+    ) -> Result<Applied, TunnelError> {
+        let trust = SshTrust::decode(version, user_cas, host_certificate)?;
+        let mut outcome = Ok(Applied::Applied);
+        self.ssh_trust
+            .send_if_modified(|current| match current.as_ref().map(|c| c.version) {
+                Some(applied) if version < applied => {
+                    outcome = Err(TunnelError::SshTrust(format!(
+                        "version {version} inférieure à la version {applied} appliquée"
+                    )));
+                    false
+                }
+                Some(applied) if version == applied => {
+                    outcome = if current.as_deref() == Some(&trust) {
+                        Ok(Applied::Unchanged)
+                    } else {
+                        Err(TunnelError::SshTrust(format!(
+                            "version {version} déjà appliquée avec un autre contenu"
+                        )))
+                    };
+                    false
+                }
+                _ => {
+                    *current = Some(Arc::new(trust));
+                    true
+                }
+            });
+        outcome
     }
 
     fn compile(&self, spec: &PolicySpec) -> Result<Arc<CompiledPolicy>, TunnelError> {
@@ -407,6 +470,36 @@ pub struct Session {
     pub max_session_secs: u32,
 }
 
+/// A native SSH access, as the agent SSH server authenticated it
+/// (ADR-0010).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshAccess {
+    /// The user, principal of the certificate.
+    pub subject: Uuid,
+    /// The `ostena login` session, key identifier of the certificate.
+    pub login_session: Uuid,
+    /// SHA-256 of the user certificate.
+    pub certificate_sha256: [u8; 32],
+    /// Account on the target.
+    pub account: String,
+    /// Resource name, mapped by the core.
+    pub resource: String,
+    /// Address of the SSH client.
+    pub client_address: std::net::SocketAddr,
+}
+
+/// An SSH session the agent may open: the common session, the account and
+/// the pinned host key of the target.
+#[derive(Debug, Clone)]
+pub struct SshSession {
+    /// Grant verified, jti consumed on both sides, target pinned.
+    pub session: Session,
+    /// Account on the target, as asked and as answered by the core.
+    pub account: String,
+    /// Host key of the target, pinned in the inventory of the core.
+    pub target_host_key: VerifyingKey,
+}
+
 fn same_protocol(answer: SessionProtocol, grant: ostena_grant::Protocol) -> bool {
     matches!(
         (answer, grant),
@@ -417,7 +510,22 @@ fn same_protocol(answer: SessionProtocol, grant: ostena_grant::Protocol) -> bool
     )
 }
 
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<CoreMessage>>>>;
+
+/// What the core answered to a session request, after the common checks.
+struct Answer {
+    session: Session,
+    account: Option<String>,
+    target_p256_public: Option<String>,
+}
 
 /// Applies the pushes of the core and opens sessions through it.
 #[derive(Debug)]
@@ -426,6 +534,7 @@ pub struct Gateway {
     link: Arc<AgentLink>,
     pending: Pending,
     next_request: AtomicU64,
+    revocations: broadcast::Sender<Uuid>,
     task: JoinHandle<()>,
 }
 
@@ -444,12 +553,19 @@ impl Gateway {
             .take_pushes()
             .ok_or_else(|| TunnelError::Config("messages du core déjà pris".into()))?;
         let pending = Pending::default();
-        let task = tokio::spawn(dispatch(pushes, state.clone(), pending.clone()));
+        let (revocations, _) = broadcast::channel(64);
+        let task = tokio::spawn(dispatch(
+            pushes,
+            state.clone(),
+            pending.clone(),
+            revocations.clone(),
+        ));
         Ok(Self {
             state,
             link,
             pending,
             next_request: AtomicU64::new(1),
+            revocations,
             task,
         })
     }
@@ -459,26 +575,18 @@ impl Gateway {
         &self.state
     }
 
-    /// Opens a session for `grant`: verified here and its jti consumed in
-    /// `store`, then verified and consumed by the core, whose answer gives the
-    /// target, pinned here through the effective policy.
-    ///
-    /// # Errors
-    ///
-    /// The first refusal, see [`SessionError`].
-    pub async fn open_session<S: ReplayStore>(
+    /// The `ostena login` sessions the core revokes, for the SSH server to
+    /// cut the sessions that depend on them.
+    pub fn subscribe_login_revocations(&self) -> broadcast::Receiver<Uuid> {
+        self.revocations.subscribe()
+    }
+
+    /// Sends the message built for a fresh request id and waits for the
+    /// answer to that id.
+    async fn ask(
         &self,
-        grant: &str,
-        now: u64,
-        store: &S,
-    ) -> Result<Session, SessionError> {
-        // Nothing passes before the core has pushed a policy.
-        if self.state.versions().policy.is_none() {
-            return Err(SessionError::Tunnel(TunnelError::NotReady(
-                "de politique de périmètre",
-            )));
-        }
-        let verified = self.state.verify_grant(grant, now, store).await?;
+        message: impl FnOnce(u64) -> AgentMessage,
+    ) -> Result<CoreMessage, SessionError> {
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
@@ -489,14 +597,7 @@ impl Gateway {
                 pending.remove(&request_id);
             }
         };
-        let sent = self
-            .link
-            .send(&AgentMessage::SessionRequest {
-                request_id,
-                grant: grant.to_owned(),
-            })
-            .await;
-        if let Err(e) = sent {
+        if let Err(e) = self.link.send(&message(request_id)).await {
             forget();
             return Err(SessionError::Tunnel(e));
         }
@@ -504,6 +605,23 @@ impl Gateway {
             forget();
             return Err(SessionError::Tunnel(TunnelError::NoAnswer));
         };
+        Ok(answer)
+    }
+
+    fn refused(code: String, message: String) -> SessionError {
+        tracing::warn!(event = "agent.session_refused", code = %code, "{message}");
+        SessionError::Core { code, message }
+    }
+
+    /// `session_request` for a grant already verified (jti consumed here),
+    /// then the common checks of the answer and the scope control.
+    async fn request(&self, grant: &str, verified: Grant) -> Result<Answer, SessionError> {
+        let answer = self
+            .ask(|request_id| AgentMessage::SessionRequest {
+                request_id,
+                grant: grant.to_owned(),
+            })
+            .await?;
         match answer {
             CoreMessage::SessionParams {
                 session_id,
@@ -511,6 +629,8 @@ impl Gateway {
                 host,
                 port,
                 max_session_secs,
+                account,
+                target_p256_public,
                 ..
             } => {
                 if !same_protocol(protocol, verified.claims.protocol) {
@@ -528,19 +648,114 @@ impl Gateway {
                     jti = %verified.jti,
                     target = %format_args!("{host}:{port}"),
                 );
-                Ok(Session {
-                    session_id,
-                    grant: verified,
-                    target,
-                    max_session_secs,
+                Ok(Answer {
+                    session: Session {
+                        session_id,
+                        grant: verified,
+                        target,
+                        max_session_secs,
+                    },
+                    account,
+                    target_p256_public,
                 })
             }
-            CoreMessage::SessionRefused { code, message, .. } => {
-                tracing::warn!(event = "agent.session_refused", code = %code, "{message}");
-                Err(SessionError::Core { code, message })
-            }
+            CoreMessage::SessionRefused { code, message, .. } => Err(Self::refused(code, message)),
             _ => Err(SessionError::Mismatch("type de réponse")),
         }
+    }
+
+    fn ready(&self) -> Result<(), SessionError> {
+        // Nothing passes before the core has pushed a policy.
+        if self.state.versions().policy.is_none() {
+            return Err(SessionError::Tunnel(TunnelError::NotReady(
+                "de politique de périmètre",
+            )));
+        }
+        Ok(())
+    }
+
+    /// Opens a session for `grant`: verified here and its jti consumed in
+    /// `store`, then verified and consumed by the core, whose answer gives the
+    /// target, pinned here through the effective policy.
+    ///
+    /// # Errors
+    ///
+    /// The first refusal, see [`SessionError`].
+    pub async fn open_session<S: ReplayStore>(
+        &self,
+        grant: &str,
+        now: u64,
+        store: &S,
+    ) -> Result<Session, SessionError> {
+        self.ready()?;
+        let verified = self.state.verify_grant(grant, now, store).await?;
+        Ok(self.request(grant, verified).await?.session)
+    }
+
+    /// Opens a native SSH session (ADR-0010): asks the core for a grant for
+    /// `access` (`ssh_grant_request`), which must name the subject of the
+    /// certificate and SSH; then the common path ([`Gateway::open_session`]:
+    /// jti consumed here, then by the core); the answer must give the account
+    /// asked and the pinned host key of the target.
+    ///
+    /// # Errors
+    ///
+    /// The first refusal, see [`SessionError`]: `TUN-E026` before the policy,
+    /// the keys or the SSH trust, `TUN-E027` without an answer, `TUN-E010`
+    /// for a grant or an answer that does not match `access`.
+    pub async fn open_ssh_session<S: ReplayStore>(
+        &self,
+        access: &SshAccess,
+        now: u64,
+        store: &S,
+    ) -> Result<SshSession, SessionError> {
+        self.ready()?;
+        if self.state.ssh_trust().is_none() {
+            return Err(SessionError::Tunnel(TunnelError::NotReady(
+                "de confiance SSH",
+            )));
+        }
+        let answer = self
+            .ask(|request_id| AgentMessage::SshGrantRequest {
+                request_id,
+                subject: access.subject.to_string(),
+                login_session: access.login_session.to_string(),
+                certificate_sha256: hex(&access.certificate_sha256),
+                account: access.account.clone(),
+                resource: access.resource.clone(),
+                client_address: access.client_address.to_string(),
+            })
+            .await?;
+        let grant = match answer {
+            CoreMessage::SshGrant { grant, .. } => grant,
+            CoreMessage::SessionRefused { code, message, .. } => {
+                return Err(Self::refused(code, message));
+            }
+            _ => return Err(SessionError::Mismatch("type de réponse")),
+        };
+        // Verified and consumed here even if it does not match: a grant
+        // that does not fit is burned.
+        let verified = self.state.verify_grant(&grant, now, store).await?;
+        if verified.claims.subject.to_bytes() != access.subject.to_bytes() {
+            return Err(SessionError::Mismatch("sujet du grant"));
+        }
+        if verified.claims.protocol != ostena_grant::Protocol::Ssh {
+            return Err(SessionError::Mismatch("protocole du grant"));
+        }
+        let answer = self.request(&grant, verified).await?;
+        if answer.account.as_deref() != Some(access.account.as_str()) {
+            return Err(SessionError::Mismatch("compte"));
+        }
+        let target_host_key = answer
+            .target_p256_public
+            .as_deref()
+            .and_then(|k| p256_point("target_p256_public", k).ok())
+            .ok_or(SessionError::Mismatch("clé d'hôte de la cible"))?;
+        Ok(SshSession {
+            session: answer.session,
+            account: access.account.clone(),
+            target_host_key,
+        })
     }
 }
 
@@ -554,6 +769,7 @@ async fn dispatch(
     mut pushes: mpsc::Receiver<CoreMessage>,
     state: Arc<GatewayState>,
     pending: Pending,
+    revocations: broadcast::Sender<Uuid>,
 ) {
     while let Some(message) = pushes.recv().await {
         match message {
@@ -589,7 +805,37 @@ async fn dispatch(
                     ),
                 }
             }
+            CoreMessage::SshTrust {
+                version,
+                user_ca_p256_public,
+                host_certificate,
+            } => match state.apply_ssh_trust(
+                version,
+                &user_ca_p256_public,
+                host_certificate.as_deref(),
+            ) {
+                Ok(Applied::Applied) => tracing::info!(
+                    event = "agent.ssh_trust_applied",
+                    version,
+                    authorities = user_ca_p256_public.len(),
+                    host_certificate = host_certificate.is_some(),
+                ),
+                Ok(Applied::Unchanged) => {}
+                Err(e) => tracing::warn!(
+                    event = "agent.ssh_trust_refused",
+                    version,
+                    code = e.code(),
+                    "{e}"
+                ),
+            },
+            CoreMessage::LoginRevoked { login_session } => {
+                if let Some(login) = Uuid::parse(&login_session) {
+                    tracing::info!(event = "agent.login_revoked", login_session = %login);
+                    let _ = revocations.send(login);
+                }
+            }
             CoreMessage::SessionParams { request_id, .. }
+            | CoreMessage::SshGrant { request_id, .. }
             | CoreMessage::SessionRefused { request_id, .. } => {
                 let waiter = pending.lock().ok().and_then(|mut p| p.remove(&request_id));
                 if let Some(waiter) = waiter {

@@ -20,6 +20,7 @@ mod ids;
 pub mod limits;
 pub mod link;
 pub mod renewal;
+pub mod ssh;
 pub mod tunnel;
 
 #[cfg(feature = "testing")]
