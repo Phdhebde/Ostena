@@ -1,9 +1,21 @@
 name: CI
 
+# Actions minutes are a hard budget (private repository, free plan, Windows
+# billed at twice the Linux rate). Hence:
+# - pull requests run the Linux jobs; the Windows job runs on a pull request
+#   only with the `ci:windows` label;
+# - main is validated once a week (schedule, or workflow_dispatch before a
+#   release), with everything: Windows 2025 and 2022, benches. This run also
+#   saves the caches every pull request restores;
+# - documentation-only changes run nothing;
+# - jobs that can leave GitHub-hosted runners use `vars.LINUX_RUNNER` when it
+#   is set (self-hosted runner), `ubuntu-24.04` otherwise.
 on:
-  push:
-    branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths-ignore: ["docs/**", "**/*.md"]
+  schedule:
+    - cron: "0 3 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -20,70 +32,98 @@ env:
 
 # Third-party actions are pinned by commit SHA; the tag is in the comment.
 jobs:
-  fmt:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
+  # Light checks gathered in one job: a job is billed by the started minute.
+  checks:
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
           persist-credentials: false
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny,cargo-cyclonedx
       - run: cargo fmt --all --check
       - run: cargo xtask check-secrets
+      - run: cargo deny --locked check
+      - run: cargo deny --manifest-path fuzz/Cargo.toml --locked check
+      - run: cargo xtask sbom
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-cyclonedx
+          path: target/sbom/
+          retention-days: 30
+      - name: Every commit carries a Signed-off-by matching its author
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            author="$(git log -1 --format='%an <%ae>' "$c")"
+            if ! git log -1 --format='%B' "$c" | grep -Fqx "Signed-off-by: $author"; then
+              echo "::error::commit $c has no 'Signed-off-by: $author'"
+              status=1
+            fi
+          done
+          exit $status
 
-  clippy:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2025]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+  linux:
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2025]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
       - run: cargo test --workspace --locked
-      # Displayed only: no regression gate yet (ADR-0005).
-      - if: runner.os == 'Linux'
+      # ostena-frame is also the protocol core of the browser client.
+      - run: cargo build --locked --release -p ostena-frame --target wasm32-unknown-unknown
+      # Displayed only: no regression gate yet (ADR-0005). Weekly on main.
+      - if: github.event_name != 'pull_request'
         run: |
           cargo bench --locked -p ostena-scope
           cargo bench --locked -p ostena-frame
           cargo bench --locked -p ostena-tunnel
 
-  deny:
+  # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
+  # our server behind the pre-check (sessions, refusals, audit), then our
+  # client against a Debian 12 OpenSSH server in Docker, with the agent key
+  # installed as `restrict,from=`. Needs Docker: GitHub-hosted runner.
+  ssh-interop:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
-          tool: cargo-deny
-      - run: cargo deny --locked check
-      - run: cargo deny --manifest-path fuzz/Cargo.toml --locked check
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: ssh -V
+      - run: cargo test --locked -p ostena-ssh --test interop
+        env:
+          OSTENA_REQUIRE_OPENSSH: "1"
+      - run: bash tests/ssh/debian12-target.sh
 
-  build-musl:
+  # Static release binary, then the agent service lifecycle under systemd
+  # (install, status, permissions, hardening score, clean stop, bounded
+  # restarts, uninstall), the unit on systemd 252 (Debian 12), and the idle
+  # footprint. Needs a full VM with systemd: stays on GitHub-hosted runners.
+  release-linux:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,6 +132,8 @@ jobs:
       # aws-lc-sys compiles C for the musl target with musl-gcc.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo build --release --locked --package ostena-cli --target x86_64-unknown-linux-musl
       - name: Check the binary is statically linked
         run: |
@@ -106,64 +148,15 @@ jobs:
           name: ostena-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/ostena
           retention-days: 7
+      - run: cargo build --release --locked --package ostena-cli
+      - run: bash tests/agent/linux-service.sh target/release/ostena
+      - run: cargo xtask footprint
 
-  build-wasm:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      # ostena-frame is also the protocol core of the browser client.
-      - run: cargo build --locked --release -p ostena-frame --target wasm32-unknown-unknown
-
-  build-windows:
-    runs-on: windows-2025
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: cargo build --release --locked --package ostena-cli --target x86_64-pc-windows-msvc
-      - run: target/x86_64-pc-windows-msvc/release/ostena.exe --version
-      - run: cargo xtask check-release target/x86_64-pc-windows-msvc/release/ostena.exe
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ostena-x86_64-pc-windows-msvc
-          path: target/x86_64-pc-windows-msvc/release/ostena.exe
-          retention-days: 7
-
-  sbom:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-cyclonedx
-      - run: cargo xtask sbom
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: sbom-cyclonedx
-          path: target/sbom/
-          retention-days: 30
-
-  # One job per target, in parallel. Keep the list in sync with FUZZ_TARGETS
-  # in xtask (checked by its tests). Longer runs: fuzz-nightly.yml.
-  fuzz:
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, ssh_precheck]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+  # All targets in one job, 30 s each: the fuzz build is shared. Longer runs:
+  # fuzz-nightly.yml.
+  fuzz-smoke:
+    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -178,69 +171,55 @@ jobs:
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           shared-key: fuzz
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
             . -> target
             fuzz -> target
-      - run: cargo xtask fuzz 30 ${{ matrix.target }}
+      # No target given: every target of FUZZ_TARGETS.
+      - run: cargo xtask fuzz 30
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
+          name: fuzz-artifacts
           path: fuzz/artifacts/
           retention-days: 30
 
-  # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
-  # our server behind the pre-check (sessions, refusals, audit), then our
-  # client against a Debian 12 OpenSSH server in Docker, with the agent key
-  # installed as `restrict,from=`.
-  ssh-interop:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: ssh -V
-      - run: cargo test --locked -p ostena-ssh --test interop
-        env:
-          OSTENA_REQUIRE_OPENSSH: "1"
-      - run: bash tests/ssh/debian12-target.sh
-
-  # Agent service lifecycle under systemd (install, status, permissions,
-  # hardening score, clean stop, bounded restarts, uninstall), the unit on
-  # systemd 252 (Debian 12), and the idle footprint.
-  agent-linux:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: cargo build --release --locked --package ostena-cli
-      - run: bash tests/agent/linux-service.sh target/release/ostena
-      - run: cargo xtask footprint
-
-  # Agent service lifecycle under the SCM (account, restricted SID, required
-  # privileges, bounded failure actions, ACLs, status, non-administrator
-  # refused on the control pipe, clean stop, uninstall).
-  agent-windows:
+  # Clippy, tests, the release binary and the agent service lifecycle under
+  # the SCM (account, restricted SID, required privileges, bounded failure
+  # actions, ACLs, status, non-administrator refused on the control pipe,
+  # clean stop, uninstall) in one job, so the release build is shared.
+  # Windows 2022 runs the service part only, and only weekly.
+  windows:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:windows')
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2025, windows-2022]
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["windows-2025"]') || fromJSON('["windows-2025", "windows-2022"]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - if: matrix.os == 'windows-2025'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: matrix.os == 'windows-2025'
+        run: cargo test --workspace --locked
+      # The host target is x86_64-pc-windows-msvc: same binary as with an
+      # explicit --target, in target/release, shared with xtask footprint.
       - run: cargo build --release --locked --package ostena-cli
+      - run: target/release/ostena.exe --version
+      - run: cargo xtask check-release target/release/ostena.exe
+      - if: matrix.os == 'windows-2025'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ostena-x86_64-pc-windows-msvc
+          path: target/release/ostena.exe
+          retention-days: 7
       - run: tests/agent/windows-service.ps1 -Binary target/release/ostena.exe
         shell: pwsh
       - run: cargo xtask footprint
@@ -251,27 +230,3 @@ jobs:
           path: C:\ProgramData\Ostena\state\agent.log
           if-no-files-found: ignore
           retention-days: 14
-
-  dco:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Every commit carries a Signed-off-by matching its author
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          status=0
-          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
-            author="$(git log -1 --format='%an <%ae>' "$c")"
-            if ! git log -1 --format='%B' "$c" | grep -Fqx "Signed-off-by: $author"; then
-              echo "::error::commit $c has no 'Signed-off-by: $author'"
-              status=1
-            fi
-          done
-          exit $status
