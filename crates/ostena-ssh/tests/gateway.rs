@@ -372,6 +372,26 @@ fn nothing_passes_before_the_ssh_trust_and_a_lower_trust_is_refused() {
         assert_eq!(trust.user_cas, [core.ssh_user_ca().verifying_key()]);
         // A lower version is refused, the trust stays.
         core.push_ssh_trust(1, None).await;
+        // The same version again is ignored; with another content, refused.
+        core.push_ssh_trust(2, None).await;
+        let host = SigningKey::generate().unwrap().0;
+        let issued = now();
+        let certificate = ostena_ssh::cert::issue(
+            &ostena_ssh::cert::Template {
+                kind: ostena_ssh::cert::Kind::Host,
+                public: host.verifying_key(),
+                serial: 1,
+                key_id: "gw".into(),
+                principals: vec!["gw.example.test".into()],
+                valid_after: issued,
+                valid_before: issued + 3600,
+                critical_options: vec![],
+                extensions: vec![],
+            },
+            &host,
+        )
+        .unwrap();
+        core.push_ssh_trust(2, Some(&certificate)).await;
         core.push(&CoreMessage::Policy {
             version: 2,
             policy: allow(&["10.0.0.0/8"]),
@@ -393,7 +413,11 @@ fn nothing_passes_before_the_ssh_trust_and_a_lower_trust_is_refused() {
         .filter(|e| e.name == "agent.ssh_trust_refused")
         .map(|e| e.code.clone())
         .collect();
-    assert!(refused.iter().any(|c| c == "TUN-E030"), "{refused:?}");
+    assert_eq!(
+        refused.iter().filter(|c| *c == "TUN-E030").count(),
+        2,
+        "lower version and same version with another content: {refused:?}"
+    );
 }
 
 #[test]

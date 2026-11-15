@@ -217,7 +217,9 @@ impl GatewayState {
     ///
     /// # Errors
     ///
-    /// [`TunnelError::SshTrust`] for a version lower than the one applied,
+    /// [`TunnelError::SshTrust`] for a version lower than the one applied, or
+    /// the same version with another content (the same push again is
+    /// ignored);
     /// [`TunnelError::Protocol`] for an invalid value. The previous trust
     /// stays.
     pub fn apply_ssh_trust(
@@ -237,7 +239,13 @@ impl GatewayState {
                     false
                 }
                 Some(applied) if version == applied => {
-                    outcome = Ok(Applied::Unchanged);
+                    outcome = if current.as_deref() == Some(&trust) {
+                        Ok(Applied::Unchanged)
+                    } else {
+                        Err(TunnelError::SshTrust(format!(
+                            "version {version} déjà appliquée avec un autre contenu"
+                        )))
+                    };
                     false
                 }
                 _ => {
