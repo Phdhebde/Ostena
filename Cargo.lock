@@ -1622,6 +1622,7 @@ dependencies = [
  "ostena-crypto",
  "ostena-grant",
  "ostena-scope",
+ "ostena-tunnel",
  "proptest",
  "russh",
  "ssh-key",
