@@ -58,12 +58,12 @@ fn build(n: usize, heads: &[bool]) -> Model {
         end_ms: T0,
     };
     let mut time = T0;
-    for i in 0..n {
+    for (i, &flagged) in heads.iter().take(n).enumerate() {
         time += 1000;
         let appended = tip.append(event(tip.seq + 1), time).unwrap();
         model.records.push(appended.body.clone());
         model.items.push(Item::Record(appended.body));
-        if i == 0 || i == n - 1 || heads[i] {
+        if i == 0 || i == n - 1 || flagged {
             time += 1;
             let head = UnsignedHead::after(
                 model.heads.last(),
