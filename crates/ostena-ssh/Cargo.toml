@@ -59,6 +59,11 @@ required-features = ["russh"]
 name = "gateway"
 required-features = ["russh"]
 
+[[bench]]
+name = "relay"
+harness = false
+required-features = ["russh"]
+
 [[example]]
 name = "footprint_server"
 required-features = ["russh"]
