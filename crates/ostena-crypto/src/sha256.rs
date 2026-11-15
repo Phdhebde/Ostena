@@ -8,6 +8,19 @@ pub fn digest(data: &[u8]) -> [u8; 32] {
     out
 }
 
+/// SHA-256 digest of the concatenation of `parts`, without copying them
+/// (domain-separated hashes: a prefix, then the data).
+pub fn digest_concat(parts: &[&[u8]]) -> [u8; 32] {
+    let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    for part in parts {
+        context.update(part);
+    }
+    let d = context.finish();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -21,5 +34,11 @@ mod tests {
             0xf2, 0x00, 0x15, 0xad,
         ];
         assert_eq!(digest(b"abc"), expected);
+    }
+
+    #[test]
+    fn concatenation_matches_one_shot() {
+        assert_eq!(digest_concat(&[b"a", b"", b"bc"]), digest(b"abc"));
+        assert_eq!(digest_concat(&[]), digest(b""));
     }
 }

@@ -601,6 +601,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "ostena-audit"
+version = "0.0.0"
+dependencies = [
+ "ostena-crypto",
+ "thiserror",
+]
+
+[[package]]
 name = "ostena-common"
 version = "0.0.0"
 dependencies = [
@@ -639,6 +647,7 @@ name = "ostena-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "ostena-audit",
  "ostena-frame",
  "ostena-grant",
  "ostena-scope",

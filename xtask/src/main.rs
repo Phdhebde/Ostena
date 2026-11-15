@@ -485,7 +485,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Fuzz target run by `cargo xtask fuzz`.
-const FUZZ_TARGETS: [&str; 7] = [
+const FUZZ_TARGETS: [&str; 9] = [
     "grant_decode",
     "scope_target",
     "scope_policy",
@@ -493,6 +493,8 @@ const FUZZ_TARGETS: [&str; 7] = [
     "frame_reassembly",
     "tunnel_control_decode",
     "ssh_precheck",
+    "audit_decode",
+    "audit_verify",
 ];
 
 /// Runs each fuzz target (all by default) for `SECS` seconds with the nightly

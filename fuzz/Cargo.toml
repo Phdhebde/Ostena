@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+ostena-audit = { path = "../crates/ostena-audit" }
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
 ostena-scope = { path = "../crates/ostena-scope" }
@@ -69,6 +70,20 @@ bench = false
 [[bin]]
 name = "tunnel_control_decode"
 path = "fuzz_targets/tunnel_control_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_decode"
+path = "fuzz_targets/audit_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_verify"
+path = "fuzz_targets/audit_verify.rs"
 test = false
 doc = false
 bench = false
