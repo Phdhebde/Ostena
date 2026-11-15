@@ -18,6 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use ostena_audit::{ExportReader, Frame, Record};
 use ostena_common::config::Mode;
 use ostena_core::testing::{TestDb, block_on};
 use ostena_crypto::p256::SigningKey;
@@ -105,6 +106,24 @@ impl Process {
     fn stop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Sends SIGTERM (what systemd does) and waits for a clean exit.
+    fn terminate(&mut self) {
+        let status = Command::new("kill")
+            .args(["-TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "{status} ; journal :\n{}", self.seen);
+                return;
+            }
+            assert!(Instant::now() < deadline, "pas d'arrêt après SIGTERM");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -329,7 +348,7 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     assert!(!list.lines().nth(1).unwrap().ends_with("\t-"), "{list}");
     agent.stop();
 
-    audit_chain_is_exported_and_verified(&lab, &db);
+    audit_chain_is_exported_and_verified(&lab, &db, &mut core);
 
     core.stop();
     drop(lab);
@@ -352,8 +371,9 @@ fn verify(lab: &Lab, export: &Path) -> (i32, String) {
 }
 
 /// The audit chain of the demonstration: exported, then verified offline
-/// with the public key only; an edit by the database owner is found.
-fn audit_chain_is_exported_and_verified(lab: &Lab, db: &TestDb) {
+/// with the public key only; a graceful stop ends it with `core.stopped`
+/// and a last head; an edit by the database owner is found.
+fn audit_chain_is_exported_and_verified(lab: &Lab, db: &TestDb, core: &mut Process) {
     let mut attempt = 0;
     let deadline = Instant::now() + WAIT;
     let report = loop {
@@ -393,6 +413,40 @@ fn audit_chain_is_exported_and_verified(lab: &Lab, db: &TestDb) {
         matches!(online.status.code(), Some(0 | 2)),
         "{}",
         String::from_utf8_lossy(&online.stdout)
+    );
+
+    // SIGTERM: the core writes core.stopped, then signs a last head over it.
+    core.terminate();
+    let stopped = lab.dir.join("audit-stopped.ostaud");
+    command(
+        &[
+            "core",
+            "audit",
+            "export",
+            "--out",
+            stopped.to_str().unwrap(),
+        ],
+        &lab.core_config,
+    );
+    let (exit, report) = verify(lab, &stopped);
+    assert_eq!(exit, 0, "{report}");
+    let frames: Vec<Frame> = ExportReader::new(std::fs::File::open(&stopped).unwrap())
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let last = frames
+        .iter()
+        .rposition(|f| matches!(f, Frame::Record(_)))
+        .unwrap();
+    let Frame::Record(body) = &frames[last] else {
+        unreachable!()
+    };
+    let record = Record::decode(body).unwrap();
+    assert_eq!(record.event, "core.stopped");
+    assert!(
+        matches!(&frames[last + 1], Frame::Head(h) if h.record_seq() == record.seq),
+        "{:?}",
+        &frames[last + 1..]
     );
 
     // The owner of the database edits a record behind the triggers: the
