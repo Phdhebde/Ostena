@@ -68,5 +68,9 @@ required-features = ["russh"]
 name = "footprint_server"
 required-features = ["russh"]
 
+[[example]]
+name = "gateway_e2e"
+required-features = ["russh"]
+
 [lints]
 workspace = true
