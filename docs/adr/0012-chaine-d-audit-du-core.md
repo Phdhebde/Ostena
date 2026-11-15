@@ -1,6 +1,6 @@
 # ADR-0012 : Chaîne d'audit du core
 
-- **Statut** : Proposé, M1 PR 3 : format et vérificateur implémentés ; intégration au core à venir
+- **Statut** : Accepté. Implémenté dans le lot M1 : format et vérificateur (PR 3a), intégration au core (PR 3b).
 - **Date** : 2026-11-15
 
 ## Contexte
@@ -21,7 +21,7 @@ CLAUDE.md annonçait une « chaîne HMAC ». Cet ADR retient une chaîne de hash
 
 ### Crate
 
-Nouvelle crate `ostena-audit`, indépendante de la plateforme et sans base de données. Dépendances : `ostena-crypto` et `thiserror`, aucune crate tierce nouvelle. Elle fournit le format des enregistrements, un constructeur d'événements, les têtes signées, le conteneur d'export, le vérificateur en flux et des points d'entrée de fuzzing. Le core (écriture en base, signataire de têtes, export depuis PostgreSQL) l'utilisera dans la PR suivante, avec le même vérificateur pour contrôler ses propres segments.
+Nouvelle crate `ostena-audit`, indépendante de la plateforme et sans base de données. Dépendances : `ostena-crypto` et `thiserror`, aucune crate tierce nouvelle. Elle fournit le format des enregistrements, un constructeur d'événements, les têtes signées, le conteneur d'export, le vérificateur en flux et des points d'entrée de fuzzing. Le core l'utilise pour écrire en base, signer les têtes et exporter, avec le même vérificateur pour contrôler ses propres segments (section « Intégration au core »).
 
 ### Enregistrement v1
 
@@ -143,9 +143,52 @@ Codes stables, jamais renumérotés ni réutilisés. Chaque message commence par
 - **Horodatage RFC 3161** : trame d'export de type 3, hors de la signature de la tête, portant un jeton sur le hash de tête. Une version ultérieure du vérificateur l'acceptera ; la v1 la refuse plutôt que de l'ignorer.
 - **Têtes hybrides v2** : ECDSA P-256 + ML-DSA-65 par concaténation, comme prévu par l'ADR-0009 pour les têtes de chaîne d'audit, dans une tête de version 2 avec son propre algorithme. Les enregistrements ne changent pas. Bloquant : ML-DSA n'est exposé par `aws-lc-rs` que derrière une fonctionnalité instable (ADR-0009).
 
-### Intégration au core (à venir, PR suivante)
+### Intégration au core
 
-Schéma PostgreSQL et écriture des enregistrements, classes d'échec d'écriture et `audit.events_lost`, cadence et battement du signataire de têtes, clé de signature transmise comme credential systemd, export depuis la base, contrôle de segments par le même vérificateur. Cet ADR sera complété à ce moment-là.
+#### Schéma (migration `0002_audit_chain`)
+
+- `audit_record` : `seq` (clé, au moins 1), `body` (le corps encodé, de 73 à 8192 octets : `MIN_RECORD_LEN` et `MAX_RECORD_LEN`), `hash` (32 octets), `event` (nom, pour l'index `(event, seq)`), `recorded_at`.
+- `audit_head` : `head_no` (clé, au moins 1), `record_seq` (référence `audit_record`), `body` (182 octets), `hash` (32 octets), `signed_at` ; index sur `record_seq`.
+- **Ajout seul** : déclencheurs `BEFORE UPDATE OR DELETE` (par ligne) et `BEFORE TRUNCATE` sur les deux tables, qui lèvent `insufficient_privilege` ; `REVOKE UPDATE, DELETE, TRUNCATE … FROM PUBLIC`.
+- **Contiguïté** : un déclencheur `BEFORE INSERT` impose `seq = max + 1`, `head_no = max + 1` et une tête qui ne dépasse pas le dernier enregistrement.
+- Avec le rôle unique de M1 (ADR-0011), ces protections n'arrêtent que les erreurs : le propriétaire peut désactiver un déclencheur. **L'intégrité est cryptographique** (chaînage, têtes signées, contrôle du core et `ostena audit verify`). Après la séparation des rôles, le compte du service n'aura que `SELECT` et `INSERT` sur ces tables ([note](../notes/core-roles-base.md)).
+
+#### Écriture
+
+- Chaque ajout prend le verrou consultatif de transaction `AUDIT_LOCK_KEY` (au-dessus de 2^62, il ne peut pas croiser celui des migrations de sqlx), lit le bout de la chaîne, le contrôle contre son contenu et insère l'enregistrement suivant. Le verrou est tenu jusqu'à la fin de la transaction : les seq suivent l'ordre des validations, sans trou.
+- L'ajout est **la dernière instruction avant le `COMMIT`**, dans une transaction `READ COMMITTED`.
+- La chaîne démarre au premier ajout (ou au démarrage du core) : identifiant tiré au hasard, `audit.chain_started` au seq 1, sous le même verrou, donc une seule fois même si plusieurs processus démarrent ensemble.
+- L'acteur d'une commande d'administration est l'utilisateur de la base (`system_user`, `peer:<compte>` en production).
+
+#### Classes d'échec d'écriture
+
+| Classe | Événements | Si l'enregistrement ne peut pas être écrit |
+|---|---|---|
+| **Accordant** | `agent.enrolled`, `agent.certificate_renewed` (choisi d'après l'insertion de la ligne `agent`), `enroll.token_issued`, `enroll.token_consumed`, `audit.signing_started`, `core.migrated`, `config.waiver`, `core.started`, `audit.break_acknowledged`, `audit.exported` | écrit dans la transaction du changement ; l'échec l'annule et le refuse (`TUN-E029` côté tunnel, `CORE-E010` sinon) ; le core refuse de démarrer |
+| **Protecteur** | `agent.revoked`, `enroll.token_rejected` (échecs, brûlage, code) | écrit dans un point de sauvegarde ; le changement est validé quand même ; l'échec est journalisé (`audit.append_failed`, niveau erreur) et compté |
+| **Au mieux** | `tunnel.agent_connected`, `tunnel.refused` (agent identifié), `agent.renewal_refused`, `agent.revocation_applied`, `core.registry_unavailable`, `core.registry_restored`, `core.stopped` | file bornée de 256 événements, écrite par une seule tâche par lots (un verrou par lot), avec reprise ; les événements perdus sont comptés, puis consignés par `audit.events_lost` (nombre, premier et dernier instant) dès que la chaîne est de nouveau inscriptible. `core.stopped` est écrit de façon synchrone, en 2 s au plus |
+
+Restent au seul journal : les refus d'un pair non authentifié (jeton inconnu, poignée de main refusée) et les événements des écouteurs.
+
+#### Têtes
+
+- **Clé** : `[core.audit] signing_key`, une clé P-256 générée sur le core par `ostena ca key new` et transmise comme les autres clés du core (credential systemd chiffré, fichier toléré jusqu'au 2027-04-30). Sa clé publique est distribuée aux auditeurs. Elle est annoncée dans la chaîne par `audit.signing_started` (kid, clé publique de 65 octets, battement) : après un changement de clé, le core ancre son contrôle sur la dernière tête signée par l'ancienne clé, dont il retrouve la clé publique dans cet enregistrement.
+- **Contrôle avant signature** : sous le même verrou, le core repasse le segment depuis la tête précédente (l'ancre) dans le vérificateur, vérifie que l'enregistrement couvert par l'ancre est toujours là avec le même hash, que la colonne `hash` correspond au corps, et que les enregistrements qu'il a lui-même écrits depuis l'ancre (au plus `head_max_records`) ont gardé leur seq et leur hash. Il signe alors la tête suivante, l'insère et journalise `audit.head_signed` avec la tête sous forme texte, son numéro et le seq couvert.
+- **Rupture** : si le contrôle échoue, le core journalise `audit.chain_broken`, cesse de signer et `ostena core run` refuse de démarrer (`CORE-E011`). Un administrateur qui a constaté et documenté la rupture l'acquitte (`ostena core audit acknowledge-break --seq N`, enregistrement `audit.break_acknowledged`) : le contrôle suivant accepte les ruptures situées avant cet enregistrement et à partir de N, puis la signature reprend. La rupture reste visible pour tout vérificateur.
+- **Cadence** : une tête après chaque enregistrement accordant ou protecteur écrit par le core et à chaque notification sur le canal du registre (les commandes d'administration notifient avec leur enregistrement) ; toutes les `head_interval_secs` (60 s par défaut) si le bout a bougé ; dès que `head_max_records` (1000) enregistrements ne sont pas couverts ; toutes les `heartbeat_secs` (300 s) même sans changement ; au démarrage, après le contrôle, et à l'arrêt. Au plus une tête par seconde.
+
+#### Export et commandes
+
+- `ostena core audit export --out <fichier> [--from-head N]` : export en flux, mémoire constante (pagination par clé de 500 lignes, têtes fusionnées par seq couvert, ordre des trames contrôlé à l'écriture), dans un instantané `REPEATABLE READ` en lecture seule ; fichier créé en mode 0600, jamais écrasé ; puis `audit.exported`.
+- `ostena core audit head` : la dernière tête, sous forme texte, à conserver hors du bastion.
+- `ostena core audit verify --key <clé publique>…` : vérification de toute la chaîne dans la base, mêmes codes de sortie que `ostena audit verify`.
+- `ostena core audit acknowledge-break --seq N` : acquittement d'une rupture.
+
+Procédure d'exploitation : [vérification de l'audit](../exploitation/audit-verification.md).
+
+#### Codes du core
+
+`CORE-E010` (écriture d'audit impossible) et `CORE-E011` (chaîne d'audit incohérente), dans la table de l'ADR-0011.
 
 ## Conséquences
 
@@ -157,3 +200,5 @@ Schéma PostgreSQL et écriture des enregistrements, classes d'échec d'écritur
   - **Signatures classiques à longue durée de vie** : une tête doit rester vérifiable des années. ECDSA P-256 n'est pas résistant à un ordinateur quantique ; la question sera réexaminée avec les têtes hybrides ML-DSA-65 (ADR-0009). Une falsification future exigerait de casser la clé publique, et un horodatage RFC 3161 antérieur à cette date la rendrait visible.
   - **SHA-256 et pas SHA-384** : le guide ANSSI recommande des empreintes d'au moins 384 bits si une sécurité post-quantique est visée (ADR-0009). SHA-256 est retenu pour rester aligné sur ECDSA P-256 / SHA-256 et sur les grants ; un passage à SHA-384 se ferait avec une nouvelle version des enregistrements et des têtes.
 - Le code `AUD-E004` couvre aussi une erreur de lecture du fichier ; la commande la distingue par son code de sortie 3.
+- **Coût pour l'enrôlement** : l'enregistrement accordant ajoute environ 0,5 ms à l'écriture d'un enrôlement ou d'un renouvellement (mesure locale, PostgreSQL 16 en conteneur : 5,1 ms au lieu de 4,5 ms, la synchronisation du `COMMIT` dominant). La signature d'une tête ne se fait pas sur ce chemin, mais elle tient le verrou le temps du contrôle du segment (7,5 ms pour 600 enregistrements), ce que la cadence borne par `head_max_records`.
+- **Troncature vue de l'intérieur** : le contrôle du core part de la dernière tête présente en base. Une troncature qui supprime aussi les têtes qui couvraient la fin passe ce contrôle ; seules les têtes externes et la fraîcheur la révèlent, d'où la procédure de copie des têtes hors du bastion. Une troncature sous la dernière tête (enregistrements supprimés, tête conservée) est une rupture, qui ne peut être acquittée qu'une fois la chaîne repassée au-delà du seq couvert par cette tête.

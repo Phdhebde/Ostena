@@ -7,7 +7,7 @@ En M1, le core se connecte avec un seul rôle, propriétaire du schéma : il app
 
 **Cible** : deux rôles.
 - `ostena_owner` possède le schéma et n'est utilisé que par `ostena core migrate`, lancé par l'exploitant lors d'une mise à jour.
-- `ostena_app` n'a que les droits DML nécessaires, table par table. Sur la chaîne d'audit, ce sera `INSERT` et `SELECT` seulement, pour renforcer l'ajout seul de la PR 3.
+- `ostena_app` n'a que les droits DML nécessaires, table par table. Sur la chaîne d'audit (`audit_record`, `audit_head`, [ADR-0012](../adr/0012-chaine-d-audit-du-core.md)), ce sera `SELECT` et `INSERT` seulement : sans `UPDATE`, `DELETE`, `TRUNCATE` ni propriété des tables, le compte du service ne peut plus désactiver les déclencheurs d'ajout seul. En M1, ces déclencheurs n'arrêtent que les erreurs, puisque le rôle unique en est propriétaire ; l'intégrité repose sur le chaînage et les têtes signées.
 
 **Difficulté avec `peer`** : l'authentification `peer` associe un compte système à un rôle du même nom. Deux rôles demandent donc :
 - soit deux comptes système (`ostena` pour le service, `ostena-admin` pour les migrations) ;
