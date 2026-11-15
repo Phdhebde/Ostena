@@ -1504,6 +1504,7 @@ name = "ostena-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "ostena-audit",
  "ostena-common",
  "ostena-core",
  "ostena-crypto",

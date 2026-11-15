@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod agent;
+mod audit;
 mod ca;
 mod control;
 #[cfg(target_os = "linux")]
@@ -35,6 +36,11 @@ enum Command {
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
+    },
+    /// Audit chain: offline verification of an export (any workstation).
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
     },
     /// Root ceremony and certification of the core keys (offline workstation).
     Ca {
@@ -113,6 +119,35 @@ enum CoreAgentCommand {
         config: PathBuf,
         /// Agent identifier (UUID).
         agent: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuditCommand {
+    /// Verify an audit export with the public keys of the head signer.
+    /// Exit code 0 intact and covered by a signed head, 1 error, 2 warnings
+    /// only, 3 usage or input/output error.
+    Verify {
+        /// Export file.
+        export: PathBuf,
+        /// Public key file of the head signer (`ostena-p256-public-key-v1`),
+        /// once per trusted key.
+        #[arg(long = "key", required = true)]
+        keys: Vec<PathBuf>,
+        /// Head kept outside the core, in text form
+        /// (`ostena-audit-head-v1:…`) or the file holding it; the export
+        /// must contain the record it covers.
+        #[arg(long = "head")]
+        heads: Vec<String>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Accepted backward step of the clock between records, in ms.
+        #[arg(long, default_value_t = 5_000)]
+        clock_tolerance_ms: u64,
+        /// Accepted delay of a head beyond its heartbeat, in seconds.
+        #[arg(long, default_value_t = 60)]
+        head_gap_tolerance_secs: u64,
     },
 }
 
@@ -331,7 +366,9 @@ fn main() -> ExitCode {
         Err(e) => {
             // Help and version also arrive here, with exit code 0.
             let _ = e.print();
-            return ExitCode::from(u8::try_from(e.exit_code()).unwrap_or(2));
+            let first = std::env::args_os().nth(1);
+            let first = first.as_deref().and_then(std::ffi::OsStr::to_str);
+            return ExitCode::from(usage_exit_code(&e, first));
         }
     };
     match cli.command {
@@ -382,6 +419,7 @@ fn main() -> ExitCode {
                     command: KeysetStateCommand::Repair { config, yes },
                 },
         }) => keyset_state::repair(&config, yes),
+        Some(Command::Audit { command }) => run_audit(command),
         #[cfg(target_os = "linux")]
         Some(Command::Core { command }) => run_core(command),
         Some(Command::Ca { command }) => match command {
@@ -419,6 +457,38 @@ fn main() -> ExitCode {
                     },
             } => ca::server_sign(&root, &public_key, &names, days, &out),
         },
+    }
+}
+
+/// Exit code of a command line that does not parse: clap's (2 for a usage
+/// error, 0 for help and version), except under `ostena audit`, where 2
+/// means "warnings only" and a usage error is 3.
+fn usage_exit_code(error: &clap::Error, first_arg: Option<&str>) -> u8 {
+    let code = u8::try_from(error.exit_code()).unwrap_or(2);
+    if code != 0 && first_arg == Some("audit") {
+        audit::USAGE_ERROR
+    } else {
+        code
+    }
+}
+
+fn run_audit(command: AuditCommand) -> ExitCode {
+    match command {
+        AuditCommand::Verify {
+            export,
+            keys,
+            heads,
+            json,
+            clock_tolerance_ms,
+            head_gap_tolerance_secs,
+        } => audit::verify(&audit::VerifyArgs {
+            export: &export,
+            keys: &keys,
+            heads: &heads,
+            json,
+            clock_tolerance_ms,
+            head_gap_tolerance_secs,
+        }),
     }
 }
 
