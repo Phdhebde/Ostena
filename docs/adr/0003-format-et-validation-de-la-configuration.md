@@ -58,7 +58,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-V012` | cohérence | section `[core]` : valeur hors bornes (validité des certificats d'agent 1 à 90 jours, threads 1 à 64, pool 1 à 64, délai de connexion 1 à 60 s, port nul) ou adresse d'enrôlement égale à celle du tunnel |
 | `CFG-V013` | cohérence | nom de base, rôle ou hôte PostgreSQL invalide (minuscules, chiffres et `_`, 63 octets au plus) |
 | `CFG-V014` | cohérence | nom de credential systemd invalide pour une clé du core |
-| `CFG-V015` | cohérence | section `[agent.ssh]` : adresse d'écoute invalide ou absente, valeur hors bornes (`max_sessions` et `max_unauthenticated` 1 à 256, `login_grace_secs` 5 à 120, `target_connect_timeout_secs` 1 à 30), ou clé d'hôte et clé vers les cibles dans le même fichier (ADR-0010) |
+| `CFG-V015` | cohérence | section `[agent.ssh]` : adresse d'écoute invalide ou absente, valeur hors bornes (`max_sessions`, `max_unauthenticated` et `max_unauthenticated_per_source` 1 à 256, `login_grace_secs` 5 à 120, `target_connect_timeout_secs` 1 à 30), ou clé d'hôte et clé vers les cibles dans le même fichier (ADR-0010) |
 | `CFG-P011` | production | clé de la CA émettrice ou du serveur lisible au-delà du compte du service (ADR-0008) |
 | `CFG-P012` | production, **dérogation datée** | clé du core lue en clair dans un fichier au lieu d'un credential systemd chiffré : accepté et journalisé (`config.waiver`) jusqu'au 2027-04-30 inclus, refusé ensuite (ADR-0011) |
 | `CFG-P014` | production | PostgreSQL joint en TCP au lieu du socket Unix local avec l'authentification `peer` (ADR-0011) |

@@ -138,7 +138,7 @@ Le parcours est celui de l'ADR-0010 ; le tunnel porte cinq messages de plus. Auc
 
 **Preuve de possession de la clé d'hôte.** Sur le modèle de `renew` : signature par la clé d'hôte SSH de l'agent de `"ostena-ssh-host-key-v1\0"` ‖ SHA-256 du certificat du tunnel courant ‖ la clé (`ostena_tunnel::ssh`). Le core la vérifie (`TUN-E022`) avant de certifier la clé et de renvoyer le certificat d'hôte dans `ssh_trust`.
 
-**Confiance SSH** (`GatewayState::apply_ssh_trust`) : la version ne recule pas (`TUN-E030`, la confiance précédente reste) ; la même version est ignorée. Elle est publiée au serveur SSH de l'agent, qui vérifie le certificat d'hôte avant de s'en servir (`SSH-E018`, ADR-0010).
+**Confiance SSH** (`GatewayState::apply_ssh_trust`) : la version ne recule pas (`TUN-E030`, la confiance précédente reste) ; la même poussée répétée est ignorée, mais la même version avec un autre contenu est refusée (`TUN-E030`). Elle est publiée au serveur SSH de l'agent, qui vérifie le certificat d'hôte avant de s'en servir (`SSH-E018`, ADR-0010).
 
 **Ouverture d'une session SSH** (`Gateway::open_ssh_session`) :
 1. pas de politique, de clés ou de confiance SSH poussées : refus (`TUN-E026`) ;
@@ -355,7 +355,7 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E027` | le core n'a pas répondu à la demande de session |
 | `TUN-E028` | politique du core refusée (autre groupe, ou ne se compile pas en production) |
 | `TUN-E029` | registre des agents (ou magasin des jetons) du core illisible : refus plutôt que copie périmée (ADR-0011) |
-| `TUN-E030` | confiance SSH poussée par le core refusée (version inférieure à celle appliquée) |
+| `TUN-E030` | confiance SSH poussée par le core refusée (version inférieure à celle appliquée, ou même version avec un autre contenu) |
 
 Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`, `agent.identity_rotated`, `agent.renewal_impossible`, `tunnel.renewal_overdue` (avertissement, répété chaque heure).
 

@@ -115,7 +115,7 @@ Les deux extrémités s'annoncent `SSH-2.0-Ostena`, sans version : la valeur par
 | Identifiant de clé | l'UUID de la session de connexion |
 | Options critiques | aucune |
 | Extensions | `permit-pty` seule ; toute redirection ou `permit-user-rc` refuse |
-| Dates | début au plus 60 s dans le futur, fin exclue, durée d'au plus 8 h 5 min |
+| Dates | début au plus 60 s dans le futur (défense en profondeur : la bibliothèque refuse avant), fin exclue, durée d'au plus 8 h 5 min |
 
 Il en sort l'identité : sujet, session de connexion, terminal permis, SHA-256 du certificat.
 
@@ -134,7 +134,9 @@ Il en sort l'identité : sujet, session de connexion, terminal permis, SHA-256 d
 
 Un certificat refusé par la bibliothèque elle-même (expiré, pas encore valide, signature invalide) n'atteint pas ces contrôles ; il est tout de même audité à la fin de la connexion (`ssh.auth_refused`, `SSH-E011`).
 
-**Bornes** (`SSH-E019`, `ssh.connection_limited`) : connexions non authentifiées (16 par défaut), sessions authentifiées (64), autorisations en cours (32). Une connexion doit s'authentifier dans le délai `login_grace` (30 s).
+La session est inscrite parmi les sessions vivantes **avant** que l'autorisation ne décide : une révocation de la session de connexion arrivée pendant la décision la coupe dès son ouverture. Tout accès accordé est clos **une et une seule fois** (`Authorizer::closed` et `ssh.session_closed`), quoi qui mette fin à la connexion, puisque le grant est consommé.
+
+**Bornes** (`SSH-E019`, `ssh.connection_limited`) : connexions non authentifiées (16 par défaut, et 4 par adresse source), sessions authentifiées (64), autorisations en cours (32). Une connexion doit s'authentifier dans le délai `login_grace` (30 s).
 
 **Un seul canal de session par connexion** (un second : `SSH-E017`). Sont relayés vers la cible, avec sa réponse :
 - le terminal, seulement si le certificat porte `permit-pty`, borné (type de 64 caractères, 10 000 colonnes ou lignes) ;
@@ -147,7 +149,6 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 
 **Relais** : une tâche par sens ; fin de données, code de sortie et signal sont rendus au client ; les octets relayés sont comptés et remis à `Authorizer::closed`. Une session prend fin à sa durée maximale (`ssh.session_expired`), à la révocation de sa session de connexion (`revoke_login`, `ssh.session_revoked`) ou à l'arrêt.
 
-**Limite connue** : la bibliothèque traite une connexion dans une seule boucle ; un flux montant et un flux descendant tous deux massifs et couplés (une cible qui ne lit plus tant qu'elle ne peut écrire) peuvent se bloquer mutuellement au-delà des tampons. Le terminal et les commandes usuelles ne sont pas concernés ; à revoir avec les transferts de fichiers.
 
 ### Driver vers les cibles (`ostena_ssh::driver`)
 
@@ -155,6 +156,7 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 - Pré-contrôle en client ; la clé d'hôte de la cible doit être **exactement** le point SEC1 épinglé dans l'inventaire (`SSH-E014`, `ssh.target_host_key_mismatch`) ; un certificat d'hôte de cible n'est pas accepté.
 - Authentification par clé publique avec la clé de l'agent (`SSH-E015`, `ssh.target_auth_failed`).
 - Tout dans le délai `target_connect_timeout` (5 s) ; cible injoignable ou négociation impossible : `SSH-E016`, `ssh.target_unreachable`.
+- La bibliothèque accepte par défaut les canaux qu'un serveur ouvre vers son client : une cible ne doit jamais en ouvrir vers l'agent. Redirections, agent, X11, sessions, `direct-tcpip` et `streamlocal` ouverts par la cible sont refusés (`SSH-E017`, `ssh.target_channel_refused`).
 
 ### Configuration (`[agent.ssh]`, lue et validée dès maintenant, utilisée à la PR 6)
 
@@ -164,6 +166,7 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 | `host_key`, `target_key`, `host_certificate` | `ssh_host_key`, `ssh_target_key`, `ssh_host_certificate` dans le dossier d'état (celui du journal anti-rejeu) | chemins absolus (`CFG-V008`) ; `host_key` et `target_key` distincts |
 | `max_sessions` | 64 | 1 à 256 |
 | `max_unauthenticated` | 16 | 1 à 256 |
+| `max_unauthenticated_per_source` | 4 | 1 à 256 |
 | `login_grace_secs` | 30 | 5 à 120 |
 | `target_connect_timeout_secs` | 5 | 1 à 30 |
 
@@ -184,7 +187,7 @@ Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et le
 | `SSH-E018` | certificat d'hôte ou identité SSH de l'agent invalide |
 | `SSH-E019` | limite du serveur atteinte |
 
-Événements (journal structuré, messages en français, textes du pair bornés et assainis, aucun nom de champ masqué par la règle des journaux) : `ssh.connection_limited`, `ssh.connection_refused`, `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`, `ssh.exec`, `ssh.session_expired`, `ssh.session_revoked`, `ssh.session_closed` (raison, octets dans chaque sens, durée), `ssh.channel_refused` ; côté driver `ssh.target_host_key_mismatch`, `ssh.target_auth_failed`, `ssh.target_unreachable` ; côté tunnel `agent.ssh_trust_applied`, `agent.ssh_trust_refused`, `agent.login_revoked` (ADR-0008). Les événements du serveur portent l'adresse du client (`peer`) et celle d'écoute (`listener`).
+Événements (journal structuré, messages en français, textes du pair bornés et assainis : caractères de contrôle et de format Unicode, dont les contrôles bidirectionnels, remplacés ; aucun nom de champ masqué par la règle des journaux) : `ssh.connection_limited`, `ssh.connection_refused`, `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`, `ssh.exec`, `ssh.session_expired`, `ssh.session_revoked`, `ssh.session_closed` (raison, octets dans chaque sens, durée), `ssh.channel_refused` ; côté driver `ssh.target_host_key_mismatch`, `ssh.target_auth_failed`, `ssh.target_unreachable`, `ssh.target_channel_refused` ; côté tunnel `agent.ssh_trust_applied`, `agent.ssh_trust_refused`, `agent.login_revoked` (ADR-0008). Les événements du serveur portent l'adresse du client (`peer`) et celle d'écoute (`listener`).
 
 ### Défaut amont : clés P-256 à scalaire court
 
@@ -195,6 +198,19 @@ Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et le
 - **Tests** : un test par propriétés vérifie que toute clé générée est relue par `ssh-key` et acceptée par OpenSSH (`ssh-keygen -y`). Un test documente le défaut (clé à 31 octets refusée par `ssh-key`, acceptée par OpenSSH) ; il échouera quand `ssh-key` sera corrigé, signal pour retirer le contournement.
 - Les tests et les scripts qui passent par `ssh-keygen` régénèrent une clé que russh ne sait pas lire.
 - À signaler en amont, et à revérifier avec `ssh-key` 0.7 stable : c'est l'un des critères de réexamen de l'ADR-0009.
+
+### Limites et écarts connus (jalon M1, PR 4)
+
+- **Le grant ne signe ni le compte ni la session de connexion.** Son format (ADR-0004) porte le sujet, la ressource, le protocole et la durée. Le compte est lié par `session_params`, reçu du core sur le tunnel mTLS, et l'agent exige qu'il soit celui demandé (`TUN-E010`). La PR 5 du jalon M1 ajoute le compte et la session de connexion aux revendications signées.
+- **`ssh.exec` journalise un SHA-256 simple** de la commande : pour une commande courte, il se retrouve par dictionnaire. La PR 8 le remplace par un hachage à clé (HMAC avec une clé d'audit, par `ostena-crypto`).
+- **Requêtes relayées une à une** : la bibliothèque ne garde qu'un indicateur « réponse attendue » par canal, si bien que chaque requête (terminal, shell, commande, environnement) est transmise à la cible et sa réponse attendue dans le rappel, jusqu'à 10 s, en bloquant la boucle de la connexion. Une seule file de réponses par canal.
+- **Adresses de la cible essayées l'une après l'autre** par le driver, dans le délai global de 5 s : une première adresse muette peut consommer tout le délai.
+- **Flux couplés** : la bibliothèque traite une connexion dans une seule boucle ; un flux montant et un flux descendant tous deux massifs et couplés (une cible qui ne lit plus tant qu'elle ne peut écrire) peuvent se bloquer mutuellement au-delà des tampons. Le terminal et les commandes usuelles ne sont pas concernés ; à revoir avec les transferts de fichiers.
+- **Aucune tolérance d'horloge sur le début de validité** : la bibliothèque refuse un certificat dont le début est encore à venir avant nos contrôles ; la marge de 60 s de `check_user` n'est qu'une défense en profondeur.
+- **Clé de la CA d'hôte** : la confiance poussée ne porte pas la clé de la CA d'hôte, si bien que l'agent ne vérifie pas la signature de son propre certificat d'hôte (seulement son type, sa clé, ses dates et l'absence d'options). La PR 5 ajoute la clé de la CA d'hôte à `ssh_trust`.
+- **Chemins par défaut des clés SSH** : `ssh_host_key`, `ssh_target_key` et `ssh_host_certificate` dans le dossier du journal anti-rejeu, pris comme dossier d'état ; à confirmer à la PR 6.
+- **`CFG-P008` sur les clés SSH dès qu'elles existent** : l'agent les créera lui-même avec des droits privés au premier démarrage (PR 6) ; avant leur création, rien n'est vérifié.
+- **Révocations perdues par le consommateur** : `Gateway::subscribe_login_revocations` est un canal de diffusion borné (64). Le consommateur (la liaison dans l'agent, PR 6) **doit couper toutes les sessions SSH en cours**, avec un événement d'audit, s'il reçoit `RecvError::Lagged` : une révocation a pu être perdue.
 
 ## Conséquences
 
