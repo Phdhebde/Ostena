@@ -34,6 +34,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ssh_certificate"
+path = "fuzz_targets/ssh_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh_login"
+path = "fuzz_targets/ssh_login.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "scope_target"
 path = "fuzz_targets/scope_target.rs"
 test = false
