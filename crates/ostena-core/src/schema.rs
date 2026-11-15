@@ -20,22 +20,26 @@ pub enum SchemaState {
 }
 
 /// Applies the pending migrations; several cores starting together wait on
-/// the same advisory lock.
+/// the same advisory lock. Returns the versions that were pending (empty if
+/// none), for the `core.migrated` audit record.
 ///
 /// # Errors
 ///
 /// [`CoreError::Migration`], or [`CoreError::Schema`] if the database holds
 /// a migration this binary does not know (a newer binary migrated it).
-pub async fn migrate(pool: &PgPool) -> Result<(), CoreError> {
+pub async fn migrate(pool: &PgPool) -> Result<Vec<i64>, CoreError> {
     let before = state(pool).await?;
     MIGRATOR
         .run(pool)
         .await
         .map_err(|e| CoreError::Migration(e.to_string()))?;
-    if let SchemaState::Pending(versions) = before {
-        tracing::info!(event = "core.migrated", versions = ?versions, "schéma mis à jour");
+    match before {
+        SchemaState::Pending(versions) => {
+            tracing::info!(event = "core.migrated", versions = ?versions, "schéma mis à jour");
+            Ok(versions)
+        }
+        SchemaState::UpToDate => Ok(Vec::new()),
     }
-    Ok(())
 }
 
 /// Compares the applied migrations with those of this binary.

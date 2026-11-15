@@ -136,6 +136,8 @@ pub mod field {
     pub const FIRST_MS: &str = "first_ms";
     /// Time of the last event of a range, Unix ms.
     pub const LAST_MS: &str = "last_ms";
+    /// Number of heads (in an export).
+    pub const HEAD_COUNT: &str = "head_count";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -166,6 +168,7 @@ pub mod field {
         MIGRATIONS,
         FIRST_MS,
         LAST_MS,
+        HEAD_COUNT,
     ];
 }
 
