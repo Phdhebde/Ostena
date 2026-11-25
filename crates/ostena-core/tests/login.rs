@@ -798,6 +798,25 @@ fn enrolment_states_and_administration() {
         assert_eq!(audit_count(&f.pool, "user.totp_enrolled").await, 2);
         // Three new secrets and one reset.
         assert_eq!(audit_count(&f.pool, "user.totp_reset").await, 4);
+        // The administrator who set the factors is the actor (ADR-0009,
+        // known limit of M1): the database account of the command.
+        let admin: String = sqlx::query_scalar("SELECT coalesce(system_user, 'trust')")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        for event in ["user.password_set", "user.totp_reset", "user.totp_enrolled"] {
+            let bodies: Vec<Vec<u8>> =
+                sqlx::query_scalar("SELECT body FROM audit_record WHERE event = $1")
+                    .bind(event)
+                    .fetch_all(&f.pool)
+                    .await
+                    .unwrap();
+            for body in bodies {
+                let record = ostena_audit::Record::decode(&body).unwrap();
+                assert_eq!(record.actor_kind, ostena_audit::ActorKind::Admin, "{event}");
+                assert_eq!(record.actor, admin, "{event}");
+            }
+        }
 
         // Nothing is left of the secret.
         let stored: Option<Vec<u8>> = sqlx::query_scalar("SELECT totp_secret FROM user_credential")
