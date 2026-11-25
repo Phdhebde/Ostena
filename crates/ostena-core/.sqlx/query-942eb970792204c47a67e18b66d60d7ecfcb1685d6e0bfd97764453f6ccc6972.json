@@ -1,0 +1,54 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT user_id::text AS \"user!\", certificate_sha256, expires_at,\n                  revoked_at IS NOT NULL AS \"revoked!\"\n           FROM login_session WHERE id = $1::text::uuid FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "certificate_sha256",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "login_session",
+            "name": "certificate_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "expires_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "login_session",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "revoked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "942eb970792204c47a67e18b66d60d7ecfcb1685d6e0bfd97764453f6ccc6972"
+}

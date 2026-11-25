@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO grant_key_set (id, version) VALUES (true, nextval('push_version'))\n                   ON CONFLICT (id) DO UPDATE SET version = nextval('push_version')\n                   RETURNING version",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "grant_key_set",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ec63a6dc6413150dcfb15f5bb7b436fb36c75958414ee0289e6d445f0653a35c"
+}

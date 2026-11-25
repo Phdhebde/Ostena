@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.id::text AS \"id!\", r.name, r.host, r.port, g.name AS \"group!\",\n                  r.ssh_host_p256_public IS NOT NULL AS \"pinned!\",\n                  coalesce(array_agg(a.name ORDER BY a.name)\n                           FILTER (WHERE a.id IS NOT NULL AND a.disabled_at IS NULL),\n                           '{}') AS \"accounts!\"\n           FROM resource r JOIN gateway_group g ON g.id = r.gateway_group\n           LEFT JOIN target_account a ON a.resource_id = r.id\n           WHERE r.disabled_at IS NULL\n           GROUP BY r.id, g.name ORDER BY r.name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "host",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "host"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "port",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "port"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "group!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "pinned!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "accounts!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "d8de3cecae679edb71418556b000296ea32d168ddd5087eb671435436e3a8773"
+}

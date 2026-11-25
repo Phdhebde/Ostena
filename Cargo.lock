@@ -1540,12 +1540,17 @@ dependencies = [
 name = "ostena-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "idna_adapter",
  "ostena-audit",
  "ostena-common",
  "ostena-core",
  "ostena-crypto",
+ "ostena-grant",
+ "ostena-scope",
+ "ostena-ssh",
  "ostena-tunnel",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",

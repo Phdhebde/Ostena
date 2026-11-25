@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO gateway_group (id, name, ssh_host_names) VALUES ($1::text::uuid, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "66110900da659e3b38200bc66ed1e079489a80440a3aa0d80814fd4b734ed5af"
+}

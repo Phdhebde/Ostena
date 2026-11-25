@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_ssh (agent_id, host_p256_public, trust_version, trust_digest)\n         VALUES ($1::text::uuid, $2, nextval('push_version'), $3)\n         ON CONFLICT (agent_id) DO UPDATE SET host_p256_public = $2,\n             host_certificate = CASE WHEN agent_ssh.host_p256_public = $2\n                                     THEN agent_ssh.host_certificate END,\n             certificate_issued_at = CASE WHEN agent_ssh.host_p256_public = $2\n                                          THEN agent_ssh.certificate_issued_at END,\n             certificate_valid_before = CASE WHEN agent_ssh.host_p256_public = $2\n                                             THEN agent_ssh.certificate_valid_before END,\n             updated_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3c77e8de097fdf72a5630982f86c647052d3abb0301f7753ce3d93c0c66fd201"
+}

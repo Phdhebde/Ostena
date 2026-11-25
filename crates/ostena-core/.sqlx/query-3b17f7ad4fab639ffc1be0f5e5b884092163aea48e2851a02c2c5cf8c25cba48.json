@@ -1,0 +1,81 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT login_session_id::text AS \"login!\", right_id::text AS \"right!\",\n                  resource_id::text AS \"resource!\", account, protocol, max_session_secs,\n                  consumed_at IS NOT NULL AS \"consumed!\"\n           FROM access_grant WHERE jti = $1 AND gateway_group = $2::text::uuid FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "login!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "right!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "resource!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "account",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_grant",
+            "name": "account"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "protocol",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_grant",
+            "name": "protocol"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "max_session_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_grant",
+            "name": "max_session_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "consumed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "3b17f7ad4fab639ffc1be0f5e5b884092163aea48e2851a02c2c5cf8c25cba48"
+}

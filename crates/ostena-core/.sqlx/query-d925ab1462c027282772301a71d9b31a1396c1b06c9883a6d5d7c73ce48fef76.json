@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO target_account (id, resource_id, name)\n         VALUES ($1::text::uuid, $2::text::uuid, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d925ab1462c027282772301a71d9b31a1396c1b06c9883a6d5d7c73ce48fef76"
+}

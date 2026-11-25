@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE gateway_group\n           SET policy = $2, policy_version = nextval('push_version'), updated_at = now()\n           WHERE id = $1::text::uuid RETURNING policy_version AS \"version!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "policy_version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "a3b150ded6c08301104026bf3ae350eac8d243178fa0b9ab9d0d9c7315c0fa43"
+}

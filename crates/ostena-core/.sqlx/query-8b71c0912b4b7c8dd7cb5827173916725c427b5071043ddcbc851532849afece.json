@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id::text AS \"id!\" FROM target_account\n           WHERE resource_id = $1::text::uuid AND name = $2 AND disabled_at IS NULL FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "8b71c0912b4b7c8dd7cb5827173916725c427b5071043ddcbc851532849afece"
+}

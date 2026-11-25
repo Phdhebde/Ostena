@@ -654,7 +654,14 @@ async fn follow_notices(mut notices: PgListener, shared: Arc<Shared>) {
                                 .u64(field::CLOSED_TUNNELS, closed as u64),
                         );
                     }
-                    Some(Notice::Registered | Notice::Audit) | None => {}
+                    // Applied to the agents once the core serves SSH access.
+                    Some(
+                        Notice::Registered
+                        | Notice::Audit
+                        | Notice::LoginRevoked(_)
+                        | Notice::Group(_),
+                    )
+                    | None => {}
                 }
             }
             Err(e) => {

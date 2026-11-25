@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT host_p256_public FROM agent_ssh WHERE agent_id = $1::text::uuid",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "host_p256_public",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "host_p256_public"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "9e211c9933f61bd9d9f0b8a3925558e1eaba530da5426b0cd93754543541119c"
+}

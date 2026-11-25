@@ -48,6 +48,10 @@ pub enum CoreError {
          (docs/exploitation/audit-verification.md)"
     )]
     AuditChain(String),
+    /// An administration request is refused: invalid value, or a rule of
+    /// the inventory (ADR-0014).
+    #[error("[CORE-E012] demande refusée : {0}")]
+    Invalid(String),
 }
 
 impl CoreError {
@@ -65,6 +69,7 @@ impl CoreError {
             Self::NotFound(_) => "CORE-E009",
             Self::AuditWrite(_) => "CORE-E010",
             Self::AuditChain(_) => "CORE-E011",
+            Self::Invalid(_) => "CORE-E012",
         }
     }
 }
@@ -93,6 +98,7 @@ mod tests {
             CoreError::NotFound("agent".into()),
             CoreError::AuditWrite("x".into()),
             CoreError::AuditChain("x".into()),
+            CoreError::Invalid("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("CORE-E{:03}", i + 1);

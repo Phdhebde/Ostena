@@ -1,0 +1,57 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT agent_id::text AS \"agent!\", host_p256_public AS \"key!\",\n                  certificate_issued_at AS \"issued!\", certificate_valid_before AS \"before!\"\n           FROM agent_ssh\n           WHERE host_certificate IS NOT NULL AND host_p256_public IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "agent!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "key!",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "host_p256_public"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "issued!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "certificate_issued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "before!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "certificate_valid_before"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "86583a13810f41548eb0cce32e48e9dae9c4260bc78f6b62256dfccabac08492"
+}

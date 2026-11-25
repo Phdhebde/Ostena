@@ -1,0 +1,66 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id::text AS \"id!\", gateway_group::text AS \"group!\", host, port,\n                  ssh_host_p256_public\n           FROM resource WHERE name = $1 AND disabled_at IS NULL FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "group!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "host",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "host"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "port",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "port"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "ssh_host_p256_public",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "ssh_host_p256_public"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "43ea76a3958bb8020a9505700922eca91e2ec1f82f301f2f7475830fb639b379"
+}

@@ -1,0 +1,57 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id::text AS \"id!\", name, ssh_host_names, policy_version\n           FROM gateway_group ORDER BY name",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "ssh_host_names",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "ssh_host_names"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "policy_version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "policy_version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "3b40b91d2ae70c4a1ec17209f004e40723b722e998a0ebe0d93a0e4a6c60a374"
+}
