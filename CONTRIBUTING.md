@@ -58,6 +58,7 @@ cargo xtask fuzz 60   # 60 s par cible de fuzz (Linux, cargo-fuzz)
 cargo xtask footprint # mémoire au repos de l'agent (version optimisée)
 cargo bench -p ostena-scope   # banc de la décision de périmètre (affiché, sans seuil)
 cargo bench -p ostena-frame   # banc du décodage des trames (affiché, sans seuil)
+lab/demo-m1.sh        # démonstration M1 de bout en bout (docs/demo-m1.md)
 cargo xtask bench-ssh # latence SSH (relais de l'agent, tunnel) : tableau dans target/bench/
 cargo build -p ostena-frame --target wasm32-unknown-unknown   # cœur protocolaire du client web
 ```

@@ -480,6 +480,12 @@ pub(crate) fn quoted(path: &Path) -> Result<String, LoginError> {
 }
 
 /// The `ssh_config` fragment.
+///
+/// No `CertificateFile`: OpenSSH loads `<IdentityFile>-cert.pub` by itself
+/// and signs with the key it pairs it with. An explicit `CertificateFile` is
+/// a separate identity, and its key, a plain `ecdsa-sha2-nistp256` key, is
+/// dropped by `PubkeyAcceptedAlgorithms` (certificates only): the client
+/// would then offer the certificate without its private key and fail.
 pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> Result<String, LoginError> {
     Ok(format!(
         "# Écrit par ostena login, réécrit à chaque connexion.\n\
@@ -487,7 +493,6 @@ pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> Result<String,
          Host {hosts}\n\
          \x20   Port {port}\n\
          \x20   IdentityFile {key}\n\
-         \x20   CertificateFile {cert}\n\
          \x20   IdentitiesOnly yes\n\
          \x20   IdentityAgent none\n\
          \x20   UserKnownHostsFile {known}\n\
@@ -505,7 +510,6 @@ pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> Result<String,
         hosts = response.ssh_hosts.join(" "),
         port = response.ssh_port,
         key = quoted(&dir.join(KEY))?,
-        cert = quoted(&dir.join(CERTIFICATE))?,
         known = quoted(&dir.join(KNOWN_HOSTS))?,
     ))
 }

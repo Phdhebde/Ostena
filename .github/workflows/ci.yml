@@ -420,6 +420,59 @@ jobs:
           path: signed/
           retention-days: 7
 
+  # The M1 demonstration end to end (docs/demo-m1.md), on the signed Linux
+  # release binary, whose signature is checked first: ostena login with
+  # password and TOTP, ssh account@resource@bastion through the agent to a
+  # real OpenSSH target in a network namespace, sealed transcript, offline
+  # audit verification, then tampering found in a transcript, the export and
+  # the database. Local processes only (PostgreSQL of the runner, sudo for
+  # the namespace).
+  demo-m1:
+    needs: [changes, release-sign]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-test-signed
+          path: signed
+      - name: The binary is the one signed by release-sign
+        run: |
+          chmod +x signed/ostena
+          signed/ostena release verify signed/ostena-release.manifest --key signed/release-test.pub
+      - name: PostgreSQL 16, local connections by peer only; OpenSSH server
+        run: |
+          sudo systemctl start postgresql.service
+          psql --version | grep -q ' 16\.'
+          sudo -u postgres createuser --createdb "$USER"
+          command -v sshd || test -x /usr/sbin/sshd \
+            || (sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server)
+          ssh -V
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      # The codes an authenticator would show: an example of ostena-crypto,
+      # never in the release binary.
+      - run: cargo build --locked -p ostena-crypto --example totp_code
+      - run: bash lab/demo-m1.sh
+        env:
+          OSTENA_BIN: ${{ github.workspace }}/signed/ostena
+          OSTENA_DEMO_DIR: ${{ runner.temp }}/demo-m1
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: demo-m1-logs
+          path: |
+            ${{ runner.temp }}/demo-m1/*.log
+            ${{ runner.temp }}/demo-m1/target/sshd.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   # The single required check of the branch protection: every job must have
   # succeeded, or been skipped by `changes` for a documentation-only change.
   ci-ok:
@@ -435,6 +488,7 @@ jobs:
       - windows
       - bench-ssh
       - release-sign
+      - demo-m1
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
