@@ -72,6 +72,8 @@ enum Cause {
     Replayed,
     /// The account changed between the derivation and the transaction.
     Changed,
+    /// The stored TOTP secret cannot be opened (another key, altered row).
+    Unreadable,
 }
 
 impl Cause {
@@ -85,6 +87,7 @@ impl Cause {
             Self::Code => "code TOTP faux",
             Self::Replayed => "code TOTP déjà utilisé",
             Self::Changed => "compte modifié pendant la vérification du mot de passe",
+            Self::Unreadable => "secret TOTP illisible",
         }
     }
 }
@@ -335,11 +338,7 @@ impl PgAuthenticator {
         };
         let last_step = u64::try_from(row.totp_last_step).unwrap_or(0);
         let checked = if password_ok {
-            let secret = self.totp.open(user, algorithm, &sealed)?;
-            secret.verify(&totp, now, last_step).map_err(|e| match e {
-                TotpError::Replayed => Cause::Replayed,
-                _ => Cause::Code,
-            })
+            self.check_code(user, algorithm, &sealed, &totp, now, last_step)
         } else {
             Err(Cause::Password)
         };
@@ -365,6 +364,35 @@ impl PgAuthenticator {
             },
         )
         .await
+    }
+
+    /// The TOTP code against the sealed secret of `user`: the accepted step.
+    fn check_code(
+        &self,
+        user: Uuid,
+        algorithm: TotpAlgorithm,
+        sealed: &[u8],
+        code: &SecretString,
+        now: u64,
+        last_step: u64,
+    ) -> Result<u64, Cause> {
+        match self.totp.open(user, algorithm, sealed) {
+            Ok(secret) => secret.verify(code, now, last_step).map_err(|e| match e {
+                TotpError::Replayed => Cause::Replayed,
+                _ => Cause::Code,
+            }),
+            // A refusal like the others, counted: never a 503 that would
+            // tell this account apart.
+            Err(e) => {
+                tracing::error!(
+                    event = "login.credential_invalid",
+                    user = %user,
+                    error = %e,
+                    "secret TOTP illisible : autre clé des secrets ou ligne altérée"
+                );
+                Err(Cause::Unreadable)
+            }
+        }
     }
 
     /// The count of consecutive failures with one more at `now`: the

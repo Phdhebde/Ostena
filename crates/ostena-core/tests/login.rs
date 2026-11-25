@@ -515,6 +515,51 @@ fn the_digest_is_checked_again_under_the_lock() {
     });
 }
 
+/// A TOTP secret the key cannot open (another key, an altered row) is a
+/// refusal like the others, counted, never a 503.
+#[test]
+fn an_unreadable_secret_is_a_counted_refusal() {
+    block_on(async {
+        let Some(f) = fixture("an_unreadable_secret_is_a_counted_refusal").await else {
+            return;
+        };
+        let other = PgAuthenticator::new(
+            f.pool.clone(),
+            f.recorder.clone(),
+            f.ssh.clone(),
+            Arc::new(totp_key()),
+            &settings(),
+        );
+        let key = SigningKey::generate().unwrap().0;
+        let refused = other
+            .login(
+                LoginRequest {
+                    protocol: 1,
+                    username: "alice".into(),
+                    password: secret(PASSWORD),
+                    totp: f.next_code(),
+                    p256_public: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+                    ttl_secs: None,
+                },
+                peer(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ApiCode::InvalidCredentials);
+        assert_eq!(refused.message, ostena_core::api::INVALID_CREDENTIALS);
+        assert_eq!(f.failures().await, (1, None));
+        // The right key still opens it.
+        f.login("alice", PASSWORD, f.next_code(), &key)
+            .await
+            .unwrap();
+
+        drop(other);
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
 async fn alice(pool: &PgPool) -> ostena_tunnel::Uuid {
     let id: String = sqlx::query_scalar("SELECT id::text FROM app_user WHERE name = 'alice'")
         .fetch_one(pool)
