@@ -76,13 +76,11 @@ impl std::fmt::Debug for Transcripts {
     }
 }
 
-/// Size and SHA-256 of `path`; an absent file is empty.
-fn measure(path: &Path) -> std::io::Result<(u64, [u8; 32])> {
+/// Size and SHA-256 of `path` as it is on disk; `None` if it is absent.
+fn measure(path: &Path) -> std::io::Result<Option<(u64, [u8; 32])>> {
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((0, ostena_crypto::sha256::digest(b"")));
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let mut hasher = ostena_crypto::sha256::Hasher::new();
@@ -94,7 +92,18 @@ fn measure(path: &Path) -> std::io::Result<(u64, [u8; 32])> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok((hasher.len(), hasher.finish()))
+    Ok(Some((hasher.len(), hasher.finish())))
+}
+
+/// The seal of a file measured on disk; the counts of the writer are not
+/// known then.
+fn measured(size: u64, sha256: [u8; 32]) -> Sealed {
+    Sealed {
+        sha256,
+        size,
+        events: 0,
+        invalid_utf8: 0,
+    }
 }
 
 /// Makes a sealed file read-only (owner read only on Unix).
@@ -175,7 +184,9 @@ fn refused_event(agent: Uuid, session: Uuid, code: &str, reason: &str) -> Event 
 
 /// How a transcript ended.
 struct Ending {
-    sealed: Sealed,
+    /// The file as written or measured; `None`: no file (it could not be
+    /// created, or it is gone), which the seal says.
+    sealed: Option<Sealed>,
     output_bytes: u64,
     reason: Option<EndReason>,
     /// `None`: complete.
@@ -204,10 +215,10 @@ async fn seal(
         session.to_string(),
         state,
         i64_of(now),
-        &ending.sealed.sha256[..],
-        i64_of(ending.sealed.size),
-        i64_of(ending.sealed.events),
-        i64_of(ending.sealed.invalid_utf8),
+        ending.sealed.as_ref().map(|s| &s.sha256[..]),
+        ending.sealed.as_ref().map(|s| i64_of(s.size)),
+        ending.sealed.as_ref().map(|s| i64_of(s.events)),
+        ending.sealed.as_ref().map(|s| i64_of(s.invalid_utf8)),
         i64_of(ending.output_bytes),
         ending.reason.map(EndReason::name),
         ending.code,
@@ -234,13 +245,18 @@ async fn seal(
         },
         agent,
     )
-    .uuid(field::ACCESS_SESSION, session.to_bytes())
-    .bytes(field::SHA256, ending.sealed.sha256)
-    .u64(field::SIZE, ending.sealed.size)
-    .u64(field::EVENTS, ending.sealed.events)
-    .u64(field::INVALID_UTF8, ending.sealed.invalid_utf8)
-    .u64(field::OUTPUT_BYTES, ending.output_bytes)
-    .bool(field::COMPLETE, complete);
+    .uuid(field::ACCESS_SESSION, session.to_bytes());
+    // Without a file, no digest: never a made-up value.
+    if let Some(sealed) = &ending.sealed {
+        event = event
+            .bytes(field::SHA256, sealed.sha256)
+            .u64(field::SIZE, sealed.size)
+            .u64(field::EVENTS, sealed.events)
+            .u64(field::INVALID_UTF8, sealed.invalid_utf8);
+    }
+    event = event
+        .u64(field::OUTPUT_BYTES, ending.output_bytes)
+        .bool(field::COMPLETE, complete);
     if let Some(reason) = ending.reason {
         event = event.text(field::REASON, reason.name());
     }
@@ -501,13 +517,9 @@ pub async fn receive(
                 WRITE_FAILED,
                 &format!("{} : {e}", path.display()),
             );
+            // No file written: the seal says so, without a digest.
             let ending = Ending {
-                sealed: Sealed {
-                    sha256: ostena_crypto::sha256::digest(b""),
-                    size: 0,
-                    events: 0,
-                    invalid_utf8: 0,
-                },
+                sealed: None,
                 output_bytes: 0,
                 reason: None,
                 code: Some(WRITE_FAILED),
@@ -529,7 +541,18 @@ pub async fn receive(
             refuse(&mut channel, failure.code(), &failure.to_string());
         }
     }
-    let (sealed, code) = finish(written, &path, session, code).await;
+    let Some((sealed, code)) = finish(written, &path, session, code).await else {
+        // Left unsealed, sealed at the next start of the core (or the
+        // start is refused): never a made-up digest.
+        tracing::error!(
+            event = "transcript.seal_failed",
+            agent = %agent,
+            session = %session,
+            code = WRITE_FAILED,
+            "fichier du transcript impossible à mesurer après une erreur d'écriture, laissé non scellé"
+        );
+        return;
+    };
     let ending = Ending {
         sealed,
         output_bytes: read.output_bytes,
@@ -542,7 +565,7 @@ pub async fn receive(
             event = "transcript.sealed",
             agent = %agent,
             session = %session,
-            size = ending.sealed.size,
+            size = ending.sealed.as_ref().map_or(0, |s| s.size),
             complete = ending.code.is_none(),
             code = ending.code.unwrap_or_default(),
             "transcript scellé"
@@ -554,37 +577,34 @@ pub async fn receive(
 }
 
 /// The seal and the code of a transcript, from what the file writer
-/// returned. If the file could not be finished, what is on disk is what
-/// gets sealed, incomplete.
+/// returned. If the file could not be finished, the file as it is on disk
+/// is measured and sealed, incomplete; `None` if it cannot be measured:
+/// the transcript is then left unsealed.
 async fn finish(
     written: Result<Sealed, RecorderError>,
     path: &Path,
     session: Uuid,
     code: Option<&'static str>,
-) -> (Sealed, Option<&'static str>) {
+) -> Option<(Option<Sealed>, Option<&'static str>)> {
     match written {
-        Ok(sealed) => (sealed, code),
+        Ok(sealed) => Some((Some(sealed), code)),
         Err(e) => {
             tracing::warn!(event = "transcript.write_failed", session = %session, code = e.code(), "{e}");
             let path = path.to_path_buf();
-            let measured = tokio::task::spawn_blocking(move || {
-                let measured = measure(&path);
-                let _ = seal_rights(&path);
-                measured
+            let on_disk = tokio::task::spawn_blocking(move || {
+                let on_disk = measure(&path)?;
+                if on_disk.is_some() {
+                    seal_rights(&path)?;
+                }
+                Ok::<_, std::io::Error>(on_disk)
             })
             .await
-            .ok()
-            .and_then(Result::ok);
-            let (size, sha256) = measured.unwrap_or((0, ostena_crypto::sha256::digest(b"")));
-            (
-                Sealed {
-                    sha256,
-                    size,
-                    events: 0,
-                    invalid_utf8: 0,
-                },
+            .ok()?
+            .ok()?;
+            Some((
+                on_disk.map(|(size, sha256)| measured(size, sha256)),
                 Some(code.unwrap_or(WRITE_FAILED)),
-            )
+            ))
         }
     }
 }
@@ -612,19 +632,15 @@ pub async fn recover(
         let session = crate::store::uuid(&row.session)?;
         let agent = crate::store::uuid(&row.agent)?;
         let path = store.path(session);
-        let (size, sha256) =
+        let on_disk =
             measure(&path).map_err(|e| CoreError::Startup(format!("{} : {e}", path.display())))?;
-        if size > 0 {
+        if on_disk.is_some() {
             seal_rights(&path)
                 .map_err(|e| CoreError::Startup(format!("{} : {e}", path.display())))?;
         }
+        let size = on_disk.map_or(0, |(size, _)| size);
         let ending = Ending {
-            sealed: Sealed {
-                sha256,
-                size,
-                events: 0,
-                invalid_utf8: 0,
-            },
+            sealed: on_disk.map(|(size, sha256)| measured(size, sha256)),
             output_bytes: 0,
             reason: None,
             code: Some(INCOMPLETE),
@@ -711,13 +727,51 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(sealed.size, bytes.len() as u64);
         assert_eq!(sealed.sha256, ostena_crypto::sha256::digest(&bytes));
-        assert_eq!(measure(&path).unwrap(), (sealed.size, sealed.sha256));
+        assert_eq!(measure(&path).unwrap(), Some((sealed.size, sealed.sha256)));
+        assert_eq!(measure(&dir.join("absent.cast")).unwrap(), None);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o400);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a write error, what is sealed is the file as it is on disk;
+    /// an absent file is sealed without a digest; a file that cannot be
+    /// measured is not sealed at all.
+    #[test]
+    fn a_write_error_seals_the_file_on_disk_or_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let dir = dir("measure");
+        let session = Uuid::random().unwrap();
+        let failed = || Err(RecorderError::Io("disque plein".into()));
+        rt.block_on(async {
+            let path = dir.join("partial.cast");
+            std::fs::write(&path, b"{\"version\":2,").unwrap();
+            let (sealed, code) = finish(failed(), &path, session, None).await.unwrap();
+            let sealed = sealed.unwrap();
+            assert_eq!(sealed.size, 13);
+            assert_eq!(
+                sealed.sha256,
+                ostena_crypto::sha256::digest(b"{\"version\":2,")
+            );
+            assert_eq!(code, Some(WRITE_FAILED));
+
+            let absent = dir.join("absent.cast");
+            let (sealed, code) = finish(failed(), &absent, session, Some("REC-E001"))
+                .await
+                .unwrap();
+            assert!(sealed.is_none());
+            assert_eq!(code, Some("REC-E001"));
+
+            // A directory cannot be read as a file: nothing is sealed.
+            #[cfg(unix)]
+            assert!(finish(failed(), &dir, session, None).await.is_none());
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

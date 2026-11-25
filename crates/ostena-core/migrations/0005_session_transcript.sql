@@ -32,8 +32,12 @@ CREATE TABLE session_transcript (
     code          text        CHECK (code ~ '^REC-E[0-9]{3}$'),
     CHECK ((command_hmac IS NULL) = (command_len IS NULL)),
     CHECK ((state = 'recording') = (sealed_at IS NULL)),
-    CHECK ((state = 'recording') = (sha256 IS NULL)),
-    CHECK ((state = 'recording') = (size IS NULL)),
+    -- No digest while recording; a sealed transcript has one; an
+    -- incomplete one has none when its file could not be created or is
+    -- gone (never a made-up digest).
+    CHECK ((sha256 IS NULL) = (size IS NULL)),
+    CHECK (state <> 'recording' OR sha256 IS NULL),
+    CHECK (state <> 'sealed' OR sha256 IS NOT NULL),
     CHECK ((state = 'incomplete') = (code IS NOT NULL)),
     CHECK (state <> 'sealed' OR end_reason IS NOT NULL)
 );

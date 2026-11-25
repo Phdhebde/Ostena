@@ -50,27 +50,38 @@ pub fn check(report: &mut Report, dir: &Path) -> Result<(), AuditError> {
         if !sealed.insert(file.clone()) {
             continue;
         }
-        match measure(&dir.join(&file)) {
-            Ok((size, sha256)) if size == seal.size && sha256 == seal.sha256 => {
-                if !seal.complete {
-                    report.add(Finding::TranscriptIncomplete {
-                        file,
-                        seq: seal.seq,
-                        code: seal.code.clone().unwrap_or_default(),
-                    });
-                }
-            }
-            Ok(_) => report.add(Finding::TranscriptAltered {
-                file,
-                seq: seal.seq,
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let on_disk = match measure(&dir.join(&file)) {
+            Ok(on_disk) => Some(on_disk),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io(e)),
+        };
+        match (seal.digest, on_disk) {
+            // As sealed: with its digest, or absent when the core wrote
+            // no file.
+            (Some(sealed), Some(on_disk)) if sealed == on_disk => {}
+            (None, None) => {}
+            (Some(_), None) => {
                 report.add(Finding::TranscriptMissing {
                     file,
                     seq: seal.seq,
                 });
+                continue;
             }
-            Err(e) => return Err(io(e)),
+            // Altered, or a file where the core sealed none.
+            (_, Some(_)) => {
+                report.add(Finding::TranscriptAltered {
+                    file,
+                    seq: seal.seq,
+                });
+                continue;
+            }
+        }
+        if !seal.complete {
+            report.add(Finding::TranscriptIncomplete {
+                file,
+                seq: seal.seq,
+                code: seal.code.clone().unwrap_or_default(),
+            });
         }
     }
     let mut unsealed: Vec<String> = std::fs::read_dir(dir)
@@ -116,8 +127,7 @@ mod tests {
         TranscriptSeal {
             seq: u64::from(session),
             session: [session; 16],
-            sha256: ostena_crypto::sha256::digest(content),
-            size: content.len() as u64,
+            digest: Some((content.len() as u64, ostena_crypto::sha256::digest(content))),
             complete,
             code: (!complete).then(|| "REC-E005".to_owned()),
         }
@@ -145,13 +155,25 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"ignored").unwrap();
         assert_eq!(ok.file_name(), "01010101-0101-0101-0101-010101010101.cast");
 
-        let mut r = report(vec![ok, cut, altered, missing]);
+        // Sealed without a file: none must be there.
+        let mut none = seal(6, b"", false);
+        none.digest = None;
+        let mut appeared = seal(7, b"", false);
+        appeared.digest = None;
+        std::fs::write(dir.join(appeared.file_name()), b"added").unwrap();
+
+        let mut r = report(vec![ok, cut, altered, missing, none, appeared]);
         check(&mut r, &dir).unwrap();
         let codes: Vec<&str> = r.findings.iter().map(Finding::code).collect();
-        assert_eq!(codes, ["AUD-E017", "AUD-E018", "AUD-W006", "AUD-W005"]);
-        assert_eq!((r.errors, r.warnings), (2, 2));
+        assert_eq!(
+            codes,
+            [
+                "AUD-E018", "AUD-W006", "AUD-E017", "AUD-E018", "AUD-W006", "AUD-W005"
+            ]
+        );
+        assert_eq!((r.errors, r.warnings), (3, 3));
         assert_eq!(r.exit_code(), 1);
-        assert_eq!(r.transcripts.len(), 4);
+        assert_eq!(r.transcripts.len(), 6);
         for finding in &r.findings {
             assert!(
                 finding

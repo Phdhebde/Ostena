@@ -164,10 +164,10 @@ pub struct TranscriptSeal {
     pub seq: u64,
     /// The access session, which names the file (`<uuid>.cast`).
     pub session: [u8; 16],
-    /// SHA-256 of the file.
-    pub sha256: [u8; 32],
-    /// Size of the file, in bytes.
-    pub size: u64,
+    /// Size and SHA-256 of the file; `None` when the core wrote no file
+    /// (it could not be created, or was gone): the file must then be
+    /// absent.
+    pub digest: Option<(u64, [u8; 32])>,
     /// Ended by its end frame.
     pub complete: bool,
     /// Why it is incomplete.
@@ -192,12 +192,11 @@ impl TranscriptSeal {
             Value::Uuid(u) => *u,
             _ => return None,
         };
-        let sha256 = match get(crate::field::SHA256)? {
-            Value::Bytes(b) => <[u8; 32]>::try_from(b.as_slice()).ok()?,
-            _ => return None,
-        };
-        let size = match get(crate::field::SIZE)? {
-            Value::U64(n) => *n,
+        let digest = match (get(crate::field::SIZE), get(crate::field::SHA256)) {
+            (Some(Value::U64(size)), Some(Value::Bytes(b))) => {
+                Some((*size, <[u8; 32]>::try_from(b.as_slice()).ok()?))
+            }
+            (None, None) => None,
             _ => return None,
         };
         let complete = matches!(get(crate::field::COMPLETE), Some(Value::Bool(true)));
@@ -208,8 +207,7 @@ impl TranscriptSeal {
         Some(Self {
             seq: record.seq,
             session,
-            sha256,
-            size,
+            digest,
             complete,
             code,
         })
