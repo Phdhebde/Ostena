@@ -19,6 +19,7 @@ mod core_link;
 mod enroll;
 mod keyset_state;
 mod login;
+mod release;
 mod sessions;
 #[cfg(feature = "ssh")]
 mod ssh;
@@ -53,6 +54,11 @@ enum Command {
     Ca {
         #[command(subcommand)]
         command: CaCommand,
+    },
+    /// Signed manifests of the deliverables: sign them, verify them offline.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
     },
     /// The core (Linux): run it, migrate its database, administer the agents.
     #[cfg(target_os = "linux")]
@@ -551,6 +557,39 @@ enum AuditCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum ReleaseCommand {
+    /// Hash the files, write the manifest and its signature (`<OUT>.sig`)
+    /// with a P-256 key from `ostena ca key new`; nothing is overwritten.
+    Sign {
+        /// Private key file (PEM PKCS#8 P-256).
+        #[arg(long)]
+        key: PathBuf,
+        /// Manifest to create.
+        #[arg(long)]
+        out: PathBuf,
+        /// Files to list, by their name.
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+    /// Verify the signature of a manifest, then every file it lists. Exit
+    /// code 0 verified, 1 error, 3 usage or input/output error.
+    Verify {
+        /// Manifest file.
+        manifest: PathBuf,
+        /// Public key file of the signer (`ostena-p256-public-key-v1`), once
+        /// per trusted key.
+        #[arg(long = "key", required = true)]
+        keys: Vec<PathBuf>,
+        /// Signature file; `<MANIFEST>.sig` if left out.
+        #[arg(long)]
+        signature: Option<PathBuf>,
+        /// Directory of the listed files; that of the manifest if left out.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum CaCommand {
     /// The offline root.
     Root {
@@ -838,6 +877,7 @@ fn main() -> ExitCode {
         Some(Command::Audit { command }) => run_audit(command),
         Some(Command::Login(args)) => login::login(&args.into()),
         Some(Command::Logout { dir }) => login::logout(dir.as_deref()),
+        Some(Command::Release { command }) => run_release(command),
         #[cfg(target_os = "linux")]
         Some(Command::Core { command }) => run_core(command),
         Some(Command::Ca { command }) => run_ca(command),
@@ -853,6 +893,8 @@ fn usage_exit_code(error: &clap::Error, args: &[&str]) -> u8 {
     let audit = matches!(args, ["audit", ..] | ["core", "audit", ..]);
     if code != 0 && audit {
         audit::USAGE_ERROR
+    } else if code != 0 && matches!(args, ["release", ..]) {
+        release::USAGE_ERROR
     } else {
         code
     }
@@ -893,6 +935,23 @@ fn run_ca(command: CaCommand) -> ExitCode {
                     out,
                 },
         } => ca::server_sign(&root, &public_key, &names, days, &out),
+    }
+}
+
+fn run_release(command: ReleaseCommand) -> ExitCode {
+    match command {
+        ReleaseCommand::Sign { key, out, files } => release::sign(&key, &out, &files),
+        ReleaseCommand::Verify {
+            manifest,
+            keys,
+            signature,
+            dir,
+        } => release::verify(&release::VerifyArgs {
+            manifest: &manifest,
+            keys: &keys,
+            signature: signature.as_deref(),
+            dir: dir.as_deref(),
+        }),
     }
 }
 
