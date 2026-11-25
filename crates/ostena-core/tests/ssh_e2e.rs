@@ -379,3 +379,150 @@ fn ssh_access_and_login_revocation_end_to_end() {
         db.drop_database().await;
     });
 }
+
+/// Notices sent while the core cannot hear them are lost; once its
+/// listening connection is cut and opened again, the core replays what they
+/// would have applied: a revoked login session and new host names of the
+/// group reach the connected agent.
+#[test]
+fn notices_lost_while_the_listener_is_cut_are_replayed() {
+    block_on(async {
+        let Some(db) = TestDb::create("notices_lost_while_the_listener_is_cut_are_replayed").await
+        else {
+            return;
+        };
+        let pool = db.pool().await;
+        schema::migrate(&pool).await.unwrap();
+        let dir = Dir(
+            std::env::temp_dir().join(format!("ostena-core-ssh-replay-{}", std::process::id()))
+        );
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let pki = TestPki::new("Ostena replay").unwrap();
+        let group = Uuid::parse(GROUP).unwrap();
+        let agent_id = Uuid::random().unwrap();
+        let (agent_key, agent_pkcs8) = SigningKey::generate().unwrap();
+        let agent_cert = pki
+            .issuing
+            .issue_agent(
+                &agent_key.verifying_key(),
+                GROUP,
+                &agent_id.to_string(),
+                valid(),
+            )
+            .unwrap();
+        let fingerprint = tls::fingerprint(&agent_cert);
+        let keys = keys(pki);
+        let store = PgStore::new(pool.clone(), Arc::new(AgentCache::default()));
+        ostena_core::audit::ensure_genesis(&pool).await.unwrap();
+        store.register(fingerprint, group, agent_id).await.unwrap();
+        inventory::create_group(&pool, Some(group), "lab", &["bastion.lab".into()])
+            .await
+            .unwrap();
+        inventory::set_group_policy(&pool, "lab", &allow_lab())
+            .await
+            .unwrap();
+        let user = inventory::add_user(&pool, "alice", "Alice").await.unwrap();
+        let target = SigningKey::generate().unwrap().0.verifying_key();
+        inventory::add_resource(&pool, "srv-lab01", "10.20.0.5", 22, "lab", &target)
+            .await
+            .unwrap();
+        inventory::add_account(&pool, "srv-lab01", "root")
+            .await
+            .unwrap();
+        inventory::grant_right(&pool, "alice", "srv-lab01", "root", now() + 86_400, 1800)
+            .await
+            .unwrap();
+
+        let port = free_port();
+        let config = config(port);
+        let core = RunningCore::start(
+            &config,
+            PgStore::new(pool.clone(), Arc::new(AgentCache::default())),
+            &keys,
+            &StartInfo::default(),
+        )
+        .await
+        .unwrap();
+        // SECRET-EXPOSURE: test only, the key file `agent enroll` would write.
+        #[expect(clippy::disallowed_methods)]
+        let key_pem = pem_private_key(&agent_pkcs8).expose_secret().to_vec();
+        let (gateway, link) = agent(&dir.0, port, &keys, &pem_certificate(&agent_cert), &key_pem);
+        let mut revocations = gateway.subscribe_login_revocations();
+        until("politique et clés de grant", || {
+            let v = gateway.state().versions();
+            v.policy.is_some() && v.keyset.is_some()
+        })
+        .await;
+        let (host_key, _) = SigningKey::generate().unwrap();
+        let message = ostena_tunnel::ssh::host_key_message(&host_key, &fingerprint).unwrap();
+        link.send(&message).await.unwrap();
+        let principals = || {
+            gateway
+                .state()
+                .ssh_trust()
+                .and_then(|t| {
+                    let blob = t.host_certificate.clone()?;
+                    let parsed = ostena_ssh::cert::parse(&blob).ok()?;
+                    Some(
+                        parsed
+                            .principals
+                            .iter()
+                            .map(|p| (*p).to_owned())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap_or_default()
+        };
+        until("certificat d'hôte", || principals() == ["bastion.lab"]).await;
+        let cert = [0xc5; 32];
+        let session = open_login(&pool, user, cert).await;
+        let access = SshAccess {
+            subject: user,
+            login_session: session,
+            certificate_sha256: cert,
+            account: "root".into(),
+            resource: "srv-lab01".into(),
+            client_address: "192.0.2.7:50022".parse().unwrap(),
+        };
+        gateway
+            .open_ssh_session(&access, now(), &MemoryReplayStore::default())
+            .await
+            .unwrap();
+
+        // Two changes whose notices are lost (made without notifying), then
+        // the server cuts the listening connection of the core.
+        sqlx::query(
+            "UPDATE login_session SET revoked_at = now(), revoked_by = 'test'
+             WHERE id = $1::uuid",
+        )
+        .bind(session.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE gateway_group SET ssh_host_names = '{jump.lab}' WHERE id = $1::uuid")
+            .bind(GROUP)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cut: Vec<bool> = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity
+             WHERE datname = current_database() AND query ILIKE 'LISTEN%'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cut, [true]);
+        revoked(&mut revocations, session).await;
+        until("certificat d'hôte des nouveaux noms", || {
+            principals() == ["jump.lab"]
+        })
+        .await;
+
+        core.stop().await;
+        drop(gateway);
+        link.stop().await;
+        pool.close().await;
+        db.drop_database().await;
+    });
+}

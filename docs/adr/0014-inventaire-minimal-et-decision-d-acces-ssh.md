@@ -129,6 +129,13 @@ Un certificat d'hôte n'est **utilisable** que s'il est valide, pour la clé enr
 
 **Révocation d'une session de connexion** (`login revoke`, `user disable`) : le core envoie `login_revoked` tout de suite aux agents connectés qui ont reçu un grant pour elle ou ouvert une session avec l'un de ses grants (`login_session.revocation_applied`, au mieux).
 
+**Notifications perdues** : une notification émise pendant que la connexion d'écoute du core est coupée est perdue. Dès qu'il écoute de nouveau, le core **rejoue depuis la base** ce que ces notifications auraient appliqué :
+- la copie du registre est rechargée (agents révoqués) et l'écoute d'enrôlement réveillée (jetons) ;
+- la politique de chaque groupe d'un agent connecté est poussée de nouveau, et les certificats d'hôte sont renouvelés si les noms d'hôte ont changé ;
+- les sessions de connexion révoquées et non expirées sont répétées à chaque agent connecté concerné.
+
+Chaque partie est idempotente pour l'agent. Le rejeu recommence toutes les 5 s tant qu'une partie échoue. Il est aussi déclenché quand le core ne peut pas appliquer une notification reçue : agents à prévenir d'une révocation illisibles, politique ou clé d'hôte d'un groupe illisible, révocations illisibles à la connexion d'un agent.
+
 ### Événements d'audit
 
 Nouveau type d'acteur **4, utilisateur** (ADR-0012), pour les décisions prises au nom d'un utilisateur. Nouveaux événements : `grant.key_activated`, `access.ssh_granted`, `access.ssh_refused`, `access.session_opened`, `access.session_refused`, `access.session_closed`, `ssh.host_certified`, `ssh.host_key_refused`, `login_session.revoked`, `login_session.revocation_applied`, `user.created`, `user.disabled`, `resource.created`, `target_account.created`, `right.granted`, `right.revoked`, `gateway_group.updated`.

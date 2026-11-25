@@ -4,7 +4,10 @@
 //! The copy of the registry is reloaded every [`RELOAD_INTERVAL`], and every
 //! [`RETRY_INTERVAL`] while it cannot be read. Notifications from the
 //! administration commands (token issued, agent revoked, login session
-//! revoked, group changed) apply at once.
+//! revoked, group changed) apply at once. Notifications sent while the
+//! listening connection is lost are lost: once it listens again, the core
+//! replays from the database what they would have applied, until it
+//! succeeds; so does a notification it fails to apply.
 //!
 //! Native SSH access (ADR-0014): when an agent connects, the core pushes
 //! the grant key set, the scope policy of its group, its SSH trust and the
@@ -298,6 +301,8 @@ struct Shared {
     recorder: Arc<Recorder>,
     grants: GrantAuthority,
     ssh: Option<Arc<SshAuthorities>>,
+    /// Asks for a replay of what lost notices would have applied.
+    resync: tokio::sync::Notify,
 }
 
 /// What the start of the core writes to the audit chain besides
@@ -452,6 +457,7 @@ impl RunningCore {
             recorder: recorder.clone(),
             grants,
             ssh: keys.ssh.clone(),
+            resync: tokio::sync::Notify::new(),
         });
         write_granting(
             &shared.store,
@@ -464,12 +470,12 @@ impl RunningCore {
         .await?;
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
-        let mut notices = PgListener::connect_with(shared.store.pool()).await?;
-        notices.listen(CHANNEL).await?;
+        let notices = listen(shared.store.pool()).await?;
         let writer = tokio::spawn(audit::run_writer(shared.store.pool().clone(), recorder));
         let tasks = vec![
             tokio::spawn(accept(listener.clone(), shared.clone())),
             tokio::spawn(follow_notices(notices, shared.clone())),
+            tokio::spawn(resync_on_request(shared.clone())),
             tokio::spawn(reload_periodically(shared.clone())),
             tokio::spawn(signer.clone().run()),
             tokio::spawn(renew_host_certificates(shared.clone())),
@@ -676,7 +682,17 @@ async fn push_on_connect(tunnel: &CoreTunnel, agent: Uuid, group: Uuid, shared: 
         }
     }
     push_ssh_trust(tunnel, agent, group, shared).await;
-    match login::revoked_for_agent(pool, agent).await {
+    if !repeat_revocations(tunnel, agent, shared).await {
+        // Not lost: the replay retries until it can read them.
+        shared.resync.notify_one();
+    }
+}
+
+/// Sends `agent` the revoked login sessions, not yet expired, it received
+/// grants for or opened sessions with; it applies them again without harm.
+/// `false` if they cannot be read.
+async fn repeat_revocations(tunnel: &CoreTunnel, agent: Uuid, shared: &Shared) -> bool {
+    match login::revoked_for_agent(shared.store.pool(), agent).await {
         Ok(sessions) => {
             for login_session in sessions {
                 let message = CoreMessage::LoginRevoked {
@@ -684,9 +700,11 @@ async fn push_on_connect(tunnel: &CoreTunnel, agent: Uuid, group: Uuid, shared: 
                 };
                 send(tunnel, agent, &message).await;
             }
+            true
         }
         Err(e) => {
             tracing::warn!(event = "core.push_failed", agent = %agent, code = e.code(), "{e}");
+            false
         }
     }
 }
@@ -1025,50 +1043,132 @@ async fn renew(
     })
 }
 
+/// Opens a connection that listens to [`CHANNEL`].
+async fn listen(pool: &sqlx::PgPool) -> Result<PgListener, sqlx::Error> {
+    let mut notices = PgListener::connect_with(pool).await?;
+    notices.listen(CHANNEL).await?;
+    Ok(notices)
+}
+
+/// Applies the notices. A notice sent while the connection is lost is lost:
+/// once it listens again, the core replays what such notices would have
+/// applied ([`replay`]).
 async fn follow_notices(mut notices: PgListener, shared: Arc<Shared>) {
+    let mut last_error: Option<tokio::time::Instant> = None;
     loop {
-        match notices.recv().await {
-            Ok(notice) => {
-                // Any change may have appended to the chain (administration
-                // commands notify in the transaction of their record).
-                shared.recorder.wake();
-                match Notice::parse(notice.payload()) {
-                    Some(Notice::Token) => {
-                        if let Err(e) = shared.enrollment.wake().await {
-                            tracing::warn!(event = "enroll.wake_failed", code = e.code(), "{e}");
-                        }
-                    }
-                    Some(Notice::Revoked(agent)) => {
-                        let fingerprints = shared.cache.revoke_agent(agent);
-                        let closed = shared.tunnels.close(&fingerprints, &TunnelError::Revoked);
-                        tracing::warn!(
-                            event = "agent.revocation_applied",
-                            agent = %agent,
-                            tunnels_closed = closed,
-                        );
-                        shared.recorder.emit(
-                            agent_event(EventKind::AgentRevocationApplied, Outcome::Success, agent)
-                                .u64(field::CLOSED_TUNNELS, closed as u64),
-                        );
-                    }
-                    Some(Notice::LoginRevoked(session)) => {
-                        tokio::spawn(apply_login_revocation(shared.clone(), session));
-                    }
-                    Some(Notice::Group(group)) => {
-                        tokio::spawn(apply_group_change(shared.clone(), group));
-                    }
-                    Some(Notice::Registered | Notice::Audit) | None => {}
-                }
+        match notices.try_recv().await {
+            Ok(Some(notice)) => apply_notice(&shared, notice.payload()).await,
+            Ok(None) => {
+                // Lost, then opened again and listening (sqlx reconnects).
+                tracing::warn!(
+                    event = "core.notices_interrupted",
+                    "connexion de notification perdue, puis rouverte"
+                );
+                shared.resync.notify_one();
             }
             Err(e) => {
-                // The listener reconnects on the next call; notices sent in
-                // between are lost, so reload everything now.
                 tracing::warn!(event = "core.notices_interrupted", "{e}");
-                reload(&shared).await;
+                // An error that comes back at once does not spin the loop.
+                if last_error.is_some_and(|t| t.elapsed() < RETRY_INTERVAL) {
+                    tokio::time::sleep(RETRY_INTERVAL).await;
+                }
+                last_error = Some(tokio::time::Instant::now());
+                notices = listen_again(&shared).await;
+                shared.resync.notify_one();
+            }
+        }
+    }
+}
+
+/// A new listening connection, attempted every [`RETRY_INTERVAL`]; the copy
+/// of the registry is reloaded meanwhile (a lost agent revocation).
+async fn listen_again(shared: &Shared) -> PgListener {
+    loop {
+        match listen(shared.store.pool()).await {
+            Ok(notices) => return notices,
+            Err(e) => {
+                tracing::warn!(event = "core.notices_interrupted", "{e}");
+                reload(shared).await;
                 tokio::time::sleep(RETRY_INTERVAL).await;
             }
         }
     }
+}
+
+async fn apply_notice(shared: &Arc<Shared>, payload: &str) {
+    // Any change may have appended to the chain (administration commands
+    // notify in the transaction of their record).
+    shared.recorder.wake();
+    match Notice::parse(payload) {
+        Some(Notice::Token) => {
+            if let Err(e) = shared.enrollment.wake().await {
+                tracing::warn!(event = "enroll.wake_failed", code = e.code(), "{e}");
+            }
+        }
+        Some(Notice::Revoked(agent)) => {
+            let fingerprints = shared.cache.revoke_agent(agent);
+            let closed = shared.tunnels.close(&fingerprints, &TunnelError::Revoked);
+            tracing::warn!(
+                event = "agent.revocation_applied",
+                agent = %agent,
+                tunnels_closed = closed,
+            );
+            shared.recorder.emit(
+                agent_event(EventKind::AgentRevocationApplied, Outcome::Success, agent)
+                    .u64(field::CLOSED_TUNNELS, closed as u64),
+            );
+        }
+        Some(Notice::LoginRevoked(session)) => {
+            tokio::spawn(apply_login_revocation(shared.clone(), session));
+        }
+        Some(Notice::Group(group)) => {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                if !apply_group_change(&shared, group).await {
+                    shared.resync.notify_one();
+                }
+            });
+        }
+        Some(Notice::Registered | Notice::Audit) | None => {}
+    }
+}
+
+/// Replays, each time it is asked, until it succeeds (every
+/// [`RETRY_INTERVAL`]). A request made during a replay starts another.
+async fn resync_on_request(shared: Arc<Shared>) {
+    loop {
+        shared.resync.notified().await;
+        while !replay(&shared).await {
+            tokio::time::sleep(RETRY_INTERVAL).await;
+        }
+    }
+}
+
+/// What lost notices would have applied, from the database: the copy of the
+/// registry reloaded (revoked agents), the enrolment listener woken (tokens),
+/// the policy and host certificates of the groups of the connected agents,
+/// and the revoked login sessions repeated to them. `false` if any part
+/// failed: the whole is replayed again, each part being idempotent.
+async fn replay(shared: &Shared) -> bool {
+    let mut done = reload(shared).await;
+    if let Err(e) = shared.enrollment.wake().await {
+        tracing::warn!(event = "enroll.wake_failed", code = e.code(), "{e}");
+        done = false;
+    }
+    let agents = connected(shared);
+    let groups: std::collections::HashSet<Uuid> = agents.iter().map(|(_, g, _)| *g).collect();
+    for group in groups {
+        done &= apply_group_change(shared, group).await;
+    }
+    for (agent, _, tunnel) in &agents {
+        done &= repeat_revocations(tunnel, *agent, shared).await;
+    }
+    tracing::info!(
+        event = "core.notices_replayed",
+        agents = agents.len(),
+        complete = done,
+    );
+    done
 }
 
 /// Reloads the copy; then closes the tunnels it no longer accepts (a lost
@@ -1125,11 +1225,15 @@ async fn apply_login_revocation(shared: Arc<Shared>, session: Uuid) {
     let agents = match login::agents_to_notify(shared.store.pool(), session).await {
         Ok(agents) => agents,
         Err(e) => {
+            // Not dropped: the replay repeats every revoked login session to
+            // the connected agents concerned, until it can read them.
             tracing::warn!(
                 event = "login_session.revocation_failed",
+                login_session = %session,
                 code = e.code(),
                 "{e}"
             );
+            shared.resync.notify_one();
             return;
         }
     };
@@ -1160,29 +1264,39 @@ async fn apply_login_revocation(shared: Arc<Shared>, session: Uuid) {
 }
 
 /// Pushes the policy of `group` again to its connected agents and
-/// certifies their host keys again if the SSH host names changed.
-async fn apply_group_change(shared: Arc<Shared>, group: Uuid) {
+/// certifies their host keys again if the SSH host names changed. `false`
+/// if the policy or a host key could not be read (a replay retries).
+async fn apply_group_change(shared: &Shared, group: Uuid) -> bool {
     let pool = shared.store.pool();
+    let mut done = true;
     let policy = match pushes::policy_message(pool, group).await {
         Ok(policy) => policy,
         Err(e) => {
             tracing::warn!(event = "core.push_failed", group = %group, code = e.code(), "{e}");
+            done = false;
             None
         }
     };
-    for (agent, agent_group, tunnel) in connected(&shared) {
+    for (agent, agent_group, tunnel) in connected(shared) {
         if agent_group != group {
             continue;
         }
         if let Some(policy) = &policy {
             send(&tunnel, agent, policy).await;
         }
-        if shared.ssh.is_some()
-            && let Ok(Some(key)) = pushes::stored_host_key(pool, agent).await
-        {
-            certify_host(&tunnel, agent, group, &key, &shared).await;
+        if shared.ssh.is_none() {
+            continue;
+        }
+        match pushes::stored_host_key(pool, agent).await {
+            Ok(Some(key)) => certify_host(&tunnel, agent, group, &key, shared).await,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(event = "core.push_failed", agent = %agent, code = e.code(), "{e}");
+                done = false;
+            }
         }
     }
+    done
 }
 
 /// Renews the host certificates due (two thirds of their life) of the
