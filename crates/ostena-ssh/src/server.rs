@@ -122,9 +122,9 @@ impl std::fmt::Debug for SshIdentity {
 }
 
 impl SshIdentity {
-    /// The host key, its host certificate (OpenSSH blob) checked at `now`
-    /// (type host, for that key, valid now, no option), the user
-    /// authorities (at least one).
+    /// The host key, its host certificate (OpenSSH blob) signed by one of
+    /// `host_cas` and checked at `now` (type host, for that key, valid now,
+    /// no option), the user authorities (at least one).
     ///
     /// # Errors
     ///
@@ -132,6 +132,7 @@ impl SshIdentity {
     pub fn new(
         host_key: PrivateKey,
         host_certificate: &[u8],
+        host_cas: &[VerifyingKey],
         user_cas: Vec<VerifyingKey>,
         now: u64,
     ) -> Result<Self, SshError> {
@@ -139,11 +140,17 @@ impl SshIdentity {
         if user_cas.is_empty() {
             return Err(invalid("aucune autorité d'utilisateurs".into()));
         }
+        if host_cas.is_empty() {
+            return Err(invalid("aucune autorité d'hôtes".into()));
+        }
         let point = sec1_point(host_key.public_key())
             .and_then(|p| p.try_into().ok())
             .and_then(|p: &[u8; 65]| VerifyingKey::from_bytes(p).ok())
             .ok_or_else(|| invalid("clé d'hôte hors de la liste figée".into()))?;
         let parsed = cert::parse(host_certificate).map_err(|e| invalid(e.to_string()))?;
+        parsed
+            .verify(host_cas)
+            .map_err(|e| invalid(format!("certificat d'hôte : {e}")))?;
         cert::check_host(&parsed, &point, now).map_err(|e| invalid(e.to_string()))?;
         let host_certificate =
             Certificate::from_bytes(host_certificate).map_err(|e| invalid(e.to_string()))?;

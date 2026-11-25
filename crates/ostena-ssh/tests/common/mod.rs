@@ -317,6 +317,19 @@ pub fn refusals(label: &str) -> Vec<String> {
         .collect()
 }
 
+/// The pre-check refusals of `label` once there are `count` of them, or
+/// after 5 s: the server logs a refusal after the client may have exited.
+pub fn wait_refusals(label: &str, count: usize) -> Vec<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let found = refusals(label);
+        if found.len() >= count || std::time::Instant::now() >= deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A runtime for one test.
 pub fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -722,6 +735,7 @@ pub async fn agent(
     let identity = ostena_ssh::server::SshIdentity::new(
         host_key,
         &certificate,
+        &[host_ca.verifying_key()],
         vec![user_ca.verifying_key()],
         ostena_grant::unix_now(),
     )

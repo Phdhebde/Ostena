@@ -211,9 +211,10 @@ impl GatewayState {
         self.ssh_trust.subscribe()
     }
 
-    /// Applies the SSH trust pushed by the core: the user certificate
-    /// authorities and the host certificate of the agent. The host
-    /// certificate is checked by the SSH server before use (`SSH-E018`).
+    /// Applies the SSH trust pushed by the core: the user and host
+    /// certificate authorities and the host certificate of the agent. The
+    /// host certificate, its signature by a host authority included, is
+    /// checked by the SSH server before use (`SSH-E018`).
     ///
     /// # Errors
     ///
@@ -226,9 +227,10 @@ impl GatewayState {
         &self,
         version: u64,
         user_cas: &[String],
+        host_cas: &[String],
         host_certificate: Option<&str>,
     ) -> Result<Applied, TunnelError> {
-        let trust = SshTrust::decode(version, user_cas, host_certificate)?;
+        let trust = SshTrust::decode(version, user_cas, host_cas, host_certificate)?;
         let mut outcome = Ok(Applied::Applied);
         self.ssh_trust
             .send_if_modified(|current| match current.as_ref().map(|c| c.version) {
@@ -694,7 +696,8 @@ impl Gateway {
 
     /// Opens a native SSH session (ADR-0010): asks the core for a grant for
     /// `access` (`ssh_grant_request`), which must name the subject of the
-    /// certificate and SSH; then the common path ([`Gateway::open_session`]:
+    /// certificate and SSH and be bound to its login session and the account
+    /// asked; then the common path ([`Gateway::open_session`]:
     /// jti consumed here, then by the core); the answer must give the account
     /// asked and the pinned host key of the target.
     ///
@@ -741,6 +744,13 @@ impl Gateway {
         }
         if verified.claims.protocol != ostena_grant::Protocol::Ssh {
             return Err(SessionError::Mismatch("protocole du grant"));
+        }
+        // The grant signs the login session and the account (format v2).
+        let binding = ostena_grant::Binding::of(access.login_session.to_bytes(), &access.account);
+        if verified.claims.binding != binding {
+            return Err(SessionError::Mismatch(
+                "liaison du grant (session de connexion, compte)",
+            ));
         }
         let answer = self.request(&grant, verified).await?;
         if answer.account.as_deref() != Some(access.account.as_str()) {
@@ -808,16 +818,19 @@ async fn dispatch(
             CoreMessage::SshTrust {
                 version,
                 user_ca_p256_public,
+                host_ca_p256_public,
                 host_certificate,
             } => match state.apply_ssh_trust(
                 version,
                 &user_ca_p256_public,
+                &host_ca_p256_public,
                 host_certificate.as_deref(),
             ) {
                 Ok(Applied::Applied) => tracing::info!(
                     event = "agent.ssh_trust_applied",
                     version,
                     authorities = user_ca_p256_public.len(),
+                    host_authorities = host_ca_p256_public.len(),
                     host_certificate = host_certificate.is_some(),
                 ),
                 Ok(Applied::Unchanged) => {}

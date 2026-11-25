@@ -19,7 +19,7 @@ use std::sync::Arc;
 use common::{
     EchoTarget, TestServer, certificate_line, dir, events, events_on, events_with, keygen, load,
     loopback, openssh, point, public, public_line, raw_offer, refusals, run_command, runtime,
-    serve, serve_handler, user_template, wait_event,
+    serve, serve_handler, user_template, wait_event, wait_refusals,
 };
 use ostena_ssh::driver;
 use ostena_ssh::server::ServerSettings;
@@ -143,7 +143,7 @@ fn openssh_client_with_only_unlisted_algorithms_is_refused() {
         assert!(!out.status.success(), "{option} accepted");
     }
     assert_eq!(
-        refusals("openssh-unlisted"),
+        wait_refusals("openssh-unlisted", 3),
         vec!["SSH-E005", "SSH-E005", "SSH-E005"],
         "every refusal audited"
     );

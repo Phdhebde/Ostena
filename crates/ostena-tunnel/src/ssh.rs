@@ -5,7 +5,8 @@
 //!   prefix, the SHA-256 of the current tunnel certificate and the key
 //!   itself (the model of `renew`). The core certifies it and sends the host
 //!   certificate back in [`CoreMessage::SshTrust`](crate::control::CoreMessage).
-//! - **Trust**: the user certificate authorities and the host certificate,
+//! - **Trust**: the user and host certificate authorities and the host
+//!   certificate,
 //!   pushed by the core, kept by [`GatewayState`](crate::gateway::GatewayState).
 
 use base64::Engine;
@@ -78,6 +79,9 @@ pub struct SshTrust {
     pub version: u64,
     /// Authorities of the user certificates.
     pub user_cas: Vec<VerifyingKey>,
+    /// Authorities of the host certificates: the SSH server checks the
+    /// signature of its host certificate against them.
+    pub host_cas: Vec<VerifyingKey>,
     /// Host certificate of the agent (OpenSSH blob), if issued.
     pub host_certificate: Option<Vec<u8>>,
 }
@@ -91,6 +95,7 @@ impl SshTrust {
     pub fn decode(
         version: u64,
         user_cas: &[String],
+        host_cas: &[String],
         certificate: Option<&str>,
     ) -> Result<Self, TunnelError> {
         Ok(Self {
@@ -98,6 +103,10 @@ impl SshTrust {
             user_cas: user_cas
                 .iter()
                 .map(|ca| p256_point("user_ca_p256_public", ca))
+                .collect::<Result<_, _>>()?,
+            host_cas: host_cas
+                .iter()
+                .map(|ca| p256_point("host_ca_p256_public", ca))
                 .collect::<Result<_, _>>()?,
             host_certificate: certificate.map(host_certificate).transpose()?,
         })

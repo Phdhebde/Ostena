@@ -32,7 +32,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ostena_common::config::{LoggingConfig, Mode};
 use ostena_common::secret::SecretBytes;
-use ostena_crypto::p256::{SigningKey, VerifyingKey};
+use ostena_crypto::p256::VerifyingKey;
 use ostena_grant::MemoryReplayStore;
 use ostena_scope::{AllowRuleSpec, LocalAddresses, PolicySpec, SharedLocalAddresses};
 use ostena_ssh::cert::{self, Kind, Template};
@@ -209,10 +209,11 @@ async fn run(args: Args) {
         ),
     );
 
-    // The agent identity: its host key, certified by a host authority.
+    // The agent identity: its host key, certified by the host authority of
+    // the core.
     let host_key = ostena_ssh::keys::generate("gateway-e2e").unwrap();
     let host_key = ostena_ssh::keys::load(&host_key.private).unwrap();
-    let host_ca = SigningKey::generate().unwrap().0;
+    let host_ca = core.ssh_host_ca();
     let now = ostena_grant::unix_now();
     let host_point = VerifyingKey::from_bytes(
         &ostena_ssh::driver::sec1_point(host_key.public_key())
@@ -233,12 +234,18 @@ async fn run(args: Args) {
             critical_options: vec![],
             extensions: vec![],
         },
-        &host_ca,
+        host_ca,
     )
     .unwrap();
     let trust = gateway.state().ssh_trust().unwrap();
-    let identity =
-        SshIdentity::new(host_key, &host_certificate, trust.user_cas.clone(), now).unwrap();
+    let identity = SshIdentity::new(
+        host_key,
+        &host_certificate,
+        &trust.host_cas,
+        trust.user_cas.clone(),
+        now,
+    )
+    .unwrap();
     let (_identity, identity_rx) = tokio::sync::watch::channel(Some(Arc::new(identity)));
     let agent_key = SecretBytes::from(std::fs::read(&args.agent_key).unwrap());
     let agent_key = Arc::new(ostena_ssh::keys::load(&agent_key).unwrap());

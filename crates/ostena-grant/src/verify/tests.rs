@@ -4,7 +4,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::format::{Claims, Protocol, Rights, SIGNED_LEN, TEXT_LEN};
-use crate::ids::{Jti, Kid, ResourceId, SubjectId};
+use crate::ids::{Binding, Jti, Kid, ResourceId, SubjectId};
 use crate::keys::Issuer;
 use crate::replay::tests::block_on;
 use crate::replay::{MemoryReplayStore, ReplayStoreError};
@@ -45,6 +45,7 @@ fn claims() -> Claims {
         protocol: Protocol::Rdp,
         rights: Rights::CLIPBOARD_TO_TARGET.with(Rights::FILE_DOWNLOAD),
         max_session_secs: 3600,
+        binding: Binding::of([3; 16], "administrateur"),
     }
 }
 
@@ -93,7 +94,7 @@ fn text_form_round_trip() {
     let f = fixture();
     let signed = f.issuer.issue(&claims(), NOW).unwrap();
     let text = signed.to_text();
-    assert_eq!(text.len(), 224);
+    assert_eq!(text.len(), 246);
     let parsed = SignedGrant::from_text(&text).unwrap();
     assert!(f.verifier.check(parsed.as_bytes(), NOW).is_ok());
 }
@@ -119,12 +120,36 @@ fn e001_malformed() {
 #[test]
 fn e002_e003_version_and_algorithm() {
     let f = fixture();
-    assert_eq!(code(&f, &tampered(&f, |b| b[3] = 2), NOW), "GRT-E002");
+    // Version 1 (168 bytes, no binding) is refused, whatever its length:
+    // by its length first, by its version at the length of version 2.
+    for version in [0u8, 1, 3, 0xff] {
+        assert_eq!(code(&f, &tampered(&f, |b| b[3] = version), NOW), "GRT-E002");
+    }
+    let signed = f.issuer.sign_ok(&grant(&f));
+    let mut v1 = signed.as_bytes()[..168].to_vec();
+    v1[3] = 1;
+    assert_eq!(f.verifier.check(&v1, NOW).unwrap_err().code(), "GRT-E001");
     // Validly signed, but announcing another algorithm: refused anyway.
     // 1 was Ed25519 in the first draft: refused like any other value.
     for alg in [0u8, 1, 3, 0xff] {
         assert_eq!(code(&f, &tampered(&f, |b| b[4] = alg), NOW), "GRT-E003");
     }
+}
+
+#[test]
+fn binding_is_signed() {
+    let f = fixture();
+    let signed = f.issuer.issue(&claims(), NOW).unwrap();
+    let g = f.verifier.check(signed.as_bytes(), NOW).unwrap();
+    assert_eq!(g.claims.binding, Binding::of([3; 16], "administrateur"));
+    assert_ne!(g.claims.binding, Binding::of([3; 16], "root"));
+    // Any change of the binding breaks the signature.
+    let mut bytes = *signed.as_bytes();
+    bytes[110] ^= 1;
+    assert_eq!(
+        f.verifier.check(&bytes, NOW).unwrap_err().code(),
+        "GRT-E006"
+    );
 }
 
 #[test]
@@ -326,6 +351,7 @@ fn arb_claims() -> impl Strategy<Value = Claims> {
         1u32..=12 * 3600,
     )
         .prop_map(|(s, r, protocol, rights, max_session_secs)| Claims {
+            binding: Binding::from_bytes(r),
             subject: SubjectId::from_bytes(s),
             resource: ResourceId::from_bytes(r),
             audience: GROUP,
