@@ -384,6 +384,47 @@ fn a_grant_opens_one_session_once() {
 }
 
 #[test]
+fn a_session_uses_any_valid_right_on_the_account() {
+    block_on(async {
+        let Some(f) = fixture("a_session_uses_any_valid_right_on_the_account").await else {
+            return;
+        };
+        // A longer right granted between the grant and its session: the
+        // session opens under it.
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        let longer = inventory::grant_right(
+            &f.pool,
+            "alice",
+            "srv-lab01",
+            "root",
+            now() + 2 * 86_400,
+            3600,
+        )
+        .await
+        .unwrap();
+        f.open(&issued.grant).await.unwrap();
+        // The right of the grant revoked, another valid: still opens.
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        let rights = inventory::list_rights(&f.pool).await.unwrap();
+        for right in rights
+            .iter()
+            .filter(|r| r.resource == "srv-lab01" && r.account == "root" && r.id != longer)
+        {
+            inventory::revoke_right(&f.pool, right.id).await.unwrap();
+        }
+        f.open(&issued.grant).await.unwrap();
+        // No valid right left: refused.
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        inventory::revoke_right(&f.pool, longer).await.unwrap();
+        assert_eq!(
+            f.open(&issued.grant).await.unwrap_err().code,
+            access::NO_RIGHT
+        );
+        f.db.drop_database().await;
+    });
+}
+
+#[test]
 fn concurrent_session_requests_consume_a_jti_once() {
     block_on(async {
         let Some(f) = fixture("concurrent_session_requests_consume_a_jti_once").await else {

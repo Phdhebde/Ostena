@@ -597,8 +597,10 @@ async fn consume(tx: &mut Tx<'_>, jti: [u8; 16], agent: Uuid, now: u64) -> Resul
 
 /// Opens the session of `grant` presented by `agent` of `group` at `now`:
 /// verified with the keys of the core, its jti consumed once for the whole
-/// group, its login session, user, right, resource and account checked
-/// again; recorded with its granting `access.session_opened` record.
+/// group, its login session, user, resource and account checked again, and
+/// a valid right of the user on the account looked for again (not
+/// necessarily the one of the grant); recorded with its granting
+/// `access.session_opened` record, which names the right used.
 ///
 /// # Errors
 ///
@@ -617,7 +619,7 @@ pub async fn open_session(
     let jti = checked.jti.to_bytes();
     let mut tx = pool.begin().await?;
     let Some(row) = sqlx::query!(
-        r#"SELECT login_session_id::text AS "login!", right_id::text AS "right!",
+        r#"SELECT login_session_id::text AS "login!",
                   resource_id::text AS "resource!", account, protocol, max_session_secs,
                   consumed_at IS NOT NULL AS "consumed!"
            FROM access_grant WHERE jti = $1 AND gateway_group = $2::text::uuid FOR UPDATE"#,
@@ -665,14 +667,9 @@ pub async fn open_session(
         now,
     )
     .await?;
-    if allowed.right != uuid(&row.right)? {
-        // The right of the grant was revoked or expired; another is valid,
-        // but a new request is needed.
-        return Err(Refusal::new(
-            NO_RIGHT,
-            format!("le droit du grant {} n'est plus valide", checked.jti),
-        ));
-    }
+    // Any valid right of the user on the account will do: the one of the
+    // grant may have been replaced by another since (a longer one, for
+    // example); without any, `allowed` refuses (`ACC-E006`).
     let session = consume(&mut tx, jti, agent, now).await?;
     let max_session_secs = u32::try_from(row.max_session_secs)
         .unwrap_or(1)
@@ -689,6 +686,7 @@ pub async fn open_session(
     .uuid(field::USER_ID, subject.to_bytes())
     .uuid(field::LOGIN_SESSION, login.to_bytes())
     .uuid(field::RESOURCE_ID, allowed.resource.to_bytes())
+    .uuid(field::RIGHT_ID, allowed.right.to_bytes())
     .text(field::ACCOUNT, truncate(&row.account))
     .text(field::HOST, truncate(&allowed.host))
     .u64(field::PORT, u64::from(allowed.port))

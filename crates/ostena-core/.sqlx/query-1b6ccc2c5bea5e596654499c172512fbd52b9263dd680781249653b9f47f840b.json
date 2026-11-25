@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT login_session_id::text AS \"login!\", right_id::text AS \"right!\",\n                  resource_id::text AS \"resource!\", account, protocol, max_session_secs,\n                  consumed_at IS NOT NULL AS \"consumed!\"\n           FROM access_grant WHERE jti = $1 AND gateway_group = $2::text::uuid FOR UPDATE",
+  "query": "SELECT login_session_id::text AS \"login!\",\n                  resource_id::text AS \"resource!\", account, protocol, max_session_secs,\n                  consumed_at IS NOT NULL AS \"consumed!\"\n           FROM access_grant WHERE jti = $1 AND gateway_group = $2::text::uuid FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -11,18 +11,12 @@
       },
       {
         "ordinal": 1,
-        "name": "right!",
-        "type_info": "Text",
-        "origin": "Expression"
-      },
-      {
-        "ordinal": 2,
         "name": "resource!",
         "type_info": "Text",
         "origin": "Expression"
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "account",
         "type_info": "Text",
         "origin": {
@@ -33,7 +27,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "protocol",
         "type_info": "Text",
         "origin": {
@@ -44,7 +38,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "max_session_secs",
         "type_info": "Int4",
         "origin": {
@@ -55,7 +49,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "consumed!",
         "type_info": "Bool",
         "origin": "Expression"
@@ -70,12 +64,11 @@
     "nullable": [
       null,
       null,
-      null,
       false,
       false,
       false,
       null
     ]
   },
-  "hash": "3b17f7ad4fab639ffc1be0f5e5b884092163aea48e2851a02c2c5cf8c25cba48"
+  "hash": "1b6ccc2c5bea5e596654499c172512fbd52b9263dd680781249653b9f47f840b"
 }
