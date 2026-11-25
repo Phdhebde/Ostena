@@ -75,6 +75,30 @@ fn plain_lines() {
     assert_eq!(shown(&read_plain_line(&mut input).unwrap()), "");
 }
 
+#[test]
+fn plain_lines_are_bounded() {
+    // A line far longer than the limit: kept up to MAX_LINE, the rest of
+    // the line skipped, the next line read whole.
+    let mut bytes = vec![b'a'; MAX_LINE * 4];
+    bytes.extend_from_slice(b"\r\nnext\n");
+    let mut input = io::BufReader::with_capacity(64, &bytes[..]);
+    let first = read_plain_line(&mut input).unwrap();
+    assert_eq!(shown(&first).len(), MAX_LINE);
+    assert!(shown(&first).bytes().all(|b| b == b'a'));
+    assert_eq!(shown(&read_plain_line(&mut input).unwrap()), "next");
+}
+
+#[test]
+fn the_editor_buffer_never_moves() {
+    let mut editor = Editor::default();
+    let start = editor.line.as_ptr();
+    for _ in 0..MAX_LINE + 10 {
+        editor.feed(b'x');
+    }
+    assert_eq!(editor.line.as_ptr(), start);
+    assert_eq!(editor.line.len(), MAX_LINE);
+}
+
 proptest! {
     /// Printable input followed by Enter comes back unchanged.
     #[test]

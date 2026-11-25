@@ -36,10 +36,19 @@ pub(crate) enum Step {
 }
 
 /// The line editor: printable bytes, backspace, Ctrl-U, Enter, Ctrl-C and
-/// Ctrl-D; other control bytes are ignored. Wiped on drop.
-#[derive(Default)]
+/// Ctrl-D; other control bytes are ignored. Wiped on drop. Its buffer is
+/// reserved at [`MAX_LINE`] bytes: it never moves, so a reallocation
+/// leaves no copy behind.
 pub(crate) struct Editor {
     line: Vec<u8>,
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self {
+            line: Vec::with_capacity(MAX_LINE),
+        }
+    }
 }
 
 impl Drop for Editor {
@@ -127,26 +136,43 @@ pub(crate) fn edit(mut next: impl FnMut() -> io::Result<Option<u8>>) -> io::Resu
 }
 
 /// Reads one line from a non-terminal input, without its line ending.
+/// The line goes straight from the reader's buffer to the editor's:
+/// at most [`MAX_LINE`] bytes are kept, the rest of the line is skipped,
+/// so a line without end cannot grow memory.
 pub(crate) fn read_plain_line(input: &mut impl BufRead) -> io::Result<SecretString> {
-    let mut bytes = Vec::new();
-    let read = input.read_until(b'\n', &mut bytes);
     let mut editor = Editor::default();
-    let result = read.and_then(|n| {
-        if n == 0 {
+    let mut read_any = false;
+    loop {
+        let available = match input.fill_buf() {
+            Ok(available) => available,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            if read_any {
+                break;
+            }
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "fin de la saisie",
             ));
         }
-        let end = bytes
-            .iter()
-            .rposition(|b| *b != b'\n' && *b != b'\r')
-            .map_or(0, |i| i + 1);
-        editor.line.extend_from_slice(&bytes[..end.min(MAX_LINE)]);
-        Ok(())
-    });
-    bytes.zeroize();
-    result?;
+        read_any = true;
+        let end = available.iter().position(|b| *b == b'\n');
+        let chunk = &available[..end.unwrap_or(available.len())];
+        let room = MAX_LINE - editor.line.len();
+        editor
+            .line
+            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+        let used = end.map_or(available.len(), |i| i + 1);
+        input.consume(used);
+        if end.is_some() {
+            break;
+        }
+    }
+    while editor.line.last() == Some(&b'\r') {
+        editor.line.pop();
+    }
     editor.finish()
 }
 

@@ -547,7 +547,9 @@ fn wire_error(error: &WireError) -> ApiError {
 }
 
 /// Reads the body into a buffer the caller wipes, refusing more than
-/// [`login::MAX_BODY`] bytes.
+/// [`login::MAX_BODY`] bytes. The caller reserves [`login::MAX_BODY`]
+/// bytes: the buffer never moves, so no copy of the secrets is left behind
+/// by a reallocation. hyper's own read buffer is out of reach.
 async fn read_body(body: Incoming, out: &mut Vec<u8>) -> Result<(), ApiError> {
     let mut body = body;
     while let Some(frame) = body.frame().await {
@@ -621,7 +623,7 @@ async fn handle<A: Authenticator>(
             "trop de tentatives depuis cette adresse, réessayez dans une minute",
         ));
     }
-    let mut body = Vec::new();
+    let mut body = Vec::with_capacity(login::MAX_BODY);
     let read = read_body(request.into_body(), &mut body).await;
     let result = match read {
         Err(e) => Err(e),

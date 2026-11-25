@@ -216,12 +216,34 @@ pub(crate) fn split_address(text: &str) -> Result<(String, u16), LoginError> {
     Ok((host, port))
 }
 
-/// One HTTPS request to the core: (status, body).
+/// A request body wiped when its last reference is dropped: hyper holds
+/// the only copy, through [`Bytes::from_owner`].
+struct Wiped(Vec<u8>);
+
+impl AsRef<[u8]> for Wiped {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for Wiped {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+/// The body of a request, its bytes wiped once sent and dropped.
+fn wiped_body(body: Vec<u8>) -> Bytes {
+    Bytes::from_owner(Wiped(body))
+}
+
+/// One HTTPS request to the core: (status, body). hyper writes the body
+/// from `body` itself (vectored writes, no flattening copy).
 async fn post(
     core: &str,
     root: &TrustAnchor,
     path: &str,
-    body: Vec<u8>,
+    body: Bytes,
 ) -> Result<(StatusCode, Vec<u8>), LoginError> {
     let (host, port) = split_address(core)?;
     let unreachable = |what: String| LoginError::Unreachable(format!("{core} : {what}"));
@@ -252,7 +274,9 @@ async fn post(
             })
         })?;
     let exchange = async {
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
+            .writev(true)
+            .handshake(TokioIo::new(stream))
             .await
             .map_err(|e| unreachable(e.to_string()))?;
         let driver = tokio::spawn(connection);
@@ -266,7 +290,7 @@ async fn post(
         let request = Request::post(path)
             .header("host", host_header)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body)))
+            .body(Full::new(body))
             .map_err(|e| LoginError::Usage(e.to_string()))?;
         let response = sender
             .send_request(request)
@@ -514,11 +538,16 @@ pub(crate) async fn login_with(
         p256_public: URL_SAFE_NO_PAD.encode(public),
         ttl_secs,
     };
-    let mut body = serde_json::to_vec(&request).map_err(|e| LoginError::Usage(e.to_string()))?;
+    // The secrets are serialised once, into a buffer of the right size
+    // (no reallocation), whose only copy hyper sends and drops.
+    let mut body = Vec::with_capacity(login::MAX_BODY);
+    let written = serde_json::to_writer(&mut body, &request);
     drop(request);
-    let sent = post(&settings.core, &root, LOGIN_PATH, body.clone()).await;
-    zeroize::Zeroize::zeroize(&mut body);
-    let (status, answer) = sent?;
+    if let Err(e) = written {
+        zeroize::Zeroize::zeroize(&mut body);
+        return Err(LoginError::Usage(e.to_string()));
+    }
+    let (status, answer) = post(&settings.core, &root, LOGIN_PATH, wiped_body(body)).await?;
     if status != StatusCode::OK {
         return Err(refusal(status, &answer));
     }
@@ -685,7 +714,8 @@ pub(crate) async fn logout_in(dir: &Path) -> Result<String, LoginError> {
         signature: URL_SAFE_NO_PAD.encode(signature.to_bytes()),
     };
     let body = serde_json::to_vec(&request).map_err(|e| LoginError::Usage(e.to_string()))?;
-    let (status, answer) = post(&settings.core, &root, LOGOUT_PATH, body).await?;
+    // No secret in a logout: signed, bound to its session and its time.
+    let (status, answer) = post(&settings.core, &root, LOGOUT_PATH, Bytes::from(body)).await?;
     if status != StatusCode::NO_CONTENT {
         return Err(refusal(status, &answer));
     }
