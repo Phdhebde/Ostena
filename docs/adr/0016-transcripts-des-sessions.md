@@ -60,8 +60,15 @@ Alternative écartée pour M1 : un tampon borné sur l'agent et une reprise du f
 
 Mise en œuvre :
 
-- **agent** (`ostena_ssh::transcript`) : à l'ouverture d'un shell ou d'un `exec`, la trame de début part dans une file bornée (8 trames) ; chaque sortie de la cible y entre **avant** d'être relayée à l'utilisateur, et une file pleine fait attendre le relais (contre-pression, pas de perte). Une tâche (`ostena_tunnel::recording::pump`) vide la file sur le flux `Recording`, ouvert avec la session. Si le flux échoue, est arrêté par le core ou perd sa connexion, la file se ferme et la session est coupée : `SSH-E021`, événement `ssh.transcript_lost` (et `agent.transcript_lost` côté service). À la fin normale, l'agent termine le flux et attend l'accusé du core 5 s au plus ;
+- **agent** (`ostena_ssh::transcript`) : à l'ouverture d'un shell ou d'un `exec`, la trame de début part dans une file bornée (2 trames, 64 Kio de sortie) ; chaque sortie de la cible y entre **avant** d'être relayée à l'utilisateur, et une file pleine fait attendre le relais (contre-pression, pas de perte). Une tâche (`ostena_tunnel::recording::pump`) vide la file sur le flux `Recording`, ouvert avec la session. Si le flux échoue, est arrêté par le core ou perd sa connexion, la file se ferme et la session est coupée : `SSH-E021`, événement `ssh.transcript_lost` (et `agent.transcript_lost` côté service). À la fin normale, l'agent termine le flux et attend l'accusé du core 5 s au plus ;
 - **raison de fin** scellée : `closed`, `revoked`, `expired`, `shutdown` ou `error` (transcript perdu).
+
+**Borne réelle de ce qui peut être montré sans être enregistré.** « Remis à l'enregistreur » veut dire entré dans la file de l'agent, pas reçu par le core. Pendant une partition entre l'agent et le core, l'utilisateur peut donc voir, sans que le core le reçoive jamais :
+
+- en volume, au plus la file (2 trames de 32 Kio), la trame que la tâche d'envoi est en train d'écrire (32 Kio) et la fenêtre de réception QUIC du flux accordée par le core (`stream_window`, 256 Kio par défaut), soit **environ 352 Kio** de sortie, en-têtes de trame en plus ;
+- en durée, au plus le temps de détecter la partition : la session est coupée quand une trame attend plus de 15 s (`WRITE_TIMEOUT` de l'envoi, `SEND_TIMEOUT` de la file), ou à l'expiration du délai d'inactivité QUIC (15 s par défaut), au premier des deux.
+
+Une session peu bavarde peut ainsi montrer jusqu'à 15 s de sortie non enregistrée, une session très bavarde jusqu'à environ 352 Kio. La fenêtre QUIC ne peut pas être réduite pour le seul flux `Recording` : QUIC (quinn 0.11) n'a qu'une fenêtre de réception par flux pour toute la connexion, et la réduire à 64 Kio limiterait aussi le débit des flux SSH et RDP (64 Kio par aller-retour). Une borne plus serrée demande un crédit applicatif (le core accuse les octets reçus sur le sens retour du flux, l'agent n'en laisse que 64 Kio sans accusé) ; c'est un lot ultérieur.
 
 ### Réception et scellement par le core
 

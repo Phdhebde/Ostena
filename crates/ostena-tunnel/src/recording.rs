@@ -17,9 +17,13 @@ use tokio::sync::mpsc;
 use crate::error::TunnelError;
 use crate::tunnel::Channel;
 
-/// Frames queued between the SSH server and the stream: at most 8 frames of
-/// 32 KiB of output, on top of the QUIC window of the stream.
-pub const QUEUE: usize = 8;
+/// Frames queued between the SSH server and the stream: at most 2 frames of
+/// 32 KiB of output (64 KiB), on top of the frame the pump is writing and of
+/// the QUIC window of the stream. What can be shown to the user before the
+/// core received it is bounded by their sum (ADR-0016). QUIC (quinn 0.11)
+/// has one receive window for every stream of a connection, so the window
+/// of this stream cannot be made smaller than that of the session streams.
+pub const QUEUE: usize = 2;
 
 /// How long the pump waits, once the transcript is complete, for the core
 /// to acknowledge all of it.
