@@ -6,6 +6,7 @@
 - **Révision** : 2026-11-13, écart SSH : cryptographie de russh dans `ostena-ssh`
 - **Révision** : 2026-11-25, engagements de la PR 6 : chargement différé d'`oleaut32`, contrôles des imports et des modules chargés, remesure de l'empreinte ; écart d'empreinte accepté par le responsable du projet
 - **Révision** : 2026-11-25, profil de release compilé en taille, chemin chaud gardé à `opt-level = 3` (PR 6bis)
+- **Révision** : 2026-11-25, identités locales : mots de passe, TOTP et écart HMAC-SHA-1 (amendement accepté, décision du responsable du projet, 2026-11-25)
 
 ## Contexte
 
@@ -98,7 +99,44 @@ CLAUDE.md prévoyait pour le coffre-fort « X25519 + ML-KEM-768, Ed25519 + ML-DS
 
 Les bloquants d'outillage notés pour l'authentification hybride (ML-DSA derrière une fonctionnalité instable d'`aws-lc-rs`) s'appliqueront au lot du coffre-fort.
 
+### Identités locales : mots de passe et TOTP (amendement du 2026-11-25)
+
+- **Statut** : Accepté (décision du responsable du projet, 2026-11-25).
+- **Portée** : `ostena login` (ADR-0010, étape 1), jalon M1, PR 7. FIDO2/WebAuthn viendra après M1 ; il ne remplace pas cet amendement, il s'y ajoute.
+
+**Mots de passe** (`ostena-crypto::password`) :
+- PBKDF2-HMAC-SHA256, **600 000 itérations**, sel aléatoire de 16 octets, condensat de 32 octets, par aws-lc-rs ;
+- format versionné et canonique, qui porte ses paramètres : `$ostena-pbkdf2-sha256$v=1$i=600000$<sel>$<condensat>` (base64 sans bourrage). Un condensat plus ancien se vérifie encore, et il est recalculé à la connexion réussie suivante ;
+- itérations acceptées de 600 000 à 10 000 000 : la borne haute empêche une valeur forcée en base de bloquer le core ;
+- vérification en temps constant ; un utilisateur inconnu coûte une dérivation complète, pour ne pas révéler les comptes existants ;
+- mot de passe de 1 à 1024 octets, pris tel que saisi, sans normalisation Unicode (elle demanderait des tables Unicode, refusées par `deny.toml`).
+
+Un mot de passe est un secret de faible entropie, attaquable hors ligne si le condensat fuit : c'est le cas que vise `RègleSecretFaibleEntropie` (§ 2.2.4). Il n'est donc **jamais le seul facteur** : la connexion exige aussi le TOTP, les échecs verrouillent le compte, les tentatives sont limitées par adresse source, et la dérivation lente rend chaque essai coûteux. Les condensats restent dans la base du core, joignable seulement par le socket local (ADR-0011).
+
+**TOTP** (`ostena-crypto::totp`, RFC 6238) :
+- 6 chiffres, pas de 30 s, tolérance d'un pas de chaque côté ;
+- **HMAC-SHA-1 par défaut**, HMAC-SHA-256 en option (`core.login.totp_algorithm`) ; écart consigné plus bas (« Écarts ») ;
+- secret de 160 bits en SHA-1 (RFC 4226 § 4), de 256 bits en SHA-256, tiré par l'aléa du système ;
+- **anti-rejeu** : un pas inférieur ou égal au dernier pas accepté pour ce secret est refusé, et le dernier pas est enregistré dans la même transaction que la connexion ;
+- **secret chiffré au repos** en AES-256-GCM (`ostena-crypto::aead`), la donnée associée liant le chiffré à son utilisateur. La clé est propre à cet usage, distincte des autres clés du core, ce que le core vérifie au démarrage ;
+- pas de codes de secours au jalon M1 : un administrateur réinitialise le TOTP.
+
 ### Écarts
+
+#### TOTP : HMAC-SHA-1 par défaut (décidé le 2026-11-25)
+
+**L'écart.** SHA-1 ne figure pas parmi les fonctions de hachage conformes : [PG-083] demande au moins 256 bits (§ 2.1.4) et [PA-079] des SHA-2 d'au moins 256 bits (R3). Le TOTP utilise par défaut HMAC-SHA-1.
+
+**Pourquoi.** Les applications d'authentification répandues ne lisent fiablement que SHA-1, 6 chiffres et 30 s. Beaucoup ignorent le paramètre `algorithm` de l'URI `otpauth://` et calculent alors en SHA-1 des codes faux, sans le signaler. Imposer SHA-256 rendrait le second facteur inutilisable pour une partie des administrateurs.
+
+**Pourquoi le risque est faible.**
+- Les attaques connues contre SHA-1 sont des **collisions**. La sécurité de HMAC repose sur la fonction de compression comme fonction pseudo-aléatoire, pas sur la résistance aux collisions ; aucune attaque pratique contre HMAC-SHA-1 n'est connue.
+- Le code n'est pas une signature : il vaut 30 s, n'est utilisable qu'une fois (anti-rejeu), avec le mot de passe, et sous la limitation des tentatives et le verrouillage. Deviner un code de 6 chiffres reste la meilleure attaque, quelle que soit la fonction.
+- Le secret est tiré au hasard (160 bits), jamais dérivé d'un mot de passe.
+
+**Confinement.** HMAC-SHA-1 n'est exposé par `ostena-crypto` que dans le module `totp`, par la constante `HMAC_SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs. Aucun autre usage de SHA-1 n'est permis. Le choix de SHA-256 vaut pour les nouveaux enrôlements ; un administrateur peut l'imposer (`totp_algorithm = "sha256"`).
+
+**Conditions de sortie.** Passage à SHA-256 par défaut quand les applications d'authentification utilisées par les clients le prennent en charge, ou remplacement du TOTP par FIDO2/WebAuthn (après M1).
 
 #### SSH : la cryptographie de russh dans `ostena-ssh` (décidé le 2026-11-13)
 
@@ -242,5 +280,6 @@ russh 0.65.1 ne propose qu'un hybride X25519 + ML-KEM-768 (`mlkem768x25519-sha25
 ## Conséquences
 
 - **`ostena-crypto`** n'expose plus Ed25519. Les algorithmes ne sont ni négociables ni configurables : `grant.signature_algorithm` n'accepte que `ecdsa-p256-sha256` en production (`CFG-P004`).
+- **Identités locales** : `ostena-crypto` expose PBKDF2-HMAC-SHA256 pour les mots de passe, le TOTP (HMAC-SHA-1 par défaut, écart ci-dessus) et AES-256-GCM pour les secrets au repos.
 - **Interopérabilité** : les deux extrémités du tunnel sont à nous. N'accepter qu'un groupe et qu'une suite ne coûte rien en interopérabilité, et supprime toute rétrogradation.
 - **Veille des guides** : toute nouvelle version de [PG-083] ou de [PA-079] impose de revoir ce tableau. Les identifiants de règles cités permettent de vérifier rapidement ce qui a changé.
