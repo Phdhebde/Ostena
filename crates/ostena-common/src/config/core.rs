@@ -384,16 +384,6 @@ fn login_bounds(out: &mut Vec<Violation>, field: &str, value: u32, min: u32, max
     }
 }
 
-/// A host name or `ssh_config` pattern: letters, digits, `.`, `-`, `*`,
-/// `?`, 1 to 253 bytes, not starting with `-`.
-fn is_host_pattern(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 253
-        && !s.starts_with('-')
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'*' | b'?'))
-}
-
 /// Rules of `[core.login]` (`CFG-V017`).
 fn login_rules(core: &CoreConfig, login: &CoreLoginConfig, out: &mut Vec<Violation>) {
     if login.listen == core.tunnel_listen || login.listen == core.enrollment_listen() {
@@ -454,7 +444,7 @@ fn login_rules(core: &CoreConfig, login: &CoreLoginConfig, out: &mut Vec<Violati
         );
     }
     for host in &login.ssh_hosts {
-        if !is_host_pattern(host) {
+        if !crate::api::login::is_host_pattern(host) {
             login_violation(
                 out,
                 format!(

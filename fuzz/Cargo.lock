@@ -648,6 +648,7 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "ostena-audit",
+ "ostena-common",
  "ostena-frame",
  "ostena-grant",
  "ostena-scope",
