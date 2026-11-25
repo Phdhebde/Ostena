@@ -34,6 +34,8 @@ const GROUP: Uuid = Uuid::from_bytes([0x2f; 16]);
 const OTHER_GROUP: Uuid = Uuid::from_bytes([0x3e; 16]);
 const AGENT: Uuid = Uuid::from_bytes([0xa1; 16]);
 const OTHER_AGENT: Uuid = Uuid::from_bytes([0xa2; 16]);
+/// A second agent of `GROUP`.
+const SIBLING: Uuid = Uuid::from_bytes([0xa3; 16]);
 const CERT: [u8; 32] = [0xc5; 32];
 
 fn now() -> u64 {
@@ -82,6 +84,7 @@ async fn fixture(test: &str) -> Option<Fixture> {
         .register([2; 32], OTHER_GROUP, OTHER_AGENT)
         .await
         .unwrap();
+    store.register([3; 32], GROUP, SIBLING).await.unwrap();
     inventory::create_group(&pool, Some(GROUP), "lab", &["bastion.lab".into()])
         .await
         .unwrap();
@@ -475,6 +478,48 @@ fn revocations_are_repeated_to_the_agents_that_received_grants() {
         .unwrap();
         assert!(revoked);
         assert_eq!(audit_count(&f.pool, "user.disabled").await, 1);
+        f.db.drop_database().await;
+    });
+}
+
+#[test]
+fn revocations_reach_the_agent_that_consumed_the_grant() {
+    block_on(async {
+        let Some(f) = fixture("revocations_reach_the_agent_that_consumed_the_grant").await else {
+            return;
+        };
+        // Issued to one agent, consumed by another of the group.
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        access::open_session(
+            &f.pool,
+            &f.authority,
+            SIBLING,
+            GROUP,
+            1,
+            &issued.grant,
+            now(),
+        )
+        .await
+        .unwrap();
+        login::revoke_session(&f.pool, f.login, "test")
+            .await
+            .unwrap();
+        let mut agents = login::agents_to_notify(&f.pool, f.login).await.unwrap();
+        agents.sort_by_key(|a| a.to_bytes());
+        assert_eq!(agents, vec![AGENT, SIBLING]);
+        for agent in [AGENT, SIBLING] {
+            assert_eq!(
+                login::revoked_for_agent(&f.pool, agent).await.unwrap(),
+                vec![f.login],
+                "{agent}"
+            );
+        }
+        assert_eq!(
+            login::revoked_for_agent(&f.pool, OTHER_AGENT)
+                .await
+                .unwrap(),
+            Vec::<Uuid>::new()
+        );
         f.db.drop_database().await;
     });
 }

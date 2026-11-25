@@ -115,7 +115,7 @@ Dans l'ordre :
 1. le jeu de clés de grant ;
 2. la politique de son groupe, si elle existe ;
 3. sa confiance SSH, si `[core.ssh]` est configuré ;
-4. `login_revoked` pour chaque session de connexion **révoquée et pas encore expirée** pour laquelle il a reçu un grant. Un agent coupé pendant une révocation l'apprend donc à son retour, y compris après un redémarrage du core.
+4. `login_revoked` pour chaque session de connexion **révoquée et pas encore expirée** pour laquelle il a reçu un grant ou ouvert une session (tout agent du groupe peut consommer un grant). Un agent coupé pendant une révocation l'apprend donc à son retour, y compris après un redémarrage du core.
 
 **Confiance SSH** : autorités d'utilisateurs et d'hôtes, et le certificat d'hôte de l'agent s'il en a un. Sa version change **seulement si son contenu change** (empreinte SHA-256 des autorités et du certificat). Une même poussée répétée garde sa version, ce que l'agent accepte (ADR-0008).
 
@@ -123,7 +123,7 @@ Dans l'ordre :
 
 **Changement de groupe** (`group policy`, `group host-names`) : la politique est poussée de nouveau aux agents connectés du groupe, et leurs certificats d'hôte sont renouvelés avec les nouveaux noms.
 
-**Révocation d'une session de connexion** (`login revoke`, `user disable`) : le core envoie `login_revoked` tout de suite aux agents connectés qui ont reçu un grant pour elle (`login_session.revocation_applied`, au mieux).
+**Révocation d'une session de connexion** (`login revoke`, `user disable`) : le core envoie `login_revoked` tout de suite aux agents connectés qui ont reçu un grant pour elle ou ouvert une session avec l'un de ses grants (`login_session.revocation_applied`, au mieux).
 
 ### Événements d'audit
 

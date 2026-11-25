@@ -6,8 +6,9 @@
 //! login service; it opens the session with [`open_session`] in its own
 //! transaction. A revocation is protective: it commits even if its audit
 //! record cannot be written, and the running core tells the agents that
-//! received a grant for that session ([`agents_to_notify`]); an agent that
-//! was disconnected is told again when it connects ([`revoked_for_agent`]).
+//! received a grant for that session or consumed one ([`agents_to_notify`]);
+//! an agent that was disconnected is told again when it connects
+//! ([`revoked_for_agent`]).
 
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
 use ostena_tunnel::Uuid;
@@ -126,7 +127,8 @@ fn truncate_reason(reason: &str) -> String {
     clean.chars().take(256).collect()
 }
 
-/// The agents that received a grant for `session`: the running core sends
+/// The agents that received a grant for `session` or opened a session with
+/// one (any agent of the group may consume a grant): the running core sends
 /// them `login_revoked`.
 ///
 /// # Errors
@@ -134,8 +136,11 @@ fn truncate_reason(reason: &str) -> String {
 /// [`CoreError::Database`].
 pub async fn agents_to_notify(pool: &PgPool, session: Uuid) -> Result<Vec<Uuid>, CoreError> {
     let rows = sqlx::query_scalar!(
-        r#"SELECT DISTINCT agent_id::text AS "agent!" FROM access_grant
-           WHERE login_session_id = $1::text::uuid"#,
+        r#"SELECT agent_id::text AS "agent!" FROM access_grant
+           WHERE login_session_id = $1::text::uuid
+           UNION
+           SELECT consumed_by::text AS "agent!" FROM access_grant
+           WHERE login_session_id = $1::text::uuid AND consumed_by IS NOT NULL"#,
         session.to_string(),
     )
     .fetch_all(pool)
@@ -144,7 +149,7 @@ pub async fn agents_to_notify(pool: &PgPool, session: Uuid) -> Result<Vec<Uuid>,
 }
 
 /// The revoked login sessions, not yet expired, for which `agent` received
-/// a grant: repeated to the agent when it connects (it may have missed the
+/// a grant or opened a session: repeated to the agent when it connects (it may have missed the
 /// revocation while disconnected).
 ///
 /// # Errors
@@ -154,7 +159,8 @@ pub async fn revoked_for_agent(pool: &PgPool, agent: Uuid) -> Result<Vec<Uuid>, 
     let rows = sqlx::query_scalar!(
         r#"SELECT DISTINCT s.id::text AS "id!" FROM login_session s
            JOIN access_grant g ON g.login_session_id = s.id
-           WHERE g.agent_id = $1::text::uuid AND s.revoked_at IS NOT NULL
+           WHERE (g.agent_id = $1::text::uuid OR g.consumed_by = $1::text::uuid)
+             AND s.revoked_at IS NOT NULL
              AND s.expires_at > $2"#,
         agent.to_string(),
         i64_of(unix_now()),
