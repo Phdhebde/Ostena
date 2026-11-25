@@ -435,15 +435,20 @@ fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> 
             ));
         }
         // The SSH keys are created by the agent with private rights at its
-        // first start (ADR-0010): checked once they exist.
+        // first start (ADR-0010): checked once they exist; before, their
+        // directory is, as `private` checks the directory of a key.
         if let Some(paths) = agent.ssh_paths() {
             for (field, key) in [
                 ("agent.ssh.host_key", &paths.host_key),
                 ("agent.ssh.target_key", &paths.target_key),
             ] {
-                if key.exists()
-                    && let Err(reason) = checker.private(key)
-                {
+                let verdict = if key.exists() {
+                    checker.private(key)
+                } else {
+                    let dir = key.parent().filter(|d| !d.as_os_str().is_empty());
+                    checker.not_writable_by_others(dir.unwrap_or(key))
+                };
+                if let Err(reason) = verdict {
                     out.push(Violation::new(
                         Code::PrivateKeyExposed,
                         format!("{field} {} : {reason}", key.display()),

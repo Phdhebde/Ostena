@@ -892,6 +892,17 @@ fn p008_ssh_keys_through_the_injected_checker() {
     };
     // Not created yet: the agent creates them with private rights.
     assert!(load_with(&path, &bad).is_ok());
+    // But in a directory that others can modify: refused before any key
+    // is created there.
+    let open_dir = FakeChecker {
+        writable: vec![dir.0.clone()],
+        exposed: vec![],
+    };
+    let codes = load_with(&path, &open_dir).unwrap_err().codes();
+    assert_eq!(
+        codes,
+        vec![Code::PrivateKeyExposed, Code::PrivateKeyExposed]
+    );
     std::fs::write(&host, b"k").unwrap();
     std::fs::write(&target, b"k").unwrap();
     let codes = load_with(&path, &bad).unwrap_err().codes();
