@@ -652,6 +652,7 @@ dependencies = [
  "ostena-crypto",
  "ostena-frame",
  "ostena-grant",
+ "ostena-recorder",
  "ostena-scope",
  "ostena-ssh",
  "ostena-tunnel",
@@ -665,6 +666,14 @@ dependencies = [
  "ostena-crypto",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "ostena-recorder"
+version = "0.0.0"
+dependencies = [
+ "ostena-crypto",
+ "thiserror",
 ]
 
 [[package]]

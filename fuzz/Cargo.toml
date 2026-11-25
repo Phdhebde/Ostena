@@ -18,6 +18,7 @@ ostena-common = { path = "../crates/ostena-common" }
 ostena-crypto = { path = "../crates/ostena-crypto" }
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
+ostena-recorder = { path = "../crates/ostena-recorder" }
 ostena-scope = { path = "../crates/ostena-scope" }
 ostena-ssh = { path = "../crates/ostena-ssh", default-features = false }
 ostena-tunnel = { path = "../crates/ostena-tunnel" }
@@ -115,6 +116,20 @@ bench = false
 [[bin]]
 name = "login_messages"
 path = "fuzz_targets/login_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recorder_decode"
+path = "fuzz_targets/recorder_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recorder_cast"
+path = "fuzz_targets/recorder_cast.rs"
 test = false
 doc = false
 bench = false
