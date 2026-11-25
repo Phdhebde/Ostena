@@ -121,6 +121,8 @@ Un mot de passe est un secret de faible entropie, attaquable hors ligne si le co
 - **secret chiffré au repos** en AES-256-GCM (`ostena-crypto::aead`), la donnée associée liant le chiffré à son utilisateur. La clé est propre à cet usage, distincte des autres clés du core, ce que le core vérifie au démarrage ;
 - pas de codes de secours au jalon M1 : un administrateur réinitialise le TOTP.
 
+**Limite connue : pas de rotation de `totp_key`.** La clé qui chiffre les secrets TOTP ne se remplace pas au jalon M1 : une autre clé rend tous les secrets illisibles (chaque connexion est alors refusée, `login.credential_invalid`), et il faut enrôler de nouveau tous les utilisateurs. Le format chiffré commence par un octet de version (`ostena-crypto::aead`, valeur 1) : il est prévu pour porter la génération de la clé, de sorte que le core puisse ouvrir avec l'ancienne clé, sceller avec la nouvelle et rechiffrer chaque secret à la connexion réussie suivante. Cette rotation viendra après M1.
+
 ### Écarts
 
 #### TOTP : HMAC-SHA-1 par défaut (décidé le 2026-11-25)

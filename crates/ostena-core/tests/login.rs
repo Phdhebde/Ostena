@@ -665,6 +665,54 @@ fn refusals_take_the_same_time() {
     });
 }
 
+/// Two logins at once with the same code: the credential row orders them,
+/// the first consumes the step, the second sees it spent.
+#[test]
+fn one_code_opens_one_session_under_concurrency() {
+    block_on(async {
+        let Some(f) = fixture("one_code_opens_one_session_under_concurrency").await else {
+            return;
+        };
+        let f = Arc::new(f);
+        let step = step_at(now()) + 1;
+        let attempts: Vec<_> = (0..2)
+            .map(|_| {
+                let f = f.clone();
+                tokio::spawn(async move {
+                    let key = SigningKey::generate().unwrap().0;
+                    f.login("alice", PASSWORD, f.totp.code(step), &key).await
+                })
+            })
+            .collect();
+        let mut results = Vec::new();
+        for attempt in attempts {
+            results.push(attempt.await.unwrap());
+        }
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|r| r.as_ref().err() == Some(&ApiCode::InvalidCredentials))
+        );
+        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM login_session")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1);
+        // The replay is a failure like the others.
+        assert_eq!(f.failures().await.0, 1);
+
+        let f = Arc::into_inner(f).unwrap();
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
 async fn alice(pool: &PgPool) -> ostena_tunnel::Uuid {
     let id: String = sqlx::query_scalar("SELECT id::text FROM app_user WHERE name = 'alice'")
         .fetch_one(pool)
