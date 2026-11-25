@@ -201,16 +201,34 @@ fn take<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
 /// ECDSA P-256 key file, as encoded; `None` if the file is not one.
 /// Bounded, never panics: used to explain a refusal.
 pub fn scalar_len(file: &[u8]) -> Option<usize> {
+    let body = decode_body(file)?;
+    // SECRET-EXPOSURE: walked to read one length, never copied.
+    #[expect(clippy::disallowed_methods)]
+    private_section(body.expose_secret()).map(|s| s.scalar.len())
+}
+
+/// The fields of the private section of an unencrypted OpenSSH ECDSA P-256
+/// key file, borrowed from the decoded body.
+struct PrivateSection<'a> {
+    public: &'a [u8],
+    scalar: &'a [u8],
+    comment: &'a [u8],
+}
+
+/// The decoded body of an OpenSSH private key file. Bounded.
+fn decode_body(file: &[u8]) -> Option<SecretBytes> {
     if file.len() > MAX_KEY_FILE {
         return None;
     }
     let text = std::str::from_utf8(file).ok()?;
     let inner = text.trim().strip_prefix(BEGIN)?.strip_suffix(END)?;
     let compact: String = inner.chars().filter(|c| !c.is_whitespace()).collect();
-    let body = SecretBytes::from(STANDARD.decode(compact).ok()?);
-    // SECRET-EXPOSURE: walked to read one length, never copied.
-    #[expect(clippy::disallowed_methods)]
-    let mut rest = body.expose_secret().strip_prefix(MAGIC)?;
+    Some(SecretBytes::from(STANDARD.decode(compact).ok()?))
+}
+
+/// Walks a decoded body. Never panics.
+fn private_section(body: &[u8]) -> Option<PrivateSection<'_>> {
+    let mut rest = body.strip_prefix(MAGIC)?;
     if take(&mut rest)? != b"none" || take(&mut rest)? != b"none" {
         return None;
     }
@@ -222,12 +240,62 @@ pub fn scalar_len(file: &[u8]) -> Option<usize> {
     rest = &rest[4..];
     take(&mut rest)?; // public key
     let private = take(&mut rest)?;
-    let mut section: &[u8] = private.get(8..)?; // check values
+    let check = private.get(..8)?;
+    if check[..4] != check[4..] {
+        return None;
+    }
+    let mut section: &[u8] = &private[8..];
     if take(&mut section)? != KEY_TYPE.as_bytes() || take(&mut section)? != CURVE.as_bytes() {
         return None;
     }
-    take(&mut section)?; // public point
-    take(&mut section).map(<[u8]>::len)
+    let public = take(&mut section)?;
+    let scalar = take(&mut section)?;
+    let comment = take(&mut section)?;
+    Some(PrivateSection {
+        public,
+        scalar,
+        comment,
+    })
+}
+
+/// Reads an unencrypted OpenSSH ECDSA P-256 private key file for
+/// `ostena-crypto` (proofs of possession): the signing key and the comment
+/// of the file. The scalar may take 31 to 33 bytes (minimal `mpint`); the
+/// public point of the file must be the one of the scalar.
+///
+/// # Errors
+///
+/// [`KeyError::Invalid`].
+pub fn decode(file: &SecretBytes) -> Result<(SigningKey, String), KeyError> {
+    let invalid = |what: &str| KeyError::Invalid(what.to_owned());
+    let unexpected = "fichier de clé OpenSSH ECDSA P-256 non chiffrée attendu";
+    // SECRET-EXPOSURE: decoded into a secret.
+    #[expect(clippy::disallowed_methods)]
+    let body = decode_body(file.expose_secret()).ok_or_else(|| invalid(unexpected))?;
+    // SECRET-EXPOSURE: walked; the scalar is only copied into a secret.
+    #[expect(clippy::disallowed_methods)]
+    let section = private_section(body.expose_secret()).ok_or_else(|| invalid(unexpected))?;
+    // A minimal mpint: one leading zero only before a high bit.
+    let digits = match section.scalar {
+        [0, next, ..] if next & 0x80 != 0 => &section.scalar[1..],
+        [0, ..] | [] => return Err(invalid("scalaire privé mal encodé")),
+        _ => section.scalar,
+    };
+    if digits.len() > 32 {
+        return Err(invalid("scalaire privé mal encodé"));
+    }
+    // Allocated once at its final size: no copy left behind by a growth.
+    let mut scalar = Vec::with_capacity(32);
+    scalar.resize(32 - digits.len(), 0);
+    scalar.extend_from_slice(digits);
+    let key = SigningKey::from_scalar(&SecretBytes::from(scalar))
+        .map_err(|e| KeyError::Invalid(e.to_string()))?;
+    if key.verifying_key().to_bytes()[..] != *section.public {
+        return Err(invalid(
+            "la clé publique du fichier ne correspond pas à son scalaire",
+        ));
+    }
+    Ok((key, String::from_utf8_lossy(section.comment).into_owned()))
 }
 
 /// Loads an unencrypted OpenSSH ECDSA P-256 private key for the SSH
