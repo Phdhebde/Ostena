@@ -173,6 +173,17 @@ pub fn read_visible(prompt: &str) -> io::Result<SecretString> {
     read_plain_line(&mut io::stdin().lock())
 }
 
+/// Reads one line from standard input, without prompt nor terminal modes
+/// (`--stdin` of the commands, for scripts).
+///
+/// # Errors
+///
+/// [`io::ErrorKind::UnexpectedEof`] at the end of input,
+/// [`io::ErrorKind::InvalidData`] for non-UTF-8 input.
+pub fn read_stdin_line() -> io::Result<SecretString> {
+    read_plain_line(&mut io::stdin().lock())
+}
+
 #[cfg(unix)]
 #[allow(
     unsafe_code,
