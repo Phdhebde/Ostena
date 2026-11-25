@@ -290,6 +290,27 @@ impl AgentLink {
         }
     }
 
+    /// Opens a session channel of `class` on the connection in use. The
+    /// channel belongs to that connection: it fails with it, and a
+    /// reconnection does not bring it back.
+    ///
+    /// # Errors
+    ///
+    /// [`TunnelError::ConnectionLost`] when not connected, or the open error.
+    pub async fn open_channel(
+        &self,
+        session: crate::Uuid,
+        class: crate::StreamClass,
+    ) -> Result<crate::Channel, TunnelError> {
+        let tunnel = self.current.lock().ok().and_then(|c| c.clone());
+        match tunnel {
+            Some(tunnel) => tunnel.open_channel(session, class).await,
+            None => Err(TunnelError::ConnectionLost(
+                "pas de connexion au core".into(),
+            )),
+        }
+    }
+
     /// The control messages pushed by the core (policy, keys, session
     /// answers…), once.
     pub fn take_pushes(&self) -> Option<mpsc::Receiver<CoreMessage>> {

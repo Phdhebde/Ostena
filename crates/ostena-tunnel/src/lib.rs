@@ -7,6 +7,7 @@
 //!   untrusted input;
 //! - [`channel`] — one stream per session and traffic class, input first;
 //! - [`limits`] — bounds on sessions, streams, buffers and timers;
+//! - [`recording`] — the transcript stream of a session, agent side;
 //! - [`tunnel`] — connection, heartbeat, channels, on both ends.
 
 #![forbid(unsafe_code)]
@@ -19,6 +20,7 @@ pub mod gateway;
 mod ids;
 pub mod limits;
 pub mod link;
+pub mod recording;
 pub mod renewal;
 pub mod ssh;
 pub mod tunnel;

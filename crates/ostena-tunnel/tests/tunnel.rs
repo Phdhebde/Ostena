@@ -89,7 +89,11 @@ fn channels_echo_with_their_class_priority() {
             .await
             .unwrap();
         let session = Uuid::random().unwrap();
-        for class in StreamClass::ALL {
+        // A transcript stream is kept, not echoed.
+        for class in StreamClass::ALL
+            .into_iter()
+            .filter(|c| *c != StreamClass::Recording)
+        {
             let mut ch = tunnel.open_channel(session, class).await.unwrap();
             assert_eq!(ch.send.priority().unwrap(), class.priority());
             ch.send.write_all(b"ping").await.unwrap();
@@ -112,7 +116,7 @@ fn stream_limit_is_enforced_by_the_peer() {
         let (tunnel, _) = connect(&core.agent_config(&id, group(), limits).unwrap())
             .await
             .unwrap();
-        // One session: control stream + three channels.
+        // One session: control stream + four channels.
         let session = Uuid::random().unwrap();
         let mut open = Vec::new();
         for class in StreamClass::ALL {
