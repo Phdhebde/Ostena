@@ -92,6 +92,7 @@ pub fn label(code: &str) -> &'static str {
         ACCOUNT_UNKNOWN => "compte inconnu sur la ressource",
         HOST_KEY_MISSING => "clé d'hôte de la cible non épinglée",
         NO_HOST_NAME => "aucun nom d'hôte SSH pour le groupe",
+        RATE_LIMITED => "trop de demandes de cet agent",
         _ => "accès refusé",
     }
 }
@@ -112,6 +113,8 @@ pub const NO_RIGHT: &str = "ACC-E006";
 pub const SSH_DISABLED: &str = "ACC-E007";
 /// `ACC-E008`: grant unknown to the core.
 pub const GRANT_UNKNOWN: &str = "ACC-E008";
+/// `ACC-E009`: too many requests from the agent ([`crate::rate`]).
+pub const RATE_LIMITED: &str = "ACC-E009";
 /// `INV-E001`: resource unknown (or disabled).
 pub const RESOURCE_UNKNOWN: &str = "INV-E001";
 /// `INV-E002`: resource of another gateway group.
@@ -796,6 +799,7 @@ mod tests {
             NO_RIGHT,
             SSH_DISABLED,
             GRANT_UNKNOWN,
+            RATE_LIMITED,
             RESOURCE_UNKNOWN,
             OTHER_GROUP,
             ACCOUNT_UNKNOWN,

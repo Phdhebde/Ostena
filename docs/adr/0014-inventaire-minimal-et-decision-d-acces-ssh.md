@@ -79,6 +79,12 @@ Le verrou `FOR SHARE` porte sur l'utilisateur, la session de connexion, la resso
 
 **Ce qui sort d'un refus** : l'agent reçoit le code précis et son libellé générique dans `session_refused`. La raison complète va dans la chaîne d'audit (`access.ssh_refused`, `access.session_refused`, au mieux). Le client SSH ne reçoit rien de plus qu'un refus.
 
+**Limites par agent** : chaque agent a un seau de jetons en mémoire du core, par type de demande :
+- `ssh_grant_request` : 50 d'un coup, puis 10 par seconde. Au-delà, la demande est refusée par `ACC-E009` sans toucher la base ;
+- `ssh_host_key` : 4 d'un coup, puis une par minute. Au-delà, la clé est ignorée et l'agent garde son certificat.
+
+Les refus ne sont pas audités un par un, ce qui inonderait la chaîne : une ligne de journal agrégée (`access.rate_limited`, avec le nombre de refus) est écrite au plus une fois par minute et par agent. La mémoire est bornée à 65 536 agents suivis ; au-delà, les agents inactifs sont oubliés, puis un nouvel agent est refusé. Les seaux sont propres à chaque core et repartent pleins à son redémarrage.
+
 **Essai à blanc** (`access check`) : mêmes contrôles, depuis la base, sans signature ni écriture. Il reste hors de la chaîne d'audit : il ne change aucun droit.
 
 ### Codes
@@ -93,6 +99,7 @@ Le verrou `FOR SHARE` porte sur l'utilisateur, la session de connexion, la resso
 | `ACC-E006` | aucun droit valide |
 | `ACC-E007` | accès SSH non configuré sur le core (`[core.ssh]`) |
 | `ACC-E008` | grant inconnu du core |
+| `ACC-E009` | trop de demandes de l'agent (limite par agent) |
 | `INV-E001` | ressource inconnue |
 | `INV-E002` | ressource d'un autre groupe de passerelles |
 | `INV-E003` | compte inconnu sur la ressource |

@@ -40,7 +40,7 @@ use crate::error::CoreError;
 use crate::grant_keys::GrantAuthority;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
-use crate::{login, pushes};
+use crate::{login, pushes, rate};
 
 /// Full reload of the registry copy.
 pub const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
@@ -303,6 +303,9 @@ struct Shared {
     ssh: Option<Arc<SshAuthorities>>,
     /// Asks for a replay of what lost notices would have applied.
     resync: tokio::sync::Notify,
+    /// Per-agent limits of `ssh_grant_request` and `ssh_host_key`.
+    grant_requests: rate::Limiter,
+    host_keys: rate::Limiter,
 }
 
 /// What the start of the core writes to the audit chain besides
@@ -458,6 +461,8 @@ impl RunningCore {
             grants,
             ssh: keys.ssh.clone(),
             resync: tokio::sync::Notify::new(),
+            grant_requests: rate::Limiter::new(rate::GRANT_REQUESTS),
+            host_keys: rate::Limiter::new(rate::HOST_KEYS),
         });
         write_granting(
             &shared.store,
@@ -971,6 +976,20 @@ async fn control(
                     break;
                 }
             },
+            AgentMessage::SshHostKey { .. }
+                if !within_limit(&shared.host_keys, agent, "ssh_host_key") =>
+            {
+                // Ignored: the agent keeps its certificate, if any.
+            }
+            AgentMessage::SshGrantRequest { request_id, .. }
+                if !within_limit(&shared.grant_requests, agent, "ssh_grant_request") =>
+            {
+                let refusal = Refusal {
+                    code: access::RATE_LIMITED,
+                    reason: String::new(),
+                };
+                send(&tunnel, agent, &refusal.to_message(request_id)).await;
+            }
             AgentMessage::SshHostKey { p256_public, proof } => {
                 match ostena_tunnel::ssh::verify_host_key(&p256_public, &proof, &fingerprint) {
                     Ok(key) => certify_host(&tunnel, agent, group, &key, &shared).await,
@@ -997,6 +1016,27 @@ async fn control(
                 close_session(agent, message, &shared).await;
             }
             _ => {}
+        }
+    }
+}
+
+/// Whether a request `kind` of `agent` is within `limiter`; the refusals
+/// are logged in aggregate (no audit record each: they would flood it).
+fn within_limit(limiter: &rate::Limiter, agent: Uuid, kind: &str) -> bool {
+    match limiter.check(agent, std::time::Instant::now()) {
+        rate::Decision::Allowed => true,
+        rate::Decision::Refused { log } => {
+            if let Some(refused) = log {
+                tracing::warn!(
+                    event = "access.rate_limited",
+                    agent = %agent,
+                    request = kind,
+                    refused,
+                    code = access::RATE_LIMITED,
+                    "demandes de l'agent au-delà de la limite, refusées"
+                );
+            }
+            false
         }
     }
 }

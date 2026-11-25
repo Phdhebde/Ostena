@@ -383,7 +383,8 @@ fn ssh_access_and_login_revocation_end_to_end() {
 /// Notices sent while the core cannot hear them are lost; once its
 /// listening connection is cut and opened again, the core replays what they
 /// would have applied: a revoked login session and new host names of the
-/// group reach the connected agent.
+/// group reach the connected agent. Then, too many grant requests from the
+/// agent are refused by the limit (`ACC-E009`).
 #[test]
 fn notices_lost_while_the_listener_is_cut_are_replayed() {
     block_on(async {
@@ -518,6 +519,27 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
             principals() == ["jump.lab"]
         })
         .await;
+
+        // Too many grant requests from one agent: refused by the limit,
+        // before the database, after the burst.
+        let replay = MemoryReplayStore::default();
+        let mut answered = 0;
+        let limited = loop {
+            let refusal = gateway
+                .open_ssh_session(&access, now(), &replay)
+                .await
+                .unwrap_err()
+                .code();
+            if refusal == "ACC-E009" {
+                break true;
+            }
+            assert_eq!(refusal, "ACC-E003");
+            answered += 1;
+            if answered > 200 {
+                break false;
+            }
+        };
+        assert!(limited && answered >= 40, "{answered}");
 
         core.stop().await;
         drop(gateway);

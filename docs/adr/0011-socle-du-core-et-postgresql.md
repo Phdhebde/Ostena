@@ -72,7 +72,7 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
 | `CORE-E011` | chaîne d'audit incohérente : le core cesse de signer et refuse de démarrer (ADR-0012) |
 | `CORE-E012` | requête d'administration invalide (ADR-0014) |
 
-Les refus d'accès (`ACC-E001` à `ACC-E008`) et d'inventaire (`INV-E001` à `INV-E005`) sont décrits dans l'ADR-0014.
+Les refus d'accès (`ACC-E001` à `ACC-E009`) et d'inventaire (`INV-E001` à `INV-E005`) sont décrits dans l'ADR-0014.
 
 Côté tunnel, `TUN-E029` signale un registre illisible (ADR-0008).
 
