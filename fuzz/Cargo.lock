@@ -601,6 +601,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "ostena-audit"
+version = "0.0.0"
+dependencies = [
+ "ostena-crypto",
+ "thiserror",
+]
+
+[[package]]
 name = "ostena-common"
 version = "0.0.0"
 dependencies = [
@@ -639,8 +647,12 @@ name = "ostena-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "ostena-audit",
+ "ostena-common",
+ "ostena-crypto",
  "ostena-frame",
  "ostena-grant",
+ "ostena-recorder",
  "ostena-scope",
  "ostena-ssh",
  "ostena-tunnel",
@@ -654,6 +666,14 @@ dependencies = [
  "ostena-crypto",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "ostena-recorder"
+version = "0.0.0"
+dependencies = [
+ "ostena-crypto",
+ "thiserror",
 ]
 
 [[package]]
@@ -674,6 +694,8 @@ dependencies = [
  "base64",
  "ostena-common",
  "ostena-crypto",
+ "ostena-grant",
+ "ostena-recorder",
  "thiserror",
  "tokio",
  "tracing",
@@ -1184,7 +1206,19 @@ dependencies = [
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
+ "tokio-macros",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]

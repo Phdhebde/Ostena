@@ -3,6 +3,7 @@
 - **Statut** : Accepté
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-11, signature ECDSA P-256 / SHA-256 (algorithme 2) au lieu d'Ed25519, absent des guides ANSSI (ADR-0009)
+- **Révision** : 2026-11-25, format v2 (184 octets) : liaison signée à la session de connexion et au compte cible (jalon M1, PR 5a) ; la v1 est refusée
 
 ## Contexte
 
@@ -28,12 +29,12 @@ Alternatives étudiées :
 
 Retenu : une **structure binaire de taille fixe**. Le décodeur lit à des positions constantes, sans allocation ni dépendance. Un grant n'a qu'un seul encodage possible, et aucun champ n'est négociable.
 
-### Format v1 (168 octets, entiers big-endian)
+### Format v2 (184 octets, entiers big-endian)
 
 | Offset | Taille | Champ | Règle |
 |---|---|---|---|
 | 0 | 3 | magic `OSG` | sinon `GRT-E001` |
-| 3 | 1 | version = 1 | sinon `GRT-E002` |
+| 3 | 1 | version = 2 | sinon `GRT-E002` ; la v1 (168 octets, sans liaison) est refusée par sa longueur (`GRT-E001`) |
 | 4 | 1 | algorithme = 2 (ECDSA P-256 / SHA-256) | sinon `GRT-E003`, même si la signature est valide ; la valeur 1 (Ed25519, premier projet) est refusée |
 | 5 | 1 | protocole : 1 SSH, 2 RDP, 3 VNC, 4 Web | sinon `GRT-E004` |
 | 6 | 2 | réservé | doit valoir 0 (`GRT-E001`) |
@@ -46,16 +47,38 @@ Retenu : une **structure binaire de taille fixe**. Le décodeur lit à des posit
 | 84 | 4 | durée de session maximale (s) | 0 : `GRT-E004` ; au-dessus de la politique : `GRT-E009` |
 | 88 | 8 | iat : émission et début de validité (s Unix) | |
 | 96 | 8 | exp : expiration, exclue (s Unix) | `exp ≤ iat` : `GRT-E004` ; `exp − iat` au-dessus de la politique : `GRT-E009` |
-| 104 | 64 | signature ECDSA P-256 / SHA-256 brute `r ‖ s` (32 + 32 octets, big-endian), forme low-S | |
+| 104 | 16 | liaison : session de connexion et compte cible (voir plus bas) | comparée par le vérificateur qui connaît les deux |
+| 120 | 64 | signature ECDSA P-256 / SHA-256 brute `r ‖ s` (32 + 32 octets, big-endian), forme low-S | |
 
-Droits v1 : presse-papiers vers la cible (bit 0), presse-papiers depuis la cible (1), dépôt de fichiers (2), récupération de fichiers (3), redirection de lecteurs (4), d'imprimante (5), de l'audio (6), redirection de ports SSH (7), agent forwarding SSH (8). Toute évolution du format passe par une nouvelle version.
+Droits (inchangés depuis la v1) : presse-papiers vers la cible (bit 0), presse-papiers depuis la cible (1), dépôt de fichiers (2), récupération de fichiers (3), redirection de lecteurs (4), d'imprimante (5), de l'audio (6), redirection de ports SSH (7), agent forwarding SSH (8). Toute évolution du format passe par une nouvelle version.
+
+### Liaison (v2)
+
+Le compte cible (jusqu'à 256 octets) ne tient pas dans un format de taille fixe, et le champ mot de passe RDP ne laisse que 23 octets de marge au format v1. Le grant porte donc une **liaison** de 16 octets :
+
+```text
+liaison = SHA-256("ostena-grant-binding-v1\0" ‖ session de connexion (16 octets) ‖ longueur du compte (u16, big-endian) ‖ compte)[0..16]
+```
+
+calculée par `ostena-crypto` (`ostena_grant::Binding::of`). Le préfixe de longueur empêche le compte de glisser dans la session. L'émetteur la calcule à partir de la session de connexion et du compte qu'il autorise ; le vérificateur la recalcule à partir de ce qu'il connaît par ailleurs et compare. **Le grant ne permet pas de retrouver la session ni le compte** : il ne sert qu'à vérifier.
+
+Pour SSH (ADR-0010), l'agent connaît la session de connexion (identifiant de clé du certificat utilisateur) et le compte (nom d'utilisateur SSH) : il exige la liaison après avoir consommé le jti (`TUN-E010`), si bien qu'un grant qui ne correspond pas est brûlé.
+
+**Ce que la liaison garantit** : un grant signé pour la session S et le compte A ne sert pas pour une autre session ni un autre compte, même si l'agent reçoit des paramètres de session erronés. Cela s'ajoute au contrôle du compte dans `session_params`, reçu par le tunnel mTLS.
+
+**Ce qu'elle ne garantit pas** :
+- elle ne dit pas *quel* compte ni *quelle* session : un lecteur du grant ne les apprend pas (c'est voulu, mais l'audit doit les tirer du registre des grants du core, pas du jeton) ;
+- elle ne protège pas contre un core ou un agent compromis, qui détient les données liées ;
+- **troncature à 128 bits** : trouver deux couples (session, compte) de même liaison demande environ 2^64 essais (paradoxe des anniversaires), mais seulement si l'attaquant choisit librement **les deux** couples. Ici, l'un des deux est imposé : c'est un compte sur lequel l'utilisateur a un droit, pour sa propre session, que le core a signé. Usurper un autre compte avec ce grant revient à trouver une seconde préimage, soit environ 2^128 essais, hors de portée. Un utilisateur qui ferait signer un compte de son choix n'obtient de grant que pour un compte autorisé : la collision ne lui ouvre rien de plus que ce qu'il a déjà. 128 bits est aussi la taille du jti et des identifiants du format.
+
+Pour un protocole sans session de connexion (à venir), la liaison est calculée avec l'identifiant de la session qui en tient lieu ; le choix sera consigné avec ce protocole.
 
 **Le grant ne contient que l'identifiant de la ressource.** L'agent n'a pas de base de données : il reçoit l'hôte, le port et le compte cible du core, par le tunnel authentifié en mTLS, quand il demande les paramètres de session. Il applique quand même `ostena-scope` (CIDR, épinglage de l'IP résolue, blocage des adresses de métadonnées et locales) à l'hôte et au port reçus.
 
 ### Signature
 
-- **La signature couvre tous les octets qui la précèdent**, c'est-à-dire `octets[0..104]` : magic, version, algorithme et kid compris. Ces octets sont précédés d'un préfixe de séparation de domaine, `"ostena-grant-v1\0"` (16 octets), signé mais non transmis. Une signature produite par la même clé pour un autre usage ne peut donc pas passer pour un grant.
-- **Signature ECDSA P-256 / SHA-256 (FIPS 186-5), au format brut de 64 octets** `r ‖ s`, pas en DER : le grant garde sa taille fixe de 168 octets (224 caractères), ce que vérifient des assertions à la compilation.
+- **La signature couvre tous les octets qui la précèdent**, c'est-à-dire `octets[0..120]` : magic, version, algorithme, kid et liaison compris. Ces octets sont précédés d'un préfixe de séparation de domaine, `"ostena-grant-v2\0"` (16 octets, `"ostena-grant-v1\0"` en v1), signé mais non transmis. Une signature produite par la même clé pour un autre usage ne peut donc pas passer pour un grant.
+- **Signature ECDSA P-256 / SHA-256 (FIPS 186-5), au format brut de 64 octets** `r ‖ s`, pas en DER : le grant garde sa taille fixe de 184 octets (246 caractères), ce que vérifient des assertions à la compilation.
 - **La vérification est stricte.** ECDSA est malléable : si `(r, s)` est valide, `(r, n − s)` l'est aussi. Le signataire produit donc toujours la forme **low-S** (`s ≤ (n − 1)/2`), et `ostena-crypto` refuse, avant la vérification d'`aws-lc-rs` :
   - `r` ou `s` nul, ou supérieur ou égal à l'ordre du groupe n ;
   - `s` au-dessus de `(n − 1)/2` (high-S), même si la signature est mathématiquement valide ;
@@ -66,13 +89,13 @@ Droits v1 : presse-papiers vers la cible (bit 0), presse-papiers depuis la cible
 
 ### Forme texte
 
-**base64url sans remplissage** (RFC 4648 §5), soit **224 caractères**, avec un décodage strict (alphabet, longueur et bits de fin canoniques).
+**base64url sans remplissage** (RFC 4648 §5), soit **246 caractères**, avec un décodage strict (alphabet, longueur et bits de fin canoniques : 184 octets laissent 4 bits inutilisés dans le dernier caractère, qui doivent être nuls).
 
-Vérifié dans [MS-RDPBCGR] 2.2.1.11.1.1 (TS_INFO_PACKET) : le champ *Password* accepte au plus **512 octets terminateur nul compris**, en UTF-16 si `INFO_UNICODE` est positionné. 224 caractères occupent 450 octets (448 plus 2 pour le terminateur), soit 62 octets de marge. Une assertion à la compilation (`format.rs`) garantit cette limite. Les limites propres aux interfaces des clients (boîtes de saisie) restent à confirmer en laboratoire.
+Vérifié dans [MS-RDPBCGR] 2.2.1.11.1.1 (TS_INFO_PACKET) : le champ *Password* accepte au plus **512 octets terminateur nul compris**, en UTF-16 si `INFO_UNICODE` est positionné. 246 caractères occupent 494 octets (492 plus 2 pour le terminateur), soit **18 octets de marge** (62 en v1). Le format ne peut plus grandir que de 7 octets (191 octets, 255 caractères, 512 octets) sans sortir de ce champ. Une assertion à la compilation (`format.rs`) garantit cette limite. Les limites propres aux interfaces des clients (boîtes de saisie) restent à confirmer en laboratoire.
 
 ### Ordre de vérification et codes
 
-1. Longueur exacte de 168 octets, magic, version, algorithme (`E001`, `E002`, `E003`).
+1. Longueur exacte de 184 octets, magic, version, algorithme (`E001`, `E002`, `E003`).
 2. Recherche du kid : inconnu (`E005`), clé révoquée (`E012`), clé retirée (`E013`).
 3. **Signature** (`E006`). Aucun autre champ n'est utilisé avant.
 4. Champs : réservé, protocole, droits, durées (`E001`, `E004`).
@@ -122,7 +145,8 @@ Une cible `cargo-fuzz` (`grant_decode`) exerce tous les décodeurs : binaire, te
 
 - Le décodeur fait une centaine de lignes, sans dépendance hormis `base64` pour la forme texte. Il est facile à auditer et à fuzzer.
 - Le format n'est pas un standard : un outil tiers doit l'implémenter d'après cet ADR. Toute évolution impose une nouvelle version, et l'agent refuse les versions inconnues.
-- 168 octets, soit 224 caractères, tiennent dans le champ mot de passe RDP avec une marge de 62 octets. Ajouter un champ (empreinte de cible, etc.) se fera au détriment de cette marge.
+- 184 octets, soit 246 caractères, tiennent dans le champ mot de passe RDP avec une marge de 18 octets. Il ne reste que 7 octets pour un éventuel champ futur : une évolution plus large devra raccourcir un champ existant (par exemple l'expiration en durée relative) ou renoncer au champ mot de passe.
+- **Passage à la v2 sans transition** : aucun grant v1 n'est déployé ; la v1 est refusée comme toute version inconnue. Le vérificateur de grants ne connaît ni la session ni le compte : comparer la liaison reste à la charge de l'appelant (`Gateway::open_ssh_session` pour SSH).
 - Quelqu'un qui peut écrire dans le journal anti-rejeu de l'agent peut effacer des jti et rejouer un grant encore valide. Seuls les droits du fichier protègent contre ça, comme pour la configuration (`CFG-P006`). La consommation par le core réduit ce risque.
 - Sous Windows, le renommage atomique ne synchronise pas le dossier (NTFS journalise ses métadonnées) ; sous Unix, le dossier est synchronisé après chaque remplacement.
 - libFuzzer n'est pas fiable sous Windows/MSVC (runtime AddressSanitizer de Visual Studio 2019 incompatible, édition de liens impossible sans sanitizer) : le fuzzing se fait sous Linux.

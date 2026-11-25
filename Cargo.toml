@@ -6,11 +6,14 @@ members = [
     "crates/ostena-common",
     "crates/ostena-crypto",
     "crates/ostena-grant",
+    "crates/ostena-audit",
+    "crates/ostena-recorder",
     "crates/ostena-scope",
     "crates/ostena-frame",
     "crates/ostena-platform",
     "crates/ostena-tunnel",
     "crates/ostena-ssh",
+    "crates/ostena-core",
     "crates/ostena-cli",
     "xtask",
 ]
@@ -21,13 +24,19 @@ edition = "2024"
 rust-version = "1.99.1"
 publish = false
 repository = "https://github.com/Phdhebde/Ostena"
+# The whole workspace, binary included (see LICENSE). Dependencies keep the
+# permissive allow list of deny.toml.
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
+ostena-audit = { path = "crates/ostena-audit" }
 ostena-common = { path = "crates/ostena-common" }
+ostena-core = { path = "crates/ostena-core" }
 ostena-frame = { path = "crates/ostena-frame" }
 ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 ostena-platform = { path = "crates/ostena-platform" }
+ostena-recorder = { path = "crates/ostena-recorder" }
 ostena-scope = { path = "crates/ostena-scope" }
 ostena-ssh = { path = "crates/ostena-ssh" }
 ostena-tunnel = { path = "crates/ostena-tunnel" }
@@ -42,6 +51,13 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 # X.509 issuance (core CA, agent certificates); no parser (no x509-parser).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 time = { version = "0.3.55", default-features = false }
+# HTTPS login API of the core and its client `ostena login` (ADR-0015):
+# HTTP/1.1 only, no axum yet. tokio-rustls carries the TLS configurations of
+# ostena-crypto::tls; it never builds one.
+hyper = { version = "1.13.0", default-features = false, features = ["http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+tokio-rustls = { version = "0.26.6", default-features = false }
 # QUIC transport of the agent-core tunnel (ADR-0008); TLS comes from ostena-crypto::tls.
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 # SSH server (agent) and client (driver to the targets), ADR-0010. Exact version:
@@ -52,14 +68,24 @@ russh = { version = "=0.65.1", default-features = false, features = ["aws-lc-rs"
 # own. Review: ssh-key 0.7 stable, a RustSec advisory, or the end of M1 at
 # the latest (ADR-0009).
 ssh-key = { version = "=0.7.0-rc.11", default-features = false }
+# PostgreSQL of the core (ADR-0011), in ostena-core only. Exact version. No TLS
+# (tls-none): its root store adds the public roots to ours; production goes
+# through the Unix socket with peer authentication. Its SCRAM and MD5 code
+# brings RustCrypto: an exception confined to sqlx-postgres (ADR-0009).
+sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "macros", "migrate", "tls-none"] }
+# Not used directly: pinned to the ASCII-only IDNA backend of url (pulled by
+# sqlx-core), so that no Unicode table (icu_*, Unicode-3.0) is linked.
+idna_adapter = "=1.0.0"
 # Shamir secret sharing of the offline root secret (2 of 3), audited; used by ostena-crypto only.
 vsss-rs = { version = "6.0.1", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.10.1", default-features = false }
 # Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
 windows-service = "0.8.1"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Services", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Services", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }
 # Test only: proves the scope decision does not allocate.
 dhat = "0.3.3"
+# Unix only, in ostena-platform: terminal modes for hidden password input.
+libc = "0.2.191"
 # Lists the agent interface addresses (no std API for it).
 if-addrs = "0.15.0"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
@@ -103,3 +129,69 @@ print_stderr = "warn"
 lto = "fat"
 codegen-units = 1
 strip = true
+# Size first: `opt-level = "s"` shrinks the resident code of the single
+# `ostena` binary (agent and core). The crates on the data path and the
+# session setup stay at `opt-level = 3`, so that the SSH relay and the tunnel
+# keep their latency and throughput (measures and criteria: ADR-0009).
+opt-level = "s"
+
+# Runtime and SSH relay path.
+package.tokio.opt-level = 3
+package.mio.opt-level = 3
+package.bytes.opt-level = 3
+package.futures-util.opt-level = 3
+package.russh.opt-level = 3
+package.russh-cryptovec.opt-level = 3
+package.ssh-cipher.opt-level = 3
+package.ssh-encoding.opt-level = 3
+package.ostena-ssh.opt-level = 3
+package.ostena-tunnel.opt-level = 3
+# Transcript frames, encoded for each output before it is relayed (ADR-0016).
+package.ostena-recorder.opt-level = 3
+package.ostena-crypto.opt-level = 3
+
+# Symmetric ciphers, MACs and hashes of the SSH transport.
+package.aes.opt-level = 3
+package.aes-gcm.opt-level = 3
+package.ctr.opt-level = 3
+package.ghash.opt-level = 3
+package.polyval.opt-level = 3
+package.universal-hash.opt-level = 3
+package.cipher.opt-level = 3
+package.chacha20.opt-level = 3
+package.poly1305.opt-level = 3
+package.sha1.opt-level = 3
+package.sha2.opt-level = 3
+package.hmac.opt-level = 3
+package.digest.opt-level = 3
+package.block-buffer.opt-level = 3
+
+# Key exchange and signatures (session setup).
+package.p256.opt-level = 3
+package.p384.opt-level = 3
+package.p521.opt-level = 3
+package.primeorder.opt-level = 3
+package.primefield.opt-level = 3
+package.elliptic-curve.opt-level = 3
+package.crypto-bigint.opt-level = 3
+package.ecdsa.opt-level = 3
+package.ff.opt-level = 3
+package.group.opt-level = 3
+package.wnaf.opt-level = 3
+package.curve25519-dalek.opt-level = 3
+package.ed25519-dalek.opt-level = 3
+package.ml-kem.opt-level = 3
+package.module-lattice.opt-level = 3
+package.sha3.opt-level = 3
+package.keccak.opt-level = 3
+package.ctutils.opt-level = 3
+package.subtle.opt-level = 3
+package.cmov.opt-level = 3
+
+# TLS and QUIC of the tunnel (aws-lc-sys: its C code too).
+package.aws-lc-rs.opt-level = 3
+package.aws-lc-sys.opt-level = 3
+package.rustls.opt-level = 3
+package.quinn.opt-level = 3
+package.quinn-proto.opt-level = 3
+package.quinn-udp.opt-level = 3

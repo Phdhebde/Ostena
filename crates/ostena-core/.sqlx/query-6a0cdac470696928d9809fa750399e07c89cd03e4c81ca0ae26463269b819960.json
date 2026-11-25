@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO app_user (id, name, display_name) VALUES ($1::text::uuid, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6a0cdac470696928d9809fa750399e07c89cd03e4c81ca0ae26463269b819960"
+}

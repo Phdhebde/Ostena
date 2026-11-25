@@ -56,7 +56,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Creates `path` with `bytes`, refusing to overwrite; `secret` files get
 /// mode 0600 on Unix.
-fn create(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
+pub(crate) fn create(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -195,6 +195,29 @@ pub(crate) fn key_new(key_out: &Path, public_out: &Path) -> ExitCode {
                 io::stdout(),
                 "Clé publique à porter à la cérémonie : {}",
                 public_out.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+/// `ostena ca key new-mac`: the key of the keyed hash of the commands
+/// (ADR-0016), 32 random bytes in a new 0600 file, generated on the core.
+pub(crate) fn mac_key_new(out: &Path) -> ExitCode {
+    let result = (|| {
+        let key = ostena_crypto::hmac::HmacKey::generate().map_err(|e| e.to_string())?;
+        // SECRET-EXPOSURE: written once to a new 0600 file.
+        #[expect(clippy::disallowed_methods)]
+        create(out, key.expose_secret(), true)
+    })();
+    match result {
+        Ok(()) => {
+            let _ = writeln!(
+                io::stdout(),
+                "Clé d'empreinte des commandes : {} (ne quitte pas cette machine ; \
+                 core.ssh.command_mac_key)",
+                out.display()
             );
             ExitCode::SUCCESS
         }

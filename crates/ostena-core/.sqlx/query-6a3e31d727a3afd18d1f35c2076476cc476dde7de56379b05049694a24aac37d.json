@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "LOCK TABLE grant_key IN SHARE ROW EXCLUSIVE MODE",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "6a3e31d727a3afd18d1f35c2076476cc476dde7de56379b05049694a24aac37d"
+}

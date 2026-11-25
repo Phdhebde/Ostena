@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 > À placer à la racine du dépôt. Claude Code le lit automatiquement à chaque session.
-> Nom de travail : **Ostena** (pas encore validé, renommer avant toute ouverture publique coûte peu).
+> Nom : **Ostena**. Dépôt public : github.com/Phdhebde/Ostena, licence AGPL-3.0-or-later.
 
 ## Le projet
 
@@ -59,12 +59,15 @@ packaging/  lab/  tests/  docs/  xtask/
 - Rust édition 2024. `#![forbid(unsafe_code)]` partout, sauf `ostena-platform` et les intégrations matérielles (PKCS#11, TPM) : chaque bloc `unsafe` a un commentaire `// SAFETY:` et un test.
 - Les crates protocolaires (`ssh`, `rdp`, `tsgu`, `rfb`, `frame`) ne dépendent ni de la base ni de l'API : testables et *fuzzables* seules.
 - Toute la cryptographie passe par `ostena-crypto`. Pas de crypto maison, pas d'OpenSSL. Algorithmes figés selon les guides ANSSI (PG-083, PA-035), pas négociables par un client ou un jeton.
+  Seule exception : TOTP HMAC-SHA-1 par défaut, écart accepté (ADR-0009).
 - Secrets dans des types `Secret<…>` (`secrecy` + `zeroize`) : jamais `Debug`/`Display`, jamais convertis en `String`, jamais journalisés.
 - Sécurité par défaut : le comportement par défaut est le plus sûr. Toute option qui l'affaiblit est journalisée et **refusée en mode production** (validation au démarrage). Exemples de refus : vérification de clé hôte SSH non stricte, certificat RDP de la cible non épinglé sans PKI, repli NTLM quand un mot de passe est délégué, grant signé avec un autre algorithme qu'ECDSA P-256 / SHA-256.
 - Contrôle de périmètre (CIDR + épinglage de l'IP résolue + blocage des adresses de métadonnées cloud et locales) appliqué à **tous** les drivers.
 - Pas de `unwrap()`/`expect()` hors tests et hors invariants documentés. Erreurs typées (`thiserror`), `anyhow` seulement dans les binaires et `xtask`.
 - Dépendances : licences MIT, Apache 2.0, BSD, ISC, Zlib, MPL 2.0 uniquement, contrôlées par `cargo-deny`. Préférer peu de dépendances, bien maintenues. Toute nouvelle dépendance se justifie dans la PR.
-  Seule exception : `Unicode-3.0`, admise uniquement pour la crate `unicode-ident` (tables Unicode, dépendance de compilation des macros procédurales, non liée au binaire), déclarée dans `deny.toml`.
+  Seule exception : `Unicode-3.0`, admise uniquement pour les crates suivantes, déclarées dans `deny.toml` :
+  - `unicode-ident` (tables Unicode, dépendance de compilation des macros procédurales, non liée au binaire) ;
+  - `unicode-normalization` et `unicode-properties`, liées au binaire du core, et seulement par le chemin `sqlx-postgres` → `stringprep` (ADR-0011). Les crates `icu_*` et toute autre crate sous Unicode-3.0 restent refusées.
 - Exclu en production : JVM, Node, Python, Redis, Kafka, Elasticsearch, Kubernetes obligatoire, FreeRDP/guacd.
 
 ## Définition de « terminé »
@@ -85,6 +88,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check
 cargo xtask <tâche>        # build reproductible, SBOM, etc.
+# Requêtes du core : après une migration ou une requête modifiée, régénérer le
+# cache hors ligne contre une base de développement migrée.
+(cd crates/ostena-core && DATABASE_URL=postgres://… cargo sqlx prepare -- --all-targets)
+# Tests qui demandent PostgreSQL (sautés sinon) : OSTENA_TEST_DB_SOCKET ou
+# OSTENA_TEST_DB_TCP, avec OSTENA_TEST_DB_USER (voir ostena_core::testing).
 ```
 
 (À compléter au fil de l'eau quand des commandes s'ajoutent.)
@@ -94,11 +102,11 @@ cargo xtask <tâche>        # build reproductible, SBOM, etc.
 - Langue : code, identifiants et messages de commit en anglais ; documentation, ADR et échanges en français.
 - Avant un changement non trivial : proposer un plan court, puis attendre validation.
 - Écrire les tests en même temps que le code, et les faire tourner avant de déclarer une tâche finie.
-- Petits commits, un sujet par commit. Ne jamais pousser sur `main` directement.
+- Petits commits, un sujet par commit, signés (`git commit -s`, DCO). PR vers `dev` ; ne jamais pousser sur `main` directement.
 - Signaler toute exigence ci-dessus qui semble impossible à tenir plutôt que de la contourner en silence.
 
 ## Confidentialité et propriété intellectuelle
 
-- Le dépôt est **privé** jusqu'à nouvel ordre. Ne rien publier, ne créer aucun dépôt public, paquet ou image publique.
+- Le dépôt est **public** (licence AGPL-3.0-or-later, fichier `LICENSE`). Tout ce qui est poussé, y compris les messages de commit, les branches et les descriptions de PR, est visible de tous. Ne publier aucun paquet, image ou version sans décision explicite du mainteneur.
 - Le code est écrit à partir des spécifications publiques (RFC, documentation Microsoft [MS-RDPBCGR], [MS-RDPEGFX], [MS-TSGU], etc.) et des bibliothèques open source citées. N'y introduire aucun code, document, test ou capture provenant d'un produit tiers ou d'un employeur, et ne pas les mentionner dans le code, les commentaires, les ADR ou les messages de commit.
-- Ne pas ajouter de fichier `LICENSE` tant que la licence n'est pas décidée (AGPLv3 envisagée).
+- Chaque crate déclare `license.workspace = true`. Les dépendances restent soumises à la liste de licences permissives de `deny.toml` : aucune dépendance sous copyleft fort (GPL, AGPL).

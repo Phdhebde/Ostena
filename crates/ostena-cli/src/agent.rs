@@ -61,7 +61,7 @@ fn fail(text: &str) -> ExitCode {
 
 /// Reads the configuration without the startup checks, to install or to set
 /// up logging before the full load.
-fn read(path: &Path) -> Result<Config, String> {
+pub(crate) fn read(path: &Path) -> Result<Config, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{} : {e}", path.display()))?;
     Config::from_toml_str(&text).map_err(|e| e.to_string())
 }
@@ -119,6 +119,31 @@ pub(crate) fn uninstall(quiet: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => fail(&e.to_string()),
+    }
+}
+
+/// `ostena agent ssh-key`: the agent key on the targets and the
+/// `authorized_keys` line (ADR-0010). Read only: the agent creates its keys.
+pub(crate) fn ssh_key(config: &Path, from: &[String], pty: bool, line: bool) -> ExitCode {
+    let parsed = match read(config) {
+        Ok(c) => c,
+        Err(e) => return fail(&e),
+    };
+    let Some(agent) = parsed.agent else {
+        return fail(&format!("{} : section [agent] absente", config.display()));
+    };
+    #[cfg(feature = "ssh")]
+    match crate::ssh::show_key(&agent, from, pty, line) {
+        Ok(text) => {
+            let _ = write!(io::stdout(), "{}{}", text, if line { "\n" } else { "" });
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+    #[cfg(not(feature = "ssh"))]
+    {
+        let _ = (agent, from, pty, line);
+        fail("ce binaire est construit sans le serveur SSH")
     }
 }
 
@@ -191,7 +216,58 @@ pub(crate) fn status(config: &Path, pid: Option<u32>) -> ExitCode {
         ),
     );
     core_details(&answer);
+    ssh_details(&answer["ssh"]);
     ExitCode::SUCCESS
+}
+
+/// What the agent says about its SSH server, if configured.
+fn ssh_details(ssh: &serde_json::Value) {
+    if !ssh.is_object() {
+        return;
+    }
+    let listen = ssh["listen"].as_array().map_or_else(String::new, |a| {
+        a.iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    let identity = match (
+        ssh["identity"].as_bool(),
+        ssh["host_certificate_valid_before"].as_u64(),
+    ) {
+        (Some(true), Some(end)) => {
+            let now = ostena_grant::unix_now();
+            format!(
+                "prête, certificat d'hôte valide encore {} h",
+                end.saturating_sub(now) / 3600
+            )
+        }
+        (Some(true), None) => "prête".to_owned(),
+        _ => match ssh["identity_refusal"].as_str() {
+            Some(reason) => format!("aucune : {reason} (aucune connexion SSH possible)"),
+            None => "pas encore reçue du core (aucune connexion SSH possible)".to_owned(),
+        },
+    };
+    let identity = match (
+        ssh["trust_version"].as_u64(),
+        ssh["trust_version_received"].as_u64(),
+    ) {
+        (Some(applied), Some(received)) if applied != received => format!(
+            "{identity}, confiance version {applied} (version {received} reçue, non applicable)"
+        ),
+        (Some(applied), _) => format!("{identity}, confiance version {applied}"),
+        (None, Some(received)) => {
+            format!("{identity}, confiance version {received} reçue, non applicable")
+        }
+        (None, None) => identity,
+    };
+    say(
+        false,
+        &format!(
+            "SSH : à l'écoute sur {listen}, {} session(s)\nIdentité SSH : {identity}",
+            ssh["sessions"]
+        ),
+    );
 }
 
 /// What the agent says about the core: pushed versions, certificate.
@@ -266,7 +342,7 @@ impl StopSource {
 }
 
 #[cfg(unix)]
-async fn wait_for_signals() {
+pub(crate) async fn wait_for_signals() {
     use std::sync::Arc;
     use tokio::signal::unix::{SignalKind, signal};
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -286,7 +362,7 @@ async fn wait_for_signals() {
 }
 
 #[cfg(not(unix))]
-async fn wait_for_signals() {
+pub(crate) async fn wait_for_signals() {
     if let Err(e) = tokio::signal::ctrl_c().await {
         tracing::error!(event = "agent.signal_failed", "Ctrl-C non installé : {e}");
     }
@@ -318,6 +394,13 @@ pub(crate) fn run(config: &Path, service: bool) -> ExitCode {
     ExitCode::from(u8::try_from(agent_main(config, StopSource::Signals, ready)).unwrap_or(1))
 }
 
+/// What the running agent shares between its parts.
+struct Running {
+    info: Arc<control::AgentInfo>,
+    /// The anti-replay journal, for the SSH sessions.
+    journal: Arc<FileReplayStore>,
+}
+
 /// The agent itself. Returns the process exit code.
 fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Send>) -> u32 {
     let started = Instant::now();
@@ -342,8 +425,16 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
         );
         return 1;
     };
+    if cfg!(not(feature = "ssh")) && agent.ssh.is_some() {
+        tracing::error!(
+            event = "agent.config_refused",
+            "[agent.ssh] présent, mais ce binaire est construit sans le serveur SSH (mesure \
+             d'empreinte seulement) : utilisez le binaire de release"
+        );
+        return 1;
+    }
     let journal = match FileReplayStore::open(&agent.replay_journal) {
-        Ok(j) => j,
+        Ok(j) => Arc::new(j),
         Err(e) => {
             tracing::error!(event = "agent.replay_store_refused", "{e}");
             return 1;
@@ -370,13 +461,24 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
         gateway_group: agent.gateway_group.clone(),
         config_fingerprint: fingerprint(config_path),
         sessions: Arc::new(Sessions::new()),
-        link: std::sync::OnceLock::new(),
-        gateway: std::sync::OnceLock::new(),
+        link: Arc::default(),
+        gateway: Arc::default(),
+        #[cfg(feature = "ssh")]
+        ssh: std::sync::OnceLock::new(),
     });
     let grace = Duration::from_secs(agent.shutdown_grace_secs);
     let mode = loaded.config.mode;
     let served = runtime.block_on(serve_until_stopped(
-        &agent, mode, &endpoint, info, grace, stop, ready,
+        &agent,
+        mode,
+        &endpoint,
+        Running {
+            info,
+            journal: journal.clone(),
+        },
+        grace,
+        stop,
+        ready,
     ));
     if !served {
         return 1;
@@ -397,34 +499,15 @@ fn agent_main(config_path: &Path, stop: StopSource, ready: Box<dyn FnOnce() + Se
     code
 }
 
-/// Control plane and idle footprint until the stop request, then the bounded
-/// shutdown of the sessions. Returns `false` when the control plane cannot
-/// start (`AGT-E006`: another agent or a squat).
-async fn serve_until_stopped(
+/// Starts the link to the core and what it pushes; `false` refuses the
+/// start (unreadable key set state: the rollback protection could not be
+/// guaranteed). Without a core CA, the agent runs without link.
+async fn start_core_link(
     agent: &AgentConfig,
     mode: config::Mode,
-    endpoint: &str,
-    info: Arc<control::AgentInfo>,
-    grace: Duration,
-    stop: StopSource,
-    ready: Box<dyn FnOnce() + Send>,
+    infrastructure: core_link::Infrastructure,
+    info: &control::AgentInfo,
 ) -> bool {
-    let listener = match ControlListener::bind(endpoint) {
-        Ok(l) => Arc::new(l),
-        Err(e) => {
-            tracing::error!(event = "agent.control_unavailable", code = e.code.as_str(), endpoint = %endpoint, "{e}");
-            return false;
-        }
-    };
-    // The Ostena components must be known before anything else (CFG-P010).
-    let infrastructure = match core_link::resolve_infrastructure(agent, mode).await {
-        Ok(i) => i,
-        Err(e) => {
-            tracing::error!(event = "agent.config_refused", code = "CFG-P010", "{e}");
-            return false;
-        }
-    };
-    let refresher = core_link::refresh_infrastructure(agent, infrastructure.clone());
     match core_link::start(agent, &info.config_fingerprint) {
         Ok(link) => {
             let link = Arc::new(link);
@@ -444,6 +527,78 @@ async fn serve_until_stopped(
         }
         Err(e) => tracing::warn!(event = "agent.core_link_disabled", "{e}"),
     }
+    true
+}
+
+/// Starts the native SSH server when configured (ADR-0010): its keys and its
+/// addresses must be usable, or the agent does not start (`Err`).
+#[cfg(feature = "ssh")]
+async fn start_ssh(
+    agent: &AgentConfig,
+    info: &control::AgentInfo,
+    journal: Arc<FileReplayStore>,
+) -> Result<Option<crate::ssh::SshService>, ()> {
+    let side = crate::ssh::CoreSide {
+        link: info.link.clone(),
+        gateway: info.gateway.clone(),
+    };
+    match crate::ssh::start(agent, side, journal).await {
+        Ok(ssh) => {
+            if let Some(ssh) = &ssh {
+                let _ = info.ssh.set(ssh.report());
+            }
+            Ok(ssh)
+        }
+        Err((e, code)) => {
+            tracing::error!(event = "agent.ssh_unavailable", code, "{e}");
+            if let Some(link) = info.link.get() {
+                link.stop().await;
+            }
+            Err(())
+        }
+    }
+}
+
+/// Control plane and idle footprint until the stop request, then the bounded
+/// shutdown of the sessions. Returns `false` when the control plane cannot
+/// start (`AGT-E006`: another agent or a squat).
+async fn serve_until_stopped(
+    agent: &AgentConfig,
+    mode: config::Mode,
+    endpoint: &str,
+    running: Running,
+    grace: Duration,
+    stop: StopSource,
+    ready: Box<dyn FnOnce() + Send>,
+) -> bool {
+    let Running { info, journal } = running;
+    #[cfg(not(feature = "ssh"))]
+    let _ = journal;
+    let listener = match ControlListener::bind(endpoint) {
+        Ok(l) => Arc::new(l),
+        Err(e) => {
+            tracing::error!(event = "agent.control_unavailable", code = e.code.as_str(), endpoint = %endpoint, "{e}");
+            return false;
+        }
+    };
+    // The Ostena components must be known before anything else (CFG-P010).
+    let infrastructure = match core_link::resolve_infrastructure(agent, mode).await {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::error!(event = "agent.config_refused", code = "CFG-P010", "{e}");
+            return false;
+        }
+    };
+    let refresher = core_link::refresh_infrastructure(agent, infrastructure.clone());
+    if !start_core_link(agent, mode, infrastructure, &info).await {
+        refresher.abort();
+        return false;
+    }
+    #[cfg(feature = "ssh")]
+    let Ok(ssh) = start_ssh(agent, &info, journal).await else {
+        refresher.abort();
+        return false;
+    };
     let server = tokio::spawn(control::serve(Arc::clone(&listener), Arc::clone(&info)));
     let footprint = tokio::spawn(async {
         tokio::time::sleep(IDLE_FOOTPRINT_DELAY).await;
@@ -469,6 +624,19 @@ async fn serve_until_stopped(
         sessions = info.sessions.active(),
         grace_secs = grace.as_secs()
     );
+    // One grace for every session, SSH or not: both stop at once, and the
+    // SSH reports are sent before the link closes.
+    #[cfg(feature = "ssh")]
+    let report = {
+        let deadline = Instant::now() + grace;
+        let ssh = async {
+            if let Some(ssh) = ssh {
+                ssh.stop(deadline).await;
+            }
+        };
+        tokio::join!(ssh, info.sessions.shutdown(grace)).1
+    };
+    #[cfg(not(feature = "ssh"))]
     let report = info.sessions.shutdown(grace).await;
     tracing::info!(
         event = "agent.sessions_closed",

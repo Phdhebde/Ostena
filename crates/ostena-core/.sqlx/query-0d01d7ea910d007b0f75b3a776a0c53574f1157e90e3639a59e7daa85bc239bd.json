@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT seq, body, hash FROM audit_record WHERE seq > $1 ORDER BY seq LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_record",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "body",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "audit_record",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "audit_record",
+            "name": "hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0d01d7ea910d007b0f75b3a776a0c53574f1157e90e3639a59e7daa85bc239bd"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE grant_key SET retire_at = $2 WHERE retire_at IS NULL AND kid <> $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b4a18b3426577c88c39460ac11e487d05b4fa8de8295060638abd22acd989975"
+}

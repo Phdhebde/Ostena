@@ -103,6 +103,13 @@ pub enum TunnelError {
     /// The core pushed a policy that does not compile here.
     #[error("[TUN-E028] politique du core refusée : {0}")]
     PolicyInvalid(String),
+    /// The core cannot read its registry of agents (or its token store):
+    /// it refuses rather than serve a stale copy.
+    #[error("[TUN-E029] registre des agents du core indisponible ; nouvelle tentative plus tard")]
+    RegistryUnavailable,
+    /// The SSH trust pushed by the core is refused (older version).
+    #[error("[TUN-E030] confiance SSH du core refusée : {0}")]
+    SshTrust(String),
 }
 
 impl TunnelError {
@@ -127,6 +134,7 @@ impl TunnelError {
             "TUN-E022" => Self::ProofOfPossession,
             "TUN-E023" => Self::TokenBurned,
             "TUN-E027" => Self::NoAnswer,
+            "TUN-E029" => Self::RegistryUnavailable,
             _ => return None,
         })
     }
@@ -162,6 +170,8 @@ impl TunnelError {
             Self::NotReady(_) => "TUN-E026",
             Self::NoAnswer => "TUN-E027",
             Self::PolicyInvalid(_) => "TUN-E028",
+            Self::RegistryUnavailable => "TUN-E029",
+            Self::SshTrust(_) => "TUN-E030",
         }
     }
 }
@@ -193,6 +203,9 @@ fn from_alert(alert: u8, reason: &str) -> TunnelError {
     // rustls sends certificate_unknown with our text: the text decides.
     if reason.contains(ostena_crypto::tls::NOT_ROOT_ISSUED) {
         return TunnelError::NotRootIssued;
+    }
+    if reason.contains(ostena_crypto::tls::REGISTRY_UNAVAILABLE) {
+        return TunnelError::RegistryUnavailable;
     }
     match alert {
         ALERT_HANDSHAKE_FAILURE if reason.contains("NoKxGroupsInCommon") => {
@@ -279,6 +292,8 @@ mod tests {
             TunnelError::NotReady("x"),
             TunnelError::NoAnswer,
             TunnelError::PolicyInvalid("x".into()),
+            TunnelError::RegistryUnavailable,
+            TunnelError::SshTrust("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("TUN-E{:03}", i + 1);
@@ -295,6 +310,7 @@ mod tests {
             TunnelError::TokenGroup,
             TunnelError::NotRootIssued,
             TunnelError::NoAnswer,
+            TunnelError::RegistryUnavailable,
         ] {
             assert_eq!(TunnelError::from_code(e.code()), Some(e));
         }

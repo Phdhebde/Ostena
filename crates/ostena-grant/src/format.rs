@@ -1,9 +1,9 @@
-//! Binary format v1 (ADR-0004). Big-endian, fixed layout, 168 bytes:
+//! Binary format v2 (ADR-0004). Big-endian, fixed layout, 184 bytes:
 //!
 //! | Offset | Size | Field |
 //! |---|---|---|
 //! | 0 | 3 | magic `OSG` |
-//! | 3 | 1 | version = 1 |
+//! | 3 | 1 | version = 2 (version 1 is refused) |
 //! | 4 | 1 | algorithm = 2 (ECDSA P-256 / SHA-256) |
 //! | 5 | 1 | protocol |
 //! | 6 | 2 | reserved, 0 |
@@ -16,9 +16,10 @@
 //! | 84 | 4 | maximum session length (s) |
 //! | 88 | 8 | issued at (Unix s) |
 //! | 96 | 8 | expires at (Unix s) |
-//! | 104 | 64 | ECDSA P-256 / SHA-256 signature over `DOMAIN ‖ bytes[0..104]`, raw `r ‖ s`, low-S |
+//! | 104 | 16 | binding: login session and account ([`Binding`]) |
+//! | 120 | 64 | ECDSA P-256 / SHA-256 signature over `DOMAIN ‖ bytes[0..120]`, raw `r ‖ s`, low-S |
 //!
-//! Text form: base64url without padding, 224 characters.
+//! Text form: base64url without padding, 246 characters.
 //!
 //! Algorithm 1 (Ed25519, the first draft) is refused like any other value.
 
@@ -28,27 +29,28 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ostena_crypto::p256::SIGNATURE_LEN;
 
 use crate::error::GrantError;
-use crate::ids::{GatewayGroupId, Jti, Kid, ResourceId, SubjectId};
+use crate::ids::{Binding, GatewayGroupId, Jti, Kid, ResourceId, SubjectId};
 
 /// Length of an encoded grant.
-pub const GRANT_LEN: usize = 168;
+pub const GRANT_LEN: usize = 184;
 /// Length of the text form.
-pub const TEXT_LEN: usize = 224;
+pub const TEXT_LEN: usize = 246;
 
 // The text form must fit the TS_INFO_PACKET Password field: at most 512 bytes
 // including the null terminator, UTF-16 when INFO_UNICODE is set
-// ([MS-RDPBCGR] 2.2.1.11.1.1). 224 characters take 450 bytes.
+// ([MS-RDPBCGR] 2.2.1.11.1.1). 246 characters take 494 bytes: 18 to spare.
 const _: () = assert!(TEXT_LEN * 2 + 2 <= 512);
-// The raw P-256 signature keeps the grant at 168 bytes (224 characters).
+// The raw P-256 signature keeps the grant at 184 bytes (246 characters).
 const _: () = assert!(SIGNED_LEN + SIGNATURE_LEN == GRANT_LEN);
-const _: () = assert!(GRANT_LEN.div_ceil(3) * 4 == TEXT_LEN);
+// base64url without padding: 4 characters per 3 bytes, 2 for the last byte.
+const _: () = assert!(GRANT_LEN % 3 == 1 && GRANT_LEN / 3 * 4 + 2 == TEXT_LEN);
 /// Length of the signed part (everything before the signature).
-pub(crate) const SIGNED_LEN: usize = 104;
+pub(crate) const SIGNED_LEN: usize = 120;
 /// Domain separation prefix, signed but not transmitted.
-pub(crate) const DOMAIN: &[u8; 16] = b"ostena-grant-v1\0";
+pub(crate) const DOMAIN: &[u8; 16] = b"ostena-grant-v2\0";
 
 const MAGIC: [u8; 3] = *b"OSG";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 /// ECDSA P-256 / SHA-256, the only accepted value.
 const ALG_ECDSA_P256_SHA256: u8 = 2;
 
@@ -144,6 +146,8 @@ pub struct Claims {
     pub rights: Rights,
     /// Maximum session length, in seconds (> 0).
     pub max_session_secs: u32,
+    /// The login session and the target account the grant is bound to.
+    pub binding: Binding,
 }
 
 /// The content of a grant (only trusted once returned by the verifier).
@@ -181,19 +185,19 @@ impl SignedGrant {
         bytes
             .try_into()
             .map(Self)
-            .map_err(|_| GrantError::Malformed("longueur différente de 168 octets"))
+            .map_err(|_| GrantError::Malformed("longueur différente de 184 octets"))
     }
 
     /// Parses the text form.
     ///
     /// # Errors
     ///
-    /// [`GrantError::Malformed`] unless the text is exactly 224 canonical
+    /// [`GrantError::Malformed`] unless the text is exactly 246 canonical
     /// base64url characters, without padding.
     pub fn from_text(text: &str) -> Result<Self, GrantError> {
         if text.len() != TEXT_LEN {
             return Err(GrantError::Malformed(
-                "longueur différente de 224 caractères",
+                "longueur différente de 246 caractères",
             ));
         }
         let bytes = URL_SAFE_NO_PAD
@@ -258,6 +262,7 @@ pub(crate) fn parse_body(bytes: &[u8; GRANT_LEN]) -> Result<Grant, GrantError> {
             protocol,
             rights,
             max_session_secs,
+            binding: Binding::from_bytes(array(bytes, 104)),
         },
         issued_at,
         expires_at,
@@ -280,6 +285,7 @@ pub(crate) fn encode_unsigned(grant: &Grant) -> [u8; SIGNED_LEN] {
     out[84..88].copy_from_slice(&grant.claims.max_session_secs.to_be_bytes());
     out[88..96].copy_from_slice(&grant.issued_at.to_be_bytes());
     out[96..104].copy_from_slice(&grant.expires_at.to_be_bytes());
+    out[104..120].copy_from_slice(&grant.claims.binding.to_bytes());
     out
 }
 
@@ -313,7 +319,7 @@ mod tests {
     #[test]
     fn lengths() {
         assert_eq!(SIGNED_LEN + SIGNATURE_LEN, GRANT_LEN);
-        assert_eq!(GRANT_LEN.div_ceil(3) * 4, TEXT_LEN);
+        assert_eq!(TEXT_LEN * 2 + 2, 494);
         assert_eq!(URL_SAFE_NO_PAD.encode([0u8; GRANT_LEN]).len(), TEXT_LEN);
     }
 
@@ -338,8 +344,14 @@ mod tests {
         if std_alphabet != text {
             assert!(SignedGrant::from_text(&std_alphabet).is_err());
         }
-        // Last character with non-zero unused bits: 168 bytes = 56 groups of
-        // 3, so there are none; any change of a char changes the bytes.
+        // 184 bytes = 61 groups of 3 and one byte: the last character
+        // carries 4 unused bits, which must be zero.
+        let mut last = text.clone().into_bytes();
+        let end = last.len() - 1;
+        // 0x07: last character 0b11_0000 (48, 'w'); 'x' sets an unused bit.
+        assert_eq!(last[end], b'w');
+        last[end] = b'x';
+        assert!(SignedGrant::from_text(std::str::from_utf8(&last).unwrap()).is_err());
         let mut bytes = text.into_bytes();
         bytes[0] = b'*';
         assert!(SignedGrant::from_text(std::str::from_utf8(&bytes).unwrap()).is_err());

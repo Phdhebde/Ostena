@@ -8,12 +8,12 @@ use quinn::{IdleTimeout, TransportConfig, VarInt};
 use crate::error::TunnelError;
 
 /// One stream per traffic class.
-const STREAMS_PER_SESSION: u32 = 3;
+const STREAMS_PER_SESSION: u32 = 4;
 
 /// Tunnel bounds. Every value is checked by [`Limits::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// Concurrent sessions (1 to 4096). Each has up to three streams, plus
+    /// Concurrent sessions (1 to 4096). Each has up to four streams, plus
     /// one control stream per tunnel.
     pub max_sessions: u32,
     /// Receive window of one stream, in bytes (16 KiB to 16 MiB).
@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(STREAMS_PER_SESSION as usize, StreamClass::ALL.len());
         let l = Limits::default();
         assert!(l.validate().is_ok());
-        assert_eq!(l.max_streams(), 769);
+        assert_eq!(l.max_streams(), 1025);
         assert_eq!(l.max_buffered_bytes(), 16 * 1024 * 1024);
         assert!(l.transport().is_ok());
     }

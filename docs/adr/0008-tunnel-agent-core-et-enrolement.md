@@ -1,7 +1,10 @@
 # ADR-0008 : Tunnel entre l'agent et le core, et enrôlement
 
-- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (PR 3b). La reconnexion et le repli TCP viendront dans les PR suivantes.
+- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (lot L2, PR 3b). La reconnexion et le repli TCP viendront dans les PR suivantes. Les messages de l'accès SSH natif sont implémentés côté agent et dans le core de test (jalon M1, PR 4) ; leur traitement par le core viendra à la PR 5 du jalon M1.
 - **Date** : 2026-11-11
+- **Révision** : 2026-11-15, messages de l'accès SSH natif et `TUN-E030` (jalon M1, PR 4)
+- **Révision** : 2026-11-25, autorités d'hôtes dans `ssh_trust`, liaison du grant exigée par l'agent (jalon M1, PR 5a)
+- **Révision** : 2026-11-25, classe de flux `enregistrement` pour les transcripts, quatre flux par session (jalon M1, PR 8, ADR-0016)
 
 ## Contexte
 
@@ -20,7 +23,7 @@ Il doit résister aux coupures et rester borné en mémoire. Les algorithmes son
 - des priorités d'envoi par flux ;
 - un contrôle de flux natif.
 
-**Le repli** (PR 5) passe par TLS 1.3 sur TCP avec un **multiplexeur maison minimal**, et non par HTTP/2 :
+**Le repli** (lot L2, PR 5) passe par TLS 1.3 sur TCP avec un **multiplexeur maison minimal**, et non par HTTP/2 :
 - le mTLS va de bout en bout, donc HTTP/2 n'apporte rien pour traverser un pare-feu ou un proxy ;
 - son ordonnanceur interne empêcherait la priorité stricte des entrées.
 
@@ -53,16 +56,19 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 ### Multiplexage, priorités, bornes
 
 - **Flux de contrôle** : le premier flux bidirectionnel, ouvert par l'agent, de priorité 40.
-- **Flux de session** : jusqu'à trois par session, ouverts à la demande, chacun précédé d'un en-tête de 18 octets (version, classe, UUID de session).
+- **Flux de session** : jusqu'à quatre par session, un par classe, ouverts à la demande, chacun précédé d'un en-tête de 18 octets (version, classe, UUID de session).
 
 | Classe | Contenu | Priorité QUIC |
 |---|---|---|
 | interactif | entrées, terminal SSH | 30 |
 | affichage | graphismes RDP et VNC | 20 |
 | transfert | fichiers, gros presse-papiers | 10 |
+| enregistrement | transcript de la session, de l'agent vers le core (ADR-0016) | 25 |
+
+Le flux d'enregistrement passe avant l'affichage et le transfert : une sortie n'est relayée à l'utilisateur qu'une fois remise à l'enregistreur, et ce flux ne doit pas la retarder. Il reste derrière l'interactif. Le core arrête un flux d'enregistrement qu'il refuse (code applicatif 1, `REC-E002`) et, au jalon M1, tout flux de session d'une autre classe (`tunnel.channel_refused`) : il ne relaie pas encore de données de session.
 
 **Bornes par défaut** (`Limits`, validées au démarrage) :
-- 256 sessions, soit 769 flux au plus. La limite est **appliquée par QUIC lui-même** : un flux de plus attend du crédit ;
+- 256 sessions, soit 1025 flux au plus (quatre par session et le flux de contrôle). La limite est **appliquée par QUIC lui-même** : un flux de plus attend du crédit ;
 - fenêtre de 256 Kio par flux et de 8 Mio par connexion, soit **16 Mio de tampons au plus par tunnel**, alloués à la demande ;
 - pas de flux unidirectionnel ni de datagramme.
 
@@ -89,8 +95,10 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 
 | Sens | Messages |
 |---|---|
-| agent → core | `hello`, `ping`, `pong`, `session_request`, `session_closed`, `renew` |
-| core → agent | `hello_ack`, `ping`, `pong`, `policy`, `key_set`, `session_params`, `session_refused`, `certificate`, `shutdown` |
+| agent → core | `hello`, `ping`, `pong`, `session_request`, `session_closed`, `renew`, `ssh_host_key`, `ssh_grant_request` |
+| core → agent | `hello_ack`, `ping`, `pong`, `policy`, `key_set`, `session_params`, `session_refused`, `certificate`, `shutdown`, `ssh_trust`, `ssh_grant`, `login_revoked` |
+
+Les messages `ssh_*` et `login_revoked` sont décrits plus bas (« Accès SSH natif »).
 
 **Tout message reçu est une entrée non fiable.** Toute valeur invalide ferme le tunnel (`TUN-E010`), et une autre version de protocole donne `TUN-E011`.
 
@@ -118,6 +126,37 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 6. l'hôte répondu est résolu une fois et épinglé par le contrôle de périmètre local, puis chaque adresse est vérifiée par la politique du core (`SCP-E…`).
 
 Événements : `agent.policy_applied`, `agent.policy_refused` (code), `agent.keyset_applied`, `agent.keyset_refused` (code), `agent.session_granted`, `agent.session_refused` (code du core), `agent.session_answer_unexpected` ; reprise de l'état : `keyset_state.repaired`, `keyset_state.repair_failed`.
+
+### Accès SSH natif (décidé le 2026-11-15, jalon M1, PR 4)
+
+Le parcours est celui de l'ADR-0010 ; le tunnel porte cinq messages de plus. Aucun nom de champ ne contient `key` : la règle de masquage des journaux (`ostena_common::logging`) les effacerait.
+
+| Message | Sens | Contenu | Contrôles (sinon `TUN-E010`) |
+|---|---|---|---|
+| `ssh_host_key` | agent → core | `p256_public` (point SEC1 non compressé, base64url), `proof` | point sur la courbe ; `proof` signature de 64 octets |
+| `ssh_grant_request` | agent → core | `request_id`, `subject`, `login_session`, `certificate_sha256`, `account`, `resource`, `client_address` | UUID canoniques, 64 hexadécimaux minuscules, compte de 1 à 256 octets sans caractère de contrôle ni espace aux bords, ressource `[a-z0-9][a-z0-9.-]{0,62}`, `ip:port` |
+| `ssh_trust` | core → agent | `version`, `user_ca_p256_public` (1 à 4), `host_ca_p256_public` (1 à 4, requis), `host_certificate` facultatif | version non nulle, autorités de chaque sorte sur la courbe et distinctes, certificat d'hôte du type figé d'au plus 4096 octets |
+| `ssh_grant` | core → agent | `request_id`, `grant` | forme texte du grant |
+| `login_revoked` | core → agent | `login_session` | UUID canonique |
+
+`session_params` gagne `account` et `target_p256_public` (clé hôte épinglée de la cible) : **tous deux requis quand le protocole est SSH**, refusés pour les autres protocoles (`TUN-E010`).
+
+**Preuve de possession de la clé d'hôte.** Sur le modèle de `renew` : signature par la clé d'hôte SSH de l'agent de `"ostena-ssh-host-key-v1\0"` ‖ SHA-256 du certificat du tunnel courant ‖ la clé (`ostena_tunnel::ssh`). Le core la vérifie (`TUN-E022`) avant de certifier la clé et de renvoyer le certificat d'hôte dans `ssh_trust`.
+
+**Confiance SSH** (`GatewayState::apply_ssh_trust`) : la version ne recule pas (`TUN-E030`, la confiance précédente reste) ; la même poussée répétée est ignorée, mais la même version avec un autre contenu est refusée (`TUN-E030`). Elle est publiée au serveur SSH de l'agent, qui vérifie le certificat d'hôte avant de s'en servir, **y compris sa signature par l'une des autorités d'hôtes poussées** (`SSH-E018`, ADR-0010). Les autorités sont des listes pour permettre une rotation.
+
+**Ouverture d'une session SSH** (`Gateway::open_ssh_session`) :
+1. pas de politique, de clés ou de confiance SSH poussées : refus (`TUN-E026`) ;
+2. l'agent envoie `ssh_grant_request` ; sans réponse sous 5 s : `TUN-E027` ; un refus du core revient en `session_refused` avec son code ;
+3. l'agent vérifie le grant et consomme son jti dans son journal, puis exige le sujet du certificat, le protocole SSH et la **liaison** à la session de connexion et au compte demandés (format v2, ADR-0004) (`TUN-E010`) : un grant qui ne correspond pas est donc brûlé ;
+4. le chemin commun suit : `session_request`, jti consommé par le core, `session_params` ;
+5. la réponse doit porter le compte demandé et la clé hôte de la cible (`TUN-E010`), puis la cible est épinglée par le contrôle de périmètre.
+
+`login_revoked` est diffusé au serveur SSH, qui coupe les sessions de cette session de connexion.
+
+Événements : `agent.ssh_trust_applied`, `agent.ssh_trust_refused` (code), `agent.login_revoked`.
+
+Le core de test (`ostena_tunnel::testing`) répond à `ssh_grant_request` depuis un inventaire de ressources nommées (avec des réglages pour mal se comporter : autre sujet, autre protocole, autre compte, liaison à un autre compte, clé hôte absente), enregistre les clés d'hôte reçues et pousse la confiance de ses propres autorités d'utilisateurs et d'hôtes. Le core réel les traite depuis la PR 5b du jalon M1 (ADR-0014) : décision depuis son inventaire, certificat d'hôte, poussées de la confiance SSH et diffusion de `login_revoked`, y compris à la reconnexion d'un agent pour les sessions de connexion révoquées et pas encore expirées pour lesquelles il a reçu un grant.
 
 ### Enrôlement, renouvellement, révocation
 
@@ -320,6 +359,8 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E026` | session refusée : le core n'a pas encore poussé de politique ou de clés |
 | `TUN-E027` | le core n'a pas répondu à la demande de session |
 | `TUN-E028` | politique du core refusée (autre groupe, ou ne se compile pas en production) |
+| `TUN-E029` | registre des agents (ou magasin des jetons) du core illisible : refus plutôt que copie périmée (ADR-0011) |
+| `TUN-E030` | confiance SSH poussée par le core refusée (version inférieure à celle appliquée, ou même version avec un autre contenu) |
 
 Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`, `agent.identity_rotated`, `agent.renewal_impossible`, `tunnel.renewal_overdue` (avertissement, répété chaque heure).
 
@@ -329,4 +370,4 @@ En développement, les trois sont journalisées et acceptées.
 - **Le core de test** est derrière la fonctionnalité `testing`. `cargo xtask check-release` échoue si elle est activée dans le binaire de release ou si le binaire contient son marqueur ; les jobs de build le vérifient.
 - **Nouvelle dépendance** : `quinn`, avec `quinn-proto`, `quinn-udp`, `socket2` et `rand` (identifiants de connexion, rien de cryptographique). `deny.toml` réserve `quinn` à `ostena-tunnel`.
 - **Cible wasm32 retirée de `cargo deny`** : `quinn-proto` dépend de `ring` sous wasm32. `ostena-frame`, seule crate wasm, n'a aucune dépendance. Il faudra remettre cette cible, ciblée, avec `ostena-web-client`.
-- **Windows Server 2016** : la pile UDP ancienne n'est pas couverte en CI. L'essai S5 vérifie le tunnel QUIC et le repli TCP (fiche d'installation, PR 6).
+- **Windows Server 2016** : la pile UDP ancienne n'est pas couverte en CI. L'essai S5 vérifie le tunnel QUIC et le repli TCP (fiche d'installation, lot L2, PR 6).

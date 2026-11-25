@@ -6,14 +6,19 @@ name = "ostena-fuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license = "AGPL-3.0-or-later"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+ostena-audit = { path = "../crates/ostena-audit" }
+ostena-common = { path = "../crates/ostena-common" }
+ostena-crypto = { path = "../crates/ostena-crypto" }
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
+ostena-recorder = { path = "../crates/ostena-recorder" }
 ostena-scope = { path = "../crates/ostena-scope" }
 ostena-ssh = { path = "../crates/ostena-ssh", default-features = false }
 ostena-tunnel = { path = "../crates/ostena-tunnel" }
@@ -33,6 +38,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ssh_certificate"
+path = "fuzz_targets/ssh_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh_login"
+path = "fuzz_targets/ssh_login.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "scope_target"
 path = "fuzz_targets/scope_target.rs"
 test = false
@@ -42,6 +61,13 @@ bench = false
 [[bin]]
 name = "scope_policy"
 path = "fuzz_targets/scope_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_manifest"
+path = "fuzz_targets/release_manifest.rs"
 test = false
 doc = false
 bench = false
@@ -69,6 +95,41 @@ bench = false
 [[bin]]
 name = "tunnel_control_decode"
 path = "fuzz_targets/tunnel_control_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_decode"
+path = "fuzz_targets/audit_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_verify"
+path = "fuzz_targets/audit_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "login_messages"
+path = "fuzz_targets/login_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recorder_decode"
+path = "fuzz_targets/recorder_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recorder_cast"
+path = "fuzz_targets/recorder_cast.rs"
 test = false
 doc = false
 bench = false

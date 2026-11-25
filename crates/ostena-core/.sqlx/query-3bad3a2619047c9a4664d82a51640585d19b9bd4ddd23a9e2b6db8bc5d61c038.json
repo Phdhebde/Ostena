@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO enrollment_token (id, digest, gateway_group, expires_at)\n         VALUES ($1, $2, $3::text::uuid, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3bad3a2619047c9a4664d82a51640585d19b9bd4ddd23a9e2b6db8bc5d61c038"
+}

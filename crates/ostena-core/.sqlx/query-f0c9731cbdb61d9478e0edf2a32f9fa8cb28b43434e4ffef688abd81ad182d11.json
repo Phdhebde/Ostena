@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT record_seq, body FROM audit_head WHERE head_no = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "record_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "record_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "body",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "audit_head",
+            "name": "body"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "f0c9731cbdb61d9478e0edf2a32f9fa8cb28b43434e4ffef688abd81ad182d11"
+}

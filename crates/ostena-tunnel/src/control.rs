@@ -78,6 +78,35 @@ pub enum AgentMessage {
         /// The request.
         request: String,
     },
+    /// The public host key of the agent SSH server, for its host
+    /// certificate (ADR-0010), with a proof of possession bound to the
+    /// tunnel certificate ([`crate::ssh::host_key_message`]).
+    SshHostKey {
+        /// Uncompressed SEC1 point, base64url without padding.
+        p256_public: String,
+        /// Signature by that key, base64url without padding.
+        proof: String,
+    },
+    /// A native SSH user asks for an access (ADR-0010): the core checks the
+    /// login session and the right, then answers [`CoreMessage::SshGrant`]
+    /// or [`CoreMessage::SessionRefused`].
+    SshGrantRequest {
+        /// Correlates the answer.
+        request_id: u64,
+        /// The user (UUID), principal of the certificate.
+        subject: String,
+        /// The `ostena login` session (UUID), key identifier of the
+        /// certificate.
+        login_session: String,
+        /// SHA-256 of the certificate, 64 lowercase hexadecimal characters.
+        certificate_sha256: String,
+        /// Account on the target.
+        account: String,
+        /// Resource name, mapped by the core.
+        resource: String,
+        /// Address of the SSH client, `ip:port`.
+        client_address: String,
+    },
 }
 
 /// A grant verification key pushed by the core.
@@ -154,6 +183,13 @@ pub enum CoreMessage {
         port: u16,
         /// Maximum session length, in seconds.
         max_session_secs: u32,
+        /// Account on the target: required for SSH, absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<String>,
+        /// Pinned host key of the target (uncompressed SEC1 point,
+        /// base64url): required for SSH, absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_p256_public: Option<String>,
     },
     /// The session is refused.
     SessionRefused {
@@ -179,7 +215,45 @@ pub enum CoreMessage {
         /// Why.
         reason: String,
     },
+    /// What the agent SSH server trusts and presents (ADR-0010).
+    SshTrust {
+        /// Increases with every change; a lower version is refused.
+        version: u64,
+        /// Authorities of the user certificates (1 to 4: rotation),
+        /// uncompressed SEC1 points, base64url.
+        user_ca_p256_public: Vec<String>,
+        /// Authorities of the host certificates (1 to 4: rotation),
+        /// uncompressed SEC1 points, base64url: the SSH server checks the
+        /// signature of its own host certificate against them.
+        host_ca_p256_public: Vec<String>,
+        /// Host certificate of the agent (OpenSSH blob, base64url), once the
+        /// core has certified its host key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_certificate: Option<String>,
+    },
+    /// Answer to [`AgentMessage::SshGrantRequest`]: a grant whose audience
+    /// is the gateway group, consumed by the agent as any other.
+    SshGrant {
+        /// The request answered.
+        request_id: u64,
+        /// The grant, text form.
+        grant: String,
+    },
+    /// An `ostena login` session was revoked: its SSH sessions are cut.
+    LoginRevoked {
+        /// The login session (UUID).
+        login_session: String,
+    },
 }
+
+/// Most user certificate authorities pushed at once (rotation).
+pub const MAX_USER_CAS: usize = 4;
+/// Most host certificate authorities pushed at once (rotation).
+pub const MAX_HOST_CAS: usize = 4;
+/// Largest host certificate, in bytes (as `ostena_ssh::cert`).
+pub const MAX_HOST_CERTIFICATE: usize = 4096;
+/// Longest SSH account, in bytes (as `ostena_ssh::login`).
+pub const MAX_ACCOUNT: usize = 256;
 
 fn invalid(what: impl Into<String>) -> TunnelError {
     TunnelError::Protocol(what.into())
@@ -205,6 +279,72 @@ fn uuid(field: &str, value: &str) -> Result<(), TunnelError> {
 fn is_lower_hex(s: &str) -> bool {
     s.bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// An uncompressed SEC1 point on P-256, base64url without padding.
+///
+/// # Errors
+///
+/// [`TunnelError::Protocol`].
+pub fn p256_point(field: &str, value: &str) -> Result<VerifyingKey, TunnelError> {
+    let bytes: [u8; p256::PUBLIC_KEY_LEN] = URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| invalid(format!("{field} n'est pas un point P-256 en base64url")))?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| invalid(format!("{field} hors de la courbe")))
+}
+
+/// An SSH account: 1 to [`MAX_ACCOUNT`] bytes, no control character, no
+/// leading or trailing space (the rules of `ostena_ssh::login`).
+fn account(value: &str) -> Result<(), TunnelError> {
+    if value.is_empty()
+        || value.len() > MAX_ACCOUNT
+        || value.chars().any(char::is_control)
+        || value.starts_with(char::is_whitespace)
+        || value.ends_with(char::is_whitespace)
+    {
+        return Err(invalid("account invalide"));
+    }
+    Ok(())
+}
+
+/// A resource name, `[a-z0-9][a-z0-9.-]{0,62}`.
+fn resource(value: &str) -> Result<(), TunnelError> {
+    let b = value.as_bytes();
+    let valid = b
+        .first()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && b.len() <= 63
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'.' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid("resource invalide"))
+    }
+}
+
+/// An OpenSSH host certificate blob of the frozen type, base64url. Its
+/// content is checked by `ostena_ssh::cert` before the SSH server uses it.
+///
+/// # Errors
+///
+/// [`TunnelError::Protocol`].
+pub fn host_certificate(value: &str) -> Result<Vec<u8>, TunnelError> {
+    const TYPE: &[u8] = b"ecdsa-sha2-nistp256-cert-v01@openssh.com";
+    let blob = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| invalid("host_certificate n'est pas du base64url"))?;
+    let typed = blob.len() > 4 + TYPE.len()
+        && blob[..4] == u32::try_from(TYPE.len()).unwrap_or(0).to_be_bytes()
+        && blob[4..4 + TYPE.len()] == *TYPE;
+    if blob.len() > MAX_HOST_CERTIFICATE || !typed {
+        return Err(invalid(
+            "host_certificate n'est pas un certificat ecdsa-sha2-nistp256 d'au plus 4096 octets",
+        ));
+    }
+    Ok(blob)
 }
 
 impl AgentMessage {
@@ -252,6 +392,35 @@ impl AgentMessage {
                     ));
                 }
                 Ok(())
+            }
+            Self::SshHostKey { p256_public, proof } => {
+                p256_point("p256_public", p256_public)?;
+                let proof_len = URL_SAFE_NO_PAD.decode(proof).map(|p| p.len());
+                if proof_len != Ok(p256::SIGNATURE_LEN) {
+                    return Err(invalid("proof n'est pas une signature P-256 en base64url"));
+                }
+                Ok(())
+            }
+            Self::SshGrantRequest {
+                subject,
+                login_session,
+                certificate_sha256,
+                account: name,
+                resource: target,
+                client_address,
+                ..
+            } => {
+                uuid("subject", subject)?;
+                uuid("login_session", login_session)?;
+                if certificate_sha256.len() != 64 || !is_lower_hex(certificate_sha256) {
+                    return Err(invalid("certificate_sha256 n'est pas 64 hex"));
+                }
+                account(name)?;
+                resource(target)?;
+                client_address
+                    .parse::<std::net::SocketAddr>()
+                    .map(|_| ())
+                    .map_err(|_| invalid("client_address n'est pas ip:port"))
             }
         }
     }
@@ -329,9 +498,12 @@ impl CoreMessage {
             }
             Self::SessionParams {
                 session_id,
+                protocol,
                 host,
                 port,
                 max_session_secs,
+                account: name,
+                target_p256_public,
                 ..
             } => {
                 uuid("session_id", session_id)?;
@@ -339,16 +511,10 @@ impl CoreMessage {
                 if *port == 0 || *max_session_secs == 0 {
                     return Err(invalid("port ou durée de session nuls"));
                 }
-                Ok(())
+                ssh_session_fields(*protocol, name.as_deref(), target_p256_public.as_deref())
             }
             Self::SessionRefused { code, message, .. } => {
-                let b = code.as_bytes();
-                let well_formed = b.len() == 8
-                    && b[..3].iter().all(u8::is_ascii_uppercase)
-                    && b[3] == b'-'
-                    && b[4].is_ascii_uppercase()
-                    && b[5..].iter().all(u8::is_ascii_digit);
-                if !well_formed {
+                if !is_code(code) {
                     return Err(invalid("code de refus mal formé"));
                 }
                 text("message", message, 256)
@@ -376,8 +542,97 @@ impl CoreMessage {
                 Ok(())
             }
             Self::Shutdown { reason } => text("reason", reason, 128),
+            Self::SshTrust { .. } => self.check_ssh_trust(),
+            Self::SshGrant { grant, .. } => SignedGrant::from_text(grant)
+                .map(|_| ())
+                .map_err(|e| invalid(format!("grant : {e}"))),
+            Self::LoginRevoked { login_session } => uuid("login_session", login_session),
         }
     }
+}
+
+/// A stable code, `AAA-A000`.
+fn is_code(code: &str) -> bool {
+    let b = code.as_bytes();
+    b.len() == 8
+        && b[..3].iter().all(u8::is_ascii_uppercase)
+        && b[3] == b'-'
+        && b[4].is_ascii_uppercase()
+        && b[5..].iter().all(u8::is_ascii_digit)
+}
+
+/// The account and the target host key of session parameters: both for
+/// SSH, neither otherwise.
+fn ssh_session_fields(
+    protocol: SessionProtocol,
+    name: Option<&str>,
+    target: Option<&str>,
+) -> Result<(), TunnelError> {
+    match (protocol, name, target) {
+        (SessionProtocol::Ssh, Some(name), Some(target)) => {
+            account(name)?;
+            p256_point("target_p256_public", target).map(|_| ())
+        }
+        (SessionProtocol::Ssh, _, _) => Err(invalid(
+            "account et target_p256_public sont requis pour SSH",
+        )),
+        (_, None, None) => Ok(()),
+        _ => Err(invalid("account et target_p256_public sont réservés à SSH")),
+    }
+}
+
+impl CoreMessage {
+    /// For [`CoreMessage::SshTrust`]: 1 to 4 distinct authorities of each
+    /// kind, a structurally valid host certificate if any, a version above
+    /// 0. Any other message passes.
+    fn check_ssh_trust(&self) -> Result<(), TunnelError> {
+        let Self::SshTrust {
+            version,
+            user_ca_p256_public,
+            host_ca_p256_public,
+            host_certificate,
+        } = self
+        else {
+            return Ok(());
+        };
+        ssh_trust(
+            *version,
+            user_ca_p256_public,
+            host_ca_p256_public,
+            host_certificate.as_deref(),
+        )
+    }
+}
+
+fn ssh_trust(
+    version: u64,
+    user_cas: &[String],
+    host_cas: &[String],
+    certificate: Option<&str>,
+) -> Result<(), TunnelError> {
+    if version == 0 {
+        return Err(invalid("confiance SSH de version 0"));
+    }
+    authorities("user_ca_p256_public", user_cas, MAX_USER_CAS)?;
+    authorities("host_ca_p256_public", host_cas, MAX_HOST_CAS)?;
+    if let Some(certificate) = certificate {
+        host_certificate(certificate)?;
+    }
+    Ok(())
+}
+
+/// 1 to `max` distinct P-256 points.
+fn authorities(field: &str, cas: &[String], max: usize) -> Result<(), TunnelError> {
+    if cas.is_empty() || cas.len() > max {
+        return Err(invalid(format!("{field} : 1 à {max} autorités attendues")));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for ca in cas {
+        if !seen.insert(p256_point(field, ca)?) {
+            return Err(invalid(format!("{field} : autorité en double")));
+        }
+    }
+    Ok(())
 }
 
 /// A control message type, decoded and checked the same way on both sides.

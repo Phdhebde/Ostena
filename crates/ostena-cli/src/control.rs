@@ -27,9 +27,24 @@ pub(crate) struct AgentInfo {
     pub config_fingerprint: String,
     pub sessions: Arc<Sessions>,
     /// The link to the core, once started.
-    pub link: std::sync::OnceLock<Arc<ostena_tunnel::link::AgentLink>>,
+    pub link: Arc<std::sync::OnceLock<Arc<ostena_tunnel::link::AgentLink>>>,
     /// What the core pushed, once the link is started.
-    pub gateway: std::sync::OnceLock<ostena_tunnel::gateway::Gateway>,
+    pub gateway: Arc<std::sync::OnceLock<ostena_tunnel::gateway::Gateway>>,
+    /// The native SSH server, once started (`[agent.ssh]`).
+    #[cfg(feature = "ssh")]
+    pub ssh: std::sync::OnceLock<Arc<crate::ssh::Report>>,
+}
+
+impl AgentInfo {
+    /// The `ssh` block of the status and its sessions.
+    #[cfg_attr(not(feature = "ssh"), expect(clippy::unused_self, reason = "SSH only"))]
+    fn ssh(&self) -> (Value, usize) {
+        #[cfg(feature = "ssh")]
+        if let Some(report) = self.ssh.get() {
+            return (report.status(), report.sessions());
+        }
+        (Value::Null, 0)
+    }
 }
 
 fn unix_now() -> u64 {
@@ -43,6 +58,7 @@ pub(crate) fn answer(info: &AgentInfo, request: &[u8]) -> Value {
     let Ok(request) = serde_json::from_slice::<Request>(request) else {
         return json!({ "error": "requête invalide" });
     };
+    let (ssh, ssh_sessions) = info.ssh();
     match request.command.as_str() {
         "status" => json!({
             "state": "running",
@@ -55,7 +71,8 @@ pub(crate) fn answer(info: &AgentInfo, request: &[u8]) -> Value {
             ),
             "core_link": info.link.get().map(|l| l.status()),
             "pushes": info.gateway.get().map(|g| g.state().versions()),
-            "sessions": info.sessions.active(),
+            "sessions": info.sessions.active() + ssh_sessions,
+            "ssh": ssh,
             "resident_bytes": ostena_platform::memory::resident_bytes(),
             "config_fingerprint": info.config_fingerprint,
         }),
@@ -124,8 +141,10 @@ mod tests {
             gateway_group: "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6".into(),
             config_fingerprint: "sha256:abcd".into(),
             sessions: Arc::new(Sessions::new()),
-            link: std::sync::OnceLock::new(),
-            gateway: std::sync::OnceLock::new(),
+            link: Arc::default(),
+            gateway: Arc::default(),
+            #[cfg(feature = "ssh")]
+            ssh: std::sync::OnceLock::new(),
         }
     }
 

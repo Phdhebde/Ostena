@@ -3,6 +3,7 @@
 - **Statut** : Accepté
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-11, support Linux à partir de Debian 12 (systemd 252), Debian 11 abandonné
+- **Révision** : 2026-11-25, serveur SSH natif dans le service (`AGT-E010`, arrêt, statut), empreinte mesurée avec et sans SSH, seuil bloquant (jalon M1, PR 6)
 
 ## Contexte
 
@@ -88,7 +89,7 @@ Un trait commun, `ServiceManager`, masque la différence entre le SCM et systemd
 
 Sur `SIGTERM` ou `SIGINT`, Ctrl-C, ou l'arrêt par le SCM, l'agent suit cette séquence :
 1. il passe en arrêt (`STOPPING=1` pour systemd) et refuse les nouvelles sessions ;
-2. il demande aux sessions en cours de se terminer et leur laisse `agent.shutdown_grace_secs` (1 à 300 s), puis interrompt les autres ;
+2. il demande aux sessions en cours de se terminer et leur laisse `agent.shutdown_grace_secs` (1 à 300 s), puis interrompt les autres. Le serveur SSH natif (ADR-0010) cesse d'écouter et déconnecte ses sessions dans le même délai, qui couvre toutes les sessions (pas un délai par type) ; leur fin, y compris celle des sessions en cours d'autorisation, est signalée au core avant la fermeture du lien, dans ce délai (`agent.ssh_stopped`) ;
 3. il ferme le plan de contrôle (le socket est supprimé) ;
 4. il fait un `fsync` du journal anti-rejeu et libère son verrou.
 
@@ -108,7 +109,9 @@ Mesures au repos, pour un objectif indicatif de 20 Mio :
 
 Le lien coûte environ 1,5 Mio sous Linux et 3,4 Mio sous Windows. **Presque tout est du code** : les pages de la pile QUIC/TLS et d'aws-lc dans l'exécutable, partagées et en lecture seule, et, sous Windows, `mswsock.dll`, chargée par la première socket UDP. Sous Windows, la liste des adresses de l'agent (`GetAdaptersAddresses`, nécessaire au plancher du contrôle de périmètre) charge aussi `NSI.dll`, `dhcpcsvc.dll`, `dhcpcsvc6.dll` et `DNSAPI.dll` : environ 0,9 Mio de pages partagées. La mémoire anonyme ne croît que d'environ 100 Kio (tampons QUIC, configuration TLS) ; la mémoire privée Windows passe de 1,3 à 2,0 Mio ; le nombre de threads ne change pas. Aucune part évitable n'a été trouvée. Une mesure prise pendant un autre build sur la même machine est faussée (11,5 Mio relevés ainsi sous Windows) : mesurer sur une machine au repos.
 
-**Seuil de régression** (décidé le 2026-11-14) : une régression d'empreinte n'est bloquante que si elle dépasse à la fois **+10 % et 1 Mio** en valeur absolue. Sur une base de quelques Mio, 10 % seuls déclencheraient pour quelques centaines de Kio de pages d'image. Ce banc est affiché en CI sans seuil bloquant, comme les autres (ADR-0005).
+**Seuil de régression** (décidé le 2026-11-14) : une régression d'empreinte n'est bloquante que si elle dépasse à la fois **+10 % et 1 Mio** en valeur absolue. Sur une base de quelques Mio, 10 % seuls déclencheraient pour quelques centaines de Kio de pages d'image.
+
+**Avec et sans SSH** (jalon M1, PR 6) : `cargo xtask footprint` mesure chaque état deux fois. La référence est un agent construit sans le serveur SSH (fonctionnalité `ssh` d'`ostena-cli` coupée, pour cette mesure seulement : `check-release` refuse un binaire de release sans elle). L'autre mesure est l'agent de release avec `[agent.ssh]` à l'écoute. La commande **échoue**, donc la CI aussi, si l'agent avec SSH dépasse la référence de +10 % et de 1 Mio à la fois, s'il charge une bibliothèque ou une DLL que la référence ne charge pas, ou une DLL d'interface graphique ou COM (ADR-0009). Les autres bancs restent affichés sans seuil (ADR-0005).
 
 ### Codes et événements
 
@@ -123,8 +126,9 @@ Le lien coûte environ 1,5 Mio sous Linux et 3,4 Mio sous Windows. **Presque tou
 | `AGT-E007` | serveur du plan de contrôle non authentique |
 | `AGT-E008` | erreur d'entrée-sortie, délai ou taille sur le plan de contrôle |
 | `AGT-E009` | accès au plan de contrôle refusé |
+| `AGT-E010` | adresse d'écoute du serveur SSH natif inutilisable (`agent.ssh.listen`) : l'agent refuse de démarrer |
 
-Événements : `agent.started`, `agent.stopping`, `agent.sessions_closed`, `agent.stopped`, `agent.idle_footprint`, `agent.config_refused`, `agent.replay_store_refused`, `agent.control_unavailable`, `agent.control_denied`, `agent.control_error`.
+Événements : `agent.started`, `agent.stopping`, `agent.sessions_closed`, `agent.stopped`, `agent.idle_footprint`, `agent.config_refused`, `agent.replay_store_refused`, `agent.control_unavailable`, `agent.control_denied`, `agent.control_error` ; pour le serveur SSH natif (ADR-0010) : `agent.ssh_started`, `agent.ssh_unavailable`, `agent.ssh_key_created`, `agent.ssh_stopped`.
 
 ### `unsafe` dans `ostena-platform`
 

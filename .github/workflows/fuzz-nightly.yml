@@ -1,12 +1,16 @@
 name: Fuzz (nightly)
 
-# One hour per fuzz target, every night, in parallel. Crashes are published
-# as artifacts. Keep the list in sync with FUZZ_TARGETS in xtask (checked by
-# its tests).
+# Each fuzz target in parallel, one hour each, every night; crashes are
+# published as artifacts. Keep the list in sync with FUZZ_TARGETS in xtask
+# (checked by its tests). A manual run can choose the duration.
 on:
   schedule:
     - cron: "17 1 * * *"
   workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "3600"
 
 permissions:
   contents: read
@@ -21,10 +25,12 @@ env:
 
 jobs:
   fuzz:
+    # Not in forks: a nightly hour per target is this repository's job.
+    if: github.repository == 'Phdhebde/Ostena'
     strategy:
       fail-fast: false
       matrix:
-        target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, ssh_precheck]
+        target: [grant_decode, login_messages, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, ssh_precheck, ssh_certificate, ssh_login, audit_decode, audit_verify, release_manifest, recorder_decode, recorder_cast]
     runs-on: ubuntu-24.04
     timeout-minutes: 80
     steps:
@@ -45,7 +51,9 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> target
-      - run: cargo xtask fuzz 3600 ${{ matrix.target }}
+      - run: cargo xtask fuzz "$SECONDS_PER_TARGET" ${{ matrix.target }}
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '3600' }}
       # Crash inputs (crash-*, leak-*, timeout-*, oom-*), to reproduce with
       # `cargo fuzz run <target> <file>` and add to the corpus once fixed.
       - if: failure()

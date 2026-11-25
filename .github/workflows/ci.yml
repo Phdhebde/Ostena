@@ -1,17 +1,36 @@
 name: CI
 
+# Public repository: GitHub-hosted runners cost nothing, so every pull request
+# runs everything, Windows included. Hence:
+# - pushes to dev and main run the same jobs and save the caches that pull
+#   requests restore (pull requests only read them, so the cache stays small);
+# - the merge queue (merge_group) runs them again on the merged result;
+# - a weekly run on main also catches new RustSec advisories and runs the
+#   benches;
+# - documentation-only changes run the light checks only (job `changes`),
+#   so that the required check `ci-ok` still reports on them;
+# - GitHub-hosted runners only: a self-hosted runner would execute the code of
+#   pull requests from forks.
+#
+# Branch protection of dev and main requires the single check `ci-ok`, which
+# succeeds only when every job succeeded or was skipped as documentation-only.
 on:
-  push:
-    branches: [main]
   pull_request:
+  push:
+    branches: [main, dev]
+  merge_group:
+  schedule:
+    - cron: "0 3 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A new push to a pull request cancels its previous run; runs on dev and main
+# go to the end, so that each one saves its caches.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,70 +39,192 @@ env:
 
 # Third-party actions are pinned by commit SHA; the tag is in the comment.
 jobs:
-  fmt:
+  # Whether the change touches more than documentation: docs/**, *.md and
+  # LICENSE only skip the build jobs. Scheduled and manual runs, and pushes
+  # without a known previous commit, run everything.
+  changes:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - run: rustup toolchain install
-      - run: cargo fmt --all --check
-      - run: cargo xtask check-secrets
-
-  clippy:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2025]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2025]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: cargo test --workspace --locked
-      # Displayed only: no regression gate yet (ADR-0005).
-      - if: runner.os == 'Linux'
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
         run: |
-          cargo bench --locked -p ostena-scope
-          cargo bench --locked -p ostena-frame
-          cargo bench --locked -p ostena-tunnel
+          case "$EVENT" in
+            pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
+            merge_group) base="$MQ_BASE"; head="$MQ_HEAD" ;;
+            push) base="$PUSH_BEFORE"; head="$PUSH_AFTER" ;;
+            *) base=""; head="" ;;
+          esac
+          code=true
+          if [ -n "$base" ] && [ -n "$head" ] && ! [[ "$base" =~ ^0+$ ]] \
+             && files="$(git diff --name-only "$base" "$head")"; then
+            code=false
+            while IFS= read -r f; do
+              case "$f" in
+                docs/*|*.md|LICENSE) ;;
+                *) code=true ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Code changed: $code"
 
-  deny:
+  # Light checks gathered in one job: one checkout and one toolchain for all.
+  checks:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
           persist-credentials: false
       - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          tool: cargo-deny
+          tool: cargo-deny,cargo-cyclonedx
+      - run: cargo fmt --all --check
+      - run: cargo xtask check-secrets
       - run: cargo deny --locked check
       - run: cargo deny --manifest-path fuzz/Cargo.toml --locked check
+      - run: cargo xtask sbom
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom-cyclonedx
+          path: target/sbom/
+          retention-days: 30
+      - name: Every commit carries a Signed-off-by matching its author
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            author="$(git log -1 --format='%an <%ae>' "$c")"
+            if ! git log -1 --format='%B' "$c" | grep -Fqx "Signed-off-by: $author"; then
+              echo "::error::commit $c has no 'Signed-off-by: $author'"
+              status=1
+            fi
+          done
+          exit $status
 
-  build-musl:
+  linux:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      # ostena-frame is also the protocol core of the browser client.
+      - run: cargo build --locked --release -p ostena-frame --target wasm32-unknown-unknown
+      # Displayed only: no regression gate yet (ADR-0005). On dev and main.
+      # The SSH latency benches run in their own job (bench-ssh).
+      - if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        run: |
+          cargo bench --locked -p ostena-scope
+          cargo bench --locked -p ostena-frame
+
+  # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
+  # our server behind the pre-check (sessions, refusals, audit) and, with a
+  # certificate, through the agent server to a target; the SSH access through
+  # the gateway against the test core; our client against a Debian 12
+  # OpenSSH server in Docker, with the agent key installed as
+  # `restrict,from=`; then the native access end to end to that target,
+  # through the real agent binary (test agent_ssh of ostena-cli).
+  # Needs Docker.
+  ssh-interop:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: ssh -V
+      - run: cargo test --locked -p ostena-ssh --test interop --test gateway
+        env:
+          OSTENA_REQUIRE_OPENSSH: "1"
+      - run: bash tests/ssh/debian12-target.sh
+      - run: bash tests/ssh/native-e2e.sh
+
+  # The core against PostgreSQL 16 as in production (ADR-0011): Unix socket,
+  # `peer` authentication, a role named after the runner account. Tests that
+  # need a database are mandatory here (OSTENA_REQUIRE_DB). Then the offline
+  # query cache (crates/ostena-core/.sqlx) is checked against the migrations.
+  # Uses the PostgreSQL preinstalled on the runner (sudo).
+  core-db:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      OSTENA_TEST_DB_SOCKET: /var/run/postgresql
+      OSTENA_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: sqlx-cli@0.9.0
+      - name: PostgreSQL 16, local connections by peer only
+        run: |
+          sudo systemctl start postgresql.service
+          psql --version | grep -q ' 16\.'
+          sudo -u postgres createuser --createdb "$USER"
+          echo "OSTENA_TEST_DB_USER=$USER" >> "$GITHUB_ENV"
+      - run: cargo test --locked -p ostena-core -p ostena-cli
+      - name: The offline query cache matches the migrations
+        working-directory: crates/ostena-core
+        run: |
+          createdb -h /var/run/postgresql ostena_prepare
+          # sqlx wants a user and a host name; `host=` then selects the socket.
+          export DATABASE_URL="postgres://$USER@localhost/ostena_prepare?host=/var/run/postgresql"
+          cargo sqlx migrate run
+          cargo sqlx prepare --check -- --all-targets
+
+  # Static release binary, then the agent service lifecycle under systemd
+  # (install, status, permissions, hardening score, clean stop, bounded
+  # restarts, uninstall), the unit on systemd 252 (Debian 12), and the idle
+  # footprint. Needs a full VM with systemd.
+  release-linux:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,6 +233,8 @@ jobs:
       # aws-lc-sys compiles C for the musl target with musl-gcc.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo build --release --locked --package ostena-cli --target x86_64-unknown-linux-musl
       - name: Check the binary is statically linked
         run: |
@@ -106,64 +249,18 @@ jobs:
           name: ostena-x86_64-unknown-linux-musl
           path: target/x86_64-unknown-linux-musl/release/ostena
           retention-days: 7
+      - run: cargo build --release --locked --package ostena-cli
+      - run: bash tests/agent/linux-service.sh target/release/ostena
+      # The static musl binary is the Linux release artifact: measure it.
+      - run: cargo xtask footprint --target x86_64-unknown-linux-musl
 
-  build-wasm:
+  # All targets in one job, 30 s each: the fuzz build is shared. Longer runs:
+  # fuzz-nightly.yml.
+  fuzz-smoke:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      # ostena-frame is also the protocol core of the browser client.
-      - run: cargo build --locked --release -p ostena-frame --target wasm32-unknown-unknown
-
-  build-windows:
-    runs-on: windows-2025
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: cargo build --release --locked --package ostena-cli --target x86_64-pc-windows-msvc
-      - run: target/x86_64-pc-windows-msvc/release/ostena.exe --version
-      - run: cargo xtask check-release target/x86_64-pc-windows-msvc/release/ostena.exe
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: ostena-x86_64-pc-windows-msvc
-          path: target/x86_64-pc-windows-msvc/release/ostena.exe
-          retention-days: 7
-
-  sbom:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
-        with:
-          tool: cargo-cyclonedx
-      - run: cargo xtask sbom
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: sbom-cyclonedx
-          path: target/sbom/
-          retention-days: 30
-
-  # One job per target, in parallel. Keep the list in sync with FUZZ_TARGETS
-  # in xtask (checked by its tests). Longer runs: fuzz-nightly.yml.
-  fuzz:
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, ssh_precheck]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -178,69 +275,56 @@ jobs:
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
         with:
           shared-key: fuzz
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: |
             . -> target
             fuzz -> target
-      - run: cargo xtask fuzz 30 ${{ matrix.target }}
+      # No target given: every target of FUZZ_TARGETS.
+      - run: cargo xtask fuzz 30
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-artifacts-${{ matrix.target }}
+          name: fuzz-artifacts
           path: fuzz/artifacts/
           retention-days: 30
 
-  # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
-  # our server behind the pre-check (sessions, refusals, audit), then our
-  # client against a Debian 12 OpenSSH server in Docker, with the agent key
-  # installed as `restrict,from=`.
-  ssh-interop:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: ssh -V
-      - run: cargo test --locked -p ostena-ssh --test interop
-        env:
-          OSTENA_REQUIRE_OPENSSH: "1"
-      - run: bash tests/ssh/debian12-target.sh
-
-  # Agent service lifecycle under systemd (install, status, permissions,
-  # hardening score, clean stop, bounded restarts, uninstall), the unit on
-  # systemd 252 (Debian 12), and the idle footprint.
-  agent-linux:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
-      - run: cargo build --release --locked --package ostena-cli
-      - run: bash tests/agent/linux-service.sh target/release/ostena
-      - run: cargo xtask footprint
-
-  # Agent service lifecycle under the SCM (account, restricted SID, required
-  # privileges, bounded failure actions, ACLs, status, non-administrator
-  # refused on the control pipe, clean stop, uninstall).
-  agent-windows:
+  # Clippy, tests, the release binary and the agent service lifecycle under
+  # the SCM (account, restricted SID, required privileges, bounded failure
+  # actions, ACLs, status, non-administrator refused on the control pipe,
+  # clean stop, uninstall) in one job, so the release build is shared.
+  # Windows 2022 runs the service part only.
+  windows:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
         os: [windows-2025, windows-2022]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - if: matrix.os == 'windows-2025'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: matrix.os == 'windows-2025'
+        run: cargo test --workspace --locked
+      # The host target is x86_64-pc-windows-msvc: same binary as with an
+      # explicit --target, in target/release, shared with xtask footprint.
       - run: cargo build --release --locked --package ostena-cli
+      - run: target/release/ostena.exe --version
+      - run: cargo xtask check-release target/release/ostena.exe
+      - if: matrix.os == 'windows-2025'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ostena-x86_64-pc-windows-msvc
+          path: target/release/ostena.exe
+          retention-days: 7
       - run: tests/agent/windows-service.ps1 -Binary target/release/ostena.exe
         shell: pwsh
       - run: cargo xtask footprint
@@ -252,26 +336,171 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  dco:
-    if: github.event_name == 'pull_request'
+  # SSH latency (CLAUDE.md: at most 3 ms added at p99 by SSH, session set up
+  # in less than 5 s): the agent relay and the tunnel, on every run. The
+  # summary of the job shows the table; the raw results are an artifact.
+  # Displayed only, never a gate (ADR-0005).
+  bench-ssh:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
-      - name: Every commit carries a Signed-off-by matching its author
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo xtask bench-ssh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-ssh-latency
+          path: target/bench/
+          retention-days: 90
+
+  # Signed deliverables (ADR-0017), with a TEST key drawn for this run only
+  # and never kept: the Linux and Windows release binaries and the SBOMs in
+  # one manifest, signed and verified by the binary itself, then a modified
+  # copy must be refused. The artifact holds the files, the manifest, its
+  # signature and the public test key.
+  release-sign:
+    needs: [changes, checks, release-linux, windows]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-unknown-linux-musl
+          path: signed
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-pc-windows-msvc
+          path: signed
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-cyclonedx
+          path: signed
+      - name: Sign with a test key, verify, refuse a modified copy
         run: |
+          chmod +x signed/ostena
+          tool="$RUNNER_TEMP/ostena"
+          cp signed/ostena "$tool"
+          key="$RUNNER_TEMP/release-test.key"
+          "$tool" ca key new --key-out "$key" --public-out "$RUNNER_TEMP/release-test.pub"
+          "$tool" release sign --key "$key" --out "$RUNNER_TEMP/ostena-release.manifest" signed/*
+          rm -f "$key"
+          mv "$RUNNER_TEMP/ostena-release.manifest" "$RUNNER_TEMP/ostena-release.manifest.sig" \
+             "$RUNNER_TEMP/release-test.pub" signed/
+          "$tool" release verify signed/ostena-release.manifest --key signed/release-test.pub
+          cp -r signed "$RUNNER_TEMP/tampered"
+          printf 'x' >> "$RUNNER_TEMP/tampered/ostena.exe"
           status=0
-          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
-            author="$(git log -1 --format='%an <%ae>' "$c")"
-            if ! git log -1 --format='%B' "$c" | grep -Fqx "Signed-off-by: $author"; then
-              echo "::error::commit $c has no 'Signed-off-by: $author'"
-              status=1
-            fi
+          "$tool" release verify "$RUNNER_TEMP/tampered/ostena-release.manifest" \
+            --key signed/release-test.pub || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a modified file must be refused with exit code 1, got $status"
+            exit 1
+          fi
+          {
+            echo "## Livrables signés (clé de test)"
+            echo
+            echo "Clé de test tirée pour cette exécution et détruite : elle ne prouve que"
+            echo "l'intégrité de l'artefact \`ostena-test-signed\`, pas son origine (ADR-0017)."
+            echo
+            echo '```text'
+            "$tool" release verify signed/ostena-release.manifest --key signed/release-test.pub
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ostena-test-signed
+          path: signed/
+          retention-days: 7
+
+  # The M1 demonstration end to end (docs/demo-m1.md), on the signed Linux
+  # release binary, whose signature is checked first: ostena login with
+  # password and TOTP, ssh account@resource@bastion through the agent to a
+  # real OpenSSH target in a network namespace, sealed transcript, offline
+  # audit verification, then tampering found in a transcript, the export and
+  # the database. Local processes only (PostgreSQL of the runner, sudo for
+  # the namespace).
+  demo-m1:
+    needs: [changes, release-sign]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-test-signed
+          path: signed
+      - name: The binary is the one signed by release-sign
+        run: |
+          chmod +x signed/ostena
+          signed/ostena release verify signed/ostena-release.manifest --key signed/release-test.pub
+      - name: PostgreSQL 16, local connections by peer only; OpenSSH server
+        run: |
+          sudo systemctl start postgresql.service
+          psql --version | grep -q ' 16\.'
+          sudo -u postgres createuser --createdb "$USER"
+          command -v sshd || test -x /usr/sbin/sshd \
+            || (sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server)
+          ssh -V
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      # The codes an authenticator would show: an example of ostena-crypto,
+      # never in the release binary.
+      - run: cargo build --locked -p ostena-crypto --example totp_code
+      - run: bash lab/demo-m1.sh
+        env:
+          OSTENA_BIN: ${{ github.workspace }}/signed/ostena
+          OSTENA_DEMO_DIR: ${{ runner.temp }}/demo-m1
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: demo-m1-logs
+          path: |
+            ${{ runner.temp }}/demo-m1/*.log
+            ${{ runner.temp }}/demo-m1/target/sshd.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The single required check of the branch protection: every job must have
+  # succeeded, or been skipped by `changes` for a documentation-only change.
+  ci-ok:
+    if: always()
+    needs:
+      - changes
+      - checks
+      - linux
+      - ssh-interop
+      - core-db
+      - release-linux
+      - fuzz-smoke
+      - windows
+      - bench-ssh
+      - release-sign
+      - demo-m1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          echo "results: $RESULTS (code changed: $CODE)"
+          for r in $RESULTS; do
+            case "$r" in
+              success) ;;
+              skipped) [ "$CODE" = "false" ] || { echo "::error::a job was skipped"; exit 1; } ;;
+              *) echo "::error::a job ended with $r"; exit 1 ;;
+            esac
           done
-          exit $status

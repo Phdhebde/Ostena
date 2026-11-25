@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, reason = "tests")]
 
-use super::{Reader, create};
+use super::{Reader, create, create_new};
 
 fn dir(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("ostena-private-{name}-{}", std::process::id()));
@@ -79,4 +79,26 @@ fn reader_ace_reads_and_deletes_only() {
         sddl.ends_with(";;;S-1-5-18)") || sddl.contains("(A;;FRSD;;;"),
         "{sddl}"
     );
+}
+
+#[test]
+fn streamed_file_is_created_once_with_the_same_rights() {
+    use std::io::Write;
+    let dir = dir("stream");
+    let path = dir.join("export.bin");
+    let mut file = create_new(&path, Reader::CurrentProcess).unwrap();
+    file.write_all(b"one").unwrap();
+    file.write_all(b"two").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    assert_eq!(std::fs::read(&path).unwrap(), b"onetwo");
+    let again = create_new(&path, Reader::CurrentProcess).unwrap_err();
+    assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

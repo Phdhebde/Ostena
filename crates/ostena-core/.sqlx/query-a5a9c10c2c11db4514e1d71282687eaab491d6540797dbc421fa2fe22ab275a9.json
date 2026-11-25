@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT system_user AS \"user\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a5a9c10c2c11db4514e1d71282687eaab491d6540797dbc421fa2fe22ab275a9"
+}

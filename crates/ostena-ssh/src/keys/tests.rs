@@ -37,6 +37,38 @@ fn public_line_format() {
 }
 
 #[test]
+fn public_line_of_a_verifying_key_matches_the_generated_line() {
+    let (signing, _) = SigningKey::generate().unwrap();
+    let generated = encode(&signing, "ca").unwrap();
+    let public = signing.verifying_key();
+    assert_eq!(public_line(&public, "ca"), generated.public);
+    assert_eq!(
+        public_line(&public, ""),
+        generated.public.trim_end_matches(" ca")
+    );
+    assert_eq!(parse_public_line(&generated.public), Some(public));
+    assert_eq!(parse_public_line(&public_line(&public, "")), Some(public));
+}
+
+#[test]
+fn foreign_public_lines_are_refused() {
+    let (signing, _) = SigningKey::generate().unwrap();
+    let line = public_line(&signing.verifying_key(), "x");
+    let blob = line.split(' ').nth(1).unwrap();
+    for bad in [
+        String::new(),
+        "ecdsa-sha2-nistp256".to_owned(),
+        line.replacen("ecdsa-sha2-nistp256", "ssh-ed25519", 1),
+        format!("ecdsa-sha2-nistp256 {}A", &blob[..blob.len() - 1]),
+        format!("ecdsa-sha2-nistp256 {blob}AAAA"),
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+            .to_owned(),
+    ] {
+        assert_eq!(parse_public_line(&bad), None, "{bad}");
+    }
+}
+
+#[test]
 fn short_scalar_is_detected() {
     let key = short_scalar_key();
     // SECRET-EXPOSURE: test only.
@@ -110,5 +142,67 @@ proptest! {
         file.push(b'\n');
         file.extend_from_slice(END.as_bytes());
         let _ = scalar_len(&file);
+        let _ = decode(&SecretBytes::from(file));
     }
+}
+
+#[test]
+fn decode_gives_back_the_generated_key_and_its_comment() {
+    let key = generate("ostena-agent-gw01").unwrap();
+    let (signing, comment) = decode(&key.private).unwrap();
+    assert_eq!(comment, "ostena-agent-gw01");
+    assert_eq!(encode(&signing, &comment).unwrap().public, key.public);
+    // A 31-byte scalar, refused by ssh-key, is still read here.
+    let short = short_scalar_key();
+    let (signing, _) = decode(&short.private).unwrap();
+    assert_eq!(encode(&signing, "short").unwrap().public, short.public);
+}
+
+/// `file` with the public point of its private section replaced by `to`.
+fn with_public(file: &SecretBytes, from: &[u8; 65], to: &[u8; 65]) -> SecretBytes {
+    // SECRET-EXPOSURE: test only.
+    #[expect(clippy::disallowed_methods)]
+    let text = std::str::from_utf8(file.expose_secret())
+        .unwrap()
+        .to_owned();
+    let inner: String = text
+        .trim()
+        .strip_prefix(BEGIN)
+        .unwrap()
+        .strip_suffix(END)
+        .unwrap()
+        .split_whitespace()
+        .collect();
+    let mut body = STANDARD.decode(inner).unwrap();
+    let at = body.windows(65).rposition(|w| w == from).unwrap();
+    body[at..at + 65].copy_from_slice(to);
+    SecretBytes::from(format!("{BEGIN}\n{}\n{END}\n", STANDARD.encode(body)).into_bytes())
+}
+
+#[test]
+fn decode_refuses_garbage_and_an_inconsistent_file() {
+    for bad in [&b""[..], b"not a key", &vec![b'a'; MAX_KEY_FILE + 1]] {
+        assert_eq!(
+            decode(&SecretBytes::from(bad.to_vec()))
+                .err()
+                .unwrap()
+                .code(),
+            "SSH-E008"
+        );
+    }
+    let (a, _) = decode(&generate("a").unwrap().private).unwrap();
+    let (b, _) = decode(&generate("b").unwrap().private).unwrap();
+    let file = encode(&a, "a").unwrap().private;
+    let forged = with_public(
+        &file,
+        &a.verifying_key().to_bytes(),
+        &b.verifying_key().to_bytes(),
+    );
+    assert!(
+        decode(&forged)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("ne correspond pas")
+    );
 }

@@ -14,3 +14,10 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0008](0008-tunnel-agent-core-et-enrolement.md) | Tunnel entre l'agent et le core, et enrôlement | Accepté en partie |
 | [0009](0009-choix-cryptographiques.md) | Choix cryptographiques et conformité aux guides ANSSI | Accepté |
 | [0010](0010-acces-ssh-natif.md) | Accès SSH natif | Accepté en partie |
+| [0011](0011-socle-du-core-et-postgresql.md) | Socle du core et base PostgreSQL | Accepté |
+| [0012](0012-chaine-d-audit-du-core.md) | Chaîne d'audit du core | Accepté |
+| [0013](0013-applications-web-et-navigateur-isole.md) | Applications web par navigateur isolé | Proposé |
+| [0014](0014-inventaire-minimal-et-decision-d-acces-ssh.md) | Inventaire minimal et décision d'accès SSH du core | Accepté |
+| [0015](0015-transport-https-de-l-api-du-core.md) | Transport HTTPS de l'API du core | Accepté |
+| [0016](0016-transcripts-des-sessions.md) | Transcripts des sessions | Accepté |
+| [0017](0017-signature-des-livrables.md) | Signature des livrables | Accepté |

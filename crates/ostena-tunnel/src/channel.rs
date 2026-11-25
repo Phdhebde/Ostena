@@ -2,7 +2,7 @@
 //!
 //! Within a session, keyboard and mouse input and a file upload travel in the
 //! same direction; in one stream they would queue behind each other. A
-//! session therefore opens up to three streams, one per [`StreamClass`], and
+//! session therefore opens up to four streams, one per [`StreamClass`], and
 //! QUIC sends the higher priorities first. Each stream starts with an
 //! 18-byte header: version, class, session identifier.
 
@@ -28,16 +28,26 @@ pub enum StreamClass {
     Display = 2,
     /// Files and large clipboard transfers.
     Transfer = 3,
+    /// The transcript of the session, from the agent to the core
+    /// (ADR-0016). Below the input, above the graphics: an output waits
+    /// for its recording before it reaches the user.
+    Recording = 4,
 }
 
 impl StreamClass {
     /// Every class.
-    pub const ALL: [Self; 3] = [Self::Interactive, Self::Display, Self::Transfer];
+    pub const ALL: [Self; 4] = [
+        Self::Interactive,
+        Self::Recording,
+        Self::Display,
+        Self::Transfer,
+    ];
 
     /// The QUIC send priority (higher goes first).
     pub const fn priority(self) -> i32 {
         match self {
             Self::Interactive => 30,
+            Self::Recording => 25,
             Self::Display => 20,
             Self::Transfer => 10,
         }
@@ -82,7 +92,8 @@ mod tests {
     #[test]
     fn priorities_are_strict() {
         assert!(CONTROL_PRIORITY > StreamClass::Interactive.priority());
-        assert!(StreamClass::Interactive.priority() > StreamClass::Display.priority());
+        assert!(StreamClass::Interactive.priority() > StreamClass::Recording.priority());
+        assert!(StreamClass::Recording.priority() > StreamClass::Display.priority());
         assert!(StreamClass::Display.priority() > StreamClass::Transfer.priority());
     }
 
@@ -95,7 +106,7 @@ mod tests {
         let mut bad = encode_header(id, StreamClass::Display);
         bad[0] = 2;
         assert_eq!(decode_header(&bad), Err(TunnelError::Version(2)));
-        for class in [0u8, 4, 0xff] {
+        for class in [0u8, 5, 0xff] {
             let mut bad = encode_header(id, StreamClass::Display);
             bad[1] = class;
             assert!(matches!(decode_header(&bad), Err(TunnelError::Protocol(_))));

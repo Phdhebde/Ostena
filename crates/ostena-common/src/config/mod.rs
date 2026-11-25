@@ -13,6 +13,7 @@
 //! [`Secret`](crate::secret::Secret) where they are used. See ADR-0003.
 
 pub mod agent;
+pub mod core;
 mod permissions;
 pub mod scope;
 mod validation;
@@ -22,7 +23,11 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub use agent::{AgentConfig, InfrastructureEndpoint};
+pub use self::core::{
+    CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig, DatabaseTcp,
+    KeySource, TotpAlgorithmSetting,
+};
+pub use agent::{AgentConfig, AgentSshConfig, InfrastructureEndpoint, SshPaths};
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{
     Code, GRANT_SIGNATURE_ALGORITHM, KNOWN_SIGNATURE_ALGORITHMS, Violation, Violations,
@@ -46,6 +51,8 @@ pub struct Config {
     pub audit: AuditConfig,
     /// Gateway agent (only on gateway hosts).
     pub agent: Option<AgentConfig>,
+    /// The core (only on the core host).
+    pub core: Option<CoreConfig>,
 }
 
 /// Run mode. Production refuses every weakening option.
@@ -267,11 +274,28 @@ impl Config {
         Violations::into_result(validation::consistency(self))
     }
 
-    /// Options that lower security (`CFG-P001` to `CFG-P005`).
+    /// Options that lower security (`CFG-P…`), refused in production.
     ///
-    /// `CFG-P006` depends on the file system and is checked by [`load`].
+    /// The rules on files (`CFG-P006`, `CFG-P008`, `CFG-P009`, `CFG-P011`)
+    /// depend on the file system and are checked by [`load`].
     pub fn weakenings(&self) -> Vec<Violation> {
-        validation::weakenings(self)
+        self.weakenings_at(unix_now())
+    }
+
+    /// [`Config::weakenings`] at `now` (Unix seconds).
+    pub fn weakenings_at(&self, now: u64) -> Vec<Violation> {
+        validation::weakenings(self, now)
+    }
+
+    /// Weakenings tolerated in production, logged at every start:
+    /// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) always.
+    pub fn tolerated(&self) -> Vec<Violation> {
+        self.tolerated_at(unix_now())
+    }
+
+    /// [`Config::tolerated`] at `now` (Unix seconds).
+    pub fn tolerated_at(&self, now: u64) -> Vec<Violation> {
+        validation::tolerated(self, now)
     }
 
     /// Consistency rules plus refusal of every weakening option.
@@ -281,9 +305,16 @@ impl Config {
     /// Every rule broken, at once.
     pub fn validate_for_production(&self) -> Result<(), Violations> {
         let mut all = validation::consistency(self);
-        all.extend(validation::weakenings(self));
+        all.extend(validation::weakenings(self, unix_now()));
         Violations::into_result(all)
     }
+}
+
+/// The wall clock, Unix seconds (0 before 1970).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A configuration ready for startup.
@@ -295,6 +326,8 @@ pub struct LoadedConfig {
     pub path: PathBuf,
     /// Weakening options accepted because the mode is development.
     pub weakenings: Vec<Violation>,
+    /// Weakenings tolerated in production until a date.
+    pub tolerated: Vec<Violation>,
 }
 
 impl LoadedConfig {
@@ -304,6 +337,14 @@ impl LoadedConfig {
         for w in &self.weakenings {
             tracing::warn!(
                 event = "config.weakening",
+                code = w.code.as_str(),
+                "{}",
+                w.message
+            );
+        }
+        for w in &self.tolerated {
+            tracing::warn!(
+                event = "config.waiver",
                 code = w.code.as_str(),
                 "{}",
                 w.message
@@ -347,12 +388,14 @@ pub fn load_with(
     if config.mode == Mode::Production {
         errors.append(&mut weakenings);
     }
+    let tolerated = config.tolerated();
     Violations::into_result(errors).map_err(ConfigError::Invalid)?;
 
     Ok(LoadedConfig {
         config,
         path: path.to_path_buf(),
         weakenings,
+        tolerated,
     })
 }
 
@@ -374,8 +417,8 @@ pub fn load_for_enrollment(path: &Path) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
-/// Rules that need the file system: `CFG-P006`, and for an agent `CFG-P008`
-/// and `CFG-P009`.
+/// Rules that need the file system: `CFG-P006`, for an agent `CFG-P008` and
+/// `CFG-P009`, for the core `CFG-P011` and `CFG-P016`.
 fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> Vec<Violation> {
     let mut out = Vec::new();
     if let Err(reason) = checker.not_writable_by_others(path) {
@@ -394,6 +437,28 @@ fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> 
                 ),
             ));
         }
+        // The SSH keys are created by the agent with private rights at its
+        // first start (ADR-0010): checked once they exist; before, their
+        // directory is, as `private` checks the directory of a key.
+        if let Some(paths) = agent.ssh_paths() {
+            for (field, key) in [
+                ("agent.ssh.host_key", &paths.host_key),
+                ("agent.ssh.target_key", &paths.target_key),
+            ] {
+                let verdict = if key.exists() {
+                    checker.private(key)
+                } else {
+                    let dir = key.parent().filter(|d| !d.as_os_str().is_empty());
+                    checker.not_writable_by_others(dir.unwrap_or(key))
+                };
+                if let Err(reason) = verdict {
+                    out.push(Violation::new(
+                        Code::PrivateKeyExposed,
+                        format!("{field} {} : {reason}", key.display()),
+                    ));
+                }
+            }
+        }
         // The journal may not exist yet: its directory must.
         let dir = agent
             .replay_journal
@@ -407,6 +472,33 @@ fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> 
                     agent.replay_journal.display()
                 ),
             ));
+        }
+    }
+    if let Some(core) = &config.core {
+        for (field, key) in core::key_paths(core) {
+            if let Err(reason) = checker.private(key) {
+                out.push(Violation::new(
+                    Code::CoreKeyExposed,
+                    format!("{field} {} : {reason}", key.display()),
+                ));
+            }
+        }
+        // The transcripts (ADR-0016): the directory is private (0700, owner
+        // root or service); before the core creates it, its parent must
+        // not be writable by others.
+        if let Some(ssh) = &core.ssh {
+            let dir = &ssh.transcripts_dir;
+            let verdict = if dir.exists() {
+                checker.private(dir)
+            } else {
+                checker.not_writable_by_others(dir.parent().unwrap_or(dir))
+            };
+            if let Err(reason) = verdict {
+                out.push(Violation::new(
+                    Code::TranscriptsExposed,
+                    format!("core.ssh.transcripts_dir {} : {reason}", dir.display()),
+                ));
+            }
         }
     }
     out

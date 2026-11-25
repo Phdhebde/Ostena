@@ -60,6 +60,92 @@ pub struct AgentConfig {
     /// at startup and refreshed.
     #[serde(default)]
     pub infrastructure: Vec<InfrastructureEndpoint>,
+    /// Native SSH server of the agent (ADR-0010); absent: no SSH server.
+    #[serde(default)]
+    pub ssh: Option<AgentSshConfig>,
+}
+
+/// Default bound of the authenticated SSH sessions.
+pub const DEFAULT_SSH_MAX_SESSIONS: u32 = 64;
+/// Default bound of the SSH connections not yet authenticated.
+pub const DEFAULT_SSH_MAX_UNAUTHENTICATED: u32 = 16;
+/// Default bound of the SSH connections not yet authenticated from one
+/// source address.
+pub const DEFAULT_SSH_MAX_UNAUTHENTICATED_PER_SOURCE: u32 = 4;
+/// Default delay to authenticate, in seconds.
+pub const DEFAULT_SSH_LOGIN_GRACE_SECS: u64 = 30;
+/// Default delay to reach a target, in seconds.
+pub const DEFAULT_SSH_TARGET_CONNECT_TIMEOUT_SECS: u64 = 5;
+/// Default file names of the SSH identity, in the state directory (the
+/// directory of `agent.replay_journal`).
+pub const DEFAULT_SSH_HOST_KEY: &str = "ssh_host_key";
+/// See [`DEFAULT_SSH_HOST_KEY`].
+pub const DEFAULT_SSH_TARGET_KEY: &str = "ssh_target_key";
+/// See [`DEFAULT_SSH_HOST_KEY`].
+pub const DEFAULT_SSH_HOST_CERTIFICATE: &str = "ssh_host_certificate";
+
+const fn default_ssh_max_sessions() -> u32 {
+    DEFAULT_SSH_MAX_SESSIONS
+}
+const fn default_ssh_max_unauthenticated() -> u32 {
+    DEFAULT_SSH_MAX_UNAUTHENTICATED
+}
+const fn default_ssh_max_unauthenticated_per_source() -> u32 {
+    DEFAULT_SSH_MAX_UNAUTHENTICATED_PER_SOURCE
+}
+const fn default_ssh_login_grace() -> u64 {
+    DEFAULT_SSH_LOGIN_GRACE_SECS
+}
+const fn default_ssh_connect_timeout() -> u64 {
+    DEFAULT_SSH_TARGET_CONNECT_TIMEOUT_SECS
+}
+
+/// `[agent.ssh]`: the native SSH server of the agent and its driver to the
+/// targets (ADR-0010).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSshConfig {
+    /// Addresses to listen on, `host:port` (at least one).
+    pub listen: Vec<String>,
+    /// Host key of the server (private); default: `ssh_host_key` in the
+    /// state directory.
+    #[serde(default)]
+    pub host_key: Option<PathBuf>,
+    /// Key of the agent on the targets (private); default: `ssh_target_key`
+    /// in the state directory. Never the host key.
+    #[serde(default)]
+    pub target_key: Option<PathBuf>,
+    /// Host certificate issued by the core; default:
+    /// `ssh_host_certificate` in the state directory.
+    #[serde(default)]
+    pub host_certificate: Option<PathBuf>,
+    /// Authenticated sessions, 1 to 256.
+    #[serde(default = "default_ssh_max_sessions")]
+    pub max_sessions: u32,
+    /// Connections not yet authenticated, 1 to 256.
+    #[serde(default = "default_ssh_max_unauthenticated")]
+    pub max_unauthenticated: u32,
+    /// Connections not yet authenticated from one source address, 1 to 256
+    /// (within `max_unauthenticated` anyway).
+    #[serde(default = "default_ssh_max_unauthenticated_per_source")]
+    pub max_unauthenticated_per_source: u32,
+    /// Delay to authenticate, 5 to 120 s.
+    #[serde(default = "default_ssh_login_grace")]
+    pub login_grace_secs: u64,
+    /// Delay to reach a target, 1 to 30 s.
+    #[serde(default = "default_ssh_connect_timeout")]
+    pub target_connect_timeout_secs: u64,
+}
+
+/// The paths of the SSH identity, defaults applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshPaths {
+    /// Host key.
+    pub host_key: PathBuf,
+    /// Key on the targets.
+    pub target_key: PathBuf,
+    /// Host certificate.
+    pub host_certificate: PathBuf,
 }
 
 /// Addresses of an Ostena component: names, IP addresses or CIDR networks.
@@ -110,6 +196,97 @@ impl AgentConfig {
     pub fn read_private_key(&self) -> std::io::Result<SecretBytes> {
         std::fs::read(&self.tls_private_key).map(SecretBytes::from)
     }
+
+    /// The state directory: the directory of the replay journal.
+    pub fn state_dir(&self) -> &Path {
+        self.replay_journal
+            .parent()
+            .unwrap_or(self.replay_journal.as_path())
+    }
+
+    /// The SSH identity paths, defaults in [`AgentConfig::state_dir`];
+    /// `None` without `[agent.ssh]`.
+    pub fn ssh_paths(&self) -> Option<SshPaths> {
+        let ssh = self.ssh.as_ref()?;
+        let dir = self.state_dir();
+        let or = |path: &Option<PathBuf>, name| path.clone().unwrap_or_else(|| dir.join(name));
+        Some(SshPaths {
+            host_key: or(&ssh.host_key, DEFAULT_SSH_HOST_KEY),
+            target_key: or(&ssh.target_key, DEFAULT_SSH_TARGET_KEY),
+            host_certificate: or(&ssh.host_certificate, DEFAULT_SSH_HOST_CERTIFICATE),
+        })
+    }
+}
+
+/// Rules of `[agent.ssh]` (`CFG-V015`, `CFG-V008` for relative paths).
+fn ssh_consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
+    let (Some(ssh), Some(paths)) = (&agent.ssh, agent.ssh_paths()) else {
+        return;
+    };
+    if ssh.listen.is_empty() {
+        out.push(Violation::new(
+            Code::AgentSsh,
+            "agent.ssh.listen est vide : au moins une adresse hôte:port est requise.",
+        ));
+    }
+    for (i, address) in ssh.listen.iter().enumerate() {
+        if parse_host_port(address).is_none() {
+            out.push(Violation::new(
+                Code::AgentSsh,
+                format!(
+                    "agent.ssh.listen[{i}] = « {address} » : attendu hôte:port, ipv4:port ou \
+                     [ipv6]:port."
+                ),
+            ));
+        }
+    }
+    let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 5] = [
+        ("max_sessions", u64::from(ssh.max_sessions), 1..=256),
+        (
+            "max_unauthenticated",
+            u64::from(ssh.max_unauthenticated),
+            1..=256,
+        ),
+        (
+            "max_unauthenticated_per_source",
+            u64::from(ssh.max_unauthenticated_per_source),
+            1..=256,
+        ),
+        ("login_grace_secs", ssh.login_grace_secs, 5..=120),
+        (
+            "target_connect_timeout_secs",
+            ssh.target_connect_timeout_secs,
+            1..=30,
+        ),
+    ];
+    for (field, value, range) in bounds {
+        if !range.contains(&value) {
+            out.push(Violation::new(
+                Code::AgentSsh,
+                format!(
+                    "agent.ssh.{field} = {value} : attendu de {} à {}.",
+                    range.start(),
+                    range.end()
+                ),
+            ));
+        }
+    }
+    for (field, path) in [
+        ("agent.ssh.host_key", &ssh.host_key),
+        ("agent.ssh.target_key", &ssh.target_key),
+        ("agent.ssh.host_certificate", &ssh.host_certificate),
+    ] {
+        if let Some(path) = path {
+            path_rule(out, field, path);
+        }
+    }
+    if paths.host_key == paths.target_key {
+        out.push(Violation::new(
+            Code::AgentSsh,
+            "agent.ssh.host_key et agent.ssh.target_key désignent le même fichier : la clé \
+             d'hôte de l'agent ne doit jamais servir à se connecter aux cibles.",
+        ));
+    }
 }
 
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`, hexadecimal.
@@ -140,7 +317,7 @@ fn is_address_like(s: &str) -> bool {
     prefix_ok && addr_ok
 }
 
-fn path_rule(out: &mut Vec<Violation>, field: &str, path: &Path) {
+pub(crate) fn path_rule(out: &mut Vec<Violation>, field: &str, path: &Path) {
     if path.as_os_str().is_empty() {
         out.push(Violation::new(
             Code::EmptyPath,
@@ -157,7 +334,8 @@ fn path_rule(out: &mut Vec<Violation>, field: &str, path: &Path) {
     }
 }
 
-/// Consistency rules of the agent section (`CFG-V006` to `CFG-V010`).
+/// Consistency rules of the agent section (`CFG-V006` to `CFG-V010`,
+/// `CFG-V015`).
 pub(crate) fn consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
     if !is_uuid(&agent.gateway_group) {
         out.push(Violation::new(
@@ -240,6 +418,7 @@ pub(crate) fn consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
              automatiquement.",
         ));
     }
+    ssh_consistency(agent, out);
     for (i, endpoint) in agent.infrastructure.iter().enumerate() {
         if endpoint.addresses.is_empty() {
             out.push(Violation::new(

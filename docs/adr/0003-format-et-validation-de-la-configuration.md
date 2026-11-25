@@ -3,6 +3,7 @@
 - **Statut** : Accepté
 - **Date** : 2026-11-11
 - **Révisé** : 2026-11-11 — section `[agent]` (`CFG-V006` à `V010`, `CFG-P007` à `P010`) et `CFG-P006` sous Windows
+- **Révisé** : 2026-11-25 — `CFG-P016`, droits du répertoire des transcripts (ADR-0016)
 
 ## Contexte
 
@@ -51,9 +52,23 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-V009` | cohérence | délai d'arrêt (1 à 300 s) ou nombre de threads (1 à 64) hors bornes |
 | `CFG-V010` | cohérence | déclaration d'infrastructure invalide, ou composants Ostena placés dans `agent.scope.infrastructure` au lieu de `[[agent.infrastructure]]` |
 | `CFG-P007` | production | pas de CA dédiée au certificat du core (`agent.tls_core_ca`) |
-| `CFG-P008` | production | clé privée de l'agent lisible ou modifiable par un autre compte que le service ou les administrateurs |
+| `CFG-P008` | production | clé privée de l'agent lisible ou modifiable par un autre compte que le service ou les administrateurs ; de même pour les clés SSH de `[agent.ssh]` (`host_key`, `target_key`) dès qu'elles existent |
 | `CFG-P009` | production | dossier du journal anti-rejeu modifiable par un autre compte |
 | `CFG-P010` | production | nom d'infrastructure impossible à résoudre au démarrage de l'agent (vérifié avant le lien avec le core ; rafraîchi toutes les 5 minutes, un échec garde les adresses précédentes) |
+| `CFG-V011` | cohérence | point de contrôle local de l'agent invalide |
+| `CFG-V012` | cohérence | section `[core]` : valeur hors bornes (validité des certificats d'agent et des certificats d'hôte SSH 1 à 90 jours, threads 1 à 64, pool 1 à 64, délai de connexion 1 à 60 s, port nul) ou adresse d'enrôlement égale à celle du tunnel |
+| `CFG-V013` | cohérence | nom de base, rôle ou hôte PostgreSQL invalide (minuscules, chiffres et `_`, 63 octets au plus) |
+| `CFG-V014` | cohérence | nom de credential systemd invalide pour une clé du core |
+| `CFG-V015` | cohérence | section `[agent.ssh]` : adresse d'écoute invalide ou absente, valeur hors bornes (`max_sessions`, `max_unauthenticated` et `max_unauthenticated_per_source` 1 à 256, `login_grace_secs` 5 à 120, `target_connect_timeout_secs` 1 à 30), ou clé d'hôte et clé vers les cibles dans le même fichier (ADR-0010) |
+| `CFG-V016` | cohérence | deux clés privées du core désignent la même source (fichier ou *credential*) : TLS, émission, tête d'audit, signature des grants, autorités SSH (ADR-0014), chiffrement des secrets TOTP (ADR-0010) |
+| `CFG-V017` | cohérence | section `[core.login]` (ADR-0010, ADR-0015) : valeur hors bornes (`session_max_hours` 1 à 8, `max_failures` 3 à 20, `lockout_minutes` 1 à 1440, `attempts_per_minute` 1 à 600, `max_connections` 1 à 1024, port nul), adresse égale à celle du tunnel ou de l'enrôlement, section `[core.ssh]` absente, `totp_issuer` invalide, `ssh_hosts` vide ou invalide, dont un motif fait seulement de jokers et de points (une `totp_key` de même source qu'une autre clé relève de `CFG-V016`) |
+| `CFG-P011` | production | clé de la CA émettrice ou du serveur lisible au-delà du compte du service (ADR-0008) |
+| `CFG-P012` | production, **dérogation datée** | clé du core lue en clair dans un fichier au lieu d'un credential systemd chiffré : accepté et journalisé (`config.waiver`) jusqu'au 2027-04-30 inclus, refusé ensuite (ADR-0011) |
+| `CFG-P014` | production | PostgreSQL joint en TCP au lieu du socket Unix local avec l'authentification `peer` (ADR-0011) |
+| `CFG-P015` | production, **écart accepté** | TOTP HMAC-SHA-1 (`core.login.totp_algorithm = "sha1"`, la valeur par défaut) : jamais refusé, journalisé (`config.waiver`) et écrit dans l'audit (`config.waiver`) à chaque démarrage, sans échéance (ADR-0009) ; `"sha256"` le supprime |
+| `CFG-P016` | production | `core.ssh.transcripts_dir` accessible au-delà du compte du service : il doit appartenir à root ou au compte du service, sans aucun droit pour le groupe ni les autres (0700) ; tant qu'il n'existe pas, son parent ne doit être modifiable que par eux (ADR-0016) |
+
+`CFG-P013` (credential non lié au TPM 2.0, ADR-0008) est réservé : il n'est pas encore contrôlé, ce qui sera fait avec la lecture des credentials chiffrés après M1.
 
 `CFG-P006` sous Unix : le fichier (après résolution des liens symboliques) et son dossier doivent appartenir à root ou au compte du service, sans droit d'écriture pour le groupe ni pour les autres. Le compte du service est le propriétaire de `/proc/self`, ce qui évite un appel FFI `unsafe`. S'il est indisponible, seul root est accepté.
 

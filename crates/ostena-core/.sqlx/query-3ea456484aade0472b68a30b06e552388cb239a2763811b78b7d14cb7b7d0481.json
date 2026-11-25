@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ar.id::text AS \"id!\", u.name AS \"user!\", r.name AS \"resource!\",\n                  a.name AS \"account!\", ar.protocol, ar.valid_until, ar.max_session_secs,\n                  ar.revoked_at IS NOT NULL AS \"revoked!\"\n           FROM access_right ar JOIN app_user u ON u.id = ar.user_id\n           JOIN target_account a ON a.id = ar.account_id JOIN resource r ON r.id = a.resource_id\n           ORDER BY ar.created_at DESC, ar.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "user!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "resource!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "account!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "target_account",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "protocol",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "protocol"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "valid_until"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "max_session_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "max_session_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "revoked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "3ea456484aade0472b68a30b06e552388cb239a2763811b78b7d14cb7b7d0481"
+}

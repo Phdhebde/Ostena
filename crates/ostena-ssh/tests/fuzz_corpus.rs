@@ -39,3 +39,40 @@ fn captured_openssh_offers_are_accepted_in_their_role() {
         );
     }
 }
+
+fn replay(target: &str, run: fn(&[u8])) -> usize {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fuzz/corpus")
+        .join(target);
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).expect("corpus directory must exist") {
+        run(&std::fs::read(entry.expect("entry").path()).expect("corpus file"));
+        count += 1;
+    }
+    count
+}
+
+#[test]
+fn replay_ssh_certificate_corpus() {
+    assert!(replay("ssh_certificate", ostena_ssh::fuzz::certificate) > 0);
+}
+
+#[test]
+fn replay_ssh_login_corpus() {
+    assert!(replay("ssh_login", ostena_ssh::fuzz::login) > 0);
+}
+
+#[test]
+fn certificate_seeds_from_ssh_keygen_parse() {
+    for entry in std::fs::read_dir(corpus().join("../ssh_certificate")).expect("corpus") {
+        let path = entry.expect("entry").path();
+        let data = std::fs::read(&path).expect("seed");
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("seed-"))
+        {
+            let parsed = ostena_ssh::cert::parse(&data).expect("seed parses");
+            assert_eq!(parsed.encode(), data, "{}", path.display());
+        }
+    }
+}

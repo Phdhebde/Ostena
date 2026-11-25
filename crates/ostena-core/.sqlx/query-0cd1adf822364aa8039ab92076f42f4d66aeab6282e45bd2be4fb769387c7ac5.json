@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT min(expires_at) FROM enrollment_token\n                 WHERE NOT used AND NOT burned AND expires_at > $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "0cd1adf822364aa8039ab92076f42f4d66aeab6282e45bd2be4fb769387c7ac5"
+}

@@ -1,0 +1,21 @@
+name: Proposition
+description: Une fonctionnalité ou une évolution.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Besoin
+      description: Le problème à résoudre et le contexte (type d'environnement, contraintes).
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposition
+      description: Ce que vous imaginez. Un choix structurant donnera lieu à un ADR dans docs/adr/.
+  - type: textarea
+    id: security
+    attributes:
+      label: Effet sur la sécurité
+      description: La proposition affaiblit-elle un comportement par défaut ? Le mode production doit alors la refuser.

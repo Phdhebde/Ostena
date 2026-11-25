@@ -1,0 +1,687 @@
+//! `[core]` section: the core (ADR-0011).
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use super::agent::path_rule;
+use super::validation::{Code, Violation};
+
+/// Default validity of an agent certificate, in days.
+pub const DEFAULT_AGENT_CERTIFICATE_DAYS: u32 = 30;
+/// Default validity of the SSH host certificate of an agent, in days.
+pub const DEFAULT_HOST_CERTIFICATE_DAYS: u32 = 30;
+/// Default directory of the PostgreSQL Unix socket (Debian).
+pub const DEFAULT_SOCKET_DIR: &str = "/var/run/postgresql";
+/// Default size of the connection pool.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 8;
+
+/// Core keys in plain files are tolerated until this instant (exclusive,
+/// 2027-05-01T00:00:00Z): a dated waiver for M1, refused afterwards
+/// (`CFG-P012`, ADR-0011).
+pub const KEY_FILE_WAIVER_END: u64 = 1_809_129_600;
+/// The last day of the waiver, for messages.
+pub const KEY_FILE_WAIVER_LAST_DAY: &str = "2027-04-30";
+
+const fn default_certificate_days() -> u32 {
+    DEFAULT_AGENT_CERTIFICATE_DAYS
+}
+
+const fn default_host_certificate_days() -> u32 {
+    DEFAULT_HOST_CERTIFICATE_DAYS
+}
+
+/// Core settings.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreConfig {
+    /// Address of the tunnel listener (QUIC), e.g. `0.0.0.0:8443`.
+    pub tunnel_listen: SocketAddr,
+    /// Address of the enrolment listener (QUIC, bound only while a token is
+    /// valid); default: the address of `tunnel_listen` on port 8444.
+    #[serde(default)]
+    pub enrollment_listen: Option<SocketAddr>,
+    /// The offline root (`root.pem`), which signs the server certificate
+    /// and the issuing CA.
+    pub tls_root_ca: PathBuf,
+    /// Server certificate presented to the agents (`server.pem`).
+    pub tls_certificate: PathBuf,
+    /// Its private key.
+    pub tls_private_key: KeySource,
+    /// Issuing CA certificate (`issuing.pem`), agent certificates only.
+    pub issuing_certificate: PathBuf,
+    /// Its private key.
+    pub issuing_private_key: KeySource,
+    /// The P-256 key that signs the session grants (ADR-0004, ADR-0014).
+    pub grant_signing_key: KeySource,
+    /// Validity of agent certificates, 1 to 90 days.
+    #[serde(default = "default_certificate_days")]
+    pub agent_certificate_days: u32,
+    /// Runtime worker threads, 1 to 64; default min(4, cores).
+    #[serde(default)]
+    pub worker_threads: Option<usize>,
+    /// The PostgreSQL database.
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    /// The audit chain (ADR-0012): its head signing key and cadence.
+    pub audit: CoreAuditConfig,
+    /// Native SSH access (ADR-0014): the SSH certificate authorities.
+    /// Without it, SSH accesses are refused (`ACC-E007`).
+    #[serde(default)]
+    pub ssh: Option<CoreSshConfig>,
+    /// `ostena login` (ADR-0010, step 1): absent, the login listener is not
+    /// started.
+    #[serde(default)]
+    pub login: Option<CoreLoginConfig>,
+}
+
+/// `[core.ssh]`: the SSH certificate authorities of the core (ADR-0014).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreSshConfig {
+    /// The P-256 key of the authority of the user certificates
+    /// (`ostena login`).
+    pub user_ca_key: KeySource,
+    /// The P-256 key of the authority of the agent host certificates.
+    pub host_ca_key: KeySource,
+    /// Validity of an agent host certificate, 1 to 90 days; it is renewed
+    /// after two thirds.
+    #[serde(default = "default_host_certificate_days")]
+    pub host_certificate_days: u32,
+    /// Directory of the session transcripts (ADR-0016), absolute: one
+    /// asciicast file per session, created by the core, read-only once
+    /// sealed. Every SSH session is recorded there.
+    pub transcripts_dir: PathBuf,
+    /// The 256-bit key of the keyed hash of the commands (HMAC-SHA-256,
+    /// `access.ssh_exec`, ADR-0016): exactly 32 random bytes
+    /// (`ostena ca key new-mac`). One use, like every key of the core.
+    pub command_mac_key: KeySource,
+}
+
+/// Default port of the SSH server of the agents, written into the
+/// `ssh_config` fragment of `ostena login`.
+pub const DEFAULT_LOGIN_SSH_PORT: u16 = 2222;
+/// Default longest login session, in hours.
+pub const DEFAULT_SESSION_MAX_HOURS: u32 = 8;
+/// Default consecutive failures before an account is locked.
+pub const DEFAULT_MAX_FAILURES: u32 = 5;
+/// Default lockout, in minutes.
+pub const DEFAULT_LOCKOUT_MINUTES: u32 = 15;
+/// Default login attempts per source address and minute.
+pub const DEFAULT_ATTEMPTS_PER_MINUTE: u32 = 10;
+/// Default simultaneous connections to the login listener.
+pub const DEFAULT_LOGIN_MAX_CONNECTIONS: u32 = 64;
+/// Default issuer shown by authenticator applications.
+pub const DEFAULT_TOTP_ISSUER: &str = "Ostena";
+
+const fn default_login_ssh_port() -> u16 {
+    DEFAULT_LOGIN_SSH_PORT
+}
+
+const fn default_session_max_hours() -> u32 {
+    DEFAULT_SESSION_MAX_HOURS
+}
+
+const fn default_max_failures() -> u32 {
+    DEFAULT_MAX_FAILURES
+}
+
+const fn default_lockout_minutes() -> u32 {
+    DEFAULT_LOCKOUT_MINUTES
+}
+
+const fn default_attempts_per_minute() -> u32 {
+    DEFAULT_ATTEMPTS_PER_MINUTE
+}
+
+const fn default_login_max_connections() -> u32 {
+    DEFAULT_LOGIN_MAX_CONNECTIONS
+}
+
+fn default_totp_issuer() -> String {
+    DEFAULT_TOTP_ISSUER.into()
+}
+
+/// HMAC of new TOTP enrolments (ADR-0009, amendment of 2026-11-25).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TotpAlgorithmSetting {
+    /// HMAC-SHA-1, the default: the deviation recorded in ADR-0009, for the
+    /// authenticator applications.
+    #[default]
+    Sha1,
+    /// HMAC-SHA-256.
+    Sha256,
+}
+
+/// `[core.login]`: the HTTPS login API of `ostena login` (ADR-0010, step 1;
+/// ADR-0015).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreLoginConfig {
+    /// Address of the login listener (HTTPS over TCP), e.g. `0.0.0.0:8445`.
+    pub listen: SocketAddr,
+    /// The AES-256-GCM key that encrypts the TOTP secrets in the database.
+    /// Its own key, distinct from every other key of the core.
+    pub totp_key: KeySource,
+    /// HMAC of new TOTP enrolments.
+    #[serde(default)]
+    pub totp_algorithm: TotpAlgorithmSetting,
+    /// Issuer shown by authenticator applications, 1 to 64 bytes, no `:`.
+    #[serde(default = "default_totp_issuer")]
+    pub totp_issuer: String,
+    /// Longest login session, 1 to 8 hours.
+    #[serde(default = "default_session_max_hours")]
+    pub session_max_hours: u32,
+    /// Consecutive failures before the account is locked, 3 to 20.
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// Lockout, 1 to 1440 minutes.
+    #[serde(default = "default_lockout_minutes")]
+    pub lockout_minutes: u32,
+    /// Attempts per source address and minute, 1 to 600.
+    #[serde(default = "default_attempts_per_minute")]
+    pub attempts_per_minute: u32,
+    /// Simultaneous connections, 1 to 1024.
+    #[serde(default = "default_login_max_connections")]
+    pub max_connections: u32,
+    /// Host names or patterns of the bastion (the agents' SSH servers), for
+    /// the `ssh_config` fragment and the `@cert-authority` line: 1 to 16,
+    /// letters, digits, `.`, `-`, `*` and `?`.
+    pub ssh_hosts: Vec<String>,
+    /// Port of the agents' SSH servers.
+    #[serde(default = "default_login_ssh_port")]
+    pub ssh_port: u16,
+}
+
+/// Default interval between two heads while the chain moves, seconds.
+pub const DEFAULT_HEAD_INTERVAL_SECS: u32 = 60;
+/// Default heartbeat: a head at least this often, even without change.
+pub const DEFAULT_HEARTBEAT_SECS: u32 = 300;
+/// Default number of records after which a head is signed at once.
+pub const DEFAULT_HEAD_MAX_RECORDS: u32 = 1000;
+
+const fn default_head_interval() -> u32 {
+    DEFAULT_HEAD_INTERVAL_SECS
+}
+
+const fn default_heartbeat() -> u32 {
+    DEFAULT_HEARTBEAT_SECS
+}
+
+const fn default_head_max_records() -> u32 {
+    DEFAULT_HEAD_MAX_RECORDS
+}
+
+/// `[core.audit]`: the audit chain of the core (ADR-0012).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreAuditConfig {
+    /// The P-256 key that signs the heads of the chain.
+    pub signing_key: KeySource,
+    /// Interval between two heads while the chain moves, 1 to 3600 s.
+    #[serde(default = "default_head_interval")]
+    pub head_interval_secs: u32,
+    /// A head at least this often, even without change: from
+    /// `head_interval_secs` to 86400 s. Written in every head, it bounds
+    /// how stale an export may look before the verifier warns.
+    #[serde(default = "default_heartbeat")]
+    pub heartbeat_secs: u32,
+    /// A head as soon as this many records are not covered, 1 to 100000.
+    #[serde(default = "default_head_max_records")]
+    pub head_max_records: u32,
+}
+
+/// Where a private key of the core is read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub enum KeySource {
+    /// A systemd credential (`LoadCredentialEncrypted=`), read from
+    /// `$CREDENTIALS_DIRECTORY/<name>`.
+    Credential(String),
+    /// A plain PKCS#8 file (`CFG-P012`: tolerated until 2027-04-30).
+    File(PathBuf),
+}
+
+/// PostgreSQL settings. Production goes through the local Unix socket with
+/// `peer` authentication only: no password, no network.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// Directory of the Unix socket.
+    pub socket_dir: PathBuf,
+    /// Server port (it names the socket file, `.s.PGSQL.<port>`).
+    pub port: u16,
+    /// Database name.
+    pub name: String,
+    /// Role, which owns the schema; with `peer`, the service account name.
+    pub user: String,
+    /// Connection pool size, 1 to 64.
+    pub max_connections: u32,
+    /// Connection timeout, 1 to 60 s.
+    pub connect_timeout_secs: u64,
+    /// TCP instead of the socket: development only (`CFG-P014`).
+    pub tcp: Option<DatabaseTcp>,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            socket_dir: PathBuf::from(DEFAULT_SOCKET_DIR),
+            port: 5432,
+            name: "ostena".into(),
+            user: "ostena".into(),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            connect_timeout_secs: 5,
+            tcp: None,
+        }
+    }
+}
+
+/// A TCP connection to PostgreSQL, in clear text: development only.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseTcp {
+    /// Host name or IP address.
+    pub host: String,
+    /// File holding the password (SCRAM), if the server asks for one.
+    #[serde(default)]
+    pub password_file: Option<PathBuf>,
+}
+
+impl CoreConfig {
+    /// The enrolment address: `enrollment_listen`, or the address of
+    /// `tunnel_listen` on port 8444.
+    pub fn enrollment_listen(&self) -> SocketAddr {
+        self.enrollment_listen.unwrap_or_else(|| {
+            SocketAddr::new(
+                self.tunnel_listen.ip(),
+                super::agent::DEFAULT_ENROLLMENT_PORT,
+            )
+        })
+    }
+
+    /// Worker threads to start.
+    pub fn worker_threads(&self) -> usize {
+        self.worker_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(super::agent::DEFAULT_MAX_WORKER_THREADS)
+        })
+    }
+
+    /// The private keys, with their field names.
+    pub fn keys(&self) -> Vec<(&'static str, &KeySource)> {
+        let mut keys = vec![
+            ("core.tls_private_key", &self.tls_private_key),
+            ("core.issuing_private_key", &self.issuing_private_key),
+            ("core.audit.signing_key", &self.audit.signing_key),
+            ("core.grant_signing_key", &self.grant_signing_key),
+        ];
+        if let Some(ssh) = &self.ssh {
+            keys.push(("core.ssh.user_ca_key", &ssh.user_ca_key));
+            keys.push(("core.ssh.host_ca_key", &ssh.host_ca_key));
+            keys.push(("core.ssh.command_mac_key", &ssh.command_mac_key));
+        }
+        if let Some(login) = &self.login {
+            keys.push(("core.login.totp_key", &login.totp_key));
+        }
+        keys
+    }
+}
+
+/// A PostgreSQL identifier we accept unquoted: lower case, digits and `_`,
+/// not starting with a digit, at most 63 bytes.
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// A systemd credential name: no path separator, not empty.
+fn is_credential_name(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && !s.contains(['/', '\\', '\0'])
+}
+
+fn bounds(out: &mut Vec<Violation>, field: &str, value: u64, min: u64, max: u64) {
+    if !(min..=max).contains(&value) {
+        out.push(Violation::new(
+            Code::CoreBounds,
+            format!("{field} = {value} : attendu de {min} à {max}."),
+        ));
+    }
+}
+
+/// Bounds of `[core.audit]` (`CFG-V012`).
+fn audit_bounds(audit: &CoreAuditConfig, out: &mut Vec<Violation>) {
+    bounds(
+        out,
+        "core.audit.head_interval_secs",
+        u64::from(audit.head_interval_secs),
+        1,
+        3600,
+    );
+    bounds(
+        out,
+        "core.audit.heartbeat_secs",
+        u64::from(audit.heartbeat_secs),
+        u64::from(audit.head_interval_secs),
+        86_400,
+    );
+    bounds(
+        out,
+        "core.audit.head_max_records",
+        u64::from(audit.head_max_records),
+        1,
+        100_000,
+    );
+}
+
+fn login_violation(out: &mut Vec<Violation>, message: String) {
+    out.push(Violation::new(Code::CoreLogin, message));
+}
+
+fn login_bounds(out: &mut Vec<Violation>, field: &str, value: u32, min: u32, max: u32) {
+    if !(min..=max).contains(&value) {
+        login_violation(
+            out,
+            format!("{field} = {value} : attendu de {min} à {max}."),
+        );
+    }
+}
+
+/// Rules of `[core.login]` (`CFG-V017`).
+fn login_rules(core: &CoreConfig, login: &CoreLoginConfig, out: &mut Vec<Violation>) {
+    if core.ssh.is_none() {
+        login_violation(
+            out,
+            "[core.login] exige [core.ssh] : l'autorité des certificats utilisateur signe le \
+             certificat de la session."
+                .into(),
+        );
+    }
+    if login.listen == core.tunnel_listen || login.listen == core.enrollment_listen() {
+        login_violation(
+            out,
+            "core.login.listen doit différer de core.tunnel_listen et de \
+             core.enrollment_listen."
+                .into(),
+        );
+    }
+    login_bounds(
+        out,
+        "core.login.session_max_hours",
+        login.session_max_hours,
+        1,
+        8,
+    );
+    login_bounds(out, "core.login.max_failures", login.max_failures, 3, 20);
+    login_bounds(
+        out,
+        "core.login.lockout_minutes",
+        login.lockout_minutes,
+        1,
+        1440,
+    );
+    login_bounds(
+        out,
+        "core.login.attempts_per_minute",
+        login.attempts_per_minute,
+        1,
+        600,
+    );
+    login_bounds(
+        out,
+        "core.login.max_connections",
+        login.max_connections,
+        1,
+        1024,
+    );
+    let issuer = &login.totp_issuer;
+    if issuer.is_empty()
+        || issuer.len() > 64
+        || issuer.contains(':')
+        || issuer.chars().any(char::is_control)
+    {
+        login_violation(
+            out,
+            format!(
+                "core.login.totp_issuer = « {} » : de 1 à 64 octets, sans « : » ni caractère de contrôle.",
+                issuer.escape_debug()
+            ),
+        );
+    }
+    if login.ssh_hosts.is_empty() || login.ssh_hosts.len() > 16 {
+        login_violation(
+            out,
+            "core.login.ssh_hosts : de 1 à 16 noms attendus.".into(),
+        );
+    }
+    for host in &login.ssh_hosts {
+        if !crate::api::login::is_host_pattern(host) {
+            login_violation(
+                out,
+                format!(
+                    "core.login.ssh_hosts : « {} » n'est pas un nom d'hôte ou un motif valide \
+                     (lettres, chiffres, « . », « - », « * », « ? »).",
+                    host.escape_debug()
+                ),
+            );
+        }
+    }
+    if login.ssh_port == 0 {
+        login_violation(out, "core.login.ssh_port = 0 : port attendu.".into());
+    }
+}
+
+/// The private keys of the core: their sources (`CFG-V008`, `CFG-V014`), one use each
+/// (`CFG-V016`), and the SSH section bounds (`CFG-V012`).
+fn key_rules(core: &CoreConfig, out: &mut Vec<Violation>) {
+    for (field, key) in core.keys() {
+        match key {
+            KeySource::File(path) => path_rule(out, field, path),
+            KeySource::Credential(name) if !is_credential_name(name) => {
+                out.push(Violation::new(
+                    Code::CoreKeySource,
+                    format!(
+                        "{field} = {{ credential = « {name} » }} : nom de credential systemd \
+                         sans séparateur attendu."
+                    ),
+                ));
+            }
+            KeySource::Credential(_) => {}
+        }
+    }
+    // One key, one use: the same source named twice (CFG-V016).
+    let keys = core.keys();
+    for (i, (field, key)) in keys.iter().enumerate() {
+        if let Some((other, _)) = keys[..i].iter().find(|(_, k)| k == key) {
+            out.push(Violation::new(
+                Code::CoreKeyReused,
+                format!("{field} : même source que {other} ; chaque clé du core a un seul usage."),
+            ));
+        }
+    }
+    if let Some(ssh) = &core.ssh {
+        path_rule(out, "core.ssh.transcripts_dir", &ssh.transcripts_dir);
+        bounds(
+            out,
+            "core.ssh.host_certificate_days",
+            u64::from(ssh.host_certificate_days),
+            1,
+            90,
+        );
+    }
+}
+
+/// Consistency rules of the core section (`CFG-V008`, `CFG-V012` to
+/// `CFG-V014`, `CFG-V016`).
+pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
+    path_rule(out, "core.tls_root_ca", &core.tls_root_ca);
+    path_rule(out, "core.tls_certificate", &core.tls_certificate);
+    path_rule(out, "core.issuing_certificate", &core.issuing_certificate);
+    key_rules(core, out);
+    if core.enrollment_listen() == core.tunnel_listen {
+        out.push(Violation::new(
+            Code::CoreBounds,
+            "core.enrollment_listen doit différer de core.tunnel_listen.",
+        ));
+    }
+    bounds(
+        out,
+        "core.agent_certificate_days",
+        u64::from(core.agent_certificate_days),
+        1,
+        90,
+    );
+    if let Some(n) = core.worker_threads {
+        bounds(
+            out,
+            "core.worker_threads",
+            u64::try_from(n).unwrap_or(u64::MAX),
+            1,
+            64,
+        );
+    }
+    audit_bounds(&core.audit, out);
+    if let Some(login) = &core.login {
+        login_rules(core, login, out);
+    }
+    let db = &core.database;
+    path_rule(out, "core.database.socket_dir", &db.socket_dir);
+    for (field, value) in [
+        ("core.database.name", &db.name),
+        ("core.database.user", &db.user),
+    ] {
+        if !is_identifier(value) {
+            out.push(Violation::new(
+                Code::DatabaseIdentifier,
+                format!(
+                    "{field} = « {value} » : minuscules, chiffres et « _ » attendus \
+                     (63 octets au plus, sans chiffre en tête)."
+                ),
+            ));
+        }
+    }
+    bounds(
+        out,
+        "core.database.max_connections",
+        u64::from(db.max_connections),
+        1,
+        64,
+    );
+    bounds(
+        out,
+        "core.database.connect_timeout_secs",
+        db.connect_timeout_secs,
+        1,
+        60,
+    );
+    if db.port == 0 {
+        out.push(Violation::new(
+            Code::CoreBounds,
+            "core.database.port = 0 : port attendu.",
+        ));
+    }
+    if let Some(tcp) = &db.tcp {
+        if tcp.host.is_empty() {
+            out.push(Violation::new(
+                Code::DatabaseIdentifier,
+                "core.database.tcp.host est vide.",
+            ));
+        }
+        if let Some(file) = &tcp.password_file {
+            path_rule(out, "core.database.tcp.password_file", file);
+        }
+    }
+}
+
+/// Production refusals of the core section that do not need the file
+/// system: `CFG-P014`, and `CFG-P012` once the waiver has ended (`now`, Unix
+/// seconds).
+pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
+    if core.database.tcp.is_some() {
+        out.push(Violation::new(
+            Code::DatabaseOverTcp,
+            "core.database.tcp : en production, le core joint PostgreSQL par le socket Unix \
+             local avec l'authentification peer uniquement (ni réseau, ni mot de passe).",
+        ));
+    }
+    if now >= KEY_FILE_WAIVER_END {
+        key_files(core, out);
+    }
+}
+
+/// Weakenings tolerated in production and logged at every start:
+/// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1, accepted
+/// deviation of ADR-0009) without end.
+pub(crate) fn tolerated(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
+    if now < KEY_FILE_WAIVER_END {
+        key_files(core, out);
+    }
+    if core
+        .login
+        .as_ref()
+        .is_some_and(|l| l.totp_algorithm == TotpAlgorithmSetting::Sha1)
+    {
+        out.push(Violation::new(
+            Code::TotpSha1,
+            "core.login.totp_algorithm = « sha1 » : les nouveaux enrôlements TOTP utilisent \
+             HMAC-SHA-1, écart accepté (ADR-0009) pour les applications d'authentification ; \
+             « sha256 » le supprime.",
+        ));
+    }
+}
+
+fn key_files(core: &CoreConfig, out: &mut Vec<Violation>) {
+    for (field, key) in core.keys() {
+        if let KeySource::File(path) = key {
+            out.push(Violation::new(
+                Code::CoreKeyInFile,
+                format!(
+                    "{field} = {{ file = « {} » }} : clé en clair dans un fichier au lieu d'un \
+                     credential systemd chiffré ; dérogation jusqu'au {KEY_FILE_WAIVER_LAST_DAY} \
+                     inclus, refusée ensuite.",
+                    path.display()
+                ),
+            ));
+        }
+    }
+}
+
+/// Paths of the key files, for the permission rule (`CFG-P011`).
+pub(crate) fn key_paths(core: &CoreConfig) -> impl Iterator<Item = (&'static str, &Path)> {
+    core.keys()
+        .into_iter()
+        .filter_map(|(field, key)| match key {
+            KeySource::File(path) => Some((field, path.as_path())),
+            KeySource::Credential(_) => None,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifiers() {
+        for ok in ["ostena", "ostena_core", "o2", "_x"] {
+            assert!(is_identifier(ok), "{ok}");
+        }
+        let long = "a".repeat(64);
+        for bad in ["", "Ostena", "2db", "a-b", "a b", "a\"b", long.as_str()] {
+            assert!(!is_identifier(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn credential_names() {
+        assert!(is_credential_name("issuing.key"));
+        for bad in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(!is_credential_name(bad), "{bad:?}");
+        }
+    }
+}

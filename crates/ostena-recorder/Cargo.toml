@@ -1,0 +1,21 @@
+[package]
+name = "ostena-recorder"
+description = "Session recordings: the agent-to-core transcript stream and the asciicast v2 writer."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[dependencies]
+ostena-crypto.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+# Each written line is read back as JSON.
+serde_json.workspace = true
+
+[lints]
+workspace = true

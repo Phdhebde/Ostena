@@ -360,6 +360,23 @@ fn revoked_agent_certificate_is_refused() {
 }
 
 #[test]
+fn unreadable_registry_refuses_the_agent() {
+    let f = fixture();
+    let agent = agent(&f.pki, valid());
+    f.registry
+        .set(agent.certificate(), ClientRefusal::Unavailable);
+    let client = client_config(&f.pki.root_anchor(), Some(&agent), &[ALPN]).unwrap();
+    let o = handshake(
+        client,
+        server_config_for(&f, f.registry.clone()),
+        "core.test",
+    );
+    assert_eq!(failure(&o.server), HandshakeFailure::RegistryUnavailable);
+    // Plain TLS carries only the alert; over QUIC the close reason names it.
+    assert_eq!(failure(&o.client), HandshakeFailure::Other);
+}
+
+#[test]
 fn agent_unknown_to_the_registry_is_refused() {
     let f = fixture();
     let client =
@@ -609,4 +626,15 @@ fn identity_and_anchor_from_pem() {
     let anchor = TrustAnchor::from_pem(f.pki.root.certificate_pem().as_bytes()).unwrap();
     assert_eq!(anchor.certificate(), f.pki.root_anchor().certificate());
     assert!(TrustAnchor::from_pem(b"not pem").is_err());
+}
+
+#[test]
+fn classify_io_finds_the_tls_error() {
+    let tls = std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer),
+    );
+    assert_eq!(classify_io(&tls), Some(HandshakeFailure::UnknownIssuer));
+    let plain = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+    assert_eq!(classify_io(&plain), None);
 }

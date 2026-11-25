@@ -4,3 +4,9 @@ xtask = "run --quiet --package xtask --"
 # Static CRT on Windows: no Visual C++ redistributable needed on the gateway.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# sqlx checks the queries against .sqlx (crates/ostena-core/.sqlx), never a
+# live database: the build works offline, on Windows too (ADR-0011).
+# `cargo sqlx prepare` sets it to false itself to refresh the cache.
+SQLX_OFFLINE = "true"

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT a.id::text AS \"id!\" FROM target_account a JOIN resource r ON r.id = a.resource_id\n           WHERE r.name = $1 AND a.name = $2 AND r.disabled_at IS NULL AND a.disabled_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9d53a523e7ef142ed6e0281f2f8fdbb51e0afbee9bc36890c8d4f30f0d5718e3"
+}

@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT session_id::text AS \"session!\", agent_id::text AS \"agent!\",\n                  command_hmac, command_len, command_kid\n           FROM session_transcript WHERE state = 'recording'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "agent!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "command_hmac",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "session_transcript",
+            "name": "command_hmac"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "command_len",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "session_transcript",
+            "name": "command_len"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "command_kid",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "session_transcript",
+            "name": "command_kid"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "e2a1b65f541ef515ff7d3be472ce2443211389f3b923d4ce40ede5ec1f28ca3d"
+}

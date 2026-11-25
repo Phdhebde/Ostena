@@ -6,16 +6,26 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 repository.workspace = true
+license.workspace = true
 
 [dependencies]
 ostena-common.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
+
+# Terminal modes for hidden password input (tcgetattr, tcsetattr): no std
+# API for them. Already in the lock file through tokio.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-service.workspace = true
 windows-sys.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true

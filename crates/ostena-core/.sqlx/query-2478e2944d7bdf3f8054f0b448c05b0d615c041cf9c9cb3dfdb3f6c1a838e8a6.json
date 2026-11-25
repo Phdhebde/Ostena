@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_credential\n         SET totp_secret = NULL, totp_algorithm = NULL, totp_pending = false,\n             totp_enrolled_at = NULL, totp_last_step = 0\n         WHERE user_id = $1::text::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2478e2944d7bdf3f8054f0b448c05b0d615c041cf9c9cb3dfdb3f6c1a838e8a6"
+}

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT policy, policy_version FROM gateway_group WHERE id = $1::text::uuid",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "policy",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "policy"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "policy_version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "policy_version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "e210ddfd1be3e216cc493e1da6613db635b8ae8197f789c188a79f52639fe34b"
+}
