@@ -200,6 +200,37 @@ impl Transcripts {
     }
 }
 
+/// Writes a **protective** record (`transcript.refused`) at once, in its
+/// own transaction: a failure is logged (`audit.append_failed`), never
+/// silent.
+async fn protect(pool: &PgPool, recorder: &Recorder, event: Option<Event>) {
+    let Some(event) = event else { return };
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(
+                event = "audit.append_failed",
+                audited = "transcript.refused",
+                code = "CORE-E010",
+                "{e}"
+            );
+            drop(event);
+            return;
+        }
+    };
+    if let Some(appended) = audit::append_protective(&mut tx, event).await {
+        match tx.commit().await {
+            Ok(()) => recorder.critical(&[appended]),
+            Err(e) => tracing::error!(
+                event = "audit.append_failed",
+                audited = "transcript.refused",
+                code = "CORE-E010",
+                "{e}"
+            ),
+        }
+    }
+}
+
 /// The `transcript.refused` record.
 fn refused_event(agent: Uuid, session: Uuid, code: &str, reason: &str) -> Event {
     agent_event(EventKind::TranscriptRefused, Outcome::Refused, agent)
@@ -548,8 +579,11 @@ pub async fn receive(
     now: impl Fn() -> u64,
     refusal_allowed: impl Fn() -> bool,
 ) {
+    // Stops the stream at once (the agent cuts the session), then gives the
+    // record to write, within the limit of refusals.
     let refuse = |channel: &mut Channel, code: &str, reason: &str| {
-        if refusal_allowed() {
+        ostena_tunnel::recording::refuse(channel);
+        refusal_allowed().then(|| {
             tracing::warn!(
                 event = "transcript.refused",
                 agent = %agent,
@@ -557,20 +591,21 @@ pub async fn receive(
                 code,
                 "{reason}"
             );
-            recorder.emit(refused_event(agent, session, code, reason));
-        }
-        ostena_tunnel::recording::refuse(channel);
+            refused_event(agent, session, code, reason)
+        })
     };
-    match register(pool, agent, session, now()).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return refuse(
-                &mut channel,
-                REFUSED,
-                "session inconnue, d'un autre agent, close, pas SSH ou déjà enregistrée",
-            );
-        }
-        Err(e) => return refuse(&mut channel, REFUSED, &e.to_string()),
+    let refusal = match register(pool, agent, session, now()).await {
+        Ok(true) => None,
+        Ok(false) => Some(refuse(
+            &mut channel,
+            REFUSED,
+            "session inconnue, d'un autre agent, close, pas SSH ou déjà enregistrée",
+        )),
+        Err(e) => Some(refuse(&mut channel, REFUSED, &e.to_string())),
+    };
+    if let Some(event) = refusal {
+        protect(pool, recorder, event).await;
+        return;
     }
     let path = store.path(session);
     let created = {
@@ -582,11 +617,12 @@ pub async fn receive(
     let file = match created {
         Ok(file) => file,
         Err(e) => {
-            refuse(
+            let event = refuse(
                 &mut channel,
                 WRITE_FAILED,
                 &format!("{} : {e}", path.display()),
             );
+            protect(pool, recorder, event).await;
             // No file written: the seal says so, without a digest.
             let ending = Ending {
                 sealed: None,
@@ -608,7 +644,8 @@ pub async fn receive(
             tracing::warn!(event = "transcript.incomplete", agent = %agent, session = %session, code = failure.code(), "{failure}");
         } else {
             // The agent cuts the session.
-            refuse(&mut channel, failure.code(), &failure.to_string());
+            let event = refuse(&mut channel, failure.code(), &failure.to_string());
+            protect(pool, recorder, event).await;
         }
     }
     let Some((sealed, code)) = finish(written, &path, session, code).await else {

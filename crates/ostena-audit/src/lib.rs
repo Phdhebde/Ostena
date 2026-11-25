@@ -38,7 +38,9 @@ pub use record::{
     ActorKind, Digest, Field, MAX_RECORD_LEN, MIN_RECORD_LEN, Outcome, Record, Value, ZERO_DIGEST,
     record_hash,
 };
-pub use verify::{Finding, Options, Report, Severity, TranscriptSeal, Verifier, verify_export};
+pub use verify::{
+    Finding, Options, Report, Severity, SshSession, TranscriptSeal, Verifier, verify_export,
+};
 
 /// Current time in Unix milliseconds.
 pub fn unix_now_ms() -> u64 {

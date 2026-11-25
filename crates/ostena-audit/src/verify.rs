@@ -145,6 +145,23 @@ pub enum Finding {
         /// Its file name.
         file: String,
     },
+    /// `AUD-E019`: an SSH session opened in the export (`access.session_opened`)
+    /// whose transcript is not sealed in it, though the session must have
+    /// ended before the export.
+    TranscriptNeverSealed {
+        /// The file its transcript would have.
+        file: String,
+        /// Seq of `access.session_opened`.
+        seq: u64,
+    },
+    /// `AUD-W007`: an SSH session opened in the export, not sealed in it,
+    /// that may still have been running at export time.
+    TranscriptPending {
+        /// The file its transcript would have.
+        file: String,
+        /// Seq of `access.session_opened`.
+        seq: u64,
+    },
     /// `AUD-W006`: a transcript sealed as incomplete (stream cut, core
     /// stopped): it is intact, but the session may not be in full.
     TranscriptIncomplete {
@@ -155,6 +172,89 @@ pub enum Finding {
         /// Why (`REC-E…`).
         code: String,
     },
+}
+
+/// An SSH session opened in the export (`access.session_opened`): its
+/// transcript must be sealed once it ends (ADR-0016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshSession {
+    /// Seq of the record.
+    pub seq: u64,
+    /// The access session.
+    pub session: [u8; 16],
+    /// Time of the record, Unix milliseconds.
+    pub opened_ms: u64,
+    /// Its maximum length, seconds.
+    pub max_session_secs: u64,
+}
+
+impl SshSession {
+    /// The SSH session opened by `record`, if it is an
+    /// `access.session_opened` record of SSH (every session of the jalon
+    /// M1; a record without a protocol is one).
+    fn of(record: &Record) -> Option<Self> {
+        if record.event != "access.session_opened" {
+            return None;
+        }
+        let get = |name: &str| {
+            record
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| &f.value)
+        };
+        match get(crate::field::PROTOCOL) {
+            None => {}
+            Some(Value::Text(p)) if p == "ssh" => {}
+            Some(_) => return None,
+        }
+        let session = match get(crate::field::ACCESS_SESSION)? {
+            Value::Uuid(u) => *u,
+            _ => return None,
+        };
+        let max_session_secs = match get(crate::field::MAX_SESSION_SECS) {
+            Some(Value::U64(n)) => *n,
+            _ => u64::MAX,
+        };
+        Some(Self {
+            seq: record.seq,
+            session,
+            opened_ms: record.time_ms,
+            max_session_secs,
+        })
+    }
+
+    /// When it ended at the latest, with `margin_ms` for the end of its
+    /// transcript.
+    pub fn ended_by_ms(&self, margin_ms: u64) -> u64 {
+        self.opened_ms
+            .saturating_add(self.max_session_secs.saturating_mul(1000))
+            .saturating_add(margin_ms)
+    }
+
+    /// The file name of its transcript.
+    pub fn file_name(&self) -> String {
+        file_name(&self.session)
+    }
+}
+
+/// The file name of the transcript of `session`: `<uuid>.cast`.
+fn file_name(session: &[u8; 16]) -> String {
+    let h = |range: std::ops::Range<usize>| {
+        session[range].iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    };
+    format!(
+        "{}-{}-{}-{}-{}.cast",
+        h(0..4),
+        h(4..6),
+        h(6..8),
+        h(8..10),
+        h(10..16)
+    )
 }
 
 /// A transcript seal read from a `transcript.sealed` record (ADR-0016).
@@ -215,21 +315,7 @@ impl TranscriptSeal {
 
     /// The file name of the transcript: `<uuid>.cast`.
     pub fn file_name(&self) -> String {
-        let h = |range: std::ops::Range<usize>| {
-            self.session[range].iter().fold(String::new(), |mut s, b| {
-                use std::fmt::Write as _;
-                let _ = write!(s, "{b:02x}");
-                s
-            })
-        };
-        format!(
-            "{}-{}-{}-{}-{}.cast",
-            h(0..4),
-            h(4..6),
-            h(6..8),
-            h(8..10),
-            h(10..16)
-        )
+        file_name(&self.session)
     }
 }
 
@@ -253,6 +339,8 @@ impl Finding {
             Self::TranscriptAltered { .. } => "AUD-E018",
             Self::TranscriptUnsealed { .. } => "AUD-W005",
             Self::TranscriptIncomplete { .. } => "AUD-W006",
+            Self::TranscriptNeverSealed { .. } => "AUD-E019",
+            Self::TranscriptPending { .. } => "AUD-W007",
         }
     }
 
@@ -264,7 +352,8 @@ impl Finding {
             | Self::HeadGap { .. }
             | Self::StaleHead { .. }
             | Self::TranscriptUnsealed { .. }
-            | Self::TranscriptIncomplete { .. } => Severity::Warning,
+            | Self::TranscriptIncomplete { .. }
+            | Self::TranscriptPending { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -351,6 +440,11 @@ impl fmt::Display for Finding {
                 "[{code}] transcript {file} différent de son sceau (enregistrement n° {seq}) : \
                  taille ou SHA-256"
             ),
+            Self::TranscriptNeverSealed { file, seq } => write!(
+                f,
+                "[{code}] session SSH ouverte (enregistrement n° {seq}) sans transcript scellé \
+                 dans l'export, alors qu'elle était forcément terminée : {file}"
+            ),
             _ => self.fmt_warning(f, code),
         }
     }
@@ -405,6 +499,11 @@ impl Finding {
                 "[{code}] transcript {file} scellé incomplet (enregistrement n° {seq}, {why}) : \
                  intact, mais la session n'y est peut-être pas en entier"
             ),
+            Self::TranscriptPending { file, seq } => write!(
+                f,
+                "[{code}] session SSH ouverte (enregistrement n° {seq}) sans transcript scellé \
+                 dans l'export, peut-être encore en cours à l'export : {file}"
+            ),
             // Errors are written by `Display::fmt`.
             _ => write!(f, "[{code}]"),
         }
@@ -456,6 +555,11 @@ pub struct Report {
     /// The transcript seals of the export, in chain order, for
     /// [`crate::transcripts::check`].
     pub transcripts: Vec<TranscriptSeal>,
+    /// The SSH sessions opened in the export, in chain order, for
+    /// [`crate::transcripts::check`].
+    pub ssh_sessions: Vec<SshSession>,
+    /// Time of the export, Unix milliseconds, when known.
+    pub export_time_ms: Option<u64>,
 }
 
 impl Report {
@@ -531,6 +635,7 @@ pub struct Verifier {
     errors: u64,
     warnings: u64,
     transcripts: Vec<TranscriptSeal>,
+    ssh_sessions: Vec<SshSession>,
 }
 
 impl Verifier {
@@ -557,6 +662,7 @@ impl Verifier {
             errors: 0,
             warnings: 0,
             transcripts: Vec::new(),
+            ssh_sessions: Vec::new(),
         };
         for head in options.external_heads {
             match head.verify(&verifier.keys) {
@@ -762,6 +868,9 @@ impl Verifier {
                 if let Some(seal) = TranscriptSeal::of(&record) {
                     self.transcripts.push(seal);
                 }
+                if let Some(opened) = SshSession::of(&record) {
+                    self.ssh_sessions.push(opened);
+                }
                 record.seq
             }
         };
@@ -922,6 +1031,8 @@ impl Verifier {
             errors: self.errors,
             warnings: self.warnings,
             transcripts: self.transcripts,
+            ssh_sessions: self.ssh_sessions,
+            export_time_ms,
         }
     }
 }

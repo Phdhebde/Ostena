@@ -5,8 +5,11 @@
 //! `<session>.cast`, with its size and SHA-256. The file must be in the
 //! directory and match (`AUD-E017`, `AUD-E018`). A transcript sealed as
 //! incomplete is reported (`AUD-W006`), as is a `.cast` file the export does
-//! not seal (`AUD-W005`). Nothing else in the directory is read, and no
-//! secret is needed.
+//! not seal (`AUD-W005`). Every SSH session opened in the export
+//! (`access.session_opened`) must have its transcript sealed in it
+//! (`AUD-E019`), unless it may still have been running at export time
+//! (`AUD-W007`). Nothing else in the directory is read, and no secret is
+//! needed.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -17,6 +20,11 @@ use ostena_crypto::sha256::Hasher;
 
 use crate::AuditError;
 use crate::verify::{Finding, Report};
+
+/// Time after the maximum length of a session within which its transcript
+/// may still be unsealed: the cut of the session, the end of the stream,
+/// the seal.
+const END_MARGIN_MS: u64 = 5 * 60 * 1000;
 
 /// Size and SHA-256 of `path`, read in chunks.
 fn measure(path: &Path) -> std::io::Result<(u64, [u8; 32])> {
@@ -100,6 +108,28 @@ pub fn check(report: &mut Report, dir: &Path) -> Result<(), AuditError> {
     for file in unsealed {
         report.add(Finding::TranscriptUnsealed { file });
     }
+    // Every SSH session opened in the export has its transcript sealed in
+    // it, unless it may still have been running at export time.
+    let export_ms = report.export_time_ms.unwrap_or(u64::MAX);
+    let sessions = std::mem::take(&mut report.ssh_sessions);
+    for opened in &sessions {
+        let file = opened.file_name();
+        if sealed.contains(&file) {
+            continue;
+        }
+        if opened.ended_by_ms(END_MARGIN_MS) > export_ms {
+            report.add(Finding::TranscriptPending {
+                file,
+                seq: opened.seq,
+            });
+        } else {
+            report.add(Finding::TranscriptNeverSealed {
+                file,
+                seq: opened.seq,
+            });
+        }
+    }
+    report.ssh_sessions = sessions;
     report.transcripts = seals;
     Ok(())
 }
@@ -107,7 +137,7 @@ pub fn check(report: &mut Report, dir: &Path) -> Result<(), AuditError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verify::TranscriptSeal;
+    use crate::verify::{SshSession, TranscriptSeal};
 
     fn report(seals: Vec<TranscriptSeal>) -> Report {
         Report {
@@ -120,6 +150,8 @@ mod tests {
             errors: 0,
             warnings: 0,
             transcripts: seals,
+            ssh_sessions: Vec::new(),
+            export_time_ms: Some(10_000_000),
         }
     }
 
@@ -181,6 +213,35 @@ mod tests {
                     .starts_with(&format!("[{}]", finding.code()))
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An SSH session opened in the export without a seal: an error once
+    /// it must have ended, a warning while it may still run.
+    #[test]
+    fn every_ssh_session_has_its_transcript_sealed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostena-audit-transcripts-sessions-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sealed = seal(1, b"x", true);
+        std::fs::write(dir.join(sealed.file_name()), b"x").unwrap();
+        let opened = |session: u8, opened_ms: u64| SshSession {
+            seq: u64::from(session) + 100,
+            session: [session; 16],
+            opened_ms,
+            max_session_secs: 60,
+        };
+        let mut r = report(vec![sealed]);
+        // Sealed; ended long ago; may still run (export at 10 000 s).
+        r.ssh_sessions = vec![opened(1, 0), opened(2, 0), opened(3, 9_900_000)];
+        check(&mut r, &dir).unwrap();
+        let codes: Vec<&str> = r.findings.iter().map(Finding::code).collect();
+        assert_eq!(codes, ["AUD-E019", "AUD-W007"]);
+        assert!(r.findings[0].to_string().contains("02020202-"));
+        assert_eq!(r.exit_code(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
