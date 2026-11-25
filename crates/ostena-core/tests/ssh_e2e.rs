@@ -380,8 +380,9 @@ fn ssh_access_and_login_revocation_end_to_end() {
         let text = String::from_utf8(written.clone()).unwrap();
         assert!(text.starts_with("{\"version\":2,"), "{text}");
         assert!(text.contains("cat /etc/shadow") && text.contains("root:*:19000"));
-        let (sha256, size, hmac): (Vec<u8>, i64, Vec<u8>) = sqlx::query_as(
-            "SELECT sha256, size, command_hmac FROM session_transcript WHERE session_id = $1::uuid",
+        let (sha256, size, hmac, kid): (Vec<u8>, i64, Vec<u8>, String) = sqlx::query_as(
+            "SELECT sha256, size, command_hmac, command_kid FROM session_transcript
+             WHERE session_id = $1::uuid",
         )
         .bind(session_id.to_string())
         .fetch_one(&pool)
@@ -395,6 +396,32 @@ fn ssh_access_and_login_revocation_end_to_end() {
                 .as_ref()
                 .unwrap()
                 .command_tag(session_id, b"cat /etc/shadow")
+        );
+        let key_id = keys.transcripts.as_ref().unwrap().key_id();
+        assert_eq!(kid, key_id);
+        assert_eq!(key_id.len(), 16);
+        // The seal carries the keyed hash and the key identifier (R2).
+        let fields: Vec<u8> = sqlx::query_scalar(
+            "SELECT body FROM audit_record WHERE event = 'transcript.sealed' ORDER BY seq DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let sealed_record = ostena_audit::Record::decode(&fields).unwrap();
+        let get = |name: &str| {
+            sealed_record
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.value.clone())
+        };
+        assert_eq!(
+            get("command_hmac"),
+            Some(ostena_audit::Value::Bytes(hmac.clone()))
+        );
+        assert_eq!(
+            get("kid"),
+            Some(ostena_audit::Value::Text(key_id.to_owned()))
         );
         #[cfg(unix)]
         {

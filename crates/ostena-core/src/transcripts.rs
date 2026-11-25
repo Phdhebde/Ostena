@@ -54,6 +54,9 @@ pub const INCOMPLETE: &str = "REC-E005";
 /// Domain of the keyed hash of a command: never the same input as another
 /// use of the key.
 const EXEC_DOMAIN: &[u8] = b"ostena/ssh-exec/v1\0";
+/// Domain of the identifier of the command key: a short keyed hash of a
+/// constant, which names the key without revealing it.
+const KEY_ID_DOMAIN: &[u8] = b"ostena/ssh-exec/key-id/v1\0";
 /// Bytes read from the stream at once.
 const READ_CHUNK: usize = 16 * 1024;
 /// Buffer of the file writer.
@@ -65,7 +68,17 @@ const WRITE_QUEUE: usize = 16;
 pub struct Transcripts {
     dir: PathBuf,
     mac: HmacKey,
+    key_id: String,
     limits: Limits,
+}
+
+/// The keyed hash of the command of an `exec`, its length and the
+/// identifier of the key: what the audit chain keeps of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Command {
+    tag: [u8; 32],
+    len: usize,
+    kid: String,
 }
 
 impl std::fmt::Debug for Transcripts {
@@ -149,9 +162,16 @@ impl Transcripts {
         if !std::fs::metadata(dir).map_err(|e| fail(&e))?.is_dir() {
             return Err(fail(&"pas un répertoire"));
         }
+        let id = mac.tag(&[KEY_ID_DOMAIN]);
+        let key_id = id[..8].iter().fold(String::with_capacity(16), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         Ok(Self {
             dir: dir.to_path_buf(),
             mac,
+            key_id,
             limits: Limits::default(),
         })
     }
@@ -172,6 +192,12 @@ impl Transcripts {
     pub fn command_tag(&self, session: Uuid, command: &[u8]) -> [u8; 32] {
         self.mac.tag(&[EXEC_DOMAIN, &session.to_bytes(), command])
     }
+
+    /// The identifier of the command key (16 hexadecimal digits), kept with
+    /// each hash so that the key can be rotated.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
 }
 
 /// The `transcript.refused` record.
@@ -191,7 +217,7 @@ struct Ending {
     reason: Option<EndReason>,
     /// `None`: complete.
     code: Option<&'static str>,
-    command: Option<([u8; 32], usize)>,
+    command: Option<Command>,
 }
 
 /// Seals the transcript of `session`: row and `transcript.sealed` record in
@@ -210,7 +236,7 @@ async fn seal(
     let updated = sqlx::query!(
         "UPDATE session_transcript SET state = $2, sealed_at = $3, sha256 = $4, size = $5,
                 events = $6, invalid_utf8 = $7, output_bytes = $8, end_reason = $9, code = $10,
-                command_hmac = $11, command_len = $12
+                command_hmac = $11, command_len = $12, command_kid = $13
          WHERE session_id = $1::text::uuid AND state = 'recording'",
         session.to_string(),
         state,
@@ -222,11 +248,12 @@ async fn seal(
         i64_of(ending.output_bytes),
         ending.reason.map(EndReason::name),
         ending.code,
-        ending.command.as_ref().map(|(tag, _)| &tag[..]),
+        ending.command.as_ref().map(|c| &c.tag[..]),
         ending
             .command
             .as_ref()
-            .map(|(_, len)| i32::try_from(*len).unwrap_or(i32::MAX)),
+            .map(|c| i32::try_from(c.len).unwrap_or(i32::MAX)),
+        ending.command.as_ref().map(|c| c.kid.as_str()),
     )
     .execute(&mut *tx)
     .await?
@@ -257,6 +284,12 @@ async fn seal(
     event = event
         .u64(field::OUTPUT_BYTES, ending.output_bytes)
         .bool(field::COMPLETE, complete);
+    if let Some(command) = &ending.command {
+        event = event
+            .bytes(field::COMMAND_HMAC, command.tag)
+            .u64(field::LENGTH, command.len as u64)
+            .text(field::KID, command.kid.as_str());
+    }
     if let Some(reason) = ending.reason {
         event = event.text(field::REASON, reason.name());
     }
@@ -360,13 +393,36 @@ fn write_file(
 struct Received {
     failure: Option<RecorderError>,
     reason: Option<EndReason>,
-    command: Option<([u8; 32], usize)>,
+    command: Option<Command>,
     output_bytes: u64,
+}
+
+/// Keeps the hash of the command in the row as soon as it is known, so
+/// that a transcript sealed at the next start still carries it.
+async fn remember_command(pool: &PgPool, session: Uuid, command: &Command) {
+    let kept = sqlx::query!(
+        "UPDATE session_transcript SET command_hmac = $2, command_len = $3, command_kid = $4
+         WHERE session_id = $1::text::uuid AND state = 'recording'",
+        session.to_string(),
+        &command.tag[..],
+        i32::try_from(command.len).unwrap_or(i32::MAX),
+        command.kid.as_str(),
+    )
+    .execute(pool)
+    .await;
+    if let Err(e) = kept {
+        tracing::warn!(
+            event = "transcript.command_unsaved",
+            session = %session,
+            "empreinte de la commande non gardée avant le scellement : {e}"
+        );
+    }
 }
 
 /// Reads the stream into the queue of the file writer until its end or
 /// the first failure.
 async fn read_stream(
+    pool: &PgPool,
     store: &Transcripts,
     recorder: &Recorder,
     agent: Uuid,
@@ -400,14 +456,20 @@ async fn read_stream(
                             command: Some(command),
                             ..
                         } => {
-                            let tag = store.command_tag(session, command);
-                            out.command = Some((tag, command.len()));
+                            let hashed = Command {
+                                tag: store.command_tag(session, command),
+                                len: command.len(),
+                                kid: store.key_id().to_owned(),
+                            };
+                            remember_command(pool, session, &hashed).await;
                             recorder.emit(
                                 agent_event(EventKind::AccessSshExec, Outcome::Success, agent)
                                     .uuid(field::ACCESS_SESSION, session.to_bytes())
-                                    .bytes(field::COMMAND_HMAC, tag)
-                                    .u64(field::LENGTH, command.len() as u64),
+                                    .bytes(field::COMMAND_HMAC, hashed.tag)
+                                    .u64(field::LENGTH, command.len() as u64)
+                                    .text(field::KID, hashed.kid.as_str()),
                             );
+                            out.command = Some(hashed);
                             tracing::info!(
                                 event = "access.ssh_exec",
                                 agent = %agent,
@@ -444,6 +506,7 @@ async fn read_stream(
 /// returns what was read and what the writer sealed. A writer error is the
 /// failure of the stream if it had none.
 async fn record(
+    pool: &PgPool,
     store: &Transcripts,
     recorder: &Recorder,
     agent: Uuid,
@@ -456,7 +519,7 @@ async fn record(
         let path = store.path(session);
         tokio::task::spawn_blocking(move || write_file(file, &path, session, queued))
     };
-    let mut read = read_stream(store, recorder, agent, session, channel, &frames).await;
+    let mut read = read_stream(pool, store, recorder, agent, session, channel, &frames).await;
     drop(frames);
     let written = written
         .await
@@ -538,7 +601,7 @@ pub async fn receive(
             return;
         }
     };
-    let (read, written) = record(store, recorder, agent, session, &mut channel, file).await;
+    let (read, written) = record(pool, store, recorder, agent, session, &mut channel, file).await;
     let code = read.failure.as_ref().map(RecorderError::code);
     if let Some(failure) = &read.failure {
         if matches!(failure, RecorderError::Incomplete(_)) {
@@ -630,7 +693,8 @@ pub async fn recover(
     now: u64,
 ) -> Result<usize, CoreError> {
     let rows = sqlx::query!(
-        r#"SELECT session_id::text AS "session!", agent_id::text AS "agent!"
+        r#"SELECT session_id::text AS "session!", agent_id::text AS "agent!",
+                  command_hmac, command_len, command_kid
            FROM session_transcript WHERE state = 'recording'"#
     )
     .fetch_all(pool)
@@ -638,6 +702,17 @@ pub async fn recover(
     for row in &rows {
         let session = crate::store::uuid(&row.session)?;
         let agent = crate::store::uuid(&row.agent)?;
+        // The hash of a command, kept in the row as soon as it was known.
+        let command = match (&row.command_hmac, row.command_len, &row.command_kid) {
+            (Some(tag), Some(len), Some(kid)) => Some(Command {
+                tag: <[u8; 32]>::try_from(tag.as_slice()).map_err(|_| {
+                    CoreError::Database(format!("empreinte de commande invalide ({session})"))
+                })?,
+                len: usize::try_from(len).unwrap_or(0),
+                kid: kid.clone(),
+            }),
+            _ => None,
+        };
         let path = store.path(session);
         let on_disk =
             measure(&path).map_err(|e| CoreError::Startup(format!("{} : {e}", path.display())))?;
@@ -651,7 +726,7 @@ pub async fn recover(
             output_bytes: 0,
             reason: None,
             code: Some(INCOMPLETE),
-            command: None,
+            command,
         };
         seal(pool, recorder, agent, session, &ending, now).await?;
         tracing::warn!(

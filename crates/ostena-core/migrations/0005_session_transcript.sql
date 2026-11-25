@@ -19,6 +19,9 @@ CREATE TABLE session_transcript (
     -- core.ssh.command_mac_key) and its length; the text is in the file.
     command_hmac  bytea       CHECK (length(command_hmac) = 32),
     command_len   integer     CHECK (command_len BETWEEN 0 AND 32768),
+    -- Identifier of the command key (short keyed hash of a constant), for
+    -- the rotation of the key.
+    command_kid   text        CHECK (command_kid ~ '^[0-9a-f]{16}$'),
     sealed_at     bigint,
     sha256        bytea       CHECK (length(sha256) = 32),
     size          bigint      CHECK (size >= 0),
@@ -31,6 +34,7 @@ CREATE TABLE session_transcript (
     -- Why an incomplete transcript is incomplete (REC-E…).
     code          text        CHECK (code ~ '^REC-E[0-9]{3}$'),
     CHECK ((command_hmac IS NULL) = (command_len IS NULL)),
+    CHECK ((command_hmac IS NULL) = (command_kid IS NULL)),
     CHECK ((state = 'recording') = (sealed_at IS NULL)),
     -- No digest while recording; a sealed transcript has one; an
     -- incomplete one has none when its file could not be created or is
