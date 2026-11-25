@@ -26,6 +26,8 @@ ostena-common.workspace = true
 ostena-crypto.workspace = true
 # Grants issued and consumed by the core (ADR-0004).
 ostena-grant.workspace = true
+# Session transcripts (ADR-0016): strict decoder and asciicast writer.
+ostena-recorder.workspace = true
 # The scope policy of a group, compiled before it is stored and pushed.
 ostena-scope.workspace = true
 # SSH certificates only (cert, keys): without the SSH library, which the

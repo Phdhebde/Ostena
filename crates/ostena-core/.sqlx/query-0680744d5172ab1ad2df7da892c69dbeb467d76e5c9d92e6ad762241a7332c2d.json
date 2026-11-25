@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE session_transcript SET state = $2, sealed_at = $3, sha256 = $4, size = $5,\n                events = $6, invalid_utf8 = $7, output_bytes = $8, end_reason = $9, code = $10,\n                command_hmac = $11, command_len = $12\n         WHERE session_id = $1::text::uuid AND state = 'recording'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Bytea",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Text",
+        "Text",
+        "Bytea",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0680744d5172ab1ad2df7da892c69dbeb467d76e5c9d92e6ad762241a7332c2d"
+}

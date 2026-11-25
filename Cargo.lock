@@ -1644,6 +1644,7 @@ dependencies = [
  "ostena-crypto",
  "ostena-grant",
  "ostena-platform",
+ "ostena-recorder",
  "ostena-scope",
  "ostena-ssh",
  "ostena-tunnel",
