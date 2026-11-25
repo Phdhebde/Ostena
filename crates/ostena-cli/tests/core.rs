@@ -207,6 +207,16 @@ fn lab(db: &TestDb) -> Lab {
         &dir.join("credentials/audit.key"),
         pem_private_key(&audit_pkcs8).expose_secret(),
     );
+    // The grant signing key and the two SSH authorities of the core.
+    for name in ["grant.key", "user_ca.key", "host_ca.key"] {
+        let (_, pkcs8) = SigningKey::generate().unwrap();
+        // SECRET-EXPOSURE: test only, the key files `ostena ca key new` writes.
+        #[expect(clippy::disallowed_methods)]
+        write_private(
+            &dir.join("credentials").join(name),
+            pem_private_key(&pkcs8).expose_secret(),
+        );
+    }
     std::fs::write(
         dir.join("audit.pub"),
         encode_public_key(&audit_key.verifying_key()),
@@ -238,7 +248,10 @@ fn lab(db: &TestDb) -> Lab {
             "mode = \"{mode}\"\n\n[core]\ntunnel_listen = \"127.0.0.1:{tunnel}\"\n\
              enrollment_listen = \"127.0.0.1:{enrollment}\"\ntls_root_ca = \"{}\"\n\
              tls_certificate = \"{}\"\ntls_private_key = {{ credential = \"server.key\" }}\n\
-             issuing_certificate = \"{}\"\nissuing_private_key = {{ credential = \"issuing.key\" }}\n\n\
+             issuing_certificate = \"{}\"\nissuing_private_key = {{ credential = \"issuing.key\" }}\n\
+             grant_signing_key = {{ credential = \"grant.key\" }}\n\n\
+             [core.ssh]\nuser_ca_key = {{ credential = \"user_ca.key\" }}\n\
+             host_ca_key = {{ credential = \"host_ca.key\" }}\n\n\
              [core.audit]\nsigning_key = {{ credential = \"audit.key\" }}\nhead_interval_secs = 1\n\
              heartbeat_secs = 60\n\n\
              [core.database]\nport = {}\nname = \"{}\"\nuser = \"{}\"\n{connection}",
