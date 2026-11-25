@@ -329,11 +329,21 @@ impl IdentitySink {
     /// withdraws the previous identity, with its user authorities; the
     /// server then refuses every connection before the banner, as without
     /// identity.
-    fn apply(&self, trust: &ostena_tunnel::ssh::SshTrust, now: u64) {
+    ///
+    /// Returns when to apply it again without a new push (Unix seconds):
+    /// at the end of validity of the host certificate in effect, or when a
+    /// certificate refused only because it is not valid yet becomes
+    /// acceptable.
+    fn apply(&self, trust: &ostena_tunnel::ssh::SshTrust, now: u64) -> Option<u64> {
+        let validity = trust
+            .host_certificate
+            .as_deref()
+            .and_then(|c| cert::parse(c).ok())
+            .map(|c| (c.valid_after, c.valid_before));
         match identity_of(&self.host_key, trust, now) {
             Ok(built) => {
                 let certificate = trust.host_certificate.as_deref().unwrap_or_default();
-                let end = cert::parse(certificate).ok().map(|c| c.valid_before);
+                let end = validity.map(|(_, end)| end);
                 self.identity.send_replace(Some(Arc::new(built)));
                 self.set_state(IdentityState {
                     applied: Some(trust.version),
@@ -354,6 +364,7 @@ impl IdentitySink {
                         "certificat d'hôte non écrit : {e}"
                     );
                 }
+                end
             }
             Err(reason) => {
                 let withdrawn = self.identity.send_replace(None).is_some();
@@ -374,13 +385,33 @@ impl IdentitySink {
                          une confiance applicable"
                     );
                 }
+                // The first instant the certificate is accepted (its start,
+                // less the tolerated clock skew).
+                validity
+                    .map(|(start, _)| start.saturating_sub(cert::CLOCK_SKEW_SECS))
+                    .filter(|&at| at > now && identity_of(&self.host_key, trust, at).is_ok())
             }
         }
     }
 }
 
+/// Sleeps until the wall clock reaches `at` (Unix seconds), in steps of an
+/// hour at most so that a clock change is caught up.
+async fn sleep_until_unix(at: u64) {
+    loop {
+        let now = ostena_grant::unix_now();
+        if now >= at {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs((at - now).min(3600))).await;
+    }
+}
+
 /// Follows the trust pushed by the core and publishes the identity of the
-/// server (see [`IdentitySink::apply`]).
+/// server (see [`IdentitySink::apply`]), applied again at the end of
+/// validity of its host certificate (the identity is then withdrawn) or at
+/// the start of validity of a certificate not valid yet, without waiting
+/// for the next push.
 fn follow_trust(
     mut trust: watch::Receiver<Option<Arc<ostena_tunnel::ssh::SshTrust>>>,
     sink: IdentitySink,
@@ -388,11 +419,14 @@ fn follow_trust(
     tokio::spawn(async move {
         loop {
             let current = trust.borrow_and_update().clone();
-            if let Some(trust) = current {
-                sink.apply(&trust, ostena_grant::unix_now());
-            }
-            if trust.changed().await.is_err() {
-                return;
+            let next = current.and_then(|trust| sink.apply(&trust, ostena_grant::unix_now()));
+            tokio::select! {
+                changed = trust.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                () = sleep_until_unix(next.unwrap_or_default()), if next.is_some() => {}
             }
         }
     })
@@ -1100,12 +1134,16 @@ mod tests {
 
         // Before the host certificate is issued: no identity, nothing to
         // withdraw.
-        t.sink.apply(&t.trust(1, None, &[&old_ca]), NOW);
+        assert_eq!(t.sink.apply(&t.trust(1, None, &[&old_ca]), NOW), None);
         assert_eq!(t.user_cas(), None);
         assert_eq!(t.state().applied, None);
 
-        t.sink
-            .apply(&t.trust(2, Some(valid.clone()), &[&old_ca]), NOW);
+        assert_eq!(
+            t.sink
+                .apply(&t.trust(2, Some(valid.clone()), &[&old_ca]), NOW),
+            Some(NOW + 86_400),
+            "applied again when the certificate expires"
+        );
         assert_eq!(t.user_cas(), Some(vec![old_ca.verifying_key()]));
         assert_eq!(
             t.state(),
@@ -1177,6 +1215,72 @@ mod tests {
                 .await
             );
             assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn identity_is_applied_again_when_the_certificate_expires_or_starts() {
+        let t = Trusted::new("trust-dates");
+        let ca = SigningKey::generate().unwrap().0;
+        let stranger = SigningKey::generate().unwrap().0;
+        // At its end: withdrawn, nothing more to wait for.
+        let short = t.certificate(&t.host_ca, NOW - 60, NOW + 10);
+        let trust = t.trust(1, Some(short), &[&ca]);
+        assert_eq!(t.sink.apply(&trust, NOW), Some(NOW + 10));
+        assert_eq!(t.sink.apply(&trust, NOW + 10), None);
+        assert_eq!(t.user_cas(), None);
+        assert!(t.state().refusal.unwrap().contains("expiré"));
+        // Not valid yet: retried at its start, then at its end.
+        let later = t.certificate(&t.host_ca, NOW + 600, NOW + 7200);
+        let trust = t.trust(2, Some(later), &[&ca]);
+        let start = NOW + 600 - cert::CLOCK_SKEW_SECS;
+        assert_eq!(t.sink.apply(&trust, NOW), Some(start));
+        assert_eq!(t.user_cas(), None);
+        assert_eq!(t.sink.apply(&trust, start), Some(NOW + 7200));
+        assert!(t.user_cas().is_some());
+        // Not valid yet and refused anyway: no retry.
+        let foreign = t.certificate(&stranger, NOW + 600, NOW + 7200);
+        assert_eq!(t.sink.apply(&t.trust(3, Some(foreign), &[&ca]), NOW), None);
+    }
+
+    #[test]
+    fn follow_trust_acts_at_the_dates_without_a_new_push() {
+        block_on(async {
+            let t = Trusted::new("trust-timer");
+            let ca = SigningKey::generate().unwrap().0;
+            let now = ostena_grant::unix_now();
+            // Expires in 2 s; the next one is accepted in 5 s.
+            let first = t.trust(
+                1,
+                Some(t.certificate(&t.host_ca, now - 60, now + 2)),
+                &[&ca],
+            );
+            let second = t.trust(
+                2,
+                Some(t.certificate(&t.host_ca, now + cert::CLOCK_SKEW_SECS + 5, now + 3600)),
+                &[&ca],
+            );
+            let identity = t.identity.clone();
+            let wait = |ready: bool| {
+                let mut identity = identity.clone();
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(15),
+                        identity.wait_for(|i| i.is_some() == ready),
+                    )
+                    .await
+                    .is_ok()
+                }
+            };
+            let (tx, rx) = watch::channel(Some(Arc::new(first)));
+            let task = follow_trust(rx, t.sink);
+            assert!(wait(true).await, "ready");
+            assert!(wait(false).await, "withdrawn at expiry");
+            tx.send_replace(Some(Arc::new(second)));
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(identity.borrow().is_none(), "not valid yet");
+            assert!(wait(true).await, "ready at its start");
+            task.abort();
         });
     }
 }
