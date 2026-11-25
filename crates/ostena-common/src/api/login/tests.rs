@@ -105,7 +105,7 @@ fn login_response_round_trips_and_is_checked() {
         |r| r.certificate.push('\n'),
         |r| r.host_ca = "ssh-ed25519 AAAA".into(),
         |r| r.valid_before = r.valid_after,
-        |r| r.valid_before = r.valid_after + MAX_SESSION_SECS + 1,
+        |r| r.valid_before = r.valid_after + MAX_SESSION_SECS + VALIDITY_MARGIN_SECS + 1,
         |r| r.ssh_hosts.clear(),
         |r| r.ssh_hosts = vec!["a b".into()],
         |r| r.ssh_port = 0,

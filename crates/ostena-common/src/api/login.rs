@@ -31,6 +31,9 @@ pub const MAX_PASSWORD: usize = 1024;
 pub const MAX_TOTP: usize = 16;
 /// Longest login session, in seconds (8 h).
 pub const MAX_SESSION_SECS: u64 = 8 * 3600;
+/// Margin of a certificate validity beyond the session: its start is set
+/// back for the clocks (5 min at most, as `ostena_ssh::cert`).
+pub const VALIDITY_MARGIN_SECS: u64 = 300;
 /// Longest certificate or public key line.
 pub const MAX_SSH_LINE: usize = 8192;
 /// Longest error message.
@@ -244,9 +247,13 @@ impl LoginResponse {
             }
         }
         if response.valid_before <= response.valid_after
-            || response.valid_before - response.valid_after > MAX_SESSION_SECS
+            || response.valid_before - response.valid_after
+                > MAX_SESSION_SECS + VALIDITY_MARGIN_SECS
         {
-            return Err(WireError::Field("valid_before", "durée de 8 h au plus"));
+            return Err(WireError::Field(
+                "valid_before",
+                "durée de 8 h 5 min au plus",
+            ));
         }
         if response.ssh_hosts.is_empty()
             || response.ssh_hosts.len() > MAX_SSH_HOSTS
