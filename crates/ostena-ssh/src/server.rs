@@ -440,6 +440,20 @@ impl<A: Authorizer> SshServer<A> {
         count
     }
 
+    /// Cuts every session, authorised or being authorised, as a revocation
+    /// does (a revocation may have been lost); returns how many.
+    pub fn revoke_all(&self) -> usize {
+        let live = self
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for l in live.values() {
+            l.revoke.send_replace(true);
+        }
+        live.len()
+    }
+
     /// Authenticated sessions now.
     pub fn sessions(&self) -> usize {
         self.shared

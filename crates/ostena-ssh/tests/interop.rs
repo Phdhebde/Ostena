@@ -893,6 +893,33 @@ fn a_revocation_during_the_authorisation_cuts_the_session() {
 }
 
 #[test]
+fn revoke_all_cuts_every_session_whatever_its_login_session() {
+    let runtime = runtime();
+    let Some(n) = native(&runtime, "native-revoke-all", ServerSettings::default()) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    assert_eq!(n.agent.server.revoke_all(), 0);
+    let child = std::thread::spawn({
+        let ssh = n.ssh.clone();
+        let args = n.args_for(&certificate);
+        move || Command::new(ssh).args(args).output().unwrap()
+    });
+    let mut revoked = 0;
+    for _ in 0..200 {
+        if n.agent.server.sessions() > 0 {
+            revoked = n.agent.server.revoke_all();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(revoked, 1);
+    assert!(!child.join().unwrap().status.success());
+    let closed = wait_closed(&n, 1);
+    assert_eq!(closed[0].reason, "révoquée");
+}
+
+#[test]
 fn a_client_gone_right_after_the_authorisation_still_closes_the_session() {
     let runtime = runtime();
     let Some(n) = native(&runtime, "native-gone", ServerSettings::default()) else {
