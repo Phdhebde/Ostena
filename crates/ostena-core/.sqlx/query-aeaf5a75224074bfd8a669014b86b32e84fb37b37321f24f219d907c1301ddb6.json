@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE gateway_group SET ssh_host_names = $2, updated_at = now()\n         WHERE id = $1::text::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aeaf5a75224074bfd8a669014b86b32e84fb37b37321f24f219d907c1301ddb6"
+}

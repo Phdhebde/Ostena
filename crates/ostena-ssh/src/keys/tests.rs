@@ -37,6 +37,38 @@ fn public_line_format() {
 }
 
 #[test]
+fn public_line_of_a_verifying_key_matches_the_generated_line() {
+    let (signing, _) = SigningKey::generate().unwrap();
+    let generated = encode(&signing, "ca").unwrap();
+    let public = signing.verifying_key();
+    assert_eq!(public_line(&public, "ca"), generated.public);
+    assert_eq!(
+        public_line(&public, ""),
+        generated.public.trim_end_matches(" ca")
+    );
+    assert_eq!(parse_public_line(&generated.public), Some(public));
+    assert_eq!(parse_public_line(&public_line(&public, "")), Some(public));
+}
+
+#[test]
+fn foreign_public_lines_are_refused() {
+    let (signing, _) = SigningKey::generate().unwrap();
+    let line = public_line(&signing.verifying_key(), "x");
+    let blob = line.split(' ').nth(1).unwrap();
+    for bad in [
+        String::new(),
+        "ecdsa-sha2-nistp256".to_owned(),
+        line.replacen("ecdsa-sha2-nistp256", "ssh-ed25519", 1),
+        format!("ecdsa-sha2-nistp256 {}A", &blob[..blob.len() - 1]),
+        format!("ecdsa-sha2-nistp256 {blob}AAAA"),
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+            .to_owned(),
+    ] {
+        assert_eq!(parse_public_line(&bad), None, "{bad}");
+    }
+}
+
+#[test]
 fn short_scalar_is_detected() {
     let key = short_scalar_key();
     // SECRET-EXPOSURE: test only.

@@ -14,11 +14,22 @@ license.workspace = true
 testing = []
 
 [dependencies]
+# Keys in the tunnel messages (base64url, ADR-0008).
+base64.workspace = true
 idna_adapter.workspace = true
 ostena-audit.workspace = true
 ostena-common.workspace = true
 ostena-crypto.workspace = true
+# Grants issued and consumed by the core (ADR-0004).
+ostena-grant.workspace = true
+# The scope policy of a group, compiled before it is stored and pushed.
+ostena-scope.workspace = true
+# SSH certificates only (cert, keys): without the SSH library, which the
+# core never runs (ADR-0014).
+ostena-ssh = { path = "../ostena-ssh", default-features = false }
 ostena-tunnel.workspace = true
+# The stored scope policy (JSON) and the digest of a pushed SSH trust.
+serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -26,6 +37,11 @@ tracing.workspace = true
 
 [dev-dependencies]
 ostena-core = { path = ".", features = ["testing"] }
+# The end-to-end test: a test PKI, and the agent side (link and gateway)
+# with its private files.
+ostena-crypto = { workspace = true, features = ["testing"] }
+ostena-platform.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

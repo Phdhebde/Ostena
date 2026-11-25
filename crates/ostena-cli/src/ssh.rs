@@ -344,6 +344,15 @@ impl IdentitySink {
             Ok(built) => {
                 let certificate = trust.host_certificate.as_deref().unwrap_or_default();
                 let end = validity.map(|(_, end)| end);
+                // Written before the identity is announced: whoever sees
+                // it ready (status, journal) finds the certificate on disk.
+                if let Err(e) = write_host_certificate(&self.certificate_path, certificate) {
+                    tracing::warn!(
+                        event = "agent.ssh_host_certificate_unwritten",
+                        path = %self.certificate_path.display(),
+                        "certificat d'hôte non écrit : {e}"
+                    );
+                }
                 self.identity.send_replace(Some(Arc::new(built)));
                 self.set_state(IdentityState {
                     applied: Some(trust.version),
@@ -357,13 +366,6 @@ impl IdentitySink {
                     host_authorities = trust.host_cas.len(),
                     valid_before = end,
                 );
-                if let Err(e) = write_host_certificate(&self.certificate_path, certificate) {
-                    tracing::warn!(
-                        event = "agent.ssh_host_certificate_unwritten",
-                        path = %self.certificate_path.display(),
-                        "certificat d'hôte non écrit : {e}"
-                    );
-                }
                 end
             }
             Err(reason) => {

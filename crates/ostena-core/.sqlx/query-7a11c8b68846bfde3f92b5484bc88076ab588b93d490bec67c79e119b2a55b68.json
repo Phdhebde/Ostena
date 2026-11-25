@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE access_grant SET consumed_at = $2, consumed_by = $3::text::uuid WHERE jti = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7a11c8b68846bfde3f92b5484bc88076ab588b93d490bec67c79e119b2a55b68"
+}

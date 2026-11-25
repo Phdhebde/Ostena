@@ -24,7 +24,7 @@ use ostena_core::{CoreError, db};
 use ostena_platform::private_file::{self, Reader};
 use ostena_tunnel::Uuid;
 
-fn fail(text: &str) -> ExitCode {
+pub(crate) fn fail(text: &str) -> ExitCode {
     let _ = writeln!(io::stderr(), "{text}");
     ExitCode::FAILURE
 }
@@ -80,7 +80,7 @@ fn init_logging(path: &Path) {
 /// Logging of an administration command: the configured destinations but
 /// standard output, which carries the result (a token, a listing); the
 /// operator reads errors on standard error.
-fn init_admin_logging(path: &Path) {
+pub(crate) fn init_admin_logging(path: &Path) {
     let mut logging =
         crate::agent::read(path).map_or_else(|_| LoggingConfig::default(), |c| c.logging);
     logging
@@ -138,7 +138,7 @@ async fn serve(loaded: Loaded) -> Result<(), CoreError> {
 
 /// Runs an administration task against the database of `path`, on a small
 /// runtime; the schema must be the one of this binary.
-fn admin<T>(
+pub(crate) fn admin<T>(
     path: &Path,
     task: impl AsyncFnOnce(db::Pool) -> Result<T, CoreError>,
 ) -> Result<T, String> {

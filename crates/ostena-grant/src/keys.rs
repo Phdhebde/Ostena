@@ -133,6 +133,20 @@ impl Issuer {
     /// [`CryptoError::Random`] if no jti can be drawn, [`CryptoError::Signing`] if
     /// the signature fails.
     pub fn issue(&self, claims: &Claims, now: u64) -> Result<SignedGrant, CryptoError> {
+        self.issue_grant(claims, now).map(|(_, signed)| signed)
+    }
+
+    /// As [`Self::issue`], with the content signed: the issuer records the
+    /// jti and the expiry of what it hands out.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::issue`].
+    pub fn issue_grant(
+        &self,
+        claims: &Claims,
+        now: u64,
+    ) -> Result<(Grant, SignedGrant), CryptoError> {
         let grant = Grant {
             kid: self.kid,
             jti: Jti::random()?,
@@ -143,7 +157,7 @@ impl Issuer {
             issued_at: now,
             expires_at: now.saturating_add(u64::from(self.ttl_secs)),
         };
-        self.sign(&grant)
+        Ok((grant, self.sign(&grant)?))
     }
 
     /// Signs arbitrary grant content (tests and tooling).

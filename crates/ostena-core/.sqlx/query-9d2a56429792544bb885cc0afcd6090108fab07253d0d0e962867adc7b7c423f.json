@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT DISTINCT s.id::text AS \"id!\" FROM login_session s\n           JOIN access_grant g ON g.login_session_id = s.id\n           WHERE (g.agent_id = $1::text::uuid OR g.consumed_by = $1::text::uuid)\n             AND s.revoked_at IS NOT NULL\n             AND s.expires_at > $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9d2a56429792544bb885cc0afcd6090108fab07253d0d0e962867adc7b7c423f"
+}

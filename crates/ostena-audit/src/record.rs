@@ -10,7 +10,7 @@
 //! | 32 | prev hash | hash of record `seq − 1`; zeros if and only if `seq = 1` |
 //! | 8 | time (Unix ms) | |
 //! | 1 | outcome | 0 success, 1 refused, 2 failure |
-//! | 1 | actor kind | 0 core, 1 admin, 2 agent, 3 peer |
+//! | 1 | actor kind | 0 core, 1 admin, 2 agent, 3 peer, 4 user |
 //! | 1 + n | actor | UTF-8, at most 128 bytes, no control character |
 //! | 1 + n | event | ASCII `[a-z0-9_.]`, 3 to 64 bytes |
 //! | 1 | field count | at most 32 |
@@ -108,11 +108,14 @@ pub enum ActorKind {
     Agent,
     /// An unauthenticated peer (an address).
     Peer,
+    /// An authenticated user of the bastion, acting for themselves
+    /// (`ostena login`, ADR-0014).
+    User,
 }
 
 impl ActorKind {
     /// Every actor kind, in code order.
-    pub const ALL: [Self; 4] = [Self::Core, Self::Admin, Self::Agent, Self::Peer];
+    pub const ALL: [Self; 5] = [Self::Core, Self::Admin, Self::Agent, Self::Peer, Self::User];
 
     /// The encoded value.
     pub const fn code(self) -> u8 {
@@ -121,6 +124,7 @@ impl ActorKind {
             Self::Admin => 1,
             Self::Agent => 2,
             Self::Peer => 3,
+            Self::User => 4,
         }
     }
 
@@ -131,6 +135,7 @@ impl ActorKind {
             1 => Some(Self::Admin),
             2 => Some(Self::Agent),
             3 => Some(Self::Peer),
+            4 => Some(Self::User),
             _ => None,
         }
     }

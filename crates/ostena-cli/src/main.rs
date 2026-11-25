@@ -11,6 +11,8 @@ mod ca;
 mod control;
 #[cfg(target_os = "linux")]
 mod core;
+#[cfg(target_os = "linux")]
+mod core_inventory;
 mod core_link;
 mod enroll;
 mod keyset_state;
@@ -91,6 +93,247 @@ enum CoreCommand {
     Audit {
         #[command(subcommand)]
         command: CoreAuditCommand,
+    },
+    /// Gateway groups: SSH host names and scope policy pushed to their
+    /// agents.
+    Group {
+        #[command(subcommand)]
+        command: CoreGroupCommand,
+    },
+    /// Users of the bastion.
+    User {
+        #[command(subcommand)]
+        command: CoreUserCommand,
+    },
+    /// Resources (targets) and their pinned SSH host key.
+    Resource {
+        #[command(subcommand)]
+        command: CoreResourceCommand,
+    },
+    /// Accounts on the resources.
+    Account {
+        #[command(subcommand)]
+        command: CoreAccountCommand,
+    },
+    /// Rights: user, account, until a date.
+    Right {
+        #[command(subcommand)]
+        command: CoreRightCommand,
+    },
+    /// Login sessions (`ostena login`).
+    Login {
+        #[command(subcommand)]
+        command: CoreLoginCommand,
+    },
+    /// Dry run of the access decision.
+    Access {
+        #[command(subcommand)]
+        command: CoreAccessCommand,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreGroupCommand {
+    /// Create a gateway group; prints its identifier.
+    Add {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Name, `[a-z0-9][a-z0-9._-]{0,62}`.
+        name: String,
+        /// The UUID its agents were enrolled with (`agent token --group`).
+        #[arg(long)]
+        id: Option<String>,
+        /// SSH host name users type after the last `@` (repeatable, at most
+        /// 16): principals of the host certificates of its agents.
+        #[arg(long = "host-name")]
+        host_names: Vec<String>,
+    },
+    /// Replace the SSH host names of a group.
+    HostNames {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Group name.
+        name: String,
+        /// SSH host name (repeatable; none removes them all).
+        #[arg(long = "host-name")]
+        host_names: Vec<String>,
+    },
+    /// Set the scope policy of a group from a TOML file (the fields of a
+    /// `[[scope.policies]]` entry); it is compiled as in production first.
+    Policy {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Group name.
+        name: String,
+        /// The policy file.
+        file: PathBuf,
+    },
+    /// List the groups.
+    List {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreUserCommand {
+    /// Create a user; prints its identifier.
+    Add {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name, `[a-z0-9][a-z0-9._-]{0,63}`.
+        name: String,
+        /// Display name.
+        #[arg(long)]
+        display_name: String,
+    },
+    /// List the users.
+    List {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+    /// Disable a user and revoke their login sessions.
+    Disable {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreResourceCommand {
+    /// Add a resource reached through a gateway group; prints its
+    /// identifier.
+    Add {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Name users type, `[a-z0-9][a-z0-9.-]{0,62}`.
+        name: String,
+        /// Target host (name or address).
+        #[arg(long)]
+        host: String,
+        /// Target port.
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+        /// Gateway group name.
+        #[arg(long)]
+        group: String,
+        /// The `ssh_host_ecdsa_key.pub` file of the target: its pinned host
+        /// key.
+        #[arg(long)]
+        host_key: PathBuf,
+    },
+    /// List the resources and their accounts.
+    List {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreAccountCommand {
+    /// Add an account to a resource; prints its identifier.
+    Add {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Resource name.
+        #[arg(long)]
+        resource: String,
+        /// Account on the target.
+        name: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreRightCommand {
+    /// Grant a user SSH access to an account, for a number of days;
+    /// prints the right identifier.
+    Grant {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        #[arg(long)]
+        user: String,
+        /// Resource name.
+        #[arg(long)]
+        resource: String,
+        /// Account on the resource.
+        #[arg(long)]
+        account: String,
+        /// Validity in days, 1 to 366 (required).
+        #[arg(long)]
+        days: u64,
+        /// Longest session in minutes, 1 to 720.
+        #[arg(long, default_value_t = 60)]
+        max_session_mins: u32,
+    },
+    /// List the rights.
+    List {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+    /// Revoke a right: no new grant under it.
+    Revoke {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Right identifier (UUID).
+        right: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreLoginCommand {
+    /// Revoke a login session: the agents cut its SSH sessions.
+    Revoke {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login session (UUID, key identifier of the user certificate).
+        session: String,
+        /// Why (audit).
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreAccessCommand {
+    /// Would this user get SSH access to this account? Nothing is written,
+    /// not even to the audit chain; exit code 1 if refused.
+    Check {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        #[arg(long)]
+        user: String,
+        /// Resource name.
+        #[arg(long)]
+        resource: String,
+        /// Account on the resource.
+        #[arg(long)]
+        account: String,
     },
 }
 
@@ -595,6 +838,92 @@ fn run_core(command: CoreCommand) -> ExitCode {
                 core::audit_acknowledge_break(&config, seq)
             }
         },
+        command => run_core_inventory(command),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_core_inventory(command: CoreCommand) -> ExitCode {
+    use core_inventory as inv;
+    match command {
+        CoreCommand::Group { command } => match command {
+            CoreGroupCommand::Add {
+                config,
+                name,
+                id,
+                host_names,
+            } => inv::group_add(&config, &name, id.as_deref(), &host_names),
+            CoreGroupCommand::HostNames {
+                config,
+                name,
+                host_names,
+            } => inv::group_host_names(&config, &name, &host_names),
+            CoreGroupCommand::Policy { config, name, file } => {
+                inv::group_policy(&config, &name, &file)
+            }
+            CoreGroupCommand::List { config } => inv::group_list(&config),
+        },
+        CoreCommand::User { command } => match command {
+            CoreUserCommand::Add {
+                config,
+                name,
+                display_name,
+            } => inv::user_add(&config, &name, &display_name),
+            CoreUserCommand::List { config } => inv::user_list(&config),
+            CoreUserCommand::Disable { config, name } => inv::user_disable(&config, &name),
+        },
+        CoreCommand::Resource { command } => match command {
+            CoreResourceCommand::Add {
+                config,
+                name,
+                host,
+                port,
+                group,
+                host_key,
+            } => inv::resource_add(&config, &name, &host, port, &group, &host_key),
+            CoreResourceCommand::List { config } => inv::resource_list(&config),
+        },
+        CoreCommand::Account {
+            command:
+                CoreAccountCommand::Add {
+                    config,
+                    resource,
+                    name,
+                },
+        } => inv::account_add(&config, &resource, &name),
+        CoreCommand::Right { command } => match command {
+            CoreRightCommand::Grant {
+                config,
+                user,
+                resource,
+                account,
+                days,
+                max_session_mins,
+            } => inv::right_grant(&config, &user, &resource, &account, days, max_session_mins),
+            CoreRightCommand::List { config } => inv::right_list(&config),
+            CoreRightCommand::Revoke { config, right } => inv::right_revoke(&config, &right),
+        },
+        CoreCommand::Login {
+            command:
+                CoreLoginCommand::Revoke {
+                    config,
+                    session,
+                    reason,
+                },
+        } => inv::login_revoke(&config, &session, &reason),
+        CoreCommand::Access {
+            command:
+                CoreAccessCommand::Check {
+                    config,
+                    user,
+                    resource,
+                    account,
+                },
+        } => inv::access_check(&config, &user, &resource, &account),
+        CoreCommand::Run { .. }
+        | CoreCommand::Migrate { .. }
+        | CoreCommand::Agent { .. }
+        | CoreCommand::Audit { .. } => ExitCode::FAILURE,
     }
 }
 

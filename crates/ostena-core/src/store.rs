@@ -41,6 +41,11 @@ pub enum Notice {
     /// The audit chain changed (an administration command appended to it):
     /// the head signer looks at the tip.
     Audit,
+    /// A login session was revoked: tell the agents concerned (ADR-0014).
+    LoginRevoked(Uuid),
+    /// A gateway group changed (SSH host names, scope policy): push again
+    /// to its agents.
+    Group(Uuid),
 }
 
 impl Notice {
@@ -51,6 +56,8 @@ impl Notice {
             Self::Registered => "registered".into(),
             Self::Revoked(agent) => format!("revoked:{agent}"),
             Self::Audit => "audit".into(),
+            Self::LoginRevoked(session) => format!("login_revoked:{session}"),
+            Self::Group(group) => format!("group:{group}"),
         }
     }
 
@@ -60,15 +67,21 @@ impl Notice {
             "token" => Some(Self::Token),
             "registered" => Some(Self::Registered),
             "audit" => Some(Self::Audit),
-            _ => payload
-                .strip_prefix("revoked:")
-                .and_then(Uuid::parse)
-                .map(Self::Revoked),
+            _ => {
+                let (kind, id) = payload.split_once(':')?;
+                let id = Uuid::parse(id)?;
+                match kind {
+                    "revoked" => Some(Self::Revoked(id)),
+                    "login_revoked" => Some(Self::LoginRevoked(id)),
+                    "group" => Some(Self::Group(id)),
+                    _ => None,
+                }
+            }
         }
     }
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -89,11 +102,11 @@ fn fingerprint(bytes: &[u8]) -> Result<[u8; 32], CoreError> {
         .map_err(|_| CoreError::Database("empreinte de certificat de taille invalide".into()))
 }
 
-fn uuid(text: &str) -> Result<Uuid, CoreError> {
+pub(crate) fn uuid(text: &str) -> Result<Uuid, CoreError> {
     Uuid::parse(text).ok_or_else(|| CoreError::Database(format!("UUID invalide : {text}")))
 }
 
-fn i64_of(value: u64) -> i64 {
+pub(crate) fn i64_of(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
@@ -438,6 +451,18 @@ async fn notify(
         .map(|_| ())
 }
 
+/// Sends `notice` on [`CHANNEL`], delivered at the commit of `tx`.
+///
+/// # Errors
+///
+/// [`CoreError::Database`].
+pub(crate) async fn notify_notice(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    notice: &Notice,
+) -> Result<(), CoreError> {
+    notify(tx, notice).await.map_err(CoreError::from)
+}
+
 /// Notifies the running core that the audit chain changed (an
 /// administration command appended to it).
 ///
@@ -586,10 +611,21 @@ mod tests {
             Notice::Registered,
             Notice::Revoked(agent),
             Notice::Audit,
+            Notice::LoginRevoked(agent),
+            Notice::Group(agent),
         ] {
             assert_eq!(Notice::parse(&n.payload()), Some(n));
         }
-        for bad in ["", "revoked:", "revoked:x", "token ", "other"] {
+        for bad in [
+            "",
+            "revoked:",
+            "revoked:x",
+            "token ",
+            "other",
+            "group:",
+            "login_revoked:x",
+            "other:07070707-0707-0707-0707-070707070707",
+        ] {
             assert_eq!(Notice::parse(bad), None, "{bad}");
         }
     }

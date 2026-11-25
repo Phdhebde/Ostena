@@ -125,7 +125,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
-        "CFG-P014", "CFG-V015",
+        "CFG-P014", "CFG-V015", "CFG-V016",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1079,6 +1079,7 @@ tls_certificate = "/etc/ostena/ca/server.pem"
 tls_private_key = { credential = "server.key" }
 issuing_certificate = "/etc/ostena/ca/issuing.pem"
 issuing_private_key = { credential = "issuing.key" }
+grant_signing_key = { credential = "grant.key" }
 audit = { signing_key = { credential = "audit.key" } }
 "#;
 
@@ -1114,6 +1115,65 @@ fn core_section_defaults_are_safe() {
         (60, 300, 1000)
     );
     assert_eq!(core.keys()[2].0, "core.audit.signing_key");
+    assert_eq!(core.keys()[3].0, "core.grant_signing_key");
+    assert_eq!(core.keys().len(), 4);
+    assert!(core.ssh.is_none());
+}
+
+#[test]
+fn core_grant_key_is_required() {
+    let text = CORE.replace("grant_signing_key = { credential = \"grant.key\" }\n", "");
+    assert_eq!(
+        Config::from_toml_str(&text).unwrap_err().codes(),
+        vec![Code::Parse]
+    );
+}
+
+#[test]
+fn core_ssh_section_and_v016_reused_keys() {
+    let c = core_with(
+        "[core.ssh]\nuser_ca_key = { credential = \"ssh-user.key\" }\n\
+         host_ca_key = { file = \"/var/lib/ostena/ca/ssh-host.key\" }\n",
+    );
+    assert_eq!(core_codes(&c), Vec::new());
+    let core = c.core.clone().unwrap();
+    let ssh = core.ssh.as_ref().unwrap();
+    assert_eq!(ssh.host_certificate_days, 30);
+    let names: Vec<_> = core.keys().iter().map(|(n, _)| *n).collect();
+    assert!(names.contains(&"core.ssh.user_ca_key") && names.contains(&"core.ssh.host_ca_key"));
+    // The SSH keys follow the key rules: a plain file is waived, then refused.
+    let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END - 1);
+    assert!(
+        waived[0].message.contains("core.ssh.host_ca_key"),
+        "{waived:?}"
+    );
+    // The same source for two keys.
+    let c = core_with(
+        "[core.ssh]\nuser_ca_key = { credential = \"grant.key\" }\n\
+         host_ca_key = { credential = \"grant.key\" }\n",
+    );
+    assert_eq!(
+        core_codes(&c),
+        vec![Code::CoreKeyReused, Code::CoreKeyReused]
+    );
+    // Bounds and strictness.
+    let c = core_with(
+        "[core.ssh]\nuser_ca_key = { credential = \"u\" }\nhost_ca_key = { credential = \"h\" }\n\
+         host_certificate_days = 91\n",
+    );
+    assert_eq!(core_codes(&c), vec![Code::CoreBounds]);
+    for extra in [
+        "[core.ssh]\nuser_ca_key = { credential = \"u\" }\n",
+        "[core.ssh]\nuser_ca_key = { credential = \"u\" }\nhost_ca_key = { credential = \"h\" }\nother = 1\n",
+    ] {
+        assert_eq!(
+            Config::from_toml_str(&format!("{CORE}{extra}"))
+                .unwrap_err()
+                .codes(),
+            vec![Code::Parse],
+            "accepted: {extra}"
+        );
+    }
 }
 
 /// [`CORE`] with its `audit` table replaced by `audit`.

@@ -16,7 +16,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ostena_common::secret::SecretBytes;
-use ostena_crypto::p256::SigningKey;
+use ostena_crypto::p256::{SigningKey, VerifyingKey};
 
 const MAGIC: &[u8] = b"openssh-key-v1\0";
 const KEY_TYPE: &str = "ecdsa-sha2-nistp256";
@@ -100,6 +100,33 @@ fn public_blob(public: &[u8; 65]) -> Vec<u8> {
     put_string(&mut blob, CURVE.as_bytes());
     put_string(&mut blob, public);
     blob
+}
+
+/// The OpenSSH public key line of `key`: `ecdsa-sha2-nistp256 AAAA…`,
+/// followed by ` comment` when `comment` is not empty.
+pub fn public_line(key: &VerifyingKey, comment: &str) -> String {
+    let encoded = STANDARD.encode(public_blob(&key.to_bytes()));
+    if comment.is_empty() {
+        format!("{KEY_TYPE} {encoded}")
+    } else {
+        format!("{KEY_TYPE} {encoded} {comment}")
+    }
+}
+
+/// The key of an OpenSSH public key line `ecdsa-sha2-nistp256 AAAA…
+/// [comment]` (an `ssh_host_ecdsa_key.pub` file), if it is one: of the
+/// frozen type, its blob canonical, its point on the curve.
+pub fn parse_public_line(line: &str) -> Option<VerifyingKey> {
+    let mut fields = line.split_ascii_whitespace();
+    if fields.next()? != KEY_TYPE {
+        return None;
+    }
+    let blob = STANDARD.decode(fields.next()?).ok()?;
+    let point: [u8; 65] = blob.get(blob.len().checked_sub(65)?..)?.try_into().ok()?;
+    if public_blob(&point) != blob {
+        return None;
+    }
+    VerifyingKey::from_bytes(&point).ok()
 }
 
 /// Writes `key` in the OpenSSH private key format, unencrypted, with its

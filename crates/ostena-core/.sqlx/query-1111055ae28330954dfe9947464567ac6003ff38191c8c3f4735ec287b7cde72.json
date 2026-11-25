@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p256_public, retire_at FROM grant_key\n             WHERE retire_at IS NULL\n                OR retire_at > (SELECT activated_at FROM grant_key WHERE kid = $1)\n             ORDER BY retire_at IS NULL DESC, activated_at DESC, kid LIMIT $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "p256_public",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "grant_key",
+            "name": "p256_public"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "retire_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "grant_key",
+            "name": "retire_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "1111055ae28330954dfe9947464567ac6003ff38191c8c3f4735ec287b7cde72"
+}

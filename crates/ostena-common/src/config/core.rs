@@ -10,6 +10,8 @@ use super::validation::{Code, Violation};
 
 /// Default validity of an agent certificate, in days.
 pub const DEFAULT_AGENT_CERTIFICATE_DAYS: u32 = 30;
+/// Default validity of the SSH host certificate of an agent, in days.
+pub const DEFAULT_HOST_CERTIFICATE_DAYS: u32 = 30;
 /// Default directory of the PostgreSQL Unix socket (Debian).
 pub const DEFAULT_SOCKET_DIR: &str = "/var/run/postgresql";
 /// Default size of the connection pool.
@@ -24,6 +26,10 @@ pub const KEY_FILE_WAIVER_LAST_DAY: &str = "2027-04-30";
 
 const fn default_certificate_days() -> u32 {
     DEFAULT_AGENT_CERTIFICATE_DAYS
+}
+
+const fn default_host_certificate_days() -> u32 {
+    DEFAULT_HOST_CERTIFICATE_DAYS
 }
 
 /// Core settings.
@@ -47,6 +53,8 @@ pub struct CoreConfig {
     pub issuing_certificate: PathBuf,
     /// Its private key.
     pub issuing_private_key: KeySource,
+    /// The P-256 key that signs the session grants (ADR-0004, ADR-0014).
+    pub grant_signing_key: KeySource,
     /// Validity of agent certificates, 1 to 90 days.
     #[serde(default = "default_certificate_days")]
     pub agent_certificate_days: u32,
@@ -58,6 +66,25 @@ pub struct CoreConfig {
     pub database: DatabaseConfig,
     /// The audit chain (ADR-0012): its head signing key and cadence.
     pub audit: CoreAuditConfig,
+    /// Native SSH access (ADR-0014): the SSH certificate authorities.
+    /// Without it, SSH accesses are refused (`ACC-E007`).
+    #[serde(default)]
+    pub ssh: Option<CoreSshConfig>,
+}
+
+/// `[core.ssh]`: the SSH certificate authorities of the core (ADR-0014).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreSshConfig {
+    /// The P-256 key of the authority of the user certificates
+    /// (`ostena login`).
+    pub user_ca_key: KeySource,
+    /// The P-256 key of the authority of the agent host certificates.
+    pub host_ca_key: KeySource,
+    /// Validity of an agent host certificate, 1 to 90 days; it is renewed
+    /// after two thirds.
+    #[serde(default = "default_host_certificate_days")]
+    pub host_certificate_days: u32,
 }
 
 /// Default interval between two heads while the chain moves, seconds.
@@ -176,13 +203,19 @@ impl CoreConfig {
         })
     }
 
-    /// The three private keys, with their field names.
-    pub fn keys(&self) -> [(&'static str, &KeySource); 3] {
-        [
+    /// The private keys, with their field names.
+    pub fn keys(&self) -> Vec<(&'static str, &KeySource)> {
+        let mut keys = vec![
             ("core.tls_private_key", &self.tls_private_key),
             ("core.issuing_private_key", &self.issuing_private_key),
             ("core.audit.signing_key", &self.audit.signing_key),
-        ]
+            ("core.grant_signing_key", &self.grant_signing_key),
+        ];
+        if let Some(ssh) = &self.ssh {
+            keys.push(("core.ssh.user_ca_key", &ssh.user_ca_key));
+            keys.push(("core.ssh.host_ca_key", &ssh.host_ca_key));
+        }
+        keys
     }
 }
 
@@ -235,12 +268,9 @@ fn audit_bounds(audit: &CoreAuditConfig, out: &mut Vec<Violation>) {
     );
 }
 
-/// Consistency rules of the core section (`CFG-V008`, `CFG-V012` to
-/// `CFG-V014`).
-pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
-    path_rule(out, "core.tls_root_ca", &core.tls_root_ca);
-    path_rule(out, "core.tls_certificate", &core.tls_certificate);
-    path_rule(out, "core.issuing_certificate", &core.issuing_certificate);
+/// The private keys of the core: their sources (`CFG-V008`, `CFG-V014`), one use each
+/// (`CFG-V016`), and the SSH section bounds (`CFG-V012`).
+fn key_rules(core: &CoreConfig, out: &mut Vec<Violation>) {
     for (field, key) in core.keys() {
         match key {
             KeySource::File(path) => path_rule(out, field, path),
@@ -256,6 +286,34 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
             KeySource::Credential(_) => {}
         }
     }
+    // One key, one use: the same source named twice (CFG-V016).
+    let keys = core.keys();
+    for (i, (field, key)) in keys.iter().enumerate() {
+        if let Some((other, _)) = keys[..i].iter().find(|(_, k)| k == key) {
+            out.push(Violation::new(
+                Code::CoreKeyReused,
+                format!("{field} : même source que {other} ; chaque clé du core a un seul usage."),
+            ));
+        }
+    }
+    if let Some(ssh) = &core.ssh {
+        bounds(
+            out,
+            "core.ssh.host_certificate_days",
+            u64::from(ssh.host_certificate_days),
+            1,
+            90,
+        );
+    }
+}
+
+/// Consistency rules of the core section (`CFG-V008`, `CFG-V012` to
+/// `CFG-V014`, `CFG-V016`).
+pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
+    path_rule(out, "core.tls_root_ca", &core.tls_root_ca);
+    path_rule(out, "core.tls_certificate", &core.tls_certificate);
+    path_rule(out, "core.issuing_certificate", &core.issuing_certificate);
+    key_rules(core, out);
     if core.enrollment_listen() == core.tunnel_listen {
         out.push(Violation::new(
             Code::CoreBounds,

@@ -40,10 +40,16 @@ tracing.workspace = true
 # which only runs the agent, does not link it nor PostgreSQL.
 [target.'cfg(target_os = "linux")'.dependencies]
 ostena-core.workspace = true
+# The scope policy of a gateway group, written in TOML as in the agent
+# configuration (`ostena core group policy`).
+toml.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The demonstration test creates its own database.
 ostena-core = { workspace = true, features = ["testing"] }
+# The host key file of a target (OpenSSH public key line), without the SSH
+# library.
+ostena-ssh = { path = "../ostena-ssh", default-features = false }
 
 [dev-dependencies]
 # The enrolment tests run the binary against the in-process test core.

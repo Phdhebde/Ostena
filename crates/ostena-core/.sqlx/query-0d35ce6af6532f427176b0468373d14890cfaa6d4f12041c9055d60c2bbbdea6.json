@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT host_p256_public, host_certificate, certificate_issued_at,\n                certificate_valid_before\n         FROM agent_ssh WHERE agent_id = $1::text::uuid FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "host_p256_public",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "host_p256_public"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "host_certificate",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "host_certificate"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "certificate_issued_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "certificate_issued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "certificate_valid_before",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "certificate_valid_before"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "0d35ce6af6532f427176b0468373d14890cfaa6d4f12041c9055d60c2bbbdea6"
+}

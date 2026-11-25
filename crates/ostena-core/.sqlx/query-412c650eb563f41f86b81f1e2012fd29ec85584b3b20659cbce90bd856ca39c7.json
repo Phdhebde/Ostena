@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO agent_ssh (agent_id, trust_version, trust_digest)\n                   VALUES ($1::text::uuid, nextval('push_version'), $2)\n                   ON CONFLICT (agent_id) DO UPDATE\n                   SET trust_version = nextval('push_version'), trust_digest = $2,\n                       updated_at = now()\n                   RETURNING trust_version",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "trust_version",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "agent_ssh",
+            "name": "trust_version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "412c650eb563f41f86b81f1e2012fd29ec85584b3b20659cbce90bd856ca39c7"
+}

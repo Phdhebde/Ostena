@@ -1517,6 +1517,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -1540,15 +1541,22 @@ dependencies = [
 name = "ostena-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "idna_adapter",
  "ostena-audit",
  "ostena-common",
  "ostena-core",
  "ostena-crypto",
+ "ostena-grant",
+ "ostena-platform",
+ "ostena-scope",
+ "ostena-ssh",
  "ostena-tunnel",
+ "serde_json",
  "sqlx",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ssh_host_names FROM gateway_group WHERE id = $1::text::uuid",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ssh_host_names",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "ssh_host_names"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4cabeb0f762f3f56f5937ce8f8cc74be446d9ef5793c311eb77cd96aa4d46896"
+}
