@@ -179,13 +179,51 @@ fn key_comment() -> String {
     }
 }
 
+/// Writes `bytes` to `path` atomically, so that an interruption leaves the
+/// old file or the new one, never a truncated one: a temporary file next to
+/// it, created exclusively with private rights (a leftover of an
+/// interrupted write is removed first, a link as a link: nothing is written
+/// through it), written and synced, then renamed over `path`, the rename
+/// made durable.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".new");
+    let tmp = std::path::PathBuf::from(tmp);
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    private_file::create(&tmp, bytes, Reader::CurrentProcess)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(unix)]
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// What to do about a key the agent cannot read (`SSH-E007`, `SSH-E008`).
+fn key_remedy(role: &str) -> &'static str {
+    if role == "target" {
+        "supprimez ce fichier et redémarrez le service : l'agent crée une nouvelle clé. Déposez \
+         ensuite sa clé publique sur les cibles à la place de l'ancienne (`ostena agent ssh-key`)"
+    } else {
+        "supprimez ce fichier et redémarrez le service : l'agent crée une nouvelle clé et \
+         l'envoie au core, qui doit lui délivrer un nouveau certificat d'hôte"
+    }
+}
+
 /// The key at `path`, created with private rights if it does not exist
-/// (`agent.ssh_key_created`), and checked: readable by `ostena-crypto` and
-/// by the SSH library.
+/// (`agent.ssh_key_created`, written atomically), and checked: readable by
+/// `ostena-crypto` and by the SSH library.
 ///
 /// # Errors
 ///
-/// The message, with `SSH-E007`–`SSH-E009` for a key problem.
+/// The message, with `SSH-E007`–`SSH-E009` for a key problem, and what to
+/// do for a key that cannot be read.
 pub(crate) fn ensure_key(path: &Path, role: &str) -> Result<SecretBytes, String> {
     let file = match std::fs::read(path) {
         Ok(bytes) => SecretBytes::from(bytes),
@@ -193,10 +231,9 @@ pub(crate) fn ensure_key(path: &Path, role: &str) -> Result<SecretBytes, String>
             let key = keys::generate(&key_comment()).map_err(|e| e.to_string())?;
             // SECRET-EXPOSURE: written once, to a file created with its final rights.
             #[expect(clippy::disallowed_methods)]
-            private_file::create(path, key.private.expose_secret(), Reader::CurrentProcess)
-                .map_err(|e| {
-                    format!("[SSH-E009] {} : création impossible : {e}", path.display())
-                })?;
+            write_atomically(path, key.private.expose_secret()).map_err(|e| {
+                format!("[SSH-E009] {} : création impossible : {e}", path.display())
+            })?;
             tracing::info!(
                 event = "agent.ssh_key_created",
                 role,
@@ -208,8 +245,15 @@ pub(crate) fn ensure_key(path: &Path, role: &str) -> Result<SecretBytes, String>
         }
         Err(e) => return Err(format!("{} : {e}", path.display())),
     };
-    keys::decode(&file).map_err(|e| format!("{} : {e}", path.display()))?;
-    keys::load(&file).map_err(|e| format!("{} : {e}", path.display()))?;
+    let unreadable = |e: keys::KeyError| {
+        format!(
+            "{} : {e}. Si la clé a été importée, ou si un arrêt a interrompu sa création, {}",
+            path.display(),
+            key_remedy(role)
+        )
+    };
+    keys::decode(&file).map_err(unreadable)?;
+    keys::load(&file).map_err(unreadable)?;
     Ok(file)
 }
 
@@ -855,16 +899,47 @@ mod tests {
     }
 
     #[test]
-    fn an_invalid_key_file_is_refused() {
+    fn an_invalid_key_file_is_refused_with_what_to_do() {
         let d = dir("bad-key");
         let path = d.0.join("ssh_host_key");
         std::fs::write(&path, b"not a key").unwrap();
-        assert!(
-            ensure_key(&path, "host")
-                .err()
-                .unwrap()
-                .contains("SSH-E008")
-        );
+        let error = ensure_key(&path, "host").err().unwrap();
+        assert!(error.contains("SSH-E008"), "{error}");
+        assert!(error.contains("supprimez ce fichier"), "{error}");
+        assert!(error.contains("certificat d'hôte"), "{error}");
+        // A key truncated by an interrupted write (before the atomic write).
+        let good = d.0.join("ssh_target_key");
+        ensure_key(&good, "target").unwrap();
+        let good = std::fs::read(&good).unwrap();
+        let truncated = d.0.join("truncated");
+        std::fs::write(&truncated, &good[..good.len() / 2]).unwrap();
+        let error = ensure_key(&truncated, "target").err().unwrap();
+        assert!(error.contains("SSH-E008"), "{error}");
+        assert!(error.contains("ostena agent ssh-key"), "{error}");
+    }
+
+    #[test]
+    fn keys_are_written_atomically_never_through_a_link() {
+        let d = dir("atomic-key");
+        let path = d.0.join("ssh_host_key");
+        let tmp = d.0.join("ssh_host_key.new");
+        // A leftover of an interrupted write is replaced.
+        std::fs::write(&tmp, b"partial").unwrap();
+        ensure_key(&path, "host").unwrap();
+        assert!(!tmp.exists(), "no temporary file left");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let victim = d.0.join("victim");
+            std::fs::write(&victim, b"untouched").unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+            ensure_key(&path, "host").unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            assert!(meta.file_type().is_file());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        }
     }
 
     #[test]
