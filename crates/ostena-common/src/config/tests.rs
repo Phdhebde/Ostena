@@ -1471,7 +1471,15 @@ fn v017_core_login_rules() {
         let c = core_with(&format!("{LOGIN}{extra}\n"));
         assert_eq!(core_codes(&c), vec![Code::CoreLogin], "{extra}");
     }
-    for hosts in ["[]", "[\"-x\"]", "[\"a b\"]", "[\"a/b\"]", "[\"\"]"] {
+    for hosts in [
+        "[]",
+        "[\"-x\"]",
+        "[\"a b\"]",
+        "[\"a/b\"]",
+        "[\"\"]",
+        "[\"*\"]",
+        "[\"*.*\"]",
+    ] {
         let c = core_with(&LOGIN.replace("[\"bastion.example\", \"*.bastion.example\"]", hosts));
         assert_eq!(core_codes(&c), vec![Code::CoreLogin], "{hosts}");
     }

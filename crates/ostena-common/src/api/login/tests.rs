@@ -97,7 +97,7 @@ fn login_response_round_trips_and_is_checked() {
     let ok = response();
     let body = serde_json::to_vec(&ok).unwrap();
     assert_eq!(LoginResponse::parse(&body).unwrap(), ok);
-    let mutations: [fn(&mut LoginResponse); 11] = [
+    let mutations: [fn(&mut LoginResponse); 14] = [
         |r| r.protocol = 0,
         |r| r.login_session = r.login_session.to_uppercase(),
         |r| r.user = "x".into(),
@@ -108,6 +108,9 @@ fn login_response_round_trips_and_is_checked() {
         |r| r.valid_before = r.valid_after + MAX_SESSION_SECS + VALIDITY_MARGIN_SECS + 1,
         |r| r.ssh_hosts.clear(),
         |r| r.ssh_hosts = vec!["a b".into()],
+        |r| r.ssh_hosts = vec!["*".into()],
+        |r| r.ssh_hosts = vec!["*.*".into()],
+        |r| r.ssh_hosts = vec!["bastion.example".into(), "?*.-".into()],
         |r| r.ssh_port = 0,
     ];
     for (i, mutate) in mutations.iter().enumerate() {
@@ -181,7 +184,7 @@ proptest! {
         after in 0u64..4_000_000_000,
         len in 1u64..=MAX_SESSION_SECS,
         port in 1u16..,
-        host in "[a-z0-9*?][a-z0-9.*?-]{0,30}",
+        host in "[*?]{0,3}[a-z0-9][a-z0-9.*?-]{0,30}",
     ) {
         let mut r = response();
         r.valid_after = after;

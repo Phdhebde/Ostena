@@ -90,7 +90,7 @@ fn settings_round_trip_through_toml() {
 #[test]
 fn ssh_fragment_and_known_hosts() {
     let dir = Path::new("/home/jdupont/.ostena");
-    let text = ssh_config(dir, &response());
+    let text = ssh_config(dir, &response()).unwrap();
     assert!(text.contains("Host bastion.example *.bastion.example\n"));
     assert!(text.contains("    Port 2222\n"));
     // The paths as the platform joins them (OpenSSH for Windows reads
@@ -129,7 +129,7 @@ fn include_is_added_once_at_the_top() {
     let ssh = scratch.0.join("ssh");
     let dir = scratch.0.join("ostena");
     install_include_in(&ssh, &dir).unwrap();
-    let line = include_line(&dir);
+    let line = include_line(&dir).unwrap();
     assert_eq!(
         fs::read_to_string(ssh.join("config")).unwrap(),
         format!("{line}\n")
@@ -142,6 +142,53 @@ fn include_is_added_once_at_the_top() {
         fs::read_to_string(ssh.join("config")).unwrap(),
         format!("{line}\nHost other\n    User me\n")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn include_refuses_a_linked_config() {
+    let scratch = Scratch::new("include-link");
+    let ssh = scratch.0.join("ssh");
+    let dir = scratch.0.join("ostena");
+    fs::create_dir_all(&ssh).unwrap();
+    let real = scratch.0.join("dotfiles-config");
+    fs::write(&real, "Host other\n").unwrap();
+    std::os::unix::fs::symlink(&real, ssh.join("config")).unwrap();
+    let refused = install_include_in(&ssh, &dir).unwrap_err().to_string();
+    assert!(refused.contains("lien symbolique"), "{refused}");
+    assert!(refused.contains("Include "), "{refused}");
+    // Neither the link nor its target changed.
+    assert!(
+        fs::symlink_metadata(ssh.join("config"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_to_string(&real).unwrap(), "Host other\n");
+}
+
+#[test]
+fn quoting_refuses_what_ssh_config_would_misread() {
+    assert_eq!(
+        quoted(Path::new("/home/jdupont/.ostena/id_ecdsa")).unwrap(),
+        "\"/home/jdupont/.ostena/id_ecdsa\""
+    );
+    // A Windows path keeps its single backslashes.
+    assert_eq!(
+        quoted(Path::new(r"C:\Users\jdupont\.ostena\id_ecdsa")).unwrap(),
+        r#""C:\Users\jdupont\.ostena\id_ecdsa""#
+    );
+    for bad in [
+        "/home/a\"b/id",
+        "/home/a\nb/id",
+        "/home/a\tb/id",
+        "/home/a\u{7f}b/id",
+        r"\\server\share\id",
+        r"C:\Users\it's\'id",
+        r"C:\Users\dir\",
+    ] {
+        assert!(quoted(Path::new(bad)).is_err(), "{bad:?}");
+    }
 }
 
 #[test]

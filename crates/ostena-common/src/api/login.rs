@@ -278,6 +278,8 @@ pub fn is_host_pattern(s: &str) -> bool {
         && !s.starts_with('-')
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'*' | b'?'))
+        // Wildcards and dots alone (`*`, `*.*`) would match every host.
+        && s.bytes().any(|b| b.is_ascii_alphanumeric())
 }
 
 /// Client → core: `POST /v1/logout`, signed with the session key.

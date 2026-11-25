@@ -450,14 +450,38 @@ fn check_certificate(
     Ok(blob)
 }
 
-/// Quotes a path for `ssh_config` and `known_hosts` readers.
-fn quoted(path: &Path) -> String {
-    format!("\"{}\"", path.display())
+/// Quotes a path for `ssh_config`. Refused: a path that is not UTF-8, a
+/// double quote or a control character (they would end the value or the
+/// line), and a backslash OpenSSH would read as an escape (before `\\`,
+/// `'` or `"`, or last). A single backslash between names, the separator
+/// of Windows paths, stays as it is: OpenSSH for Windows reads it.
+pub(crate) fn quoted(path: &Path) -> Result<String, LoginError> {
+    let refused = |why: &str| {
+        LoginError::Files(format!(
+            "{} : chemin inutilisable dans ssh_config ({why}) ; choisissez un autre dossier \
+             avec --dir",
+            path.display()
+        ))
+    };
+    let text = path.to_str().ok_or_else(|| refused("pas en UTF-8"))?;
+    if text.contains('"') {
+        return Err(refused("guillemet"));
+    }
+    if text.chars().any(char::is_control) {
+        return Err(refused("caractère de contrôle"));
+    }
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'\\' && matches!(bytes.get(i + 1), None | Some(b'\\' | b'\'' | b'"')) {
+            return Err(refused("barre oblique inverse lue comme un échappement"));
+        }
+    }
+    Ok(format!("\"{text}\""))
 }
 
 /// The `ssh_config` fragment.
-pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> String {
-    format!(
+pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> Result<String, LoginError> {
+    Ok(format!(
         "# Écrit par ostena login, réécrit à chaque connexion.\n\
          # Session {session}, valable jusqu'au {until}.\n\
          Host {hosts}\n\
@@ -480,10 +504,10 @@ pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> String {
         until = utc_text(response.valid_before),
         hosts = response.ssh_hosts.join(" "),
         port = response.ssh_port,
-        key = quoted(&dir.join(KEY)),
-        cert = quoted(&dir.join(CERTIFICATE)),
-        known = quoted(&dir.join(KNOWN_HOSTS)),
-    )
+        key = quoted(&dir.join(KEY))?,
+        cert = quoted(&dir.join(CERTIFICATE))?,
+        known = quoted(&dir.join(KNOWN_HOSTS))?,
+    ))
 }
 
 /// The `known_hosts` line that trusts the host CA for the bastion hosts.
@@ -570,7 +594,7 @@ pub(crate) async fn login_with(
         format!("{}\n", response.certificate).as_bytes(),
     )?;
     write_private(&dir, KNOWN_HOSTS, known_hosts(&response).as_bytes())?;
-    write_private(&dir, SSH_CONFIG, ssh_config(&dir, &response).as_bytes())?;
+    write_private(&dir, SSH_CONFIG, ssh_config(&dir, &response)?.as_bytes())?;
     if options.install_include {
         install_include(&dir)?;
     }
@@ -583,8 +607,8 @@ pub(crate) async fn login_with(
 }
 
 /// The `Include` line of the fragment.
-fn include_line(dir: &Path) -> String {
-    format!("Include {}", quoted(&dir.join(SSH_CONFIG)))
+fn include_line(dir: &Path) -> Result<String, LoginError> {
+    Ok(format!("Include {}", quoted(&dir.join(SSH_CONFIG))?))
 }
 
 /// Adds the `Include` line at the top of `~/.ssh/config`, once.
@@ -598,12 +622,21 @@ fn install_include(dir: &Path) -> Result<(), LoginError> {
 fn install_include_in(ssh: &Path, dir: &Path) -> Result<(), LoginError> {
     ensure_dir(ssh)?;
     let path = ssh.join("config");
+    let line = include_line(dir)?;
+    // A link (dotfiles kept elsewhere) would be replaced by a plain file:
+    // the user adds the line where the link points.
+    if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(LoginError::Files(format!(
+            "{} est un lien symbolique : il n'est pas modifié ; ajoutez vous-même en tête du \
+             fichier qu'il désigne la ligne\n  {line}",
+            path.display()
+        )));
+    }
     let current = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(files(&path, &e)),
     };
-    let line = include_line(dir);
     if current.lines().any(|l| l.trim() == line) {
         return Ok(());
     }
@@ -654,11 +687,10 @@ pub(crate) fn login(options: &Options) -> ExitCode {
                 summary.login_session,
                 utc_text(summary.valid_before)
             ));
-            if !options.install_include {
+            if let (false, Ok(line)) = (options.install_include, include_line(&summary.dir)) {
                 say(&format!(
                     "Ajoutez une fois cette ligne en tête de ~/.ssh/config (ou relancez avec \
-                     --install-include) :\n  {}",
-                    include_line(&summary.dir)
+                     --install-include) :\n  {line}"
                 ));
             }
             if let Some(host) = summary.ssh_hosts.first() {
