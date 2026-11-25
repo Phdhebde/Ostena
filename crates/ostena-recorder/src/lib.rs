@@ -25,5 +25,5 @@ pub mod fuzz;
 
 pub use cast::{CastWriter, Sealed};
 pub use error::RecorderError;
-pub use event::{EndReason, Event, Frame};
+pub use event::{EndReason, Event, Exit, Frame};
 pub use wire::{Decoder, Limits, encode};

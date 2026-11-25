@@ -60,7 +60,7 @@ use crate::login::parse_login;
 use crate::precheck::Role;
 use crate::precheck::stream::Prechecked;
 use crate::transcript::{Terminal, Transcript};
-use ostena_recorder::EndReason;
+use ostena_recorder::{EndReason, Exit};
 
 /// Longest command accepted.
 pub const MAX_COMMAND: usize = 32 * 1024;
@@ -817,6 +817,25 @@ async fn user_to_target(
     }
 }
 
+/// The name of a signal as SSH carries it (`KILL`, not `SIGKILL`).
+fn signal_name_of(signal: &Sig) -> String {
+    match signal {
+        Sig::ABRT => "ABRT".into(),
+        Sig::ALRM => "ALRM".into(),
+        Sig::FPE => "FPE".into(),
+        Sig::HUP => "HUP".into(),
+        Sig::ILL => "ILL".into(),
+        Sig::INT => "INT".into(),
+        Sig::KILL => "KILL".into(),
+        Sig::PIPE => "PIPE".into(),
+        Sig::QUIT => "QUIT".into(),
+        Sig::SEGV => "SEGV".into(),
+        Sig::TERM => "TERM".into(),
+        Sig::USR1 => "USR1".into(),
+        Sig::Custom(name) => name.clone(),
+    }
+}
+
 /// From the target to the user: data, end of data, exit status, close;
 /// the answers to the relayed requests go to the handler. Each output is
 /// recorded before it is relayed; an output that cannot be recorded is not
@@ -848,13 +867,26 @@ async fn target_to_user(
                 user.extended_data_bytes(ext, data).await
             }
             ChannelMsg::Eof => user.eof().await,
-            ChannelMsg::ExitStatus { exit_status } => user.exit_status(exit_status).await,
+            ChannelMsg::ExitStatus { exit_status } => {
+                if transcript.exit(Exit::Status(exit_status)).await.is_err() {
+                    break;
+                }
+                user.exit_status(exit_status).await
+            }
             ChannelMsg::ExitSignal {
                 signal_name,
                 core_dumped,
                 error_message,
                 lang_tag,
             } => {
+                let name = signal_name_of(&signal_name);
+                if transcript
+                    .exit(Exit::Signal { name, core_dumped })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
                 let _ = handle
                     .exit_signal_request(id, signal_name, core_dumped, error_message, lang_tag)
                     .await;

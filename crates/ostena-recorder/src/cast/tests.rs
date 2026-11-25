@@ -1,7 +1,7 @@
 use proptest::prelude::*;
 
 use super::*;
-use crate::event::EndReason;
+use crate::event::{EndReason, Exit};
 
 const SESSION: [u8; 16] = [
     0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
@@ -107,6 +107,40 @@ fn bidirectional_format_characters_are_escaped() {
     );
 }
 
+/// The exit status or signal of the target is a marker.
+#[test]
+fn the_exit_is_a_marker() {
+    let (sealed, text) = write(&[
+        start("", Some(b"sleep 60")),
+        frame(1_000_000, Event::Exit(Exit::Status(0))),
+        end(1_000_000),
+    ]);
+    assert_eq!(
+        text.lines().nth(1),
+        Some("[1.000000,\"m\",\"exit-status 0\"]")
+    );
+    assert_eq!(sealed.events, 1);
+    let killed = |core_dumped| {
+        frame(
+            2,
+            Event::Exit(Exit::Signal {
+                name: "SEGV".into(),
+                core_dumped,
+            }),
+        )
+    };
+    let (_, text) = write(&[start("", None), killed(true), end(2)]);
+    assert_eq!(
+        text.lines().nth(1),
+        Some("[0.000002,\"m\",\"exit-signal SEGV core-dumped\"]")
+    );
+    let (_, text) = write(&[start("", None), killed(false), end(2)]);
+    assert_eq!(
+        text.lines().nth(1),
+        Some("[0.000002,\"m\",\"exit-signal SEGV\"]")
+    );
+}
+
 #[test]
 fn utf8_split_across_events_is_joined() {
     let euro = "€".as_bytes();
@@ -204,6 +238,7 @@ fn arb_frames() -> impl Strategy<Value = Vec<Frame>> {
                 prop_oneof![
                     proptest::collection::vec(any::<u8>(), 1..40).prop_map(Event::Output),
                     (1u16..500, 1u16..500).prop_map(|(cols, rows)| Event::Resize { cols, rows }),
+                    any::<u32>().prop_map(|s| Event::Exit(Exit::Status(s))),
                 ],
             ),
             0..20,
@@ -245,6 +280,7 @@ proptest! {
             match v[1].as_str().unwrap() {
                 "o" => shown.push_str(v[2].as_str().unwrap()),
                 "r" => {}
+                "m" => prop_assert!(v[2].as_str().unwrap().starts_with("exit-status ")),
                 other => prop_assert!(false, "type {other}"),
             }
             count += 1;

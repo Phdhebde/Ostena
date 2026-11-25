@@ -8,7 +8,10 @@
 //!   `command` (an `exec` only), `title` (`ostena <session>`), `env`
 //!   (`TERM`, with a terminal only).
 //! - Events: `[t, "o", text]` for output, `[t, "r", "COLSxROWS"]` for a
-//!   window change; `t` in seconds with six decimals.
+//!   window change, a marker `[t, "m", "exit-status N"]` or
+//!   `[t, "m", "exit-signal NAME"]` (`exit-signal NAME core-dumped`) for
+//!   the end of the shell or the command; `t` in seconds with six
+//!   decimals.
 //! - Output is decoded as UTF-8 across events: an incomplete sequence at
 //!   the end of an event waits for the next one; each invalid sequence
 //!   becomes U+FFFD and is counted. Nothing is written for an event that
@@ -29,7 +32,7 @@ use std::io::Write;
 use ostena_crypto::sha256::Hasher;
 
 use crate::error::RecorderError;
-use crate::event::{Event, Frame};
+use crate::event::{Event, Exit, Frame};
 
 /// Size of a window when the session has no terminal.
 pub const DEFAULT_SIZE: (u16, u16) = (80, 24);
@@ -253,6 +256,26 @@ impl<W: Write> CastWriter<W> {
                 self.line.push('[');
                 push_time(&mut self.line, frame.at_us);
                 let _ = write!(self.line, ",\"r\",\"{cols}x{rows}\"]");
+                self.events += 1;
+                self.emit()
+            }
+            Event::Exit(exit) => {
+                self.line.push('[');
+                push_time(&mut self.line, frame.at_us);
+                let _ = match exit {
+                    Exit::Status(status) => write!(self.line, ",\"m\",\"exit-status {status}\""),
+                    // Printable ASCII, escaped all the same.
+                    Exit::Signal { name, core_dumped } => {
+                        let mut text = format!("exit-signal {name}");
+                        if *core_dumped {
+                            text.push_str(" core-dumped");
+                        }
+                        self.line.push_str(",\"m\",");
+                        push_json_str(&mut self.line, &text);
+                        Ok(())
+                    }
+                };
+                self.line.push(']');
                 self.events += 1;
                 self.emit()
             }

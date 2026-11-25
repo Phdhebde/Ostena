@@ -94,6 +94,13 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             },
         },
         Frame {
+            at_us: 4,
+            event: Event::Exit(ostena_recorder::Exit::Signal {
+                name: "TERM".into(),
+                core_dumped: false,
+            }),
+        },
+        Frame {
             at_us: 5,
             event: Event::End {
                 reason: EndReason::Expired,

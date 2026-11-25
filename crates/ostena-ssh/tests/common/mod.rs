@@ -513,6 +513,13 @@ impl russh::server::Handler for EchoTarget {
             }
             return Ok(());
         }
+        if data == b"signal" {
+            // The command is killed.
+            session.exit_signal_request(channel, russh::Sig::KILL, false, "", "")?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            return Ok(());
+        }
         if data == b"open-channels" {
             // A hostile target opens channels towards the agent.
             let handle = session.handle();

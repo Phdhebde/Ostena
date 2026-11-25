@@ -435,6 +435,11 @@ fn native_session_with_a_certificate_reaches_the_target() {
         .flatten()
         .collect();
     assert_eq!(output, b"ran:hello world\n");
+    // The exit status of the target, before the end.
+    assert_eq!(
+        frames[frames.len() - 2].event,
+        ostena_recorder::Event::Exit(ostena_recorder::Exit::Status(0))
+    );
     assert_eq!(
         frames.last().unwrap().event,
         ostena_recorder::Event::End {
@@ -960,6 +965,28 @@ fn a_transcript_lost_before_the_start_is_logged_as_lost() {
     assert_eq!(lost[0].code, "SSH-E021");
     assert_eq!(wait_closed(&n, 1)[0].reason, "transcript perdu");
     assert!(events_on(n.agent.addr, "ssh.channel_refused").is_empty());
+}
+
+/// The exit signal of the target is relayed and recorded.
+#[test]
+fn the_exit_signal_is_recorded() {
+    let runtime = runtime();
+    let Some(n) = native(&runtime, "native-exit-signal", ServerSettings::default()) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["signal"]);
+    assert!(!out.status.success());
+    let closed = wait_closed(&n, 1);
+    let frames = n.agent.authorizer.transcript(&closed[0].session_id);
+    assert!(
+        frames.iter().any(|f| f.event
+            == ostena_recorder::Event::Exit(ostena_recorder::Exit::Signal {
+                name: "KILL".into(),
+                core_dumped: false
+            })),
+        "{frames:?}"
+    );
 }
 
 /// A core that no longer reads the transcript (ADR-0016): the output

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ostena_recorder::{EndReason, Event, Frame, wire};
+use ostena_recorder::{EndReason, Event, Exit, Frame, wire};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::error::SshError;
@@ -50,6 +50,8 @@ struct State {
     origin: Option<Instant>,
     last_us: u64,
     output: u64,
+    /// The exit of the shell or the command is recorded (once only).
+    exited: bool,
 }
 
 /// What [`Transcript::closed`] watches, outside the lock of the state.
@@ -108,6 +110,7 @@ impl Transcript {
                 origin: None,
                 last_us: 0,
                 output: 0,
+                exited: false,
             })),
             send_timeout,
         }
@@ -240,6 +243,41 @@ impl Transcript {
         self.pending_resize(&mut state).await?;
         self.queue(&mut state, Event::Output(data.to_vec())).await?;
         state.output = state.output.saturating_add(data.len() as u64);
+        Ok(())
+    }
+
+    /// Records how the shell or the command ended, as the target said: the
+    /// first exit status or signal only (the recorder refuses a second
+    /// one), before it is relayed. A signal name that the recorder would
+    /// refuse (empty, too long, not printable ASCII) is recorded as `?`.
+    ///
+    /// # Errors
+    ///
+    /// [`SshError::TranscriptLost`]: do not relay it, cut the session.
+    pub async fn exit(&self, exit: Exit) -> Result<(), SshError> {
+        let exit = match exit {
+            Exit::Signal { name, core_dumped }
+                if name.is_empty()
+                    || name.len() > ostena_recorder::event::MAX_SIGNAL
+                    || !name.bytes().all(|b| b.is_ascii_graphic()) =>
+            {
+                Exit::Signal {
+                    name: "?".into(),
+                    core_dumped,
+                }
+            }
+            exit => exit,
+        };
+        let mut state = self.state.lock().await;
+        if state.exited {
+            return Ok(());
+        }
+        if state.origin.is_none() {
+            self.start_locked(&mut state, None, None).await?;
+        }
+        self.pending_resize(&mut state).await?;
+        self.queue(&mut state, Event::Exit(exit)).await?;
+        state.exited = true;
         Ok(())
     }
 
@@ -377,6 +415,34 @@ mod tests {
                 }
             );
             assert!(frames.windows(2).all(|w| w[0].at_us <= w[1].at_us));
+        });
+    }
+
+    /// The first exit only, so that the stream stays valid; a signal name
+    /// the recorder would refuse becomes `?`.
+    #[test]
+    fn the_first_exit_is_recorded() {
+        rt().block_on(async {
+            let (t, rx) = Transcript::channel(8);
+            let drained = tokio::spawn(drain(rx));
+            t.start(None, Some(b"kill -9 $$")).await.unwrap();
+            t.exit(Exit::Signal {
+                name: "SIG KILL".into(),
+                core_dumped: true,
+            })
+            .await
+            .unwrap();
+            t.exit(Exit::Status(0)).await.unwrap();
+            t.end(EndReason::Closed).await.unwrap();
+            let frames = decode(drained.await.unwrap());
+            assert_eq!(frames.len(), 3);
+            assert_eq!(
+                frames[1].event,
+                Event::Exit(Exit::Signal {
+                    name: "?".into(),
+                    core_dumped: true
+                })
+            );
         });
     }
 

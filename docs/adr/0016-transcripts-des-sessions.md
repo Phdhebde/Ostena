@@ -18,14 +18,14 @@ Contraintes :
 
 ### Ce qui est enregistré
 
-Les sorties de la cible (standard et erreur) et les changements de taille de la fenêtre, avec le type de terminal et la commande d'un `exec`. **Pas les frappes** au jalon M1.
+Les sorties de la cible (standard et erreur) et les changements de taille de la fenêtre, avec le type de terminal et la commande d'un `exec`, et la fin du shell ou de la commande telle que la cible l'annonce (`exit-status` ou `exit-signal`). **Pas les frappes** au jalon M1.
 
 ### Format : asciicast v2, écrit par le core
 
 Le fichier stocké est un **asciicast v2**, lisible par les lecteurs courants. Il est écrit par le core, de façon **déterministe** : les mêmes événements donnent les mêmes octets, donc le même SHA-256.
 
 - **En-tête**, clés dans cet ordre : `version` (2), `width`, `height` (80 × 24 sans terminal), `timestamp` (secondes Unix, horloge de l'agent), `command` (un `exec` seulement), `title` (`ostena <session>`), `env` (`TERM`, avec un terminal seulement).
-- **Événements** : `[t, "o", texte]` pour une sortie, `[t, "r", "COLSxLIGNES"]` pour un changement de taille ; `t` en secondes, six décimales, depuis le début de la session (horloge monotone de l'agent).
+- **Événements** : `[t, "o", texte]` pour une sortie, `[t, "r", "COLSxLIGNES"]` pour un changement de taille, un marqueur `[t, "m", "exit-status N"]` ou `[t, "m", "exit-signal NOM"]` (suivi de ` core-dumped` si la cible l'indique) pour la fin du shell ou de la commande ; `t` en secondes, six décimales, depuis le début de la session (horloge monotone de l'agent).
 - **UTF-8** : décodé d'un événement à l'autre (une séquence coupée attend la suite). Chaque séquence invalide devient U+FFFD et est **comptée** ; le nombre est scellé avec le transcript. C'est une perte assumée : un terminal affiche de toute façon U+FFFD.
 - **Échappement** : aucun caractère de contrôle dans le fichier hors des fins de ligne. C0, DEL et C1 sont écrits `\uXXXX`, séquences d'échappement de la session comprises : afficher le fichier dans un terminal ne l'altère pas. Les caractères de format bidirectionnels (U+061C, U+200E, U+200F, U+202A à U+202E, U+2066 à U+2069) sont échappés de même, dans la commande comme dans les sorties : ils pourraient faire lire une commande pour une autre. Un lecteur asciicast rejoue la session.
 - **Risque du rejeu** : un lecteur qui rejoue le transcript dans un vrai terminal y exécute les séquences d'échappement de la session, comme la session l'a fait (titre de fenêtre, presse-papiers, voire réponses injectées par certains émulateurs). Un transcript se rejoue dans un lecteur isolé (navigateur, terminal jetable), pas dans le terminal d'un administrateur.
@@ -38,17 +38,18 @@ L'agent capture les événements et les envoie au fil de la session, sur un flux
 
 | Taille | Champ |
 |---|---|
-| 1 | type : 1 début, 2 sortie, 3 taille, 4 fin |
+| 1 | type : 1 début, 2 sortie, 3 taille, 4 fin, 5 fin de commande |
 | 8 | temps, en microsecondes depuis le début |
 | 4 | longueur de la charge |
 | n | charge |
 
-Charges : début `cols u16 ‖ lignes u16 ‖ début en ms Unix u64 ‖ longueur du type de terminal u8 ‖ type ‖ commande présente u8 (0 ou 1) ‖ commande` (jusqu'à la fin de la charge) ; sortie : les octets ; taille `cols u16 ‖ lignes u16` ; fin `raison u8 ‖ octets de sortie u64`.
+Charges : début `cols u16 ‖ lignes u16 ‖ début en ms Unix u64 ‖ longueur du type de terminal u8 ‖ type ‖ commande présente u8 (0 ou 1) ‖ commande` (jusqu'à la fin de la charge) ; sortie : les octets ; taille `cols u16 ‖ lignes u16` ; fin `raison u8 ‖ octets de sortie u64` ; fin de commande `1 ‖ code u32` (`exit-status`) ou `2 ‖ core u8 (0 ou 1) ‖ nom du signal` (`exit-signal`, 1 à 32 caractères ASCII imprimables, `KILL` et non `SIGKILL`).
 
 **Décodeur strict** (`ostena_recorder::wire::Decoder`), donc `encode(decode(b)) == b` :
 
 - le début vient en premier, au temps 0, une seule fois ; la fin en dernier, avec le nombre exact d'octets de sortie reçus ; rien après ;
 - les temps ne reculent jamais ;
+- au plus une fin de commande, avant la fin ; l'agent n'enregistre que la première annoncée par la cible, et la consigne avant de la relayer ;
 - bornes : sortie de 1 octet à 32 Kio (l'agent découpe au-delà), commande de 32 Kio au plus, type de terminal de 64 caractères ASCII imprimables au plus, 1 à 10 000 colonnes ou lignes (0 et 0 sans terminal), trame de 32 Kio et 91 octets au plus ;
 - **limites du core** : taille (256 Mio de sortie par défaut) et durée (8 h 10 min) : `REC-E003` ;
 - le décodeur mémorise au plus une trame incomplète.

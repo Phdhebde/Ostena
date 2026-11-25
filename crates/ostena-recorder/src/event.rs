@@ -1,7 +1,7 @@
 //! The recorded events and their bounds.
 //!
 //! A transcript is one [`Event::Start`], then outputs and window changes,
-//! then one [`Event::End`]. Each event carries its time in microseconds
+//! at most one [`Event::Exit`], then one [`Event::End`]. Each event carries its time in microseconds
 //! since the start of the session, from the monotonic clock of the agent.
 //! Keystrokes are not recorded (ADR-0016).
 
@@ -17,6 +17,23 @@ pub const MAX_COMMAND: usize = 32 * 1024;
 pub const MAX_TERM: usize = 64;
 /// Largest number of columns or rows.
 pub const MAX_CELLS: u16 = 10_000;
+/// Longest exit signal name, in bytes (printable ASCII, as in SSH: `KILL`,
+/// not `SIGKILL`).
+pub const MAX_SIGNAL: usize = 32;
+
+/// How the shell or the command ended, as the target said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    /// Its exit status.
+    Status(u32),
+    /// The signal that ended it.
+    Signal {
+        /// Signal name, 1 to [`MAX_SIGNAL`] printable ASCII bytes.
+        name: String,
+        /// The target says it dumped core.
+        core_dumped: bool,
+    },
+}
 
 /// Why a session ended, as recorded in its end event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,6 +106,8 @@ pub enum Event {
         /// Rows.
         rows: u16,
     },
+    /// The shell or the command ended (`exit-status` or `exit-signal`).
+    Exit(Exit),
     /// The session ended.
     End {
         /// Why.
@@ -153,7 +172,16 @@ impl Event {
                 }
                 Ok(())
             }
-            Self::End { .. } => Ok(()),
+            Self::Exit(Exit::Signal { name, .. }) => {
+                if name.is_empty()
+                    || name.len() > MAX_SIGNAL
+                    || !name.bytes().all(|b| b.is_ascii_graphic())
+                {
+                    return Err(RecorderError::Malformed("nom de signal invalide"));
+                }
+                Ok(())
+            }
+            Self::Exit(Exit::Status(_)) | Self::End { .. } => Ok(()),
         }
     }
 }
@@ -198,6 +226,18 @@ mod tests {
         assert!(command(0).check().is_ok());
         assert!(command(MAX_COMMAND).check().is_ok());
         assert!(command(MAX_COMMAND + 1).check().is_err());
+        let signal = |name: &str| {
+            Event::Exit(Exit::Signal {
+                name: name.into(),
+                core_dumped: false,
+            })
+        };
+        assert!(signal("KILL").check().is_ok());
+        assert!(signal(&"X".repeat(MAX_SIGNAL)).check().is_ok());
+        for bad in ["", "K ILL", "KÏLL", &"X".repeat(MAX_SIGNAL + 1)] {
+            assert!(signal(bad).check().is_err(), "{bad:?}");
+        }
+        assert!(Event::Exit(Exit::Status(u32::MAX)).check().is_ok());
         assert!(Event::Output(vec![0; MAX_OUTPUT]).check().is_ok());
         assert!(Event::Output(vec![]).check().is_err());
         assert!(Event::Output(vec![0; MAX_OUTPUT + 1]).check().is_err());

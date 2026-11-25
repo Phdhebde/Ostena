@@ -5,7 +5,7 @@
 //!
 //! | Size | Field |
 //! |---|---|
-//! | 1 | type: 1 start, 2 output, 3 resize, 4 end |
+//! | 1 | type: 1 start, 2 output, 3 resize, 4 end, 5 exit |
 //! | 8 | time, microseconds since the start |
 //! | 4 | payload length |
 //! | n | payload |
@@ -13,15 +13,16 @@
 //! Payloads: start `cols u16 ‖ rows u16 ‖ started_ms u64 ‖ term_len u8 ‖
 //! term ‖ has_command u8 (0 or 1) ‖ command` (the command runs to the end of
 //! the payload); output: the bytes; resize `cols u16 ‖ rows u16`; end
-//! `reason u8 ‖ output_bytes u64`.
+//! `reason u8 ‖ output_bytes u64`; exit `1 ‖ status u32` or
+//! `2 ‖ core_dumped u8 (0 or 1) ‖ signal name` (to the end of the payload).
 //!
 //! The decoder is strict: the start comes first, at time 0, and only once;
-//! times never decrease; the end comes last, with the exact count of output
-//! bytes; nothing follows it. Anything else is refused, so that
+//! times never decrease; at most one exit, before the end; the end comes
+//! last, with the exact count of output bytes; nothing follows it. Anything else is refused, so that
 //! `encode(decode(b)) == b`.
 
 use crate::error::RecorderError;
-use crate::event::{EndReason, Event, Frame, MAX_COMMAND, MAX_OUTPUT, MAX_TERM};
+use crate::event::{EndReason, Event, Exit, Frame, MAX_COMMAND, MAX_OUTPUT, MAX_TERM};
 
 /// Length of a frame header.
 pub const FRAME_HEADER_LEN: usize = 13;
@@ -34,6 +35,9 @@ const START: u8 = 1;
 const OUTPUT: u8 = 2;
 const RESIZE: u8 = 3;
 const END: u8 = 4;
+const EXIT: u8 = 5;
+const EXIT_STATUS: u8 = 1;
+const EXIT_SIGNAL: u8 = 2;
 
 /// Default largest transcript: 256 MiB of output.
 pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 256 * 1024 * 1024;
@@ -79,6 +83,8 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), RecorderError> {
         Event::Output(data) => (OUTPUT, data.len()),
         Event::Resize { .. } => (RESIZE, 4),
         Event::End { .. } => (END, 9),
+        Event::Exit(Exit::Status(_)) => (EXIT, 5),
+        Event::Exit(Exit::Signal { name, .. }) => (EXIT, 2 + name.len()),
     };
     let len32 = len_u32(len)?;
     out.reserve(FRAME_HEADER_LEN + len);
@@ -118,6 +124,15 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), RecorderError> {
         } => {
             out.push(*reason as u8);
             out.extend_from_slice(&output_bytes.to_be_bytes());
+        }
+        Event::Exit(Exit::Status(status)) => {
+            out.push(EXIT_STATUS);
+            out.extend_from_slice(&status.to_be_bytes());
+        }
+        Event::Exit(Exit::Signal { name, core_dumped }) => {
+            out.push(EXIT_SIGNAL);
+            out.push(u8::from(*core_dumped));
+            out.extend_from_slice(name.as_bytes());
         }
     }
     Ok(())
@@ -198,10 +213,26 @@ fn decode_payload(kind: u8, p: &[u8]) -> Result<Event, RecorderError> {
                 output_bytes: be_u64(&p[1..]),
             }
         }
+        EXIT => Event::Exit(decode_exit(p)?),
         _ => return Err(RecorderError::Malformed("type de trame inconnu")),
     };
     event.check()?;
     Ok(event)
+}
+
+fn decode_exit(p: &[u8]) -> Result<Exit, RecorderError> {
+    match p {
+        [EXIT_STATUS, status @ ..] => <[u8; 4]>::try_from(status)
+            .map(|s| Exit::Status(u32::from_be_bytes(s)))
+            .map_err(|_| RecorderError::Malformed("fin de commande mal formée")),
+        [EXIT_SIGNAL, core @ (0 | 1), name @ ..] => Ok(Exit::Signal {
+            name: std::str::from_utf8(name)
+                .map_err(|_| RecorderError::Malformed("nom de signal invalide"))?
+                .to_owned(),
+            core_dumped: *core == 1,
+        }),
+        _ => Err(RecorderError::Malformed("fin de commande mal formée")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +254,7 @@ pub struct Decoder {
     state: State,
     last_at: u64,
     output: u64,
+    exited: bool,
     limits: Limits,
 }
 
@@ -235,6 +267,7 @@ impl Decoder {
             state: State::Fresh,
             last_at: 0,
             output: 0,
+            exited: false,
             limits,
         }
     }
@@ -286,7 +319,7 @@ impl Decoder {
         let at_us = be_u64(&header[1..]);
         let len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]);
         let len = usize::try_from(len).unwrap_or(usize::MAX);
-        if !(START..=END).contains(&kind) {
+        if !(START..=EXIT).contains(&kind) {
             return Err(self.fail(RecorderError::Malformed("type de trame inconnu")));
         }
         if len > MAX_PAYLOAD {
@@ -326,6 +359,12 @@ impl Decoder {
                 }
             }
             (State::Started, Event::Resize { .. }) => {}
+            (State::Started, Event::Exit(_)) => {
+                if self.exited {
+                    return Err(RecorderError::Malformed("deuxième fin de commande"));
+                }
+                self.exited = true;
+            }
             (State::Started, Event::End { output_bytes, .. }) => {
                 if *output_bytes != self.output {
                     return Err(RecorderError::Malformed(

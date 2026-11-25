@@ -146,6 +146,81 @@ fn order_is_enforced() {
     assert_eq!(code(&[]), "REC-E005", "empty stream");
 }
 
+fn exit(at_us: u64, exit: Exit) -> Frame {
+    Frame {
+        at_us,
+        event: Event::Exit(exit),
+    }
+}
+
+/// The exit status or signal of the target: once, before the end.
+#[test]
+fn the_exit_comes_once_before_the_end() {
+    let killed = Exit::Signal {
+        name: "KILL".into(),
+        core_dumped: true,
+    };
+    for frames in [
+        vec![start(None), exit(3, Exit::Status(130)), end(4, 0)],
+        vec![
+            start(None),
+            output(1, b"a"),
+            exit(2, killed.clone()),
+            end(2, 1),
+        ],
+    ] {
+        assert_eq!(decode_all(&stream(&frames), Limits::default()), Ok(frames));
+    }
+    let mut out = Vec::new();
+    encode(&exit(1, killed.clone()), &mut out).unwrap();
+    assert_eq!(out[FRAME_HEADER_LEN..], *b"\x02\x01KILL");
+    encode(&exit(1, Exit::Status(258)), &mut out).unwrap();
+    assert_eq!(out[out.len() - 5..], [1, 0, 0, 1, 2]);
+    assert_eq!(code(&[exit(0, Exit::Status(0))]), "REC-E001", "no start");
+    assert_eq!(
+        code(&[start(None), exit(1, Exit::Status(0)), exit(2, killed)]),
+        "REC-E001",
+        "two exits"
+    );
+    assert_eq!(
+        code(&[start(None), end(1, 0), exit(2, Exit::Status(0))]),
+        "REC-E001",
+        "exit after the end"
+    );
+    // Malformed payloads: kind, core flag, length, name.
+    let good = stream(&[start(None), exit(1, Exit::Status(7)), end(1, 0)]);
+    let at = good.len() - (FRAME_HEADER_LEN + 9) - 5;
+    for (offset, byte) in [(0, 3), (0, 0)] {
+        let mut bad = good.clone();
+        bad[at + offset] = byte;
+        assert_eq!(
+            decode_all(&bad, Limits::default()).unwrap_err().code(),
+            "REC-E001"
+        );
+    }
+    let signal = stream(&[
+        start(None),
+        exit(
+            1,
+            Exit::Signal {
+                name: "HUP".into(),
+                core_dumped: false,
+            },
+        ),
+        end(1, 0),
+    ]);
+    let at = signal.len() - (FRAME_HEADER_LEN + 9) - 5;
+    for (offset, byte) in [(1, 2), (2, b' '), (3, 0xff)] {
+        let mut bad = signal.clone();
+        bad[at + offset] = byte;
+        assert_eq!(
+            decode_all(&bad, Limits::default()).unwrap_err().code(),
+            "REC-E001",
+            "{offset}"
+        );
+    }
+}
+
 #[test]
 fn limits_are_enforced() {
     let limits = Limits {
@@ -224,13 +299,22 @@ fn arb_event() -> impl Strategy<Value = Event> {
 
 const MAX_CELLS_T: u16 = crate::event::MAX_CELLS;
 
+fn arb_exit() -> impl Strategy<Value = Exit> {
+    prop_oneof![
+        any::<u32>().prop_map(Exit::Status),
+        ("[A-Z0-9@.-]{1,32}", any::<bool>())
+            .prop_map(|(name, core_dumped)| Exit::Signal { name, core_dumped }),
+    ]
+}
+
 fn arb_session() -> impl Strategy<Value = Vec<Frame>> {
     (
         proptest::option::of(proptest::collection::vec(any::<u8>(), 0..64)),
         proptest::collection::vec((0u64..1000, arb_event()), 0..32),
+        proptest::option::of(arb_exit()),
         proptest::sample::select(EndReason::ALL.to_vec()),
     )
-        .prop_map(|(command, events, reason)| {
+        .prop_map(|(command, events, exit, reason)| {
             let mut frames = vec![Frame {
                 at_us: 0,
                 event: Event::Start {
@@ -249,6 +333,12 @@ fn arb_session() -> impl Strategy<Value = Vec<Frame>> {
                     output += d.len() as u64;
                 }
                 frames.push(Frame { at_us: at, event });
+            }
+            if let Some(exit) = exit {
+                frames.push(Frame {
+                    at_us: at,
+                    event: Event::Exit(exit),
+                });
             }
             frames.push(Frame {
                 at_us: at,
