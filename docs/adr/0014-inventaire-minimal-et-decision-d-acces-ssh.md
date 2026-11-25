@@ -138,7 +138,12 @@ Chaque partie est idempotente pour l'agent. Le rejeu recommence toutes les 5 s t
 
 ### Événements d'audit
 
-Nouveau type d'acteur **4, utilisateur** (ADR-0012), pour les décisions prises au nom d'un utilisateur. Nouveaux événements : `grant.key_activated`, `access.ssh_granted`, `access.ssh_refused`, `access.session_opened`, `access.session_refused`, `access.session_closed`, `ssh.host_certified`, `ssh.host_key_refused`, `login_session.revoked`, `login_session.revocation_applied`, `user.created`, `user.disabled`, `resource.created`, `target_account.created`, `right.granted`, `right.revoked`, `gateway_group.updated`.
+Nouveau type d'acteur **4, utilisateur** (ADR-0012), pour les décisions prises à la demande d'un utilisateur :
+- `access.ssh_granted`, `access.ssh_refused` et `access.session_opened` ont pour acteur l'UUID de l'utilisateur. C'est le principal d'un certificat de l'autorité utilisateur que l'agent a vérifié, ou le sujet d'un grant vérifié par le core. L'agent qui relaie la demande figure dans le champ `agent_id`. Une recherche « qu'a fait cet utilisateur ? » porte donc sur l'acteur, comme pour les administrateurs ;
+- `access.session_refused` et `access.session_closed` restent au nom de l'agent. Dans le premier, l'utilisateur n'est pas établi (grant illisible ou invalide) ; dans le second, c'est l'agent qui rapporte la fin ;
+- la PR 7 l'emploie aussi pour `ostena login`.
+
+Nouveaux événements : `grant.key_activated`, `access.ssh_granted`, `access.ssh_refused`, `access.session_opened`, `access.session_refused`, `access.session_closed`, `ssh.host_certified`, `ssh.host_key_refused`, `login_session.revoked`, `login_session.revocation_applied`, `user.created`, `user.disabled`, `resource.created`, `target_account.created`, `right.granted`, `right.revoked`, `gateway_group.updated`.
 
 ### Dépendances
 

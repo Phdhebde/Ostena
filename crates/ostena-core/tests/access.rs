@@ -14,6 +14,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{TestDb, block_on};
+use ostena_audit::{ActorKind, Record};
 use ostena_common::config::scope::{AllowRuleSpec, PolicySpec};
 use ostena_core::access::{self, Refusal, SshRequest};
 use ostena_core::cache::AgentCache;
@@ -57,6 +58,17 @@ async fn audit_count(pool: &PgPool, event: &str) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn last_record(pool: &PgPool, event: &str) -> Record {
+    let body: Vec<u8> = sqlx::query_scalar(
+        "SELECT body FROM audit_record WHERE event = $1 ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(event)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    Record::decode(&body).unwrap()
 }
 
 async fn open_login(pool: &PgPool, user: Uuid, cert: [u8; 32], secs: u64) -> Uuid {
@@ -306,6 +318,22 @@ fn a_grant_opens_one_session_once() {
         let key = ostena_tunnel::control::p256_point("k", target_p256_public.as_ref().unwrap());
         assert_eq!(key.unwrap().to_bytes(), f.target_key);
         assert_eq!(audit_count(&f.pool, "access.session_opened").await, 1);
+        // Taken at the request of the user: the user is the actor, the agent
+        // is named in the fields.
+        for (event, kind, actor) in [
+            ("access.ssh_granted", ActorKind::User, f.user.to_string()),
+            ("access.session_opened", ActorKind::User, f.user.to_string()),
+        ] {
+            let record = last_record(&f.pool, event).await;
+            assert_eq!((record.actor_kind, record.actor), (kind, actor), "{event}");
+            assert!(
+                record
+                    .fields
+                    .iter()
+                    .any(|field| field.name == ostena_audit::field::AGENT_ID),
+                "{event}"
+            );
+        }
 
         // Once only, for the whole group.
         assert_eq!(f.open(&issued.grant).await.unwrap_err().code, "GRT-E010");

@@ -397,8 +397,11 @@ pub struct Issued {
     pub appended: Appended,
 }
 
+/// A record of a decision taken at the request of a user: the actor is the
+/// user (ADR-0014), the principal of a certificate of the user authority
+/// that the agent verified; the agent that relayed it is in `agent_id`.
 fn access_event(kind: EventKind, outcome: Outcome, agent: Uuid, request: &SshRequest) -> Event {
-    Event::new(kind, outcome, ActorKind::Agent, agent.to_string())
+    Event::new(kind, outcome, ActorKind::User, request.subject.to_string())
         .uuid(field::AGENT_ID, agent.to_bytes())
         .uuid(field::USER_ID, request.subject.to_bytes())
         .uuid(field::LOGIN_SESSION, request.login_session.to_bytes())
@@ -689,11 +692,13 @@ pub async fn open_session(
         ],
         login_expires.saturating_sub(now),
     );
+    // The user of the grant, verified with the keys of the core, is the
+    // actor; the agent that presented it is in `agent_id`.
     let event = Event::new(
         EventKind::AccessSessionOpened,
         Outcome::Success,
-        ActorKind::Agent,
-        agent.to_string(),
+        ActorKind::User,
+        subject.to_string(),
     )
     .uuid(field::AGENT_ID, agent.to_bytes())
     .uuid(field::ACCESS_SESSION, session.to_bytes())
