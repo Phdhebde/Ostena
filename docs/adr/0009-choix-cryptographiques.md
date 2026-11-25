@@ -4,7 +4,7 @@
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-11, algorithmes du coffre-fort décidés (P-256 + ML-KEM-768, ECDSA P-256 + ML-DSA-65)
 - **Révision** : 2026-11-13, écart SSH : cryptographie de russh dans `ostena-ssh`
-- **Révision** : 2026-11-25, engagements de la PR 6 : chargement différé d'`oleaut32`, contrôles des imports et des modules chargés, remesure de l'empreinte (seuil dépassé sous Linux, décision attendue)
+- **Révision** : 2026-11-25, engagements de la PR 6 : chargement différé d'`oleaut32`, contrôles des imports et des modules chargés, remesure de l'empreinte ; écart d'empreinte accepté par le responsable du projet
 
 ## Contexte
 
@@ -161,8 +161,8 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 **Mise en œuvre à la PR 6 (2026-11-25)** :
 - **Chargement différé** : `crates/ostena-cli/build.rs` passe `/DELAYLOAD:oleaut32.dll` et `delayimp.lib` à l'éditeur de liens pour le binaire `ostena`, sous Windows avec MSVC et seulement avec la fonctionnalité `ssh`.
 - **Imports statiques** : `cargo xtask check-release` lit le répertoire d'imports et celui des imports différés du binaire PE (analyseur borné, sans dépendance, `xtask/src/pe.rs`) et échoue si l'une des six DLL interdites est importée statiquement. Une DLL interdite en import différé est admise : elle n'est chargée qu'à l'appel. Le même contrôle refuse un binaire de release construit sans la fonctionnalité `ssh`.
-- **Modules chargés au repos** : `cargo xtask footprint` relève, pour chaque état, les bibliothèques chargées par l'agent sans SSH et avec SSH (`/proc/<pid>/maps` sous Linux, modules du processus sous Windows). Il échoue si l'agent avec SSH charge un module que la référence ne charge pas, ou l'une des six DLL interdites.
-- **Seuil d'empreinte** : le même outil échoue si l'agent avec SSH dépasse la référence de +10 % et de 1 Mio à la fois (ADR-0007).
+- **Modules chargés au repos** : `cargo xtask footprint` relève, pour chaque état, les bibliothèques chargées par l'agent sans SSH et avec SSH (`/proc/<pid>/maps` sous Linux, modules du processus sous Windows). Il échoue si l'agent avec SSH charge un module que la référence ne charge dans aucun état, ou l'une des six DLL interdites. La comparaison porte sur tous les états de la référence parce que, sans lien au core, l'écoute SSH est le seul socket de l'agent : Winsock charge alors son fournisseur `mswsock.dll`, que la référence charge dès qu'elle se connecte (relevé par la CI Windows le 2026-11-25).
+- **Seuil d'empreinte** : le même outil échoue si l'agent avec SSH dépasse la référence de plus que le plafond accepté (décision du 2026-11-25 ci-dessous).
 
 **Remesure sous Linux** (conteneur de développement, mémoire résidente au repos, `cargo xtask footprint` ; la référence est l'agent construit sans la fonctionnalité `ssh`, l'autre mesure l'agent avec `[agent.ssh]` à l'écoute). Binaire statique musl, l'artefact Linux de release, que la CI mesure désormais (`--target x86_64-unknown-linux-musl`) :
 
@@ -185,7 +185,14 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 - **`opt-level = "s"`** (mesure seulement) : 3,61 / 5,09 / 5,32 Mio sans SSH, 5,43 / 6,27 / 6,65 Mio avec, soit un agent avec SSH plus petit que l'agent actuel sans SSH. Mais l'écart reste au-dessus du seuil (+1,18 à +1,83 Mio, +23 à +51 %), et l'effet sur la latence n'est pas mesuré.
 - **Initialisation paresseuse** : elle ne pourrait retirer que la part du serveur en marche (≤ 0,5 Mio clés créées) ; la part de la liaison seule dépasse déjà 1 Mio dans deux états.
 
-**Le seuil est dépassé dans les trois états** (+10 % et +1 Mio à la fois) : `cargo xtask footprint` échoue, donc le job `release-linux` de la CI aussi. Conformément à l'engagement 3, la PR 6 ne fusionne pas sans **décision explicite du responsable du projet**. Aucune réduction suffisante n'est obtenue sans changer le comportement ou le profil. Mesures sous Windows (working set et DLL chargées) : à relever par le job Windows de la CI ; le contrôle des imports y passe (`oleaut32.dll` en import différé seulement, aucune DLL d'interface graphique ou COM en import statique).
+**Mesures sous Windows** (CI GitHub, windows-2022, working set au repos) : 6,02 → 6,94 Mio sans liaison (+0,93 Mio, +15,4 %), 8,18 → 8,56 Mio non connecté (+0,38 Mio), 8,86 → 9,25 Mio connecté (+0,39 Mio). Le seuil double n'y est pas dépassé. Imports statiques : `kernel32`, `api-ms-win-core-synch-l1-2-0`, `bcryptprimitives`, `ntdll`, `advapi32`, `ws2_32`, `psapi`, `iphlpapi` ; `oleaut32.dll` en import différé seulement ; aucune DLL d'interface graphique ou COM chargée au repos. Les engagements 1 et 2 sont tenus.
+
+**Sous Linux, le seuil double est dépassé dans les trois états** (+10 % et +1 Mio à la fois), sans réduction suffisante possible sans changer le comportement ou le profil.
+
+**Décision du 2026-11-25 (responsable du projet)** : l'écart d'empreinte dû à la liaison du serveur SSH est **accepté**, pour les motifs suivants : il est fait de pages de code, sans bibliothèque ni DLL chargée en plus ; la mémoire anonyme ne prend que 0 à +170 Kio ; l'agent avec SSH reste à 9,44 Mio connecté sous Linux et 9,25 Mio sous Windows, loin de l'objectif indicatif de 20 Mio. L'engagement 3 est levé par cette décision explicite. En conséquence :
+- `cargo xtask footprint` borne désormais le coût du serveur SSH par un **plafond daté**, au lieu du seuil double : **2,25 Mio sous Linux** (mesure maximale +1,91 Mio, plus environ 0,3 Mio de bruit) et **1,25 Mio sous Windows** (mesure maximale +0,93 Mio, plus le bruit). Au-delà, la CI échoue. Le contrôle des modules et des DLL interdites est inchangé.
+- Le seuil double (+10 % et +1 Mio) reste la règle pour toute autre régression d'empreinte (CLAUDE.md, ADR-0007) ; il n'est pas automatisé par rapport à `dev`.
+- Une PR séparée mesure la compilation de l'agent en taille (`opt-level = "s"`), qui ramènerait l'agent avec SSH sous l'agent actuel sans SSH ; elle n'est retenue que si le banc de latence SSH ne régresse pas de plus de 10 % au p99 et reste sous l'objectif de 3 ms.
 
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 
