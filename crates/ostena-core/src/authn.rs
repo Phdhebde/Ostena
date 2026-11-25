@@ -1,8 +1,11 @@
 //! The PostgreSQL [`Authenticator`] of the login API (ADR-0010, step 1).
 //!
-//! A login is one transaction on the credential row of the user, locked
-//! (`FOR UPDATE`), so that concurrent attempts count failures and consume
-//! TOTP steps one after the other:
+//! A login is one transaction. It first locks the user row (`FOR SHARE`,
+//! in the canonical order of ADR-0014: `app_user` before `login_session`),
+//! so that a concurrent `disable_user` either waits for the session to be
+//! opened and revokes it, or is seen and refuses the login. It then locks
+//! the credential row (`FOR UPDATE`), so that concurrent attempts count
+//! failures and consume TOTP steps one after the other:
 //!
 //! 1. unknown name, locked, disabled or not enrolled account: refused,
 //!    after a dummy password check of the same cost;
@@ -133,6 +136,21 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| Failure::Broken(CoreError::Keys(format!("vérification interrompue : {e}"))))
 }
 
+/// Locks the row of the user `name`, shared, before anything else
+/// (ADR-0014: `app_user` before `login_session`): a disabling waits for
+/// this transaction, and this one sees a disabling committed before it.
+/// Returns the user and whether they are active.
+async fn lock_user(tx: &mut Tx<'_>, name: &str) -> Result<Option<(Uuid, bool)>, Failure> {
+    let row = sqlx::query!(
+        r#"SELECT id::text AS "id!", state FROM app_user WHERE name = $1 FOR SHARE"#,
+        name,
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|r| Ok((uuid(&r.id)?, r.state == "active")))
+        .transpose()
+}
+
 /// The stored password digest, sealed TOTP secret and its HMAC, if the
 /// user is fully enrolled.
 fn enrolled(
@@ -205,23 +223,24 @@ impl PgAuthenticator {
             ..
         } = request;
         let mut tx = self.pool.begin().await?;
+        let Some((user, active)) = lock_user(&mut tx, &username).await? else {
+            blocking(move || password::dummy_verify(&password)).await?;
+            return Err(Failure::Refused(Cause::UnknownUser, None));
+        };
         let row = sqlx::query!(
-            r#"SELECT u.id::text AS "id!", u.state, c.password_hash, c.totp_secret,
-                      c.totp_algorithm, c.totp_pending, c.totp_last_step,
-                      c.failed_attempts, c.locked_until
-               FROM user_credential c JOIN app_user u ON u.id = c.user_id
-               WHERE u.name = $1
-               FOR UPDATE OF c"#,
-            username,
+            r#"SELECT password_hash, totp_secret, totp_algorithm, totp_pending,
+                      totp_last_step, failed_attempts, locked_until
+               FROM user_credential WHERE user_id = $1::text::uuid
+               FOR UPDATE"#,
+            user.to_string(),
         )
         .fetch_optional(&mut *tx)
         .await?;
         let now = unix_now();
         let Some(row) = row else {
             blocking(move || password::dummy_verify(&password)).await?;
-            return Err(Failure::Refused(Cause::UnknownUser, None));
+            return Err(Failure::Refused(Cause::NotEnrolled, Some(user)));
         };
-        let user = uuid(&row.id)?;
         let locked = row
             .locked_until
             .is_some_and(|t| u64::try_from(t).unwrap_or(0) > now);
@@ -234,7 +253,7 @@ impl PgAuthenticator {
         );
         let early = if locked {
             Some(Cause::Locked)
-        } else if row.state != "active" {
+        } else if !active {
             Some(Cause::Disabled)
         } else if enrolled.is_none() {
             Some(Cause::NotEnrolled)

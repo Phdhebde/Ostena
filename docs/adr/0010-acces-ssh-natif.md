@@ -84,7 +84,7 @@ Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-
 
 **Événements de l'authentification** (avec l'authentificateur PostgreSQL) : `login.succeeded` (utilisateur, session, empreinte du certificat, fin de validité, adresse), `login.refused` (nom tel que saisi, assaini et borné, cause interne, adresse), `login.locked` (fin du verrouillage) ; `ostena logout` écrit `login_session.revoked` avec l'utilisateur pour acteur, et les agents concernés sont prévenus comme pour une révocation par l'administrateur. Côté administration : `user.password_set`, `user.totp_enrolled`, `user.totp_reset`, `user.unlocked`. La cause précise d'un refus n'est que dans l'audit, jamais dans la réponse.
 
-**Décision du core** (`ostena_core::authn`), dans une transaction qui verrouille la ligne d'identifiants de l'utilisateur (`FOR UPDATE`) :
+**Décision du core** (`ostena_core::authn`), dans une transaction qui verrouille d'abord la ligne `app_user` de l'utilisateur (`FOR SHARE`, ordre canonique des verrous de l'ADR-0014 : `app_user` avant `login_session`), puis sa ligne d'identifiants (`FOR UPDATE`). Une désactivation concurrente attend donc l'ouverture de la session et la révoque, ou bien elle est vue et la connexion est refusée :
 1. nom inconnu, compte verrouillé, désactivé ou non enrôlé (mot de passe absent, TOTP absent ou en attente) : refus, après une vérification factice du même coût ;
 2. mot de passe (PBKDF2, hors des fils du runtime, quatre à la fois), puis code TOTP (un pas de tolérance, un pas jamais accepté deux fois) ;
 3. un échec compte ; à `max_failures` échecs consécutifs, le compte est verrouillé `lockout_minutes` ;

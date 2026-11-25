@@ -1,27 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT u.id::text AS \"id!\", u.state, c.password_hash, c.totp_secret,\n                      c.totp_algorithm, c.totp_pending, c.totp_last_step,\n                      c.failed_attempts, c.locked_until\n               FROM user_credential c JOIN app_user u ON u.id = c.user_id\n               WHERE u.name = $1\n               FOR UPDATE OF c",
+  "query": "SELECT password_hash, totp_secret, totp_algorithm, totp_pending,\n                      totp_last_step, failed_attempts, locked_until\n               FROM user_credential WHERE user_id = $1::text::uuid\n               FOR UPDATE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id!",
-        "type_info": "Text",
-        "origin": "Expression"
-      },
-      {
-        "ordinal": 1,
-        "name": "state",
-        "type_info": "Text",
-        "origin": {
-          "Table": {
-            "table": "app_user",
-            "name": "state"
-          }
-        }
-      },
-      {
-        "ordinal": 2,
         "name": "password_hash",
         "type_info": "Text",
         "origin": {
@@ -32,7 +15,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 1,
         "name": "totp_secret",
         "type_info": "Bytea",
         "origin": {
@@ -43,7 +26,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 2,
         "name": "totp_algorithm",
         "type_info": "Text",
         "origin": {
@@ -54,7 +37,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 3,
         "name": "totp_pending",
         "type_info": "Bool",
         "origin": {
@@ -65,7 +48,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 4,
         "name": "totp_last_step",
         "type_info": "Int8",
         "origin": {
@@ -76,7 +59,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 5,
         "name": "failed_attempts",
         "type_info": "Int4",
         "origin": {
@@ -87,7 +70,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 6,
         "name": "locked_until",
         "type_info": "Int8",
         "origin": {
@@ -104,8 +87,6 @@
       ]
     },
     "nullable": [
-      null,
-      false,
       true,
       true,
       true,
@@ -115,5 +96,5 @@
       true
     ]
   },
-  "hash": "f404bb5ed56cf76a4a07f12b759bb7063ce0a1a8d8aa729e25ab7a0be15cc1bb"
+  "hash": "ad7d7b58599f06fcbf292a9f9af3f9d377bf7e5790c4cae45eb9700db049dec0"
 }

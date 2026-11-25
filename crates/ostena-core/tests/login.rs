@@ -350,6 +350,52 @@ fn failures_lock_the_account_and_refusals_are_uniform() {
     });
 }
 
+/// A disabling that runs during a login: the login waits on the user row,
+/// then sees the user disabled and opens no session (ADR-0014 lock order).
+#[test]
+fn a_disabled_user_cannot_open_a_login_session() {
+    block_on(async {
+        let Some(f) = fixture("a_disabled_user_cannot_open_a_login_session").await else {
+            return;
+        };
+        let f = Arc::new(f);
+        // An uncommitted disabling holds the user row.
+        let mut disabling = f.pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE app_user SET state = 'disabled', disabled_at = now() WHERE name = 'alice'",
+        )
+        .execute(&mut *disabling)
+        .await
+        .unwrap();
+        let attempt = tokio::spawn({
+            let f = f.clone();
+            async move {
+                let key = SigningKey::generate().unwrap().0;
+                f.login("alice", PASSWORD, f.next_code(), &key).await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!attempt.is_finished(), "the login waits on the user row");
+        disabling.commit().await.unwrap();
+        assert_eq!(
+            attempt.await.unwrap().unwrap_err(),
+            ApiCode::InvalidCredentials
+        );
+        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM login_session")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+        // The refusal did not count as a failure.
+        assert_eq!(f.failures().await, (0, None));
+
+        let f = Arc::into_inner(f).unwrap();
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
 async fn alice(pool: &PgPool) -> ostena_tunnel::Uuid {
     let id: String = sqlx::query_scalar("SELECT id::text FROM app_user WHERE name = 'alice'")
         .fetch_one(pool)
