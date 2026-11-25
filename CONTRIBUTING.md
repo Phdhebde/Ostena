@@ -58,8 +58,13 @@ cargo xtask fuzz 60   # 60 s par cible de fuzz (Linux, cargo-fuzz)
 cargo xtask footprint # mémoire au repos de l'agent (version optimisée)
 cargo bench -p ostena-scope   # banc de la décision de périmètre (affiché, sans seuil)
 cargo bench -p ostena-frame   # banc du décodage des trames (affiché, sans seuil)
+cargo xtask bench-ssh # latence SSH (relais de l'agent, tunnel) : tableau dans target/bench/
 cargo build -p ostena-frame --target wasm32-unknown-unknown   # cœur protocolaire du client web
 ```
+
+Livrables signés ([ADR-0017](docs/adr/0017-signature-des-livrables.md)) : `ostena release sign` et `ostena release verify`. En CI, le job `release-sign` signe les binaires et les SBOM avec une clé de test tirée pour l'exécution (artefact `ostena-test-signed`).
+
+Le seul contrôle requis pour fusionner dans `dev` et `main` est `ci-ok` : il réussit quand tous les jobs ont réussi, ou ont été sautés parce que la PR ne touche que la documentation (`docs/`, `*.md`, `LICENSE`).
 
 Outils : `cargo install --locked cargo-deny cargo-cyclonedx cargo-fuzz`.
 
