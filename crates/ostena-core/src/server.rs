@@ -387,6 +387,7 @@ struct Shared {
     /// Per-agent limits of `ssh_grant_request` and `ssh_host_key`.
     grant_requests: rate::Limiter,
     host_keys: rate::Limiter,
+    stream_refusals: rate::Limiter,
 }
 
 /// What the start of the core writes to the audit chain besides
@@ -565,6 +566,7 @@ impl RunningCore {
             resync: tokio::sync::Notify::new(),
             grant_requests: rate::Limiter::new(rate::GRANT_REQUESTS),
             host_keys: rate::Limiter::new(rate::HOST_KEYS),
+            stream_refusals: rate::Limiter::new(rate::STREAM_REFUSALS),
         });
         write_granting(
             &shared.store,
@@ -799,6 +801,34 @@ async fn recover_transcripts(
     Ok(())
 }
 
+/// Counts a refused session stream of `agent`: `true` if it is within the
+/// limit and is reported on its own. Beyond it, the tunnel of the agent is
+/// closed, and one aggregated line is logged per minute at most
+/// (`tunnel.streams_limited`) instead of one event per refusal.
+fn refusal_allowed(shared: &Shared, tunnel: &CoreTunnel, agent: Uuid) -> bool {
+    match shared
+        .stream_refusals
+        .check(agent, std::time::Instant::now())
+    {
+        rate::Decision::Allowed => true,
+        rate::Decision::Refused { log } => {
+            if let Some(refused) = log {
+                tracing::warn!(
+                    event = "tunnel.streams_limited",
+                    agent = %agent,
+                    refused,
+                    code = transcripts::REFUSED,
+                    "flux de session refusés au-delà de la limite : tunnel de l'agent fermé"
+                );
+            }
+            tunnel.close(TunnelError::Protocol(
+                "trop de flux de session refusés".into(),
+            ));
+            false
+        }
+    }
+}
+
 /// The session streams an agent opens: transcripts (ADR-0016) are received
 /// and sealed; any other class is refused, the core relays no session data
 /// yet.
@@ -819,6 +849,7 @@ async fn streams(tunnel: Arc<CoreTunnel>, agent: Uuid, shared: Arc<Shared>) {
         if let (Some(store), ostena_tunnel::StreamClass::Recording) = (&shared.transcripts, class) {
             let shared = shared.clone();
             let store = store.clone();
+            let tunnel = tunnel.clone();
             tokio::spawn(async move {
                 transcripts::receive(
                     shared.store.pool(),
@@ -828,17 +859,20 @@ async fn streams(tunnel: Arc<CoreTunnel>, agent: Uuid, shared: Arc<Shared>) {
                     session,
                     channel,
                     unix_now,
+                    || refusal_allowed(&shared, &tunnel, agent),
                 )
                 .await;
             });
         } else {
-            tracing::warn!(
-                event = "tunnel.channel_refused",
-                agent = %agent,
-                session = %session,
-                class = ?class,
-                "flux de session refusé par le core"
-            );
+            if refusal_allowed(&shared, &tunnel, agent) {
+                tracing::warn!(
+                    event = "tunnel.channel_refused",
+                    agent = %agent,
+                    session = %session,
+                    class = ?class,
+                    "flux de session refusé par le core"
+                );
+            }
             ostena_tunnel::recording::refuse(&mut channel);
         }
     }

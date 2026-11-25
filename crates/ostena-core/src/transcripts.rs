@@ -470,7 +470,11 @@ async fn record(
 }
 
 /// Receives the transcript stream of `session` from `agent`, writes it and
-/// seals it (see the module documentation).
+/// seals it (see the module documentation). Each refusal of the stream is
+/// first counted by `refusal_allowed`, which closes the tunnel of an agent
+/// beyond its limit: only refusals within the limit are reported one by
+/// one.
+#[allow(clippy::too_many_arguments)]
 pub async fn receive(
     pool: &PgPool,
     recorder: &Recorder,
@@ -479,16 +483,19 @@ pub async fn receive(
     session: Uuid,
     mut channel: Channel,
     now: impl Fn() -> u64,
+    refusal_allowed: impl Fn() -> bool,
 ) {
     let refuse = |channel: &mut Channel, code: &str, reason: &str| {
-        tracing::warn!(
-            event = "transcript.refused",
-            agent = %agent,
-            session = %session,
-            code,
-            "{reason}"
-        );
-        recorder.emit(refused_event(agent, session, code, reason));
+        if refusal_allowed() {
+            tracing::warn!(
+                event = "transcript.refused",
+                agent = %agent,
+                session = %session,
+                code,
+                "{reason}"
+            );
+            recorder.emit(refused_event(agent, session, code, reason));
+        }
         ostena_tunnel::recording::refuse(channel);
     };
     match register(pool, agent, session, now()).await {

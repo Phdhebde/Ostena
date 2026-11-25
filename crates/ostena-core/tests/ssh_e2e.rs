@@ -477,6 +477,31 @@ fn ssh_access_and_login_revocation_end_to_end() {
         // Cut by the stop: sealed incomplete, by the core that stopped or
         // at this start.
         assert_eq!(until_sealed(&pool, live_id).await, "incomplete");
+
+        // Refused streams beyond the limit: the core closes the tunnel of
+        // the agent, which reconnects.
+        let connections = link.status().connections;
+        let mut sent = 0;
+        while link.status().connections == connections {
+            assert!(sent < 40, "tunnel jamais fermé");
+            sent += 1;
+            let Ok(foreign) = link
+                .open_channel(
+                    Uuid::random().unwrap(),
+                    ostena_tunnel::StreamClass::Recording,
+                )
+                .await
+            else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let (transcript, pumped) = record(foreign);
+            let _ = transcript.start(None, None).await;
+            let _ = tokio::time::timeout(WAIT, transcript.closed()).await;
+            drop(transcript);
+            let _ = pumped.await;
+        }
+        assert!(sent > 8, "{sent}");
         core.stop().await;
 
         // The audit export and the transcript directory verify offline.
