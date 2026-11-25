@@ -197,7 +197,8 @@ jobs:
           retention-days: 7
       - run: cargo build --release --locked --package ostena-cli
       - run: bash tests/agent/linux-service.sh target/release/ostena
-      - run: cargo xtask footprint
+      # The static musl binary is the Linux release artifact: measure it.
+      - run: cargo xtask footprint --target x86_64-unknown-linux-musl
 
   # All targets in one job, 30 s each: the fuzz build is shared. Longer runs:
   # fuzz-nightly.yml.

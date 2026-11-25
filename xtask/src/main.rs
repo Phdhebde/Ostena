@@ -25,8 +25,10 @@ Tasks:
   check-secrets  Check that every secret exposure is justified
   vendor         Vendor all dependencies into vendor/ for offline builds
   sbom           Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
-  footprint      Measure the idle memory of the agent, with and without SSH (release
-                 build); fail on a blocking regression (ADR-0009)
+  footprint [--target TRIPLE]
+                 Measure the idle memory of the agent, with and without SSH (release
+                 build, for TRIPLE if given, such as x86_64-unknown-linux-musl); fail
+                 on a blocking regression (ADR-0009)
   fuzz [SECS] [TARGET...]
                  Run fuzz targets, each for SECS (default 60, all targets)
   check-release [BINARY]
@@ -48,7 +50,7 @@ fn main() -> ExitCode {
         Some("check-secrets") => check_secrets(),
         Some("vendor") => vendor(),
         Some("sbom") => sbom(),
-        Some("footprint") => footprint(),
+        Some("footprint") => footprint(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("fuzz") => fuzz(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("check-release") => check_release(std::env::args().nth(2).as_deref()),
         None | Some("help" | "-h" | "--help") => {
@@ -237,9 +239,17 @@ struct Measure {
 
 /// Builds the release agent, the reference without SSH (kept next to it as
 /// `ostena-without-ssh`) and the test core; returns their paths.
-fn footprint_binaries() -> Result<(PathBuf, PathBuf, PathBuf)> {
+/// `target`: a target triple, such as `x86_64-unknown-linux-musl` for the
+/// static Linux release; the host target if `None`. The test core is built
+/// for the host.
+fn footprint_binaries(target: Option<&str>) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let root = workspace_root()?;
-    let release = root.join("target/release");
+    let host_release = root.join("target/release");
+    let release = target.map_or_else(
+        || host_release.clone(),
+        |t| root.join("target").join(t).join("release"),
+    );
+    let target_args: Vec<&str> = target.map(|t| vec!["--target", t]).unwrap_or_default();
     let exe = release.join(format!("ostena{}", std::env::consts::EXE_SUFFIX));
     let reference = release.join(format!(
         "ostena-without-ssh{}",
@@ -255,10 +265,12 @@ fn footprint_binaries() -> Result<(PathBuf, PathBuf, PathBuf)> {
         "ostena-cli",
         "--no-default-features",
     ]);
+    build.args(&target_args);
     run(build)?;
     fs::copy(&exe, &reference)?;
     let mut build = cargo();
     build.args(["build", "--release", "--locked", "--package", "ostena-cli"]);
+    build.args(&target_args);
     run(build)?;
     let mut build = cargo();
     build.args([
@@ -273,7 +285,7 @@ fn footprint_binaries() -> Result<(PathBuf, PathBuf, PathBuf)> {
         "test_core",
     ]);
     run(build)?;
-    let test_core = release
+    let test_core = host_release
         .join("examples")
         .join(format!("test_core{}", std::env::consts::EXE_SUFFIX));
     Ok((exe, reference, test_core))
@@ -293,11 +305,16 @@ fn footprint_binaries() -> Result<(PathBuf, PathBuf, PathBuf)> {
 /// - loads a library or DLL the reference does not load;
 /// - loads a GUI or COM DLL (`user32`, `gdi32`, `win32u`, `combase`,
 ///   `ole32`, `oleaut32`).
-fn footprint() -> Result<()> {
+fn footprint(args: &[String]) -> Result<()> {
     use std::io::BufRead;
     use std::process::Stdio;
 
-    let (exe, reference, test_core) = footprint_binaries()?;
+    let target = match args {
+        [] => None,
+        [flag, triple] if flag == "--target" => Some(triple.as_str()),
+        _ => return Err(format!("footprint takes [--target TRIPLE]\n\n{USAGE}").into()),
+    };
+    let (exe, reference, test_core) = footprint_binaries(target)?;
 
     let dir = std::env::temp_dir().join(format!("ostena-footprint-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -539,25 +556,43 @@ fn parse_maps(maps: &str) -> Vec<String> {
 }
 
 /// Linux: anonymous (heap, stacks) and file-backed (code of the binary and
-/// of the libraries) resident memory, and the thread count, to explain a
-/// difference. Empty elsewhere.
+/// of the libraries) resident memory, the proportional (PSS) and private
+/// resident memory (pages shared with no other process), and the thread
+/// count, to explain a difference. Empty elsewhere.
 fn breakdown(pid: u32) -> String {
     let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
         return String::new();
     };
-    let field = |name: &str| {
-        status
-            .lines()
+    let rollup = fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).unwrap_or_default();
+    let field = |text: &str, name: &str| {
+        text.lines()
             .find_map(|l| l.strip_prefix(name))
             .map_or("?", str::trim)
             .to_owned()
     };
     format!(
-        " [anonymous {}, file-backed {}, threads {}]",
-        field("RssAnon:"),
-        field("RssFile:"),
-        field("Threads:")
+        " [anonymous {}, file-backed {}, PSS {}, private {}, threads {}]",
+        field(&status, "RssAnon:"),
+        field(&status, "RssFile:"),
+        field(&rollup, "Pss:"),
+        private_kib(&rollup).map_or_else(|| "?".to_owned(), |k| format!("{k} kB")),
+        field(&status, "Threads:")
     )
+}
+
+/// `Private_Clean` plus `Private_Dirty` of a `smaps_rollup`, in KiB.
+fn private_kib(rollup: &str) -> Option<u64> {
+    let kib = |name: &str| {
+        rollup
+            .lines()
+            .find_map(|l| l.strip_prefix(name))?
+            .trim()
+            .trim_end_matches("kB")
+            .trim()
+            .parse::<u64>()
+            .ok()
+    };
+    Some(kib("Private_Clean:")? + kib("Private_Dirty:")?)
 }
 
 /// `"resident_bytes":12345` in a JSON log line.
@@ -913,6 +948,14 @@ mod tests {
             parse_module_names("ostena.exe\r\nntdll.dll\r\nKERNEL32.DLL\r\n\r\n"),
             ["ntdll.dll", "kernel32.dll"]
         );
+    }
+
+    #[test]
+    fn reads_private_memory() {
+        let rollup = "Rss:  9000 kB\nPss:  6000 kB\nPrivate_Clean:  300 kB\n\
+                      Private_Dirty:  900 kB\n";
+        assert_eq!(private_kib(rollup), Some(1200));
+        assert_eq!(private_kib("Rss: 1 kB\n"), None);
     }
 
     #[test]
