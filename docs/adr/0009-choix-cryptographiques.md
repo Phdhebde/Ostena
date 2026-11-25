@@ -164,17 +164,28 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 - **Modules chargés au repos** : `cargo xtask footprint` relève, pour chaque état, les bibliothèques chargées par l'agent sans SSH et avec SSH (`/proc/<pid>/maps` sous Linux, modules du processus sous Windows). Il échoue si l'agent avec SSH charge un module que la référence ne charge pas, ou l'une des six DLL interdites.
 - **Seuil d'empreinte** : le même outil échoue si l'agent avec SSH dépasse la référence de +10 % et de 1 Mio à la fois (ADR-0007).
 
-**Remesure sous Linux** (conteneur de développement, binaire de release glibc, `cargo xtask footprint`, mémoire résidente au repos ; la référence est l'agent construit sans la fonctionnalité `ssh`, l'autre mesure l'agent avec `[agent.ssh]` à l'écoute) :
+**Remesure sous Linux** (conteneur de développement, mémoire résidente au repos, `cargo xtask footprint` ; la référence est l'agent construit sans la fonctionnalité `ssh`, l'autre mesure l'agent avec `[agent.ssh]` à l'écoute). Binaire statique musl, l'artefact Linux de release, que la CI mesure désormais (`--target x86_64-unknown-linux-musl`) :
 
-| État | Sans SSH | Avec SSH | Écart | Modules |
+| État | Sans SSH | Avec SSH | Écart | Lié seulement |
 |---|---|---|---|---|
-| sans liaison | 7,27 Mio | 9,12 Mio | +1,85 Mio (+25,4 %) | 4 et 4 |
-| non connecté | 9,86 Mio | 11,66 Mio | +1,80 Mio (+18,3 %) | 4 et 4 |
-| connecté | 10,73 Mio | 12,30 Mio | +1,58 Mio (+14,7 %) | 4 et 4 |
+| sans liaison | 4,67 Mio | 6,58 Mio | +1,91 Mio (+40,9 %) | +0,70 Mio |
+| non connecté | 7,09 Mio | 8,93 Mio | +1,83 Mio (+25,8 %) | +1,44 Mio |
+| connecté | 7,80 Mio | 9,44 Mio | +1,63 Mio (+20,9 %) | +1,13 Mio |
 
-Avant la PR 6, sur `dev` et dans le même environnement, l'agent mesurait 7,8, 10,0 et 10,6 Mio : la référence sans SSH n'a pas bougé. Aucun module en plus. L'écart est presque entièrement fait de **pages d'image** (adossées au binaire, partagées et récupérables) : le tas privé ne prend que +50 à +200 Kio. Une mesure de diagnostic, avec le binaire lié avec SSH mais sans `[agent.ssh]`, donne déjà l'essentiel de l'écart : il tient à la taille du binaire (12,1 Mo), pas au serveur en marche. Les mesures varient d'environ 0,3 Mio d'une exécution à l'autre.
+« Lié seulement » : le binaire avec SSH, lancé sans `[agent.ssh]` (mesure de diagnostic). Deux exécutions donnent les mêmes valeurs à 0,02 Mio près. Le binaire glibc donne des écarts du même ordre (+1,58 à +1,85 Mio, sur 7,27 à 10,73 Mio), plus bruités (±0,3 Mio).
 
-**Le seuil est dépassé dans les trois états** (+10 % et +1 Mio à la fois) : `cargo xtask footprint` échoue, donc le job `release-linux` de la CI aussi. Conformément à l'engagement 3, la PR 6 ne fusionne pas sans **décision explicite du responsable du projet**. Pistes à arbitrer : accepter l'écart en le motivant par sa nature (pages d'image partagées) ; mesurer le seuil sur la mémoire privée ; réduire les pages touchées (initialisation paresseuse, disposition du code). Mesures sous Windows (working set et DLL chargées) : à relever par le job Windows de la CI.
+**Analyse** :
+- **PSS et mémoire privée égalent la mémoire résidente** pour le binaire statique : un seul processus projette ses pages, rien n'est partagé. Changer de métrique ne change pas le verdict.
+- **L'écart est fait de pages de code** : `.text` résident +1,4 Mio, `.rodata` et `.eh_frame` +0,16 à +0,29 Mio, en-têtes et `.rela.dyn` +44 Kio, segment inscriptible (relro, GOT, `.data`) +64 Kio dont +48 Kio modifiés, tas et piles +0 à +170 Kio. Le binaire passe de 9,7 à 12,2 Mo (`.text` +1,9 Mo, `.data` +194 Kio, `.data.rel.ro` +32 Kio) et de 11 911 à 13 728 relocations `R_X86_64_RELATIVE`.
+- **L'essentiel tient à la liaison**, pas au serveur : sans `[agent.ssh]`, le binaire avec SSH coûte déjà +0,7 à +1,44 Mio. Le code du chemin commun est le même (les fonctionnalités unifiées n'ajoutent rien de lourd), mais avec la LTO complète et une seule unité de compilation, il s'éparpille sur davantage de pages, que le noyau projette par blocs. Le serveur en marche ajoute +0,4 à +0,5 Mio une fois les clés créées ; la mesure « sans liaison » comprend leur création au premier démarrage (+1,2 Mio).
+
+**Pistes essayées** (sans changer le comportement) :
+- **Non-PIE** (`relocation-model=static`) : refusé. Il retire l'ASLR du binaire en production, pour un gain borné au segment relogé (+48 Kio modifiés d'écart).
+- **Profil de release** : déjà `lto = "fat"`, `codegen-units = 1`, `strip = true`. `panic = "abort"` réduirait `.eh_frame` et `.gcc_except_table`, mais change le comportement (une panique d'une tâche arrête l'agent) : non essayé.
+- **`opt-level = "s"`** (mesure seulement) : 3,61 / 5,09 / 5,32 Mio sans SSH, 5,43 / 6,27 / 6,65 Mio avec, soit un agent avec SSH plus petit que l'agent actuel sans SSH. Mais l'écart reste au-dessus du seuil (+1,18 à +1,83 Mio, +23 à +51 %), et l'effet sur la latence n'est pas mesuré.
+- **Initialisation paresseuse** : elle ne pourrait retirer que la part du serveur en marche (≤ 0,5 Mio clés créées) ; la part de la liaison seule dépasse déjà 1 Mio dans deux états.
+
+**Le seuil est dépassé dans les trois états** (+10 % et +1 Mio à la fois) : `cargo xtask footprint` échoue, donc le job `release-linux` de la CI aussi. Conformément à l'engagement 3, la PR 6 ne fusionne pas sans **décision explicite du responsable du projet**. Aucune réduction suffisante n'est obtenue sans changer le comportement ou le profil. Mesures sous Windows (working set et DLL chargées) : à relever par le job Windows de la CI ; le contrôle des imports y passe (`oleaut32.dll` en import différé seulement, aucune DLL d'interface graphique ou COM en import statique).
 
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 
