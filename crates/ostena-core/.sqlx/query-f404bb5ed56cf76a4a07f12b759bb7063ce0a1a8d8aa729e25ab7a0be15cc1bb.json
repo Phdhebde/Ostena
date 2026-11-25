@@ -1,0 +1,119 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT u.id::text AS \"id!\", u.state, c.password_hash, c.totp_secret,\n                      c.totp_algorithm, c.totp_pending, c.totp_last_step,\n                      c.failed_attempts, c.locked_until\n               FROM user_credential c JOIN app_user u ON u.id = c.user_id\n               WHERE u.name = $1\n               FOR UPDATE OF c",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_user",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "password_hash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "password_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "totp_secret",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "totp_secret"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "totp_algorithm",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "totp_algorithm"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "totp_pending",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "totp_pending"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "totp_last_step",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "totp_last_step"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "failed_attempts",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "failed_attempts"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "locked_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "locked_until"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "f404bb5ed56cf76a4a07f12b759bb7063ce0a1a8d8aa729e25ab7a0be15cc1bb"
+}

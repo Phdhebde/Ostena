@@ -8,6 +8,7 @@
 pub mod access;
 pub mod api;
 pub mod audit;
+pub mod authn;
 pub mod cache;
 pub mod credential;
 pub mod db;

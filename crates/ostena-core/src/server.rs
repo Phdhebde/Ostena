@@ -34,8 +34,11 @@ use sqlx::postgres::PgListener;
 use tokio::task::JoinHandle;
 
 use crate::access::{self, Refusal, SshRequest};
+use crate::api::{Limits as LoginLimits, LoginListener};
 use crate::audit::{self, Cadence, HeadSigner, Recorder, SystemClock};
+use crate::authn::PgAuthenticator;
 use crate::cache::AgentCache;
+use crate::credential::TotpKey;
 use crate::error::CoreError;
 use crate::grant_keys::GrantAuthority;
 use crate::ssh_ca::SshAuthorities;
@@ -82,6 +85,8 @@ pub struct Keys {
     pub grant: Arc<Issuer>,
     /// The SSH certificate authorities, if `[core.ssh]` is set (ADR-0014).
     pub ssh: Option<Arc<SshAuthorities>>,
+    /// The key of the TOTP secrets, if `[core.login]` is set (ADR-0010).
+    pub totp: Option<Arc<TotpKey>>,
 }
 
 impl std::fmt::Debug for Keys {
@@ -143,6 +148,7 @@ impl Keys {
             .map_err(|e| keys("core.issuing_certificate", &e))?
             .certificate()
             .clone();
+        let issuing_scalar = SigningKey::from_pkcs8(&issuing_key).and_then(|k| k.scalar());
         let issuing = IssuingAuthority::from_certificate(&issuing_key, issuing_certificate)
             .map_err(|e| {
                 keys(
@@ -187,6 +193,32 @@ impl Keys {
             publics.push(("core.ssh.host_ca_key", ssh.host_ca_public()));
         }
         distinct_keys(&publics)?;
+        let totp = match &config.login {
+            Some(login) => {
+                // A key of its own: never the bytes of another key.
+                let mut others = Vec::new();
+                let scalar =
+                    |field: &'static str, key: &SigningKey| key.scalar().ok().map(|s| (field, s));
+                others.extend(scalar("core.audit.signing_key", &audit));
+                others.extend(scalar("core.grant_signing_key", &grant));
+                if let Ok(s) = issuing_scalar {
+                    others.push(("core.issuing_private_key", s));
+                }
+                if let Some(s) = ostena_crypto::pki::pkcs8_from_pem(&server_key)
+                    .ok()
+                    .and_then(|p| SigningKey::from_pkcs8(&p).ok())
+                    .and_then(|k| k.scalar().ok())
+                {
+                    others.push(("core.tls_private_key", s));
+                }
+                if let Some(ssh) = &ssh {
+                    others.extend(ssh.scalars());
+                }
+                let bytes = read_key("core.login.totp_key", &login.totp_key, credentials)?;
+                Some(Arc::new(TotpKey::from_bytes(&bytes, &others)?))
+            }
+            None => None,
+        };
         Ok(Self {
             root,
             server,
@@ -194,6 +226,7 @@ impl Keys {
             audit: Arc::new(audit),
             grant: Arc::new(Issuer::new(grant)),
             ssh: ssh.map(Arc::new),
+            totp,
         })
     }
 }
@@ -209,6 +242,25 @@ fn distinct_keys(publics: &[(&str, ostena_crypto::p256::VerifyingKey)]) -> Resul
         }
     }
     Ok(())
+}
+
+/// The key of the TOTP secrets alone, for `ostena core user totp-enroll`:
+/// its format is checked, not its distinctness from the other keys (the
+/// core checks it at startup).
+///
+/// # Errors
+///
+/// [`CoreError::Keys`], also when `[core.login]` is absent.
+pub fn load_totp_key(
+    config: &CoreConfig,
+    credentials: Option<&Path>,
+) -> Result<TotpKey, CoreError> {
+    let login = config
+        .login
+        .as_ref()
+        .ok_or_else(|| CoreError::Keys("section [core.login] absente".into()))?;
+    let bytes = read_key("core.login.totp_key", &login.totp_key, credentials)?;
+    TotpKey::from_bytes(&bytes, &[])
 }
 
 /// `$CREDENTIALS_DIRECTORY`, set by systemd for the credentials of the unit.
@@ -366,6 +418,35 @@ fn start_events(signer: &HeadSigner, info: &StartInfo) -> Vec<Event> {
     events
 }
 
+/// The login listener of `[core.login]` (ADR-0010, ADR-0015).
+async fn start_login(
+    config: &CoreConfig,
+    keys: &Keys,
+    store: &PgStore,
+    recorder: &Arc<Recorder>,
+) -> Result<Option<LoginListener>, CoreError> {
+    let Some(settings) = &config.login else {
+        return Ok(None);
+    };
+    let (Some(ssh), Some(totp)) = (keys.ssh.clone(), keys.totp.clone()) else {
+        return Err(CoreError::Startup(
+            "[core.login] exige [core.ssh] et core.login.totp_key".into(),
+        ));
+    };
+    let tls = tls::server_config(&keys.server, ClientAuth::None, &[b"http/1.1"])
+        .map_err(|e| CoreError::Startup(e.to_string()))?;
+    let authenticator =
+        PgAuthenticator::new(store.pool().clone(), recorder.clone(), ssh, totp, settings);
+    LoginListener::bind(
+        settings.listen,
+        tls,
+        LoginLimits::from_config(settings),
+        Arc::new(authenticator),
+    )
+    .await
+    .map(Some)
+}
+
 /// A started core. Dropping it does not stop it: call [`RunningCore::stop`].
 pub struct RunningCore {
     shared: Arc<Shared>,
@@ -374,6 +455,7 @@ pub struct RunningCore {
     tasks: Vec<JoinHandle<()>>,
     writer: JoinHandle<()>,
     signer: Arc<HeadSigner>,
+    login: Option<LoginListener>,
 }
 
 impl std::fmt::Debug for RunningCore {
@@ -473,6 +555,7 @@ impl RunningCore {
             ],
         )
         .await?;
+        let login = start_login(config, keys, &shared.store, &recorder).await?;
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
         let notices = listen(shared.store.pool()).await?;
@@ -493,6 +576,7 @@ impl RunningCore {
             kid = %signer.kid(),
             grant_kid = %shared.grants.kid(),
             ssh = shared.ssh.is_some(),
+            login = ?login.as_ref().map(LoginListener::local_addr),
             "core démarré"
         );
         Ok(Self {
@@ -502,7 +586,13 @@ impl RunningCore {
             tasks,
             writer,
             signer,
+            login,
         })
+    }
+
+    /// The bound address of the login listener, if `[core.login]` is set.
+    pub fn login_addr(&self) -> Option<SocketAddr> {
+        self.login.as_ref().map(LoginListener::local_addr)
     }
 
     /// The bound tunnel address.
@@ -541,6 +631,9 @@ impl RunningCore {
     pub async fn stop(self) {
         for task in &self.tasks {
             task.abort();
+        }
+        if let Some(login) = &self.login {
+            login.close();
         }
         self.listener.close();
         self.shared.enrollment.close();
