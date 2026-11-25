@@ -105,7 +105,8 @@ jobs:
   # certificate, through the agent server to a target; the SSH access through
   # the gateway against the test core; our client against a Debian 12
   # OpenSSH server in Docker, with the agent key installed as
-  # `restrict,from=`; then the native access end to end to that target.
+  # `restrict,from=`; then the native access end to end to that target,
+  # through the real agent binary (test agent_ssh of ostena-cli).
   # Needs Docker.
   ssh-interop:
     runs-on: ubuntu-24.04
@@ -196,7 +197,8 @@ jobs:
           retention-days: 7
       - run: cargo build --release --locked --package ostena-cli
       - run: bash tests/agent/linux-service.sh target/release/ostena
-      - run: cargo xtask footprint
+      # The static musl binary is the Linux release artifact: measure it.
+      - run: cargo xtask footprint --target x86_64-unknown-linux-musl
 
   # All targets in one job, 30 s each: the fuzz build is shared. Longer runs:
   # fuzz-nightly.yml.

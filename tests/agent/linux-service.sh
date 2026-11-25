@@ -37,6 +37,9 @@ tls_private_key = "/var/lib/ostena/agent.key"
 tls_core_ca = "/etc/ostena/core-ca.pem"
 replay_journal = "/var/lib/ostena/replay.journal"
 shutdown_grace_secs = 5
+
+[agent.ssh]
+listen = ["127.0.0.1:2222"]
 TOML
 # The identity lives in the state directory, where the service may write
 # (renewal).
@@ -51,9 +54,34 @@ sudo stat -c '%U:%G %a %n' "$CONFIG" /var/lib/ostena/agent.key /var/lib/ostena /
 [ "$(sudo stat -c '%U %a' /run/ostena)" = "ostena 700" ] || fail "runtime directory permissions"
 [ "$(sudo stat -c '%U %a' /run/ostena/agent.sock)" = "ostena 600" ] || fail "socket permissions"
 
+echo "=== native SSH server (ADR-0010): keys created by the service, listening, no handshake without identity"
+for key in ssh_host_key ssh_target_key; do
+    [ "$(sudo stat -c '%U %a' /var/lib/ostena/$key)" = "ostena 600" ] || fail "$key permissions"
+done
+ss -ltn | grep -q '127.0.0.1:2222 ' || fail "the SSH server does not listen on 127.0.0.1:2222"
+# Without a core, no host certificate is pushed: the server accepts the
+# connection and closes it before its identification, with an audit event.
+rc=0
+reply=$(timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2222 || exit 9; head -c 14 <&3') || rc=$?
+[ "$rc" = 0 ] || fail "SSH server: connection refused or left open (exit $rc)"
+[ -z "$reply" ] || fail "SSH identification sent without a host identity: '$reply'"
+refused() {
+    sudo journalctl -u "$UNIT" --no-pager | grep '"ssh.connection_refused"' | grep -q '"code":"SSH-E018"'
+}
+for _ in $(seq 1 20); do refused && break; sleep 0.5; done
+refused || fail "no ssh.connection_refused (SSH-E018) for a connection without identity"
+line=$(sudo ostena agent ssh-key --config "$CONFIG" --line --from 10.20.0.11)
+echo "$line"
+case "$line" in
+    'restrict,from="10.20.0.11" ecdsa-sha2-nistp256 '*) ;;
+    *) fail "authorized_keys line: $line" ;;
+esac
+
 echo "=== status (root)"
 sudo ostena agent status --config "$CONFIG" | tee status.txt
 grep -q "Groupe : 2f6c9a4e" status.txt || fail "status did not reach the control plane"
+grep -q "SSH : à l'écoute sur 127.0.0.1:2222" status.txt || fail "status does not show the SSH server"
+grep -q "Identité SSH : pas encore reçue du core" status.txt || fail "status does not show the pending SSH identity"
 
 echo "=== status (unprivileged user): refused"
 if ostena agent status --config "$CONFIG" --pid 1; then fail "an unprivileged user reached the control plane"; fi
@@ -66,6 +94,7 @@ echo "=== clean stop"
 sudo systemctl stop "$UNIT"
 sudo journalctl -u "$UNIT" --no-pager | grep -q '"agent.stopped"' || fail "no agent.stopped event"
 sudo journalctl -u "$UNIT" --no-pager | grep -q '"agent.sessions_closed"' || fail "no agent.sessions_closed event"
+sudo journalctl -u "$UNIT" --no-pager | grep -q '"agent.ssh_stopped"' || fail "no agent.ssh_stopped event"
 
 echo "=== bounded restarts: at most 3 in 10 minutes"
 sudo systemctl reset-failed "$UNIT" || true

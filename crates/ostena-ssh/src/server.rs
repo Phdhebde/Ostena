@@ -160,6 +160,11 @@ impl SshIdentity {
             user_cas,
         })
     }
+
+    /// The authorities the user certificates are checked against.
+    pub fn user_authorities(&self) -> &[VerifyingKey] {
+        &self.user_cas
+    }
 }
 
 /// An access to authorise: who, as which account, on which resource.
@@ -440,6 +445,20 @@ impl<A: Authorizer> SshServer<A> {
         count
     }
 
+    /// Cuts every session, authorised or being authorised, as a revocation
+    /// does (a revocation may have been lost); returns how many.
+    pub fn revoke_all(&self) -> usize {
+        let live = self
+            .shared
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for l in live.values() {
+            l.revoke.send_replace(true);
+        }
+        live.len()
+    }
+
     /// Authenticated sessions now.
     pub fn sessions(&self) -> usize {
         self.shared
@@ -447,6 +466,16 @@ impl<A: Authorizer> SshServer<A> {
             .lock()
             .map(|l| l.values().filter(|s| s.active).count())
             .unwrap_or_default()
+    }
+
+    /// Sessions authorised or being authorised, until their end is handed
+    /// to [`Authorizer::closed`]: what a stop waits for.
+    pub fn in_progress(&self) -> usize {
+        self.shared
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 }
 

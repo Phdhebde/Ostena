@@ -12,7 +12,16 @@ license.workspace = true
 name = "ostena"
 path = "src/main.rs"
 
+[features]
+# The native SSH server of the agent (ADR-0010). Always on in a release
+# binary (`cargo xtask check-release` refuses one without it); turned off
+# only by `cargo xtask footprint`, to measure an agent without SSH.
+default = ["ssh"]
+ssh = ["dep:ostena-ssh", "dep:base64"]
+
 [dependencies]
+# The host certificate is written as an OpenSSH line (ssh feature).
+base64 = { workspace = true, optional = true }
 clap.workspace = true
 ostena-audit.workspace = true
 ostena-common.workspace = true
@@ -20,6 +29,7 @@ ostena-crypto.workspace = true
 ostena-grant.workspace = true
 ostena-platform.workspace = true
 ostena-scope.workspace = true
+ostena-ssh = { workspace = true, optional = true }
 ostena-tunnel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -38,6 +48,10 @@ ostena-core = { workspace = true, features = ["testing"] }
 [dev-dependencies]
 # The enrolment tests run the binary against the in-process test core.
 ostena-tunnel = { workspace = true, features = ["testing"] }
+
+[[test]]
+name = "agent_ssh"
+required-features = ["ssh"]
 
 [lints]
 workspace = true

@@ -150,6 +150,49 @@ fn reconnects_after_the_core_comes_back() {
 }
 
 #[test]
+fn tells_each_connection_with_its_certificate() {
+    run(async {
+        let core = TestCore::start(fast(), Behaviour::default()).unwrap();
+        let (params, _files) = params(&core, "connected", valid());
+        let pem = std::fs::read(&params.certificate).unwrap();
+        let der = TrustAnchor::from_pem(&pem).unwrap();
+        let expected = ostena_crypto::tls::fingerprint(der.certificate());
+        let link = AgentLink::spawn(params);
+        let mut connected = link.subscribe_connected();
+        assert_eq!(*connected.borrow(), None);
+        let first =
+            tokio::time::timeout(Duration::from_secs(10), connected.wait_for(Option::is_some))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(first.count, 1);
+        assert_eq!(first.certificate_sha256, expected);
+        // Usable at once: the message goes on the connection just told.
+        link.send(&ostena_tunnel::control::AgentMessage::SessionClosed {
+            session_id: "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6".into(),
+            reason: "test".into(),
+            bytes_to_target: 0,
+            bytes_from_target: 0,
+        })
+        .await
+        .unwrap();
+        core.stop();
+        core.restart().await.unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_secs(20),
+            connected.wait_for(|c| c.is_some_and(|c| c.count == 2)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.certificate_sha256, expected);
+        link.stop().await;
+    });
+}
+
+#[test]
 fn renews_its_certificate_at_two_thirds_with_a_new_key() {
     run(async {
         let core = TestCore::start(fast(), Behaviour::default()).unwrap();

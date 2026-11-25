@@ -201,6 +201,17 @@ pub struct AgentLink {
     stop: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
     pushes: Mutex<Option<mpsc::Receiver<CoreMessage>>>,
+    connected: watch::Receiver<Option<Connection>>,
+}
+
+/// A connection established, as [`AgentLink::subscribe_connected`] tells
+/// it: what a message bound to the tunnel needs (`ssh_host_key`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Connection {
+    /// Connections established since the start, this one included.
+    pub count: u64,
+    /// SHA-256 of the agent certificate this connection presented.
+    pub certificate_sha256: [u8; 32],
 }
 
 /// The tunnel of the connection in use, if any.
@@ -228,10 +239,12 @@ impl AgentLink {
         let (stop, stop_rx) = watch::channel(false);
         let (push_tx, push_rx) = mpsc::channel(64);
         let current = Current::default();
+        let (connected_tx, connected) = watch::channel(None);
         let task = tokio::spawn(run(
             params,
             status.clone(),
             current.clone(),
+            connected_tx,
             stop_rx,
             push_tx,
         ));
@@ -241,7 +254,14 @@ impl AgentLink {
             stop,
             task: Mutex::new(Some(task)),
             pushes: Mutex::new(Some(push_rx)),
+            connected,
         }
+    }
+
+    /// Changes each time a connection is established, once it can carry
+    /// messages ([`AgentLink::send`]); `None` before the first one.
+    pub fn subscribe_connected(&self) -> watch::Receiver<Option<Connection>> {
+        self.connected.clone()
     }
 
     /// The current status.
@@ -402,6 +422,7 @@ async fn run(
     params: LinkParams,
     status: Arc<Mutex<LinkStatus>>,
     current: Current,
+    connected: watch::Sender<Option<Connection>>,
     mut stop: watch::Receiver<bool>,
     pushes: mpsc::Sender<CoreMessage>,
 ) {
@@ -435,6 +456,11 @@ async fn run(
                 if let Ok(mut c) = current.lock() {
                     *c = Some(tunnel.clone());
                 }
+                let count = connected.borrow().map_or(1, |c| c.count + 1);
+                connected.send_replace(Some(Connection {
+                    count,
+                    certificate_sha256: tls::fingerprint(&certificate),
+                }));
                 let ended = serve(&params, &tunnel, &certificate, &status, &stop, &pushes).await;
                 if let Ok(mut c) = current.lock() {
                     *c = None;
