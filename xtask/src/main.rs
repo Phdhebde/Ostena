@@ -515,11 +515,12 @@ fn measure(exe: &Path, dir: &Path, core: Option<&str>, ssh: Option<u16>) -> Resu
         }
     }
     let detail = breakdown(child.id());
-    let modules = modules(child.id());
+    let modules = modules(child.id(), exe);
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(dir.join("state/replay.journal"));
     let line = footprint.ok_or("the agent stopped before reporting its footprint")?;
+    let modules = modules?;
     if core.is_some_and(|c| c != "127.0.0.1:9") && !connected {
         return Err("the agent did not connect to the test core".into());
     }
@@ -535,25 +536,82 @@ fn measure(exe: &Path, dir: &Path, core: Option<&str>, ssh: Option<u16>) -> Resu
 }
 
 /// The shared libraries (Linux, `/proc/<pid>/maps`) or DLLs (Windows, through
-/// PowerShell) loaded by `pid`, lower case, sorted. Empty elsewhere or if
-/// they cannot be listed.
-fn modules(pid: u32) -> Vec<String> {
-    let mut found: Vec<String> = if cfg!(windows) {
+/// PowerShell) loaded by `pid`, running `exe`, lower case, sorted.
+///
+/// # Errors
+///
+/// The list cannot be read, or it cannot be the one of the agent (see
+/// [`windows_modules`] and [`linux_modules`]): an empty list must not pass
+/// the module checks unnoticed.
+fn modules(pid: u32, exe: &Path) -> Result<Vec<String>> {
+    let mut found = if cfg!(windows) {
         let script =
             format!("(Get-Process -Id {pid}).Modules | ForEach-Object {{ $_.ModuleName }}");
-        Command::new("powershell")
+        let out = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
-            .map(|o| parse_module_names(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or_default()
+            .map_err(|e| format!("modules of the agent: PowerShell: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "modules of the agent: PowerShell failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        windows_modules(&String::from_utf8_lossy(&out.stdout))?
+    } else if cfg!(target_os = "linux") {
+        let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+            .map_err(|e| format!("modules of the agent: /proc/{pid}/maps: {e}"))?;
+        let name = exe
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or("modules of the agent: executable without a name")?;
+        linux_modules(&maps, name)?
     } else {
-        fs::read_to_string(format!("/proc/{pid}/maps"))
-            .map(|maps| parse_maps(&maps))
-            .unwrap_or_default()
+        return Err("modules of the agent: not listed on this system".into());
     };
     found.sort();
     found.dedup();
-    found
+    Ok(found)
+}
+
+/// The DLLs of a PowerShell module list. Every process maps `ntdll.dll`
+/// and `kernel32.dll`: a list without them was not read from the agent.
+fn windows_modules(text: &str) -> Result<Vec<String>> {
+    let found = parse_module_names(text);
+    let missing: Vec<&str> = ["ntdll.dll", "kernel32.dll"]
+        .into_iter()
+        .filter(|m| !found.iter().any(|f| f == m))
+        .collect();
+    if missing.is_empty() {
+        Ok(found)
+    } else {
+        Err(format!(
+            "modules of the agent: {} missing from the list ({} modules): not the list of a \
+             running process",
+            missing.join(", "),
+            found.len()
+        )
+        .into())
+    }
+}
+
+/// The shared libraries of a `/proc/<pid>/maps` that maps the executable
+/// `exe` (file name). A static musl binary maps no shared library: an
+/// empty list is then expected, but the executable is always mapped.
+fn linux_modules(maps: &str, exe: &str) -> Result<Vec<String>> {
+    let mapped = maps
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(5))
+        .any(|p| p.rsplit('/').next() == Some(exe));
+    if !mapped {
+        return Err(format!(
+            "modules of the agent: {exe} is not mapped in the process: not the agent"
+        )
+        .into());
+    }
+    Ok(parse_maps(maps))
 }
 
 /// One module name per line (PowerShell), the executable excluded.
@@ -992,6 +1050,30 @@ mod tests {
             parse_module_names("ostena.exe\r\nntdll.dll\r\nKERNEL32.DLL\r\n\r\n"),
             ["ntdll.dll", "kernel32.dll"]
         );
+    }
+
+    #[test]
+    fn module_lists_that_cannot_be_the_agent_fail() {
+        // Windows: nothing, or no ntdll.dll and kernel32.dll.
+        assert!(windows_modules("").is_err());
+        assert!(windows_modules("ostena.exe\r\nws2_32.dll\r\n").is_err());
+        assert!(windows_modules("ntdll.dll\r\n").is_err());
+        assert_eq!(
+            windows_modules("ostena.exe\r\nNTDLL.DLL\r\nkernel32.dll\r\n").unwrap(),
+            ["ntdll.dll", "kernel32.dll"]
+        );
+        // Linux, static musl: the executable alone, no shared library.
+        let musl = "\
+55d0c0a00000-55d0c0a20000 r--p 00000000 08:01 1234 /tmp/x/ostena
+55d0c0a20000-55d0c0b20000 r-xp 00020000 08:01 1234 /tmp/x/ostena
+7f00a0200000-7f00a0220000 rw-p 00000000 00:00 0
+7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]
+7ffd00100000-7ffd00102000 r-xp 00000000 00:00 0 [vdso]
+";
+        assert_eq!(linux_modules(musl, "ostena").unwrap(), Vec::<String>::new());
+        // Nothing, or another executable: not the agent.
+        assert!(linux_modules("", "ostena").is_err());
+        assert!(linux_modules(musl, "ostena-reference").is_err());
     }
 
     #[test]
