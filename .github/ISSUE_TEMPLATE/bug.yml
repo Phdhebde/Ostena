@@ -1,0 +1,47 @@
+name: Anomalie
+description: Un comportement d'Ostena qui ne correspond pas à la documentation.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Une faille de sécurité ne se signale pas ici** : voir [SECURITY.md](https://github.com/Phdhebde/Ostena/blob/main/SECURITY.md).
+        Retirez des journaux et des captures tout secret, nom d'hôte ou adresse interne.
+  - type: input
+    id: version
+    attributes:
+      label: Version ou commit
+      description: Sortie de `ostena --version`, ou le commit construit.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Composant
+      options:
+        - Core
+        - Agent passerelle (Linux)
+        - Agent passerelle (Windows)
+        - Accès SSH
+        - Audit, ostena-verify
+        - Construction, CI, documentation
+        - Autre
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: Ce qui se passe
+      description: Ce que vous avez fait, ce que vous attendiez, ce que vous avez obtenu.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Pour reproduire
+      description: Étapes, extrait de configuration (sans secret), système et version.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Journaux
+      render: text
