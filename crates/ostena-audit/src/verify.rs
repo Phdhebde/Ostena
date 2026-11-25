@@ -16,7 +16,7 @@ use crate::AuditError;
 use crate::export::{ExportReader, Frame};
 use crate::head::{Head, TrustedKeys};
 use crate::ids::ChainId;
-use crate::record::{Digest, Record, ZERO_DIGEST, record_hash};
+use crate::record::{Digest, Record, Value, ZERO_DIGEST, record_hash};
 
 /// Largest number of findings kept in a report; the others are only counted.
 pub const MAX_FINDINGS: usize = 1000;
@@ -124,6 +124,115 @@ pub enum Finding {
         /// Accepted age, seconds.
         allowed_secs: u64,
     },
+    /// `AUD-E017`: a transcript sealed in the chain is absent from the
+    /// transcript directory.
+    TranscriptMissing {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+    },
+    /// `AUD-E018`: a transcript differs from its seal (size or SHA-256).
+    TranscriptAltered {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+    },
+    /// `AUD-W005`: a transcript file without a seal in the export (not
+    /// sealed yet, sealed outside the export, or added).
+    TranscriptUnsealed {
+        /// Its file name.
+        file: String,
+    },
+    /// `AUD-W006`: a transcript sealed as incomplete (stream cut, core
+    /// stopped): it is intact, but the session may not be in full.
+    TranscriptIncomplete {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+        /// Why (`REC-E…`).
+        code: String,
+    },
+}
+
+/// A transcript seal read from a `transcript.sealed` record (ADR-0016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSeal {
+    /// Seq of the record.
+    pub seq: u64,
+    /// The access session, which names the file (`<uuid>.cast`).
+    pub session: [u8; 16],
+    /// SHA-256 of the file.
+    pub sha256: [u8; 32],
+    /// Size of the file, in bytes.
+    pub size: u64,
+    /// Ended by its end frame.
+    pub complete: bool,
+    /// Why it is incomplete.
+    pub code: Option<String>,
+}
+
+impl TranscriptSeal {
+    /// The seal carried by `record`, if it is a well-formed
+    /// `transcript.sealed` record.
+    fn of(record: &Record) -> Option<Self> {
+        if record.event != "transcript.sealed" {
+            return None;
+        }
+        let get = |name: &str| {
+            record
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| &f.value)
+        };
+        let session = match get(crate::field::ACCESS_SESSION)? {
+            Value::Uuid(u) => *u,
+            _ => return None,
+        };
+        let sha256 = match get(crate::field::SHA256)? {
+            Value::Bytes(b) => <[u8; 32]>::try_from(b.as_slice()).ok()?,
+            _ => return None,
+        };
+        let size = match get(crate::field::SIZE)? {
+            Value::U64(n) => *n,
+            _ => return None,
+        };
+        let complete = matches!(get(crate::field::COMPLETE), Some(Value::Bool(true)));
+        let code = match get(crate::field::CODE) {
+            Some(Value::Text(t)) => Some(t.clone()),
+            _ => None,
+        };
+        Some(Self {
+            seq: record.seq,
+            session,
+            sha256,
+            size,
+            complete,
+            code,
+        })
+    }
+
+    /// The file name of the transcript: `<uuid>.cast`.
+    pub fn file_name(&self) -> String {
+        let h = |range: std::ops::Range<usize>| {
+            self.session[range].iter().fold(String::new(), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            })
+        };
+        format!(
+            "{}-{}-{}-{}-{}.cast",
+            h(0..4),
+            h(4..6),
+            h(6..8),
+            h(8..10),
+            h(10..16)
+        )
+    }
 }
 
 impl Finding {
@@ -142,6 +251,10 @@ impl Finding {
             Self::ClockBackwards { .. } => "AUD-W002",
             Self::HeadGap { .. } => "AUD-W003",
             Self::StaleHead { .. } => "AUD-W004",
+            Self::TranscriptMissing { .. } => "AUD-E017",
+            Self::TranscriptAltered { .. } => "AUD-E018",
+            Self::TranscriptUnsealed { .. } => "AUD-W005",
+            Self::TranscriptIncomplete { .. } => "AUD-W006",
         }
     }
 
@@ -151,7 +264,9 @@ impl Finding {
             Self::UncoveredTail { .. }
             | Self::ClockBackwards { .. }
             | Self::HeadGap { .. }
-            | Self::StaleHead { .. } => Severity::Warning,
+            | Self::StaleHead { .. }
+            | Self::TranscriptUnsealed { .. }
+            | Self::TranscriptIncomplete { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -228,6 +343,16 @@ impl fmt::Display for Finding {
                 "[{code}] export partiel commençant à l'enregistrement n° {first_seq} sans tête \
                  d'ancrage de confiance qui le précède directement"
             ),
+            Self::TranscriptMissing { file, seq } => write!(
+                f,
+                "[{code}] transcript {file} scellé par l'enregistrement n° {seq}, absent du \
+                 répertoire"
+            ),
+            Self::TranscriptAltered { file, seq } => write!(
+                f,
+                "[{code}] transcript {file} différent de son sceau (enregistrement n° {seq}) : \
+                 taille ou SHA-256"
+            ),
             _ => self.fmt_warning(f, code),
         }
     }
@@ -267,6 +392,20 @@ impl Finding {
                 f,
                 "[{code}] la dernière tête (n° {head_no}) a {age_secs} s au moment de l'export, \
                  plus que deux battements ({allowed_secs} s) : fin de chaîne peut-être tronquée"
+            ),
+            Self::TranscriptUnsealed { file } => write!(
+                f,
+                "[{code}] transcript {file} sans sceau dans l'export (pas encore scellé, scellé \
+                 hors de l'export, ou ajouté)"
+            ),
+            Self::TranscriptIncomplete {
+                file,
+                seq,
+                code: why,
+            } => write!(
+                f,
+                "[{code}] transcript {file} scellé incomplet (enregistrement n° {seq}, {why}) : \
+                 intact, mais la session n'y est peut-être pas en entier"
             ),
             // Errors are written by `Display::fmt`.
             _ => write!(f, "[{code}]"),
@@ -316,9 +455,23 @@ pub struct Report {
     pub errors: u64,
     /// Warnings found, beyond the cap included.
     pub warnings: u64,
+    /// The transcript seals of the export, in chain order, for
+    /// [`crate::transcripts::check`].
+    pub transcripts: Vec<TranscriptSeal>,
 }
 
 impl Report {
+    /// Adds a finding found outside the chain (transcripts).
+    pub fn add(&mut self, finding: Finding) {
+        match finding.severity() {
+            Severity::Error => self.errors += 1,
+            Severity::Warning => self.warnings += 1,
+        }
+        if self.findings.len() < MAX_FINDINGS {
+            self.findings.push(finding);
+        }
+    }
+
     /// 0: intact and covered; 1: at least one error; 2: warnings only.
     pub fn exit_code(&self) -> u8 {
         if self.errors > 0 {
@@ -379,6 +532,7 @@ pub struct Verifier {
     findings: Vec<Finding>,
     errors: u64,
     warnings: u64,
+    transcripts: Vec<TranscriptSeal>,
 }
 
 impl Verifier {
@@ -404,6 +558,7 @@ impl Verifier {
             findings: Vec::new(),
             errors: 0,
             warnings: 0,
+            transcripts: Vec::new(),
         };
         for head in options.external_heads {
             match head.verify(&verifier.keys) {
@@ -606,6 +761,9 @@ impl Verifier {
                 }
                 self.last_time_ms = Some(record.time_ms);
                 self.check_external(&mut first, record.seq, &hash);
+                if let Some(seal) = TranscriptSeal::of(&record) {
+                    self.transcripts.push(seal);
+                }
                 record.seq
             }
         };
@@ -765,6 +923,7 @@ impl Verifier {
             findings: self.findings,
             errors: self.errors,
             warnings: self.warnings,
+            transcripts: self.transcripts,
         }
     }
 }
