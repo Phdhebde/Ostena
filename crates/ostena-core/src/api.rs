@@ -7,9 +7,12 @@
 //! - `POST /v1/login`: [`LoginRequest`] → [`LoginResponse`];
 //! - `POST /v1/logout`: [`LogoutRequest`] → `204`.
 //!
-//! The listener bounds connections, handshake, headers, body and the whole
-//! exchange, and limits attempts per source address before any work on the
-//! request. The decision belongs to an [`Authenticator`]: in production,
+//! The listener bounds connections (in all and per source from `accept`),
+//! handshake, headers, body and the whole exchange, and limits attempts per
+//! source before any work on the request. A source is an IPv4 address or
+//! an IPv6 /64 prefix ([`source_of`]). The noisy refusals
+//! (`login.connection_limited`, `login.tls_refused`) are logged at most
+//! once a minute, with the count of those left unlogged. The decision belongs to an [`Authenticator`]: in production,
 //! the PostgreSQL store (passwords, TOTP, sessions, audit).
 //!
 //! Every refusal is a JSON [`ErrorResponse`] with a stable code
@@ -20,7 +23,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -153,6 +156,8 @@ pub trait Authenticator: Send + Sync + 'static {
 pub struct Limits {
     /// Simultaneous connections; beyond, a connection is closed at once.
     pub max_connections: usize,
+    /// Simultaneous connections from one source ([`source_of`]).
+    pub connections_per_source: usize,
     /// Attempts per source address and minute.
     pub attempts_per_minute: u32,
     /// TLS handshake.
@@ -178,6 +183,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_connections: 64,
+            connections_per_source: CONNECTIONS_PER_SOURCE,
             attempts_per_minute: 10,
             handshake_timeout: Duration::from_secs(10),
             header_timeout: Duration::from_secs(10),
@@ -188,6 +194,8 @@ impl Default for Limits {
 
 /// Most source addresses followed by the attempt limiter.
 pub const MAX_TRACKED_ADDRESSES: usize = 10_000;
+/// Simultaneous connections from one source, by default.
+pub const CONNECTIONS_PER_SOURCE: usize = 4;
 /// Most request headers.
 const MAX_HEADERS: usize = 32;
 /// Read buffer of a connection (hyper's minimum is 8 KiB).
@@ -199,7 +207,84 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Attempts per source address, in fixed one-minute windows.
+/// The source an address counts for, in the connection cap and the
+/// attempt limiter: an IPv4 address (also mapped in IPv6), or the /64
+/// prefix of an IPv6 address, which one host or site usually holds whole.
+pub fn source_of(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+    }
+}
+
+/// Open connections per source.
+#[derive(Debug, Default)]
+struct Sources(Mutex<HashMap<IpAddr, usize>>);
+
+/// A connection counted for its source until dropped.
+struct SourceSlot {
+    sources: Arc<Sources>,
+    source: IpAddr,
+}
+
+impl Sources {
+    /// Counts a connection from `ip`, or `None` at `limit`.
+    fn take(self: &Arc<Self>, ip: IpAddr, limit: usize) -> Option<SourceSlot> {
+        let source = source_of(ip);
+        let mut map = self.0.lock().ok()?;
+        let open = map.entry(source).or_insert(0);
+        if *open >= limit {
+            return None;
+        }
+        *open += 1;
+        Some(SourceSlot {
+            sources: self.clone(),
+            source,
+        })
+    }
+
+    fn open(&self, ip: IpAddr) -> usize {
+        self.0
+            .lock()
+            .map_or(0, |m| m.get(&source_of(ip)).copied().unwrap_or(0))
+    }
+}
+
+impl Drop for SourceSlot {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.sources.0.lock()
+            && let Some(open) = map.get_mut(&self.source)
+        {
+            *open = open.saturating_sub(1);
+            if *open == 0 {
+                map.remove(&self.source);
+            }
+        }
+    }
+}
+
+/// At most one log line a minute for a noisy event; the others are
+/// counted and reported by the next line.
+#[derive(Debug, Default)]
+pub struct LogBudget(Mutex<(Option<u64>, u64)>);
+
+impl LogBudget {
+    /// An event at `now` (Unix seconds): `Some(n)` to log it, `n` being the
+    /// events left unlogged since the previous line; `None` to count it.
+    pub fn take(&self, now: u64) -> Option<u64> {
+        let minute = now / 60;
+        let mut state = self.0.lock().ok()?;
+        if state.0 == Some(minute) {
+            state.1 = state.1.saturating_add(1);
+            return None;
+        }
+        let unlogged = state.1;
+        *state = (Some(minute), 0);
+        Some(unlogged)
+    }
+}
+
+/// Attempts per source, in fixed one-minute windows.
 #[derive(Debug)]
 pub struct Attempts {
     per_minute: u32,
@@ -228,12 +313,14 @@ impl Attempts {
         }
     }
 
-    /// Counts an attempt of `ip` at `now` (Unix seconds).
+    /// Counts an attempt of `ip` at `now` (Unix seconds), for its source
+    /// ([`source_of`]).
     ///
-    /// When [`MAX_TRACKED_ADDRESSES`] addresses are followed in the current
-    /// window, a new address is refused: the limiter fails closed rather
-    /// than forget the counts.
+    /// When [`MAX_TRACKED_ADDRESSES`] sources are followed in the current
+    /// window, a new one is refused: the limiter fails closed rather than
+    /// forget the counts.
     pub fn admit(&self, ip: IpAddr, now: u64) -> Admission {
+        let ip = source_of(ip);
         let window = now / 60;
         let Ok(mut map) = self.map.lock() else {
             return Admission::Refused { first: false };
@@ -263,6 +350,9 @@ struct Shared<A> {
     authenticator: Arc<A>,
     attempts: Attempts,
     limits: Limits,
+    sources: Arc<Sources>,
+    connection_logs: LogBudget,
+    tls_logs: LogBudget,
 }
 
 /// The bound login listener. Dropping it does not stop it: call
@@ -294,6 +384,9 @@ impl LoginListener {
             authenticator,
             attempts: Attempts::new(limits.attempts_per_minute),
             limits,
+            sources: Arc::default(),
+            connection_logs: LogBudget::default(),
+            tls_logs: LogBudget::default(),
         });
         let task = tokio::spawn(accept(listener, TlsAcceptor::from(tls), shared));
         tracing::info!(
@@ -326,13 +419,16 @@ async fn accept<A: Authenticator>(listener: TcpListener, tls: TlsAcceptor, share
                 continue;
             }
         };
+        let Some(source) = shared
+            .sources
+            .take(peer.ip(), shared.limits.connections_per_source)
+        else {
+            connection_limited(&shared, peer, "source");
+            drop(stream);
+            continue;
+        };
         let Ok(slot) = slots.clone().try_acquire_owned() else {
-            tracing::warn!(
-                event = "login.connection_limited",
-                peer = %peer,
-                limit = shared.limits.max_connections,
-                "connexion refusée : limite de connexions atteinte"
-            );
+            connection_limited(&shared, peer, "total");
             drop(stream);
             continue;
         };
@@ -341,7 +437,37 @@ async fn accept<A: Authenticator>(listener: TcpListener, tls: TlsAcceptor, share
         tokio::spawn(async move {
             serve(stream, peer, tls, shared).await;
             drop(slot);
+            drop(source);
         });
+    }
+}
+
+/// `login.connection_limited`, at most once a minute.
+fn connection_limited<A>(shared: &Shared<A>, peer: SocketAddr, limit: &'static str) {
+    if let Some(unlogged) = shared.connection_logs.take(unix_now()) {
+        tracing::warn!(
+            event = "login.connection_limited",
+            peer = %peer,
+            limit,
+            total = shared.limits.max_connections,
+            per_source = shared.limits.connections_per_source,
+            open_from_source = shared.sources.open(peer.ip()),
+            unlogged,
+            "connexion refusée : limite de connexions atteinte (au plus une ligne par minute)"
+        );
+    }
+}
+
+/// `login.tls_refused`, at most once a minute.
+fn tls_refused<A>(shared: &Shared<A>, peer: SocketAddr, error: &dyn std::fmt::Display) {
+    if let Some(unlogged) = shared.tls_logs.take(unix_now()) {
+        tracing::info!(
+            event = "login.tls_refused",
+            peer = %peer,
+            error = %error,
+            unlogged,
+            "poignée de main TLS refusée (au plus une ligne par minute)"
+        );
     }
 }
 
@@ -356,16 +482,11 @@ async fn serve<A: Authenticator>(
     let stream = match tokio::time::timeout(limits.handshake_timeout, tls.accept(stream)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
-            tracing::info!(
-                event = "login.tls_refused",
-                peer = %peer,
-                error = %e,
-                "poignée de main TLS refusée"
-            );
+            tls_refused(&shared, peer, &e);
             return;
         }
         Err(_) => {
-            tracing::info!(event = "login.tls_refused", peer = %peer, error = "délai dépassé", "poignée de main TLS refusée");
+            tls_refused(&shared, peer, &"délai dépassé");
             return;
         }
     };
@@ -577,6 +698,62 @@ mod tests {
         assert_eq!(a.admit(other, 619), Admission::Allowed);
         // The next minute starts afresh.
         assert_eq!(a.admit(ip, 660), Admission::Allowed);
+    }
+
+    #[test]
+    fn ipv6_sources_are_64_prefixes() {
+        let a: IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:bbbb::9".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(source_of(a), "2001:db8:1:2::".parse::<IpAddr>().unwrap());
+        assert_eq!(source_of(a), source_of(b));
+        assert_ne!(source_of(a), source_of(other));
+        // IPv4, plain or mapped, is one address.
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(source_of(v4), v4);
+        assert_eq!(source_of("::ffff:192.0.2.1".parse().unwrap()), v4);
+        assert_ne!(source_of("192.0.2.2".parse().unwrap()), v4);
+        // The limiter counts the prefix.
+        let limiter = Attempts::new(2);
+        assert_eq!(limiter.admit(a, 60), Admission::Allowed);
+        assert_eq!(limiter.admit(b, 60), Admission::Allowed);
+        assert_eq!(limiter.admit(a, 60), Admission::Refused { first: true });
+        assert_eq!(limiter.admit(other, 60), Admission::Allowed);
+    }
+
+    #[test]
+    fn connections_are_capped_per_source() {
+        let sources = Arc::new(Sources::default());
+        let a: IpAddr = "2001:db8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8::2".parse().unwrap();
+        let held: Vec<_> = (0..CONNECTIONS_PER_SOURCE)
+            .map(|i| sources.take(if i % 2 == 0 { a } else { b }, CONNECTIONS_PER_SOURCE))
+            .collect();
+        assert!(held.iter().all(Option::is_some));
+        assert!(sources.take(a, CONNECTIONS_PER_SOURCE).is_none());
+        assert!(
+            sources
+                .take("2001:db8:0:1::1".parse().unwrap(), CONNECTIONS_PER_SOURCE)
+                .is_some()
+        );
+        assert_eq!(sources.open(a), CONNECTIONS_PER_SOURCE);
+        drop(held);
+        assert_eq!(sources.open(a), 0);
+        assert!(sources.0.lock().unwrap().is_empty());
+        assert!(sources.take(b, CONNECTIONS_PER_SOURCE).is_some());
+    }
+
+    #[test]
+    fn noisy_logs_are_one_line_a_minute() {
+        let budget = LogBudget::default();
+        assert_eq!(budget.take(120), Some(0));
+        for t in 121..=179 {
+            assert_eq!(budget.take(t), None);
+        }
+        // The next minute logs once, with the count left unlogged.
+        assert_eq!(budget.take(180), Some(59));
+        assert_eq!(budget.take(181), None);
+        assert_eq!(budget.take(600), Some(1));
     }
 
     #[test]

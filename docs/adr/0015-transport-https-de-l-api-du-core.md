@@ -41,13 +41,15 @@ Toutes ces crates sont sous MIT ou Apache-2.0 (matchit sous MIT et BSD-3-Clause)
 
 | Borne | Valeur |
 |---|---|
-| Connexions simultanées | `core.login.max_connections` (64) ; au-delà, la connexion est fermée aussitôt |
+| Connexions simultanées | `core.login.max_connections` (64), et 4 par source dès `accept`, avant la poignée de main TLS ; au-delà, la connexion est fermée aussitôt |
 | Poignée de main TLS | 10 s |
 | Lecture des en-têtes | 10 s ; 32 en-têtes au plus, tampon de 16 Kio |
 | Échange complet | 30 s |
 | Corps | 16 Kio, `Content-Type: application/json` exigé |
 | Connexion persistante | non : une requête par connexion |
-| Tentatives par adresse source | `core.login.attempts_per_minute` (10), en mémoire, 10 000 adresses suivies au plus |
+| Tentatives par source | `core.login.attempts_per_minute` (10), en mémoire, 10 000 sources suivies au plus |
+| Source | une adresse IPv4 (aussi quand elle est vue en IPv6), ou le préfixe /64 d'une adresse IPv6, qu'un hôte ou un site détient d'ordinaire en entier : changer d'adresse dans son /64 ne contourne ni le plafond de connexions ni le limiteur |
+| Journaux bruyants | `login.connection_limited` et `login.tls_refused` : une ligne par minute au plus, qui compte les refus non journalisés depuis la précédente (`unlogged`) |
 
 ## Conséquences
 

@@ -411,3 +411,35 @@ fn connections_and_idle_clients_are_bounded() {
         let _ = idle.shutdown().await;
     });
 }
+
+#[test]
+fn connections_are_capped_per_source_from_accept() {
+    runtime().block_on(async {
+        let f = start(Limits::default()).await;
+        let addr = f.listener.local_addr();
+        let root = f.pki.root_anchor();
+        // Four idle connections from 127.0.0.1 hold the slots of the source...
+        let mut idle = Vec::new();
+        for _ in 0..ostena_core::api::CONNECTIONS_PER_SOURCE {
+            idle.push(connect(addr, client(&root)).await.unwrap());
+        }
+        // ...so a fifth is closed before the handshake, though the total
+        // limit (64) is far.
+        assert!(connect(addr, client(&root)).await.is_err());
+        // One closes: a slot is free again.
+        let mut first = idle.remove(0);
+        let _ = first.shutdown().await;
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (status, _) = send(
+            addr,
+            &root,
+            "POST",
+            LOGIN_PATH,
+            JSON,
+            login_body("jdupont", "good"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    });
+}
