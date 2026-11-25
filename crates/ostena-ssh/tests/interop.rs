@@ -940,6 +940,28 @@ fn a_session_whose_transcript_is_lost_is_cut() {
     assert_eq!(closed[0].reason, "transcript perdu");
 }
 
+/// A transcript lost before the shell starts: the session is cut, and the
+/// journal says the transcript was lost, not that a channel was refused.
+#[test]
+fn a_transcript_lost_before_the_start_is_logged_as_lost() {
+    let runtime = runtime();
+    let Some(n) = native(
+        &runtime,
+        "native-transcript-lost-early",
+        ServerSettings::default(),
+    ) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    *n.agent.authorizer.lose_transcript_after.lock().unwrap() = Some(std::time::Duration::ZERO);
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["hold"]);
+    assert!(!out.status.success());
+    let lost = wait_event(n.agent.addr, "ssh.transcript_lost");
+    assert_eq!(lost[0].code, "SSH-E021");
+    assert_eq!(wait_closed(&n, 1)[0].reason, "transcript perdu");
+    assert!(events_on(n.agent.addr, "ssh.channel_refused").is_empty());
+}
+
 /// A core that no longer reads the transcript (ADR-0016): the output
 /// waits, then the session is cut in the delay, and its permit and report
 /// are given back.

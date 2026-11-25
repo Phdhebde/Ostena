@@ -681,8 +681,15 @@ impl<A: Authorizer> Handler<A> {
         match transcript.start(self.terminal.as_ref(), command).await {
             Ok(()) => true,
             Err(e) => {
+                // Lost: the session is cut (`SSH-E021`); otherwise only this
+                // request is refused.
+                let event = if matches!(e, SshError::TranscriptLost(_)) {
+                    "ssh.transcript_lost"
+                } else {
+                    "ssh.channel_refused"
+                };
                 tracing::warn!(
-                    event = "ssh.channel_refused",
+                    event,
                     code = e.code(),
                     session = %format_uuid(&self.session_id),
                     peer = %self.peer,

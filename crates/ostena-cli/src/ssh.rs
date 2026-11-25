@@ -169,7 +169,7 @@ impl Authorizer for TunnelAuthorizer {
             if let Err(e) = link.send(&message).await {
                 tracing::warn!(
                     event = "agent.session_report_lost",
-                    session_id = %session_id,
+                    session = %session_id,
                     code = e.code(),
                     "bilan de session non transmis au core : {e}"
                 );
