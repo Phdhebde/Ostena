@@ -51,7 +51,7 @@ Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-
 | `id_ecdsa`, `id_ecdsa.pub` | clé de la session, nouvelle à chaque connexion, générée par `ostena-crypto` |
 | `id_ecdsa-cert.pub` | certificat de la session |
 | `known_hosts` | `@cert-authority [hôte]:port,… <clé de la CA d'hôte> ostena-host-ca` |
-| `ssh_config` | fragment : `IdentityFile`, `CertificateFile`, `IdentitiesOnly yes`, `IdentityAgent none`, `UserKnownHostsFile`, `StrictHostKeyChecking yes`, algorithmes de la liste, aucune redirection |
+| `ssh_config` | fragment : `IdentityFile` (OpenSSH y associe `id_ecdsa-cert.pub` ; un `CertificateFile` explicite serait offert sans sa clé, que `PubkeyAcceptedAlgorithms` écarte), `IdentitiesOnly yes`, `IdentityAgent none`, `UserKnownHostsFile`, `StrictHostKeyChecking yes`, algorithmes de la liste, aucune redirection |
 
 `ostena login` affiche la ligne `Include` à placer une fois en tête de `~/.ssh/config` ; `--install-include` l'y ajoute, une seule fois, et refuse un `~/.ssh/config` qui est un lien symbolique (il le remplacerait par un fichier). Les chemins écrits entre guillemets dans `ssh_config` refusent un guillemet, un caractère de contrôle, un chemin non UTF-8 et une barre oblique inverse qu'OpenSSH lirait comme un échappement (devant `\`, `'`, `"`, ou en dernier) ; la barre oblique inverse simple des chemins Windows reste valide. Un motif de `ssh_hosts` fait seulement de jokers et de points (`*`, `*.*`) est refusé, dans la configuration (`CFG-V017`) comme dans la réponse du core. OpenSSH lit les fichiers tels qu'écrits (test `openssh_reads_the_files` : `ssh-keygen -L`, `ssh-keygen -y`, `ssh -G`).
 

@@ -95,11 +95,7 @@ fn ssh_fragment_and_known_hosts() {
     assert!(text.contains("    Port 2222\n"));
     // The paths as the platform joins them (OpenSSH for Windows reads
     // both separators), each quoted, one per line.
-    for (option, name) in [
-        ("IdentityFile", KEY),
-        ("CertificateFile", CERTIFICATE),
-        ("UserKnownHostsFile", KNOWN_HOSTS),
-    ] {
+    for (option, name) in [("IdentityFile", KEY), ("UserKnownHostsFile", KNOWN_HOSTS)] {
         let path = dir.join(name);
         let line = format!("    {option} \"{}\"\n", path.display());
         assert!(text.contains(&line), "{line:?} absent : {text}");
@@ -107,11 +103,13 @@ fn ssh_fragment_and_known_hosts() {
     #[cfg(unix)]
     {
         assert!(text.contains("    IdentityFile \"/home/jdupont/.ostena/id_ecdsa\"\n"));
-        assert!(text.contains("    CertificateFile \"/home/jdupont/.ostena/id_ecdsa-cert.pub\"\n"));
         assert!(text.contains("    UserKnownHostsFile \"/home/jdupont/.ostena/known_hosts\"\n"));
     }
     assert!(text.contains("    StrictHostKeyChecking yes\n"));
     assert!(text.contains("    ForwardAgent no\n"));
+    // The certificate is found next to the key (`id_ecdsa-cert.pub`).
+    assert!(!text.contains("CertificateFile"), "{text}");
+    assert_eq!(CERTIFICATE, format!("{KEY}-cert.pub"));
     assert!(text.contains("2027-01-15 16:00:00 UTC"), "{text}");
     assert_eq!(
         known_hosts(&response()),
@@ -569,11 +567,17 @@ mod against_the_listener {
             ] {
                 assert!(config.lines().any(|l| l == line), "{line}\n{config}");
             }
-            let certificate = dir.join(CERTIFICATE);
+            // No explicit certificate: OpenSSH pairs `id_ecdsa-cert.pub`
+            // with `id_ecdsa` (see `ssh_config`).
+            assert!(
+                !config.lines().any(|l| l.starts_with("certificatefile ")),
+                "{config}"
+            );
+            let key = dir.join(KEY);
             assert!(
                 config
                     .lines()
-                    .any(|l| l == format!("certificatefile {}", certificate.display())),
+                    .any(|l| l == format!("identityfile {}", key.display())),
                 "{config}"
             );
             f.listener.close();
