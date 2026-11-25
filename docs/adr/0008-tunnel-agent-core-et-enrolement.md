@@ -4,6 +4,7 @@
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-15, messages de l'accès SSH natif et `TUN-E030` (jalon M1, PR 4)
 - **Révision** : 2026-11-25, autorités d'hôtes dans `ssh_trust`, liaison du grant exigée par l'agent (jalon M1, PR 5a)
+- **Révision** : 2026-11-25, classe de flux `enregistrement` pour les transcripts, quatre flux par session (jalon M1, PR 8, ADR-0016)
 
 ## Contexte
 
@@ -55,16 +56,19 @@ Paramètres (ADR-0009, construits par `ostena-crypto::tls` uniquement) :
 ### Multiplexage, priorités, bornes
 
 - **Flux de contrôle** : le premier flux bidirectionnel, ouvert par l'agent, de priorité 40.
-- **Flux de session** : jusqu'à trois par session, ouverts à la demande, chacun précédé d'un en-tête de 18 octets (version, classe, UUID de session).
+- **Flux de session** : jusqu'à quatre par session, un par classe, ouverts à la demande, chacun précédé d'un en-tête de 18 octets (version, classe, UUID de session).
 
 | Classe | Contenu | Priorité QUIC |
 |---|---|---|
 | interactif | entrées, terminal SSH | 30 |
 | affichage | graphismes RDP et VNC | 20 |
 | transfert | fichiers, gros presse-papiers | 10 |
+| enregistrement | transcript de la session, de l'agent vers le core (ADR-0016) | 25 |
+
+Le flux d'enregistrement passe avant l'affichage et le transfert : une sortie n'est relayée à l'utilisateur qu'une fois remise à l'enregistreur, et ce flux ne doit pas la retarder. Il reste derrière l'interactif. Le core arrête un flux d'enregistrement qu'il refuse (code applicatif 1, `REC-E002`) et, au jalon M1, tout flux de session d'une autre classe (`tunnel.channel_refused`) : il ne relaie pas encore de données de session.
 
 **Bornes par défaut** (`Limits`, validées au démarrage) :
-- 256 sessions, soit 769 flux au plus. La limite est **appliquée par QUIC lui-même** : un flux de plus attend du crédit ;
+- 256 sessions, soit 1025 flux au plus (quatre par session et le flux de contrôle). La limite est **appliquée par QUIC lui-même** : un flux de plus attend du crédit ;
 - fenêtre de 256 Kio par flux et de 8 Mio par connexion, soit **16 Mio de tampons au plus par tunnel**, alloués à la demande ;
 - pas de flux unidirectionnel ni de datagramme.
 

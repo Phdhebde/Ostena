@@ -1,6 +1,6 @@
 # ADR-0016 : Transcripts des sessions
 
-- **Statut** : Accepté en partie. Le format du flux, l'écrivain asciicast et les primitives cryptographiques sont implémentés (jalon M1, PR 8, première partie). La capture par l'agent, la réception et le stockage par le core, le scellement et la vérification viennent avec la suite de la PR, après les PR 5b et 6.
+- **Statut** : Accepté, implémenté (jalon M1, PR 8) : format du flux, écrivain asciicast, primitives cryptographiques, capture par l'agent, réception, stockage et scellement par le core, vérification hors ligne.
 - **Date** : 2026-11-25
 
 ## Contexte
@@ -58,19 +58,49 @@ Charges : début `cols u16 ‖ lignes u16 ‖ début en ms Unix u64 ‖ longueur
 
 Alternative écartée pour M1 : un tampon borné sur l'agent et une reprise du flux après reconnexion. Elle pourra venir plus tard ; le code isole cette décision. Stocker le transcript sur le disque de l'agent est exclu.
 
+Mise en œuvre :
+
+- **agent** (`ostena_ssh::transcript`) : à l'ouverture d'un shell ou d'un `exec`, la trame de début part dans une file bornée (8 trames) ; chaque sortie de la cible y entre **avant** d'être relayée à l'utilisateur, et une file pleine fait attendre le relais (contre-pression, pas de perte). Une tâche (`ostena_tunnel::recording::pump`) vide la file sur le flux `Recording`, ouvert avec la session. Si le flux échoue, est arrêté par le core ou perd sa connexion, la file se ferme et la session est coupée : `SSH-E021`, événement `ssh.transcript_lost` (et `agent.transcript_lost` côté service). À la fin normale, l'agent termine le flux et attend l'accusé du core 5 s au plus ;
+- **raison de fin** scellée : `closed`, `revoked`, `expired`, `shutdown` ou `error` (transcript perdu).
+
+### Réception et scellement par le core
+
+- Le core n'accepte un flux `Recording` que pour une session SSH **ouverte, de cet agent** (`access_session`) ; sinon, et pour toute autre classe de flux, il arrête le flux (`transcript.refused`, `REC-E002` ; `tunnel.channel_refused`) et l'agent coupe la session.
+- Le fichier `<session>.cast` est créé dans `[core.ssh] transcripts_dir` (création exclusive, mode 0600, répertoire 0700). Une ligne `session_transcript` (migration 0005) passe de `recording` à `sealed` ou `incomplete`.
+- À la trame de début d'un `exec`, le core consigne `access.ssh_exec` : longueur de la commande et HMAC (ci-dessous), jamais le texte.
+- Un flux mal formé, une limite dépassée ou une écriture impossible arrête le flux : le transcript est scellé incomplet avec son code (`REC-E001`, `REC-E003`, `REC-E004`) et la session est coupée par l'agent.
+- **Scellement** : à la fin du flux, le fichier est synchronisé sur le disque et passé en lecture seule (0400) ; son SHA-256, sa taille, le nombre d'événements, d'octets de sortie et de séquences UTF-8 invalides, la raison de fin et le code éventuel sont écrits dans la ligne et dans l'enregistrement d'audit `transcript.sealed`, dans une même transaction. Un flux coupé sans trame de fin est scellé incomplet (`REC-E005`).
+- **Reprise** : au démarrage, les lignes encore `recording` (core arrêté pendant une session) sont scellées incomplètes, `REC-E005`, sur le contenu présent du fichier ; le journal montre `transcript.recovered`.
+- **Pas de SSH sans transcript** : avec `[core.ssh]`, `transcripts_dir` et `command_mac_key` sont obligatoires ; à défaut, la configuration est refusée, et le core refuse de démarrer (`REC-E002`).
+
+### Vérification hors ligne
+
+`ostena audit verify --transcripts <répertoire>` compare chaque transcript scellé dans un export vérifié au fichier du répertoire, sans secret : absent `AUD-E017`, modifié (taille ou SHA-256) `AUD-E018`, fichier `.cast` sans scellé `AUD-W005`, transcript scellé incomplet `AUD-W006`. Seuls les fichiers `.cast` du répertoire sont lus.
+
 ### Empreinte de la commande : HMAC-SHA-256 calculé par le core
 
 L'agent ne journalise plus que la longueur d'une commande. Le core, qui reçoit la commande dans le début du transcript, en consigne un **hachage à clé** : HMAC-SHA-256 sous une clé de 256 bits propre au core, à usage unique, par `ostena_crypto::hmac`. Seul celui qui détient la clé vérifie qu'une commande donnée a été lancée ; un auditeur hors ligne lit la commande dans le transcript scellé.
+
+- Message authentifié : `ostena/ssh-exec/v1\0 ‖ identifiant de session (16 octets) ‖ commande` ; la même commande dans deux sessions donne deux empreintes.
+- Clé : 32 octets aléatoires, `ostena ca key new-mac --out <fichier>` (mode 0600, jamais écrasé), référencée par `[core.ssh] command_mac_key` comme les autres clés du core (credential systemd ou fichier). Une clé nulle ou de mauvaise taille est refusée au démarrage.
+- L'empreinte est dans l'événement `access.ssh_exec` et dans la ligne `session_transcript`.
 
 ### Codes
 
 | Code | Signification |
 |---|---|
 | `REC-E001` | flux de transcript mal formé (trame, ordre) |
-| `REC-E002` | réservé : session sans transcript possible (core) |
+| `REC-E002` | transcript refusé par le core (session inconnue, close ou d'un autre agent, flux d'une autre classe), ou `[core.ssh]` sans transcripts |
 | `REC-E003` | taille ou durée maximale dépassée |
 | `REC-E004` | écriture du transcript impossible |
-| `REC-E005` | transcript incomplet : flux terminé sans trame de fin ou au milieu d'une trame |
+| `REC-E005` | transcript incomplet : flux terminé sans trame de fin ou au milieu d'une trame, ou interrompu par l'arrêt du core |
+| `SSH-E021` | session coupée par l'agent : transcript perdu |
+| `AUD-E017` | transcript scellé absent du répertoire vérifié |
+| `AUD-E018` | transcript modifié depuis son scellement |
+| `AUD-W005` | fichier de transcript sans scellé dans l'export |
+| `AUD-W006` | transcript scellé incomplet |
+
+Événements : `access.ssh_exec`, `transcript.sealed`, `transcript.refused` (chaîne d'audit) ; `ssh.transcript_lost`, `agent.transcript_lost`, `transcript.recovered`, `transcript.write_failed`, `tunnel.channel_refused` (journal).
 
 ### Crate
 
@@ -80,7 +110,9 @@ Nouvelle crate `ostena-recorder`, prévue dans l'organisation du dépôt : évé
 
 ## Conséquences
 
-- Un transcript se vérifie avec `sha256sum` contre le hachage scellé dans la chaîne d'audit ; le vérificateur le fera de lui-même (suite de la PR).
+- Un transcript se vérifie avec `sha256sum` contre le hachage scellé dans la chaîne d'audit, ou par `ostena audit verify --transcripts`.
+- Le répertoire des transcripts grossit sans limite au jalon M1 : sa rétention et son archivage (WORM) relèvent de l'exploitation, puis d'un lot ultérieur.
+- L'écriture du fichier se fait dans la tâche de réception, par blocs ; un disque lent ralentit, par contre-pression, la seule session concernée.
 - Les transcripts contiennent ce que la session a affiché, secrets compris, et la commande d'un `exec` en clair : ils sont aussi sensibles que la session elle-même.
 - Une panne du lien entre l'agent et le core coupe les sessions SSH en cours. C'est le prix de la traçabilité.
 - Le décodage UTF-8 avec remplacement perd les octets invalides ; leur nombre est scellé.
