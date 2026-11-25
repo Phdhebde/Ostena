@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use ostena_common::config::scope::PolicySpec;
-use ostena_core::{access, inventory, login};
+use ostena_core::{access, credential, inventory, login};
 use ostena_tunnel::Uuid;
 
 use crate::core::{admin, fail, init_admin_logging};
@@ -122,13 +122,36 @@ pub(crate) fn user_add(path: &Path, name: &str, display_name: &str) -> ExitCode 
 pub(crate) fn user_list(path: &Path) -> ExitCode {
     init_admin_logging(path);
     done(
-        admin(path, async |pool| inventory::list_users(&pool).await).map(|users| {
-            let mut out = String::from("utilisateur\tnom\tnom affiché\tétat");
+        admin(path, async |pool| {
+            let users = inventory::list_users(&pool).await?;
+            let mut rows = Vec::with_capacity(users.len());
             for u in users {
+                let state = credential::state(&pool, u.id).await?;
+                rows.push((u, state));
+            }
+            Ok(rows)
+        })
+        .map(|rows| {
+            let mut out =
+                String::from("utilisateur\tnom\tnom affiché\tétat\tmot de passe\ttotp\tverrouillé");
+            for (u, c) in rows {
+                let yes = |b: bool| if b { "oui" } else { "non" };
+                let totp = if c.totp_pending {
+                    "en attente"
+                } else {
+                    yes(c.totp)
+                };
+                let locked = c
+                    .locked_until
+                    .map_or_else(|| "-".to_owned(), ostena_common::logging::utc_text);
                 let _ = write!(
                     out,
-                    "\n{}\t{}\t{}\t{}",
-                    u.id, u.name, u.display_name, u.state
+                    "\n{}\t{}\t{}\t{}\t{}\t{totp}\t{locked}",
+                    u.id,
+                    u.name,
+                    u.display_name,
+                    u.state,
+                    yes(c.password)
                 );
             }
             out

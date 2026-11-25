@@ -349,6 +349,7 @@ mod against_the_listener {
                 dir: Some(self.dir()),
                 replace_root: false,
                 install_include: false,
+                stdin: false,
             }
         }
     }

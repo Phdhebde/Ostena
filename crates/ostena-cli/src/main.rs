@@ -12,6 +12,8 @@ mod control;
 #[cfg(target_os = "linux")]
 mod core;
 #[cfg(target_os = "linux")]
+mod core_credential;
+#[cfg(target_os = "linux")]
 mod core_inventory;
 mod core_link;
 mod enroll;
@@ -93,6 +95,10 @@ struct LoginArgs {
     /// Add the Include line of the fragment at the top of ~/.ssh/config.
     #[arg(long)]
     install_include: bool,
+    /// Read the password, then the TOTP code, from standard input, one
+    /// line each (scripts).
+    #[arg(long)]
+    stdin: bool,
 }
 
 impl From<LoginArgs> for login::Options {
@@ -105,6 +111,7 @@ impl From<LoginArgs> for login::Options {
             dir: a.dir,
             replace_root: a.replace_root,
             install_include: a.install_include,
+            stdin: a.stdin,
         }
     }
 }
@@ -252,6 +259,50 @@ enum CoreUserCommand {
     },
     /// Disable a user and revoke their login sessions.
     Disable {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+    },
+    /// Set the password of a user (typed twice without echo); clears the
+    /// lockout.
+    SetPassword {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+        /// Read the password from standard input, one line (scripts).
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Generate a new TOTP secret, pending and shown once; with --confirm,
+    /// activate it with a code of the application. Needs the TOTP key of the core.
+    TotpEnroll {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+        /// Activate the pending secret with a code of the application.
+        #[arg(long)]
+        confirm: bool,
+        /// Read the code from standard input, one line (scripts).
+        #[arg(long, requires = "confirm")]
+        stdin: bool,
+    },
+    /// Remove the TOTP secret of a user: login refused until a new
+    /// enrolment is confirmed.
+    TotpReset {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+    },
+    /// Clear the failed logins and the lockout of a user.
+    Unlock {
         /// Configuration file.
         #[arg(long, default_value = CORE_CONFIG)]
         config: PathBuf,
@@ -927,6 +978,21 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
             } => inv::user_add(&config, &name, &display_name),
             CoreUserCommand::List { config } => inv::user_list(&config),
             CoreUserCommand::Disable { config, name } => inv::user_disable(&config, &name),
+            CoreUserCommand::SetPassword {
+                config,
+                name,
+                stdin,
+            } => core_credential::set_password(&config, &name, stdin),
+            CoreUserCommand::TotpEnroll {
+                config,
+                name,
+                confirm,
+                stdin,
+            } => core_credential::totp_enroll(&config, &name, confirm, stdin),
+            CoreUserCommand::TotpReset { config, name } => {
+                core_credential::totp_reset(&config, &name)
+            }
+            CoreUserCommand::Unlock { config, name } => core_credential::unlock(&config, &name),
         },
         CoreCommand::Resource { command } => match command {
             CoreResourceCommand::Add {

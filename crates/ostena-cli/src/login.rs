@@ -107,6 +107,8 @@ pub(crate) struct Options {
     pub(crate) replace_root: bool,
     /// Add `Include` of the fragment at the top of `~/.ssh/config`.
     pub(crate) install_include: bool,
+    /// Read the password and the code from standard input, one line each.
+    pub(crate) stdin: bool,
 }
 
 /// `config.toml`.
@@ -601,9 +603,17 @@ fn input(e: &io::Error) -> LoginError {
 /// `ostena login`.
 pub(crate) fn login(options: &Options) -> ExitCode {
     let run = || -> Result<Summary, LoginError> {
-        let password =
-            ostena_platform::tty::read_hidden("Mot de passe : ").map_err(|e| input(&e))?;
-        let totp = ostena_platform::tty::read_visible("Code TOTP : ").map_err(|e| input(&e))?;
+        let (password, totp) = if options.stdin {
+            (
+                ostena_platform::tty::read_stdin_line().map_err(|e| input(&e))?,
+                ostena_platform::tty::read_stdin_line().map_err(|e| input(&e))?,
+            )
+        } else {
+            (
+                ostena_platform::tty::read_hidden("Mot de passe : ").map_err(|e| input(&e))?,
+                ostena_platform::tty::read_visible("Code TOTP : ").map_err(|e| input(&e))?,
+            )
+        };
         runtime()
             .map_err(|e| LoginError::Usage(e.to_string()))?
             .block_on(login_with(options, password, totp))

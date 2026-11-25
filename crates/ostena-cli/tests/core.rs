@@ -11,8 +11,8 @@
     reason = "test helpers outside #[test] functions"
 )]
 
-use std::io::BufRead;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::io::{BufRead, Write as _};
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -24,9 +24,19 @@ use ostena_core::testing::{TestDb, block_on};
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::testing::{TestPki, valid};
 use ostena_crypto::pki::{encode_public_key, pem_certificate, pem_private_key};
+use ostena_crypto::totp::{TotpAlgorithm, TotpSecret, step_at};
 
 const GROUP: &str = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
 const WAIT: Duration = Duration::from_secs(20);
+
+/// A free TCP port on 127.0.0.1 (the login listener).
+fn free_tcp_port() -> u16 {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
 
 /// A free UDP port on 127.0.0.1 (QUIC listeners).
 fn free_port() -> u16 {
@@ -154,6 +164,7 @@ struct Lab {
     dir: PathBuf,
     core_config: PathBuf,
     agent_config: PathBuf,
+    login_port: u16,
 }
 
 impl Drop for Lab {
@@ -222,8 +233,11 @@ fn lab(db: &TestDb) -> Lab {
         pem_private_key(&pki.issuing_key).expose_secret(),
     );
     write_service_keys(&dir);
+    // The key of the TOTP secrets: 32 random bytes.
+    let totp_key: [u8; 32] = ostena_crypto::rand::array().unwrap();
+    write_private(&dir.join("credentials/totp.key"), &totp_key);
 
-    let (tunnel, enrollment) = (free_port(), free_port());
+    let (tunnel, enrollment, login_port) = (free_port(), free_port(), free_tcp_port());
     let p = |name: &str| dir.join(name).display().to_string();
     let database = &db.config;
     let connection = match &database.tcp {
@@ -252,6 +266,8 @@ fn lab(db: &TestDb) -> Lab {
              grant_signing_key = {{ credential = \"grant.key\" }}\n\n\
              [core.ssh]\nuser_ca_key = {{ credential = \"user_ca.key\" }}\n\
              host_ca_key = {{ credential = \"host_ca.key\" }}\n\n\
+             [core.login]\nlisten = \"127.0.0.1:{login_port}\"\n\
+             totp_key = {{ credential = \"totp.key\" }}\nssh_hosts = [\"bastion.lab\"]\n\n\
              [core.audit]\nsigning_key = {{ credential = \"audit.key\" }}\nhead_interval_secs = 1\n\
              heartbeat_secs = 60\n\n\
              [core.database]\nport = {}\nname = \"{}\"\nuser = \"{}\"\n{connection}",
@@ -284,6 +300,7 @@ fn lab(db: &TestDb) -> Lab {
         dir,
         core_config,
         agent_config,
+        login_port,
     }
 }
 
@@ -338,6 +355,7 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     let agent_id = fields[0].to_owned();
 
     inventory_is_administered(&lab, &mut agent);
+    login_and_logout(&lab, &mut core);
 
     // The core restarts: the agent comes back without enrolling again.
     core.stop();
@@ -499,6 +517,152 @@ fn inventory_is_administered(lab: &Lab, agent: &mut Process) {
     command(&["core", "user", "disable", "alice"], config);
     let users = command(&["core", "user", "list"], config);
     assert!(users.contains("alice\tAlice Martin\tdisabled"), "{users}");
+}
+
+/// Runs `args` with `CREDENTIALS_DIRECTORY` and `input` on its standard
+/// input; returns (success, stdout, stderr).
+fn run_with_input(args: &[&str], config: Option<&Path>, input: &str) -> (bool, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ostena"));
+    command.args(args);
+    if let Some(config) = config {
+        command.arg("--config").arg(config).env(
+            "CREDENTIALS_DIRECTORY",
+            config.parent().unwrap().join("credentials"),
+        );
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// RFC 4648 base32 without padding, as shown by `totp-enroll`.
+fn base32_decode(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut buffer, mut bits) = (0u32, 0);
+    for c in text.bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'2'..=b'7' => c - b'2' + 26,
+            _ => panic!("base32 : {c}"),
+        };
+        buffer = (buffer << 5) | u32::from(value);
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from((buffer >> bits) & 0xff).unwrap());
+        }
+    }
+    out
+}
+
+/// `ostena login` against the running core (ADR-0010, step 1): the
+/// administrator sets the password and enrols the TOTP of bob, who logs in
+/// with the real client and logs out.
+fn login_and_logout(lab: &Lab, core: &mut Process) {
+    // The login listener is bound before `core.started`.
+    let config = &lab.core_config;
+    command(
+        &["core", "user", "add", "bob", "--display-name", "Bob Durand"],
+        config,
+    );
+    let password = "un mot de passe assez long";
+    let (ok, _, err) = run_with_input(
+        &["core", "user", "set-password", "bob", "--stdin"],
+        Some(config),
+        &format!("{password}\n"),
+    );
+    assert!(ok, "{err}");
+    let (ok, shown, err) =
+        run_with_input(&["core", "user", "totp-enroll", "bob"], Some(config), "");
+    assert!(ok, "{err}");
+    assert!(shown.contains("otpauth://totp/"), "{shown}");
+    let base32 = shown
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("clé : "))
+        .expect("clé affichée");
+    let secret = TotpSecret::from_bytes(
+        TotpAlgorithm::Sha1,
+        ostena_common::secret::SecretBytes::from(base32_decode(base32)),
+    )
+    .unwrap();
+    let code = |step: u64| {
+        // SECRET-EXPOSURE: test only, the code an authenticator shows.
+        #[expect(clippy::disallowed_methods)]
+        let shown = secret.code(step).expose_secret().to_owned();
+        shown
+    };
+    let step = step_at(ostena_grant::unix_now());
+    let (ok, _, err) = run_with_input(
+        &["core", "user", "totp-enroll", "bob", "--confirm", "--stdin"],
+        Some(config),
+        &format!("{}\n", code(step)),
+    );
+    assert!(ok, "{err}");
+    let users = command(&["core", "user", "list"], config);
+    assert!(
+        users.contains("bob\tBob Durand\tactive\toui\toui\t-"),
+        "{users}"
+    );
+
+    // The client: password and code on standard input.
+    let dir = lab.dir.join("bob");
+    let core_address = format!("127.0.0.1:{}", lab.login_port);
+    let root = lab.dir.join("root.pem");
+    let login = |code: String| {
+        run_with_input(
+            &[
+                "login",
+                "--core",
+                &core_address,
+                "--root",
+                root.to_str().unwrap(),
+                "--user",
+                "bob",
+                "--dir",
+                dir.to_str().unwrap(),
+                "--stdin",
+            ],
+            None,
+            &format!("{password}\n{code}\n"),
+        )
+    };
+    // The confirmed code is spent.
+    let (ok, _, err) = login(code(step));
+    assert!(!ok && err.contains("AUTH-E001"), "{err}");
+    let (ok, out, err) = login(code(step + 1));
+    assert!(ok, "{err}");
+    assert!(out.contains("Connecté : session"), "{out}");
+    for name in [
+        "id_ecdsa",
+        "id_ecdsa-cert.pub",
+        "known_hosts",
+        "ssh_config",
+        "root.pem",
+    ] {
+        assert!(dir.join(name).exists(), "{name}");
+    }
+    core.wait_for("login.succeeded");
+
+    let (ok, out, err) = run_with_input(&["logout", "--dir", dir.to_str().unwrap()], None, "");
+    assert!(ok, "{err}");
+    assert!(out.contains("fermée"), "{out}");
+    assert!(!dir.join("id_ecdsa").exists());
+    core.wait_for("login_session.revoked");
 }
 
 /// `ostena audit verify <export> --key audit.pub`: exit code and report.
