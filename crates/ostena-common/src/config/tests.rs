@@ -1371,7 +1371,7 @@ fn p016_transcript_directory_through_the_injected_checker() {
         format!(
             "{CORE}[core.ssh]\nuser_ca_key = {{ credential = \"ssh-user.key\" }}\n\
              host_ca_key = {{ credential = \"ssh-host.key\" }}\n\
-             transcripts_dir = \"{}\"\ncommand_mac_key = {{ credential = \"mac.key\" }}\n",
+             transcripts_dir = '{}'\ncommand_mac_key = {{ credential = \"mac.key\" }}\n",
             path.display()
         )
     };
