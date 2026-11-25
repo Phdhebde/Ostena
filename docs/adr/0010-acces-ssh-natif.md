@@ -1,6 +1,6 @@
 # ADR-0010 : Accès SSH natif
 
-- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). Le grant signe le compte et la session de connexion, et l'agent vérifie la signature de son certificat d'hôte (jalon M1, PR 5a). L'autorisation par le core (session de connexion, droit, émission du grant et du certificat d'hôte) est implémentée à la PR 5b (ADR-0014) ; l'émission des certificats utilisateur vient avec le service de connexion (PR 7). Le serveur est lié dans l'agent, avec ses clés créées au premier démarrage et `ostena agent ssh-key` (jalon M1, PR 6). Les transcripts viennent ensuite.
+- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). Le grant signe le compte et la session de connexion, et l'agent vérifie la signature de son certificat d'hôte (jalon M1, PR 5a). L'autorisation par le core (session de connexion, droit, émission du grant et du certificat d'hôte) est implémentée à la PR 5b (ADR-0014). Le serveur est lié dans l'agent, avec ses clés créées au premier démarrage et `ostena agent ssh-key` (jalon M1, PR 6). `ostena login` et `ostena logout`, avec l'émission des certificats utilisateur, sont implémentés à la PR 7 (ADR-0015). Les transcripts viennent ensuite.
 - **Date** : 2026-11-13
 - **Révision** : 2026-11-15, certificats, serveur, driver, codes `SSH-E010` à `SSH-E019`, événements (jalon M1, PR 4)
 - **Révision** : 2026-11-25, compte et session de connexion signés par le grant (format v2), autorités d'hôtes poussées et signature du certificat d'hôte vérifiée (jalon M1, PR 5a)
@@ -82,7 +82,17 @@ Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-
 
 **Événements de l'écouteur** : `login.listener_started`, `login.connection_limited`, `login.tls_refused`, `login.exchange_timeout`, `login.rate_limited`, `login.accept_failed`.
 
-**Événements de l'authentification** (avec l'authentificateur PostgreSQL) : `login.succeeded` (utilisateur, session, empreinte du certificat, fin de validité, adresse), `login.refused` (nom tel que saisi, assaini et borné, cause interne, adresse), `login.locked`, `login.logout` ; côté administration : `user.password_set`, `user.totp_enrolled`, `user.totp_reset`, `user.unlocked`. La cause précise d'un refus n'est que dans l'audit, jamais dans la réponse.
+**Événements de l'authentification** (avec l'authentificateur PostgreSQL) : `login.succeeded` (utilisateur, session, empreinte du certificat, fin de validité, adresse), `login.refused` (nom tel que saisi, assaini et borné, cause interne, adresse), `login.locked` (fin du verrouillage) ; `ostena logout` écrit `login_session.revoked` avec l'utilisateur pour acteur, et les agents concernés sont prévenus comme pour une révocation par l'administrateur. Côté administration : `user.password_set`, `user.totp_enrolled`, `user.totp_reset`, `user.unlocked`. La cause précise d'un refus n'est que dans l'audit, jamais dans la réponse.
+
+**Décision du core** (`ostena_core::authn`), dans une transaction qui verrouille la ligne d'identifiants de l'utilisateur (`FOR UPDATE`) :
+1. nom inconnu, compte verrouillé, désactivé ou non enrôlé (mot de passe absent, TOTP absent ou en attente) : refus, après une vérification factice du même coût ;
+2. mot de passe (PBKDF2, hors des fils du runtime, quatre à la fois), puis code TOTP (un pas de tolérance, un pas jamais accepté deux fois) ;
+3. un échec compte ; à `max_failures` échecs consécutifs, le compte est verrouillé `lockout_minutes` ;
+4. succès : compteurs remis à zéro, pas retenu, empreinte recalculée si ses paramètres ne sont plus ceux du binaire, certificat émis et session ouverte dans la même transaction que `login.succeeded`.
+
+Le certificat commence 60 s avant l'heure du core (horloges) et finit avec la session : sa validité dépasse donc la session d'une minute, dans la limite de 8 h 5 min de `check_user`.
+
+**Administration** : `ostena core user set-password`, `totp-enroll` puis `totp-enroll --confirm`, `totp-reset`, `unlock` ; `user list` montre l'état des identifiants ([exploitation](../exploitation/core-installation.md)).
 
 ### Clés de l'agent sur les cibles (jalon M1, avant le coffre-fort)
 
