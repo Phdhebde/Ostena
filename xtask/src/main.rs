@@ -813,14 +813,17 @@ enum SshLink {
     WithoutLibrary,
 }
 
-/// Reads a `cargo tree -e normal,features --prefix none` output.
+/// Reads a `cargo tree -e normal,features --prefix none` output. The
+/// feature `russh` shows as an edge only when a dependency declaration
+/// enables it; enabled by a feature of ostena-cli itself (`ssh`, while
+/// `ostena login` links ostena-ssh without it), only the library shows.
 fn ssh_without_library(tree: &str) -> SshLink {
     let lines: Vec<&str> = tree.lines().map(str::trim).collect();
     if !lines.iter().any(|l| l.starts_with("ostena-ssh v")) {
         SshLink::Absent
     } else if lines
         .iter()
-        .any(|l| l.starts_with("ostena-ssh feature \"russh\""))
+        .any(|l| l.starts_with("ostena-ssh feature \"russh\"") || l.starts_with("russh v"))
     {
         SshLink::WithLibrary
     } else {
@@ -1096,6 +1099,9 @@ mod tests {
         );
         let with = "ostena-ssh v0.0.0 (C:\\x)\nostena-ssh feature \"default\"\nostena-ssh feature \"russh\"\n";
         assert_eq!(ssh_without_library(with), SshLink::WithLibrary);
+        let by_root_feature =
+            "ostena-ssh v0.0.0 (C:\\x)\nrussh v0.65.1\nrussh feature \"aws-lc-rs\"\n";
+        assert_eq!(ssh_without_library(by_root_feature), SshLink::WithLibrary);
         let without = "ostena-ssh v0.0.0 (C:\\x)\nrussh feature \"aws-lc-rs\"\n";
         assert_eq!(ssh_without_library(without), SshLink::WithoutLibrary);
     }
