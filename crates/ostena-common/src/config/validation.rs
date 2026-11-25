@@ -87,11 +87,13 @@ pub enum Code {
     AgentSsh,
     /// Core: the same key source named for two keys.
     CoreKeyReused,
+    /// Core: invalid `[core.login]` (bound, address, host pattern).
+    CoreLogin,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -123,6 +125,7 @@ impl Code {
         Self::DatabaseOverTcp,
         Self::AgentSsh,
         Self::CoreKeyReused,
+        Self::CoreLogin,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -159,6 +162,7 @@ impl Code {
             Self::DatabaseOverTcp => "CFG-P014",
             Self::AgentSsh => "CFG-V015",
             Self::CoreKeyReused => "CFG-V016",
+            Self::CoreLogin => "CFG-V017",
         }
     }
 
