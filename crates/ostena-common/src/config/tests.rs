@@ -125,7 +125,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
-        "CFG-P014", "CFG-V015", "CFG-V016",
+        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1375,4 +1375,142 @@ fn p011_key_files_through_the_injected_checker() {
         loaded.tolerated.iter().map(|v| v.code).collect::<Vec<_>>(),
         vec![Code::CoreKeyInFile]
     );
+}
+
+// ---------------------------------------------------------------- core.login
+
+const LOGIN: &str = r#"
+[core.ssh]
+user_ca_key = { credential = "ssh-user.key" }
+host_ca_key = { credential = "ssh-host.key" }
+
+[core.login]
+listen = "0.0.0.0:8445"
+totp_key = { credential = "totp.key" }
+ssh_hosts = ["bastion.example", "*.bastion.example"]
+"#;
+
+#[test]
+fn core_login_defaults_are_safe() {
+    let c = core_with(LOGIN);
+    assert_eq!(core_codes(&c), Vec::new());
+    assert_eq!(production_codes(&c), Vec::new());
+    // TOTP HMAC-SHA-1 by default: an accepted deviation, logged at every
+    // start, never refused (ADR-0009).
+    let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END + 365 * 86_400);
+    assert_eq!(
+        waived.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::TotpSha1]
+    );
+    assert!(waived[0].message.contains("ADR-0009"));
+    let core = c.core.unwrap();
+    let login = core.login.as_ref().unwrap();
+    assert_eq!(login.totp_algorithm, TotpAlgorithmSetting::Sha1);
+    assert_eq!(login.totp_issuer, "Ostena");
+    assert_eq!(
+        (
+            login.session_max_hours,
+            login.max_failures,
+            login.lockout_minutes,
+            login.attempts_per_minute,
+            login.max_connections,
+            login.ssh_port
+        ),
+        (8, 5, 15, 10, 64, 2222)
+    );
+    let keys = core.keys();
+    assert_eq!(keys.last().unwrap().0, "core.login.totp_key");
+    // Without the section, no listener and no key.
+    assert!(parse(CORE).core.unwrap().login.is_none());
+}
+
+#[test]
+fn core_login_is_strict() {
+    for text in [
+        format!("{CORE}[core.login]\nlisten = \"0.0.0.0:8445\"\nssh_hosts = [\"b\"]\n"),
+        format!("{CORE}{LOGIN}unknown = 1\n"),
+        format!("{CORE}{LOGIN}totp_algorithm = \"md5\"\n"),
+        format!("{CORE}{LOGIN}totp_algorithm = \"SHA1\"\n"),
+    ] {
+        assert_eq!(
+            Config::from_toml_str(&text).unwrap_err().codes(),
+            vec![Code::Parse],
+            "accepted: {text}"
+        );
+    }
+    let c = core_with(&format!("{LOGIN}totp_algorithm = \"sha256\"\n"));
+    assert_eq!(c.tolerated(), Vec::new());
+    assert_eq!(
+        c.core.unwrap().login.unwrap().totp_algorithm,
+        TotpAlgorithmSetting::Sha256
+    );
+}
+
+#[test]
+fn v017_core_login_rules() {
+    let ok = core_with(&format!(
+        "{LOGIN}session_max_hours = 1\nmax_failures = 20\nlockout_minutes = 1440\n\
+         attempts_per_minute = 600\nmax_connections = 1\ntotp_issuer = \"Lab A\"\n"
+    ));
+    assert_eq!(core_codes(&ok), Vec::new());
+    for extra in [
+        "session_max_hours = 0",
+        "session_max_hours = 9",
+        "max_failures = 2",
+        "max_failures = 21",
+        "lockout_minutes = 0",
+        "lockout_minutes = 1441",
+        "attempts_per_minute = 0",
+        "attempts_per_minute = 601",
+        "max_connections = 0",
+        "max_connections = 1025",
+        "ssh_port = 0",
+        "totp_issuer = \"\"",
+        "totp_issuer = \"a:b\"",
+    ] {
+        let c = core_with(&format!("{LOGIN}{extra}\n"));
+        assert_eq!(core_codes(&c), vec![Code::CoreLogin], "{extra}");
+    }
+    for hosts in [
+        "[]",
+        "[\"-x\"]",
+        "[\"a b\"]",
+        "[\"a/b\"]",
+        "[\"\"]",
+        "[\"*\"]",
+        "[\"*.*\"]",
+    ] {
+        let c = core_with(&LOGIN.replace("[\"bastion.example\", \"*.bastion.example\"]", hosts));
+        assert_eq!(core_codes(&c), vec![Code::CoreLogin], "{hosts}");
+    }
+    for listen in ["0.0.0.0:8443", "0.0.0.0:8444"] {
+        let c = core_with(&LOGIN.replace("0.0.0.0:8445", listen));
+        assert_eq!(core_codes(&c), vec![Code::CoreLogin], "{listen}");
+    }
+    // The session certificate needs the SSH user authority.
+    let without_ssh = &LOGIN[LOGIN.find("[core.login]").unwrap()..];
+    let c = core_with(without_ssh);
+    assert_eq!(core_codes(&c), vec![Code::CoreLogin]);
+}
+
+#[test]
+fn core_login_key_is_a_key_of_its_own() {
+    for other in ["server.key", "issuing.key", "audit.key"] {
+        let c = core_with(&LOGIN.replace("totp.key", other));
+        // One key, one use (CFG-V016).
+        assert_eq!(core_codes(&c), vec![Code::CoreKeyReused], "{other}");
+    }
+    let c = core_with(&LOGIN.replace("totp.key", "../totp.key"));
+    assert_eq!(core_codes(&c), vec![Code::CoreKeySource]);
+    // A plain file follows the waiver of the other keys.
+    let c = core_with(&LOGIN.replace(
+        "{ credential = \"totp.key\" }",
+        "{ file = \"/var/lib/ostena/totp.key\" }",
+    ));
+    let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END - 1);
+    assert_eq!(
+        waived.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::CoreKeyInFile, Code::TotpSha1]
+    );
+    assert!(waived[0].message.contains("core.login.totp_key"));
 }

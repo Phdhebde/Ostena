@@ -70,6 +70,10 @@ pub struct CoreConfig {
     /// Without it, SSH accesses are refused (`ACC-E007`).
     #[serde(default)]
     pub ssh: Option<CoreSshConfig>,
+    /// `ostena login` (ADR-0010, step 1): absent, the login listener is not
+    /// started.
+    #[serde(default)]
+    pub login: Option<CoreLoginConfig>,
 }
 
 /// `[core.ssh]`: the SSH certificate authorities of the core (ADR-0014).
@@ -85,6 +89,102 @@ pub struct CoreSshConfig {
     /// after two thirds.
     #[serde(default = "default_host_certificate_days")]
     pub host_certificate_days: u32,
+}
+
+/// Default port of the SSH server of the agents, written into the
+/// `ssh_config` fragment of `ostena login`.
+pub const DEFAULT_LOGIN_SSH_PORT: u16 = 2222;
+/// Default longest login session, in hours.
+pub const DEFAULT_SESSION_MAX_HOURS: u32 = 8;
+/// Default consecutive failures before an account is locked.
+pub const DEFAULT_MAX_FAILURES: u32 = 5;
+/// Default lockout, in minutes.
+pub const DEFAULT_LOCKOUT_MINUTES: u32 = 15;
+/// Default login attempts per source address and minute.
+pub const DEFAULT_ATTEMPTS_PER_MINUTE: u32 = 10;
+/// Default simultaneous connections to the login listener.
+pub const DEFAULT_LOGIN_MAX_CONNECTIONS: u32 = 64;
+/// Default issuer shown by authenticator applications.
+pub const DEFAULT_TOTP_ISSUER: &str = "Ostena";
+
+const fn default_login_ssh_port() -> u16 {
+    DEFAULT_LOGIN_SSH_PORT
+}
+
+const fn default_session_max_hours() -> u32 {
+    DEFAULT_SESSION_MAX_HOURS
+}
+
+const fn default_max_failures() -> u32 {
+    DEFAULT_MAX_FAILURES
+}
+
+const fn default_lockout_minutes() -> u32 {
+    DEFAULT_LOCKOUT_MINUTES
+}
+
+const fn default_attempts_per_minute() -> u32 {
+    DEFAULT_ATTEMPTS_PER_MINUTE
+}
+
+const fn default_login_max_connections() -> u32 {
+    DEFAULT_LOGIN_MAX_CONNECTIONS
+}
+
+fn default_totp_issuer() -> String {
+    DEFAULT_TOTP_ISSUER.into()
+}
+
+/// HMAC of new TOTP enrolments (ADR-0009, amendment of 2026-11-25).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TotpAlgorithmSetting {
+    /// HMAC-SHA-1, the default: the deviation recorded in ADR-0009, for the
+    /// authenticator applications.
+    #[default]
+    Sha1,
+    /// HMAC-SHA-256.
+    Sha256,
+}
+
+/// `[core.login]`: the HTTPS login API of `ostena login` (ADR-0010, step 1;
+/// ADR-0015).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreLoginConfig {
+    /// Address of the login listener (HTTPS over TCP), e.g. `0.0.0.0:8445`.
+    pub listen: SocketAddr,
+    /// The AES-256-GCM key that encrypts the TOTP secrets in the database.
+    /// Its own key, distinct from every other key of the core.
+    pub totp_key: KeySource,
+    /// HMAC of new TOTP enrolments.
+    #[serde(default)]
+    pub totp_algorithm: TotpAlgorithmSetting,
+    /// Issuer shown by authenticator applications, 1 to 64 bytes, no `:`.
+    #[serde(default = "default_totp_issuer")]
+    pub totp_issuer: String,
+    /// Longest login session, 1 to 8 hours.
+    #[serde(default = "default_session_max_hours")]
+    pub session_max_hours: u32,
+    /// Consecutive failures before the account is locked, 3 to 20.
+    #[serde(default = "default_max_failures")]
+    pub max_failures: u32,
+    /// Lockout, 1 to 1440 minutes.
+    #[serde(default = "default_lockout_minutes")]
+    pub lockout_minutes: u32,
+    /// Attempts per source address and minute, 1 to 600.
+    #[serde(default = "default_attempts_per_minute")]
+    pub attempts_per_minute: u32,
+    /// Simultaneous connections, 1 to 1024.
+    #[serde(default = "default_login_max_connections")]
+    pub max_connections: u32,
+    /// Host names or patterns of the bastion (the agents' SSH servers), for
+    /// the `ssh_config` fragment and the `@cert-authority` line: 1 to 16,
+    /// letters, digits, `.`, `-`, `*` and `?`.
+    pub ssh_hosts: Vec<String>,
+    /// Port of the agents' SSH servers.
+    #[serde(default = "default_login_ssh_port")]
+    pub ssh_port: u16,
 }
 
 /// Default interval between two heads while the chain moves, seconds.
@@ -215,6 +315,9 @@ impl CoreConfig {
             keys.push(("core.ssh.user_ca_key", &ssh.user_ca_key));
             keys.push(("core.ssh.host_ca_key", &ssh.host_ca_key));
         }
+        if let Some(login) = &self.login {
+            keys.push(("core.login.totp_key", &login.totp_key));
+        }
         keys
     }
 }
@@ -266,6 +369,103 @@ fn audit_bounds(audit: &CoreAuditConfig, out: &mut Vec<Violation>) {
         1,
         100_000,
     );
+}
+
+fn login_violation(out: &mut Vec<Violation>, message: String) {
+    out.push(Violation::new(Code::CoreLogin, message));
+}
+
+fn login_bounds(out: &mut Vec<Violation>, field: &str, value: u32, min: u32, max: u32) {
+    if !(min..=max).contains(&value) {
+        login_violation(
+            out,
+            format!("{field} = {value} : attendu de {min} à {max}."),
+        );
+    }
+}
+
+/// Rules of `[core.login]` (`CFG-V017`).
+fn login_rules(core: &CoreConfig, login: &CoreLoginConfig, out: &mut Vec<Violation>) {
+    if core.ssh.is_none() {
+        login_violation(
+            out,
+            "[core.login] exige [core.ssh] : l'autorité des certificats utilisateur signe le \
+             certificat de la session."
+                .into(),
+        );
+    }
+    if login.listen == core.tunnel_listen || login.listen == core.enrollment_listen() {
+        login_violation(
+            out,
+            "core.login.listen doit différer de core.tunnel_listen et de \
+             core.enrollment_listen."
+                .into(),
+        );
+    }
+    login_bounds(
+        out,
+        "core.login.session_max_hours",
+        login.session_max_hours,
+        1,
+        8,
+    );
+    login_bounds(out, "core.login.max_failures", login.max_failures, 3, 20);
+    login_bounds(
+        out,
+        "core.login.lockout_minutes",
+        login.lockout_minutes,
+        1,
+        1440,
+    );
+    login_bounds(
+        out,
+        "core.login.attempts_per_minute",
+        login.attempts_per_minute,
+        1,
+        600,
+    );
+    login_bounds(
+        out,
+        "core.login.max_connections",
+        login.max_connections,
+        1,
+        1024,
+    );
+    let issuer = &login.totp_issuer;
+    if issuer.is_empty()
+        || issuer.len() > 64
+        || issuer.contains(':')
+        || issuer.chars().any(char::is_control)
+    {
+        login_violation(
+            out,
+            format!(
+                "core.login.totp_issuer = « {} » : de 1 à 64 octets, sans « : » ni caractère de contrôle.",
+                issuer.escape_debug()
+            ),
+        );
+    }
+    if login.ssh_hosts.is_empty() || login.ssh_hosts.len() > 16 {
+        login_violation(
+            out,
+            "core.login.ssh_hosts : de 1 à 16 noms attendus.".into(),
+        );
+    }
+    for host in &login.ssh_hosts {
+        if !crate::api::login::is_host_pattern(host) {
+            login_violation(
+                out,
+                format!(
+                    "core.login.ssh_hosts : « {} » n'est pas un nom d'hôte ou un motif valide \
+                     (lettres, chiffres, « . », « - », « * », « ? »).",
+                    host.escape_debug()
+                ),
+            );
+        }
+    }
+    if login.ssh_port == 0 {
+        login_violation(out, "core.login.ssh_port = 0 : port attendu.".into());
+    }
 }
 
 /// The private keys of the core: their sources (`CFG-V008`, `CFG-V014`), one use each
@@ -337,6 +537,9 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
         );
     }
     audit_bounds(&core.audit, out);
+    if let Some(login) = &core.login {
+        login_rules(core, login, out);
+    }
     let db = &core.database;
     path_rule(out, "core.database.socket_dir", &db.socket_dir);
     for (field, value) in [
@@ -402,11 +605,24 @@ pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) 
     }
 }
 
-/// Weakenings tolerated in production until a date, and logged at every
-/// start: `CFG-P012` until 2027-04-30.
+/// Weakenings tolerated in production and logged at every start:
+/// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1, accepted
+/// deviation of ADR-0009) without end.
 pub(crate) fn tolerated(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
     if now < KEY_FILE_WAIVER_END {
         key_files(core, out);
+    }
+    if core
+        .login
+        .as_ref()
+        .is_some_and(|l| l.totp_algorithm == TotpAlgorithmSetting::Sha1)
+    {
+        out.push(Violation::new(
+            Code::TotpSha1,
+            "core.login.totp_algorithm = « sha1 » : les nouveaux enrôlements TOTP utilisent \
+             HMAC-SHA-1, écart accepté (ADR-0009) pour les applications d'authentification ; \
+             « sha256 » le supprime.",
+        ));
     }
 }
 

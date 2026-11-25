@@ -101,6 +101,7 @@ fn keys(pki: TestPki) -> Keys {
             )
             .unwrap(),
         )),
+        totp: None,
     }
 }
 

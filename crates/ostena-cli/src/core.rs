@@ -152,6 +152,21 @@ pub(crate) fn admin<T>(
     .map_err(|e| e.to_string())
 }
 
+/// As [`admin`], with the `[core]` section of `path`.
+pub(crate) fn admin_core<T>(
+    path: &Path,
+    task: impl AsyncFnOnce(db::Pool, CoreConfig) -> Result<T, CoreError>,
+) -> Result<T, String> {
+    let loaded = load(path)?;
+    let rt = runtime(1)?;
+    rt.block_on(async {
+        let pool = db::connect(&loaded.core.database, loaded.config.mode).await?;
+        schema::require_up_to_date(&pool).await?;
+        task(pool, loaded.core).await
+    })
+    .map_err(|e| e.to_string())
+}
+
 /// `ostena core migrate [--check]`.
 pub(crate) fn migrate(path: &Path, check: bool) -> ExitCode {
     init_admin_logging(path);

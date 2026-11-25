@@ -99,6 +99,22 @@ event_kinds! {
     UserCreated => "user.created",
     /// A user was disabled (their login sessions revoked).
     UserDisabled => "user.disabled",
+    /// `ostena login` succeeded: a login session opened and its user
+    /// certificate issued (ADR-0010).
+    LoginSucceeded => "login.succeeded",
+    /// `ostena login` was refused (internal cause, never told the client).
+    LoginRefused => "login.refused",
+    /// An account was locked after too many failed logins.
+    LoginLocked => "login.locked",
+    /// The password of a user was set by an administrator.
+    UserPasswordSet => "user.password_set",
+    /// The TOTP enrolment of a user was confirmed.
+    UserTotpEnrolled => "user.totp_enrolled",
+    /// The TOTP secret of a user was removed or replaced by a new pending
+    /// one.
+    UserTotpReset => "user.totp_reset",
+    /// An administrator unlocked an account.
+    UserUnlocked => "user.unlocked",
     /// A resource was added to the inventory.
     ResourceCreated => "resource.created",
     /// A target account was added to a resource.
@@ -221,6 +237,10 @@ pub mod field {
     pub const NOTIFIED_AGENTS: &str = "notified_agents";
     /// Number of login sessions revoked.
     pub const REVOKED_SESSIONS: &str = "revoked_sessions";
+    /// HMAC of a one-time code (`sha1`, `sha256`).
+    pub const HMAC: &str = "hmac";
+    /// End of an account lockout, Unix seconds.
+    pub const LOCKED_UNTIL: &str = "locked_until";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -276,6 +296,8 @@ pub mod field {
         BYTES_FROM_TARGET,
         NOTIFIED_AGENTS,
         REVOKED_SESSIONS,
+        HMAC,
+        LOCKED_UNTIL,
     ];
 }
 
@@ -445,7 +467,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 39);
+        assert_eq!(names.len(), 46);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

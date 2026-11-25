@@ -83,6 +83,19 @@ impl SshAuthorities {
         })
     }
 
+    /// The private scalars of both authorities, for the distinctness
+    /// check of the other keys of the core.
+    pub(crate) fn scalars(&self) -> Vec<(&'static str, ostena_common::secret::SecretBytes)> {
+        let mut out = Vec::new();
+        if let Ok(s) = self.user.scalar() {
+            out.push(("core.ssh.user_ca_key", s));
+        }
+        if let Ok(s) = self.host.scalar() {
+            out.push(("core.ssh.host_ca_key", s));
+        }
+        out
+    }
+
     /// The public key of the user authority.
     pub fn user_ca_public(&self) -> VerifyingKey {
         self.user.verifying_key()

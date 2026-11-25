@@ -59,6 +59,7 @@ packaging/  lab/  tests/  docs/  xtask/
 - Rust édition 2024. `#![forbid(unsafe_code)]` partout, sauf `ostena-platform` et les intégrations matérielles (PKCS#11, TPM) : chaque bloc `unsafe` a un commentaire `// SAFETY:` et un test.
 - Les crates protocolaires (`ssh`, `rdp`, `tsgu`, `rfb`, `frame`) ne dépendent ni de la base ni de l'API : testables et *fuzzables* seules.
 - Toute la cryptographie passe par `ostena-crypto`. Pas de crypto maison, pas d'OpenSSL. Algorithmes figés selon les guides ANSSI (PG-083, PA-035), pas négociables par un client ou un jeton.
+  Seule exception : TOTP HMAC-SHA-1 par défaut, écart accepté (ADR-0009).
 - Secrets dans des types `Secret<…>` (`secrecy` + `zeroize`) : jamais `Debug`/`Display`, jamais convertis en `String`, jamais journalisés.
 - Sécurité par défaut : le comportement par défaut est le plus sûr. Toute option qui l'affaiblit est journalisée et **refusée en mode production** (validation au démarrage). Exemples de refus : vérification de clé hôte SSH non stricte, certificat RDP de la cible non épinglé sans PKI, repli NTLM quand un mot de passe est délégué, grant signé avec un autre algorithme qu'ECDSA P-256 / SHA-256.
 - Contrôle de périmètre (CIDR + épinglage de l'IP résolue + blocage des adresses de métadonnées cloud et locales) appliqué à **tous** les drivers.

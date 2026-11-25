@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use self::core::{
-    CoreAuditConfig, CoreConfig, CoreSshConfig, DatabaseConfig, DatabaseTcp, KeySource,
+    CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig, DatabaseTcp,
+    KeySource, TotpAlgorithmSetting,
 };
 pub use agent::{AgentConfig, AgentSshConfig, InfrastructureEndpoint, SshPaths};
 pub use permissions::{DefaultPermissions, PermissionChecker};
@@ -286,8 +287,8 @@ impl Config {
         validation::weakenings(self, now)
     }
 
-    /// Weakenings tolerated in production until a date (`CFG-P012` until
-    /// 2027-04-30), logged at every start.
+    /// Weakenings tolerated in production, logged at every start:
+    /// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) always.
     pub fn tolerated(&self) -> Vec<Violation> {
         self.tolerated_at(unix_now())
     }

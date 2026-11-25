@@ -17,39 +17,46 @@ path = "src/main.rs"
 # binary (`cargo xtask check-release` refuses one without it); turned off
 # only by `cargo xtask footprint`, to measure an agent without SSH.
 default = ["ssh"]
-ssh = ["dep:ostena-ssh", "dep:base64"]
+ssh = ["ostena-ssh/russh"]
 
 [dependencies]
-# The host certificate is written as an OpenSSH line (ssh feature).
-base64 = { workspace = true, optional = true }
+base64.workspace = true
 clap.workspace = true
+# `ostena login` (ADR-0015): one HTTP/1.1 request per connection, no pool.
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
 ostena-audit.workspace = true
 ostena-common.workspace = true
 ostena-crypto.workspace = true
 ostena-grant.workspace = true
 ostena-platform.workspace = true
 ostena-scope.workspace = true
-ostena-ssh = { workspace = true, optional = true }
+# Keys and certificates of `ostena login` without the SSH library, which
+# only the feature `ssh` (the SSH server of the agent) links.
+ostena-ssh = { path = "../ostena-ssh", default-features = false }
 ostena-tunnel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+# `config.toml` of `ostena login`; the scope policy of a gateway group
+# (`ostena core group policy`), written in TOML as in the agent configuration.
+toml.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 # The core is a Linux component by design (ADR-0011): the Windows binary,
 # which only runs the agent, does not link it nor PostgreSQL.
 [target.'cfg(target_os = "linux")'.dependencies]
 ostena-core.workspace = true
-# The scope policy of a gateway group, written in TOML as in the agent
-# configuration (`ostena core group policy`).
-toml.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The demonstration test creates its own database.
 ostena-core = { workspace = true, features = ["testing"] }
-# The host key file of a target (OpenSSH public key line), without the SSH
-# library.
-ostena-ssh = { path = "../ostena-ssh", default-features = false }
+# The login tests run the core listener with a test PKI.
+ostena-crypto = { workspace = true, features = ["testing"] }
 
 [dev-dependencies]
 # The enrolment tests run the binary against the in-process test core.

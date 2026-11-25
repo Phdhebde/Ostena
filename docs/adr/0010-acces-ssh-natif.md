@@ -1,11 +1,12 @@
 # ADR-0010 : Accès SSH natif
 
-- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). Le grant signe le compte et la session de connexion, et l'agent vérifie la signature de son certificat d'hôte (jalon M1, PR 5a). L'autorisation par le core (session de connexion, droit, émission du grant et du certificat d'hôte) est implémentée à la PR 5b (ADR-0014) ; l'émission des certificats utilisateur vient avec le service de connexion (PR 7). Le serveur est lié dans l'agent, avec ses clés créées au premier démarrage et `ostena agent ssh-key` (jalon M1, PR 6). Les transcripts viennent ensuite.
+- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). Le grant signe le compte et la session de connexion, et l'agent vérifie la signature de son certificat d'hôte (jalon M1, PR 5a). L'autorisation par le core (session de connexion, droit, émission du grant et du certificat d'hôte) est implémentée à la PR 5b (ADR-0014). Le serveur est lié dans l'agent, avec ses clés créées au premier démarrage et `ostena agent ssh-key` (jalon M1, PR 6). `ostena login` et `ostena logout`, avec l'émission des certificats utilisateur, sont implémentés à la PR 7 (ADR-0015). Les transcripts viennent ensuite.
 - **Date** : 2026-11-13
 - **Révision** : 2026-11-15, certificats, serveur, driver, codes `SSH-E010` à `SSH-E019`, événements (jalon M1, PR 4)
 - **Révision** : 2026-11-25, compte et session de connexion signés par le grant (format v2), autorités d'hôtes poussées et signature du certificat d'hôte vérifiée (jalon M1, PR 5a)
 - **Révision** : 2026-11-25, liaison dans l'agent, clés créées par l'agent, `ostena agent ssh-key`, code `SSH-E020`, événements `agent.ssh_*` (jalon M1, PR 6)
 - **Révision** : 2026-11-25, relecture de sécurité de la PR 6 : confiance fermée par défaut (identité retirée sur un push inapplicable), identité réévaluée aux dates du certificat d'hôte, arrêt dans un seul délai de grâce avec les bilans envoyés avant la fermeture du lien, clés et certificat d'hôte écrits de façon atomique, dossier des clés vérifié avant leur création
+- **Révision** : 2026-11-25, `ostena login` et `ostena logout` : fichiers, API, codes `AUTH-E001` à `AUTH-E006` et `LOGIN-E001` à `LOGIN-E006`, événements (jalon M1, PR 7)
 
 ## Contexte
 
@@ -31,6 +32,67 @@ Le format des grants (ADR-0004) prévoit qu'un grant puisse transiter dans un ch
 6. **Le driver client** joint la cible avec la clé de l'agent et vérifie strictement sa clé hôte, épinglée dans l'inventaire. Il relaie le terminal, écrit le transcript et le transmet au core.
 
 **Révocation.** Une session `ostena login` dure 8 h et peut être révoquée sur le core. La révocation coupe aussi les sessions SSH en cours qui en dépendent, et elle est auditée.
+
+### `ostena login` et `ostena logout` (jalon M1, PR 7)
+
+Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-0009 (amendement du 2026-11-25).
+
+**Échange.** `POST /v1/login` porte le nom, le mot de passe, le code TOTP, la clé publique P-256 (point non compressé, base64url) et une durée facultative. La réponse porte la session de connexion, l'identifiant de l'utilisateur, le certificat, ses dates, la ligne de la CA d'hôte, les motifs d'hôtes du bastion et leur port. Les messages sont des types stricts (`ostena_common::api::login`) : champs inconnus refusés, 16 Kio au plus, cible `cargo-fuzz` `login_messages`. Aucune preuve de possession de la clé n'est demandée : le certificat ne sert qu'à qui détient la clé privée.
+
+**Contrôles du client avant d'écrire.** Le certificat reçu doit certifier la clé envoyée, porter une signature valide de son autorité, passer `check_user`, et nommer l'utilisateur, la session et les dates de la réponse. Sinon rien n'est écrit (`LOGIN-E003`).
+
+**Fichiers de `~/.ostena/`.** Le dossier est créé en 0700 ; chaque fichier est privé dès sa création (0600 sous Unix ; sous Windows, descripteur protégé : SYSTEM, les administrateurs et le compte courant) et remplacé atomiquement :
+
+| Fichier | Contenu |
+|---|---|
+| `config.toml` | adresse du core et nom d'utilisateur, repris aux connexions suivantes |
+| `root.pem` | racine épinglée ; une autre racine est refusée sans `--replace-root` (`LOGIN-E005`) |
+| `id_ecdsa`, `id_ecdsa.pub` | clé de la session, nouvelle à chaque connexion, générée par `ostena-crypto` |
+| `id_ecdsa-cert.pub` | certificat de la session |
+| `known_hosts` | `@cert-authority [hôte]:port,… <clé de la CA d'hôte> ostena-host-ca` |
+| `ssh_config` | fragment : `IdentityFile`, `CertificateFile`, `IdentitiesOnly yes`, `IdentityAgent none`, `UserKnownHostsFile`, `StrictHostKeyChecking yes`, algorithmes de la liste, aucune redirection |
+
+`ostena login` affiche la ligne `Include` à placer une fois en tête de `~/.ssh/config` ; `--install-include` l'y ajoute, une seule fois, et refuse un `~/.ssh/config` qui est un lien symbolique (il le remplacerait par un fichier). Les chemins écrits entre guillemets dans `ssh_config` refusent un guillemet, un caractère de contrôle, un chemin non UTF-8 et une barre oblique inverse qu'OpenSSH lirait comme un échappement (devant `\`, `'`, `"`, ou en dernier) ; la barre oblique inverse simple des chemins Windows reste valide. Un motif de `ssh_hosts` fait seulement de jokers et de points (`*`, `*.*`) est refusé, dans la configuration (`CFG-V017`) comme dans la réponse du core. OpenSSH lit les fichiers tels qu'écrits (test `openssh_reads_the_files` : `ssh-keygen -L`, `ssh-keygen -y`, `ssh -G`).
+
+**Déconnexion.** `ostena logout` envoie `POST /v1/logout` avec la session, le certificat, l'heure et une signature ECDSA de la clé de la session sur `"ostena-logout-v1\0" ‖ session ‖ heure`. L'heure est acceptée à ±60 s de celle du core (`LOGOUT_SKEW_SECS`). Le core révoque la session, puis le client supprime la clé et le certificat. La réponse est `204`.
+
+**Saisie.** Le mot de passe est lu sans écho sur le terminal (`ostena_platform::tty`) ; le terminal est restauré même sur erreur ou Ctrl-C (Ctrl-C annule la saisie), immédiatement (`TCSANOW`). Sous Unix, un `SIGHUP`, `SIGTERM`, `SIGINT` ou `SIGQUIT` reçu pendant la saisie est intercepté : la saisie s'arrête, le terminal est restauré, puis le signal est relancé avec l'action précédente, qui termine le processus comme il l'aurait fait.
+
+**Codes du core** (corps `{"protocol":1,"code":…,"message":…}`) :
+
+| Code | HTTP | Signification |
+|---|---|---|
+| `AUTH-E001` | 401 | identifiants invalides ou compte indisponible : nom inconnu, mot de passe ou code faux, code rejoué, compte verrouillé, désactivé ou non enrôlé. Un seul message, quelle que soit la cause, et un seul délai : la réponse ne part pas avant 1 s après l'arrivée de la requête (plancher fixe, au-dessus du coût de PBKDF2, de la transaction et de l'écriture d'audit), ce qui égalise les temps mieux qu'un COMMIT factice ; vaut aussi pour un logout refusé |
+| `AUTH-E002` | 429 | trop de tentatives depuis cette adresse |
+| `AUTH-E003` | 400, 404, 405, 413, 415 | requête mal formée (route, méthode, type, taille, JSON, champ) |
+| `AUTH-E004` | 400 | clé publique refusée |
+| `AUTH-E005` | 400 | version du protocole non prise en charge |
+| `AUTH-E006` | 503 | le core ne peut pas décider (base indisponible) |
+
+**Codes du client** :
+
+| Code | Signification |
+|---|---|
+| `LOGIN-E001` | core injoignable, ou poignée de main TLS refusée (certificat du core non signé par la racine épinglée pour ce nom) |
+| `LOGIN-E002` | réponse du core invalide |
+| `LOGIN-E003` | certificat reçu invalide ou différent de la demande |
+| `LOGIN-E004` | fichier de `~/.ostena` illisible ou impossible à écrire |
+| `LOGIN-E005` | racine différente de celle épinglée |
+| `LOGIN-E006` | réglage manquant, saisie interrompue |
+
+**Événements de l'écouteur** : `login.listener_started`, `login.connection_limited`, `login.tls_refused`, `login.exchange_timeout`, `login.rate_limited`, `login.accept_failed`.
+
+**Événements de l'authentification** (avec l'authentificateur PostgreSQL) : `login.succeeded` (utilisateur, session, empreinte du certificat, fin de validité, adresse), `login.refused` (nom tel que saisi, assaini et borné, cause interne, adresse ; protecteur, dans la transaction, pour un compte connu, au mieux pour un nom inconnu), `login.locked` (fin du verrouillage) ; `ostena logout` écrit `login_session.revoked` avec l'utilisateur pour acteur, et les agents concernés sont prévenus comme pour une révocation par l'administrateur. Côté administration : `user.password_set`, `user.totp_enrolled`, `user.totp_reset`, `user.unlocked`. La cause précise d'un refus n'est que dans l'audit, jamais dans la réponse.
+
+**Décision du core** (`ostena_core::authn`), en deux temps, pour ne tenir ni verrou de ligne ni place de calcul pendant qu'une autre tentative attend :
+1. l'empreinte du mot de passe est lue sans verrou, puis PBKDF2 tourne hors des fils du runtime et hors de toute transaction ; la place de calcul (quatre à la fois) n'est tenue que pendant la dérivation. Un nom inconnu ou un compte sans empreinte reçoit une dérivation factice du même coût ;
+2. une transaction verrouille ensuite, dans l'ordre canonique de l'ADR-0014, la ligne `app_user` (`FOR SHARE` : une désactivation concurrente attend l'ouverture de la session et la révoque, ou bien elle est vue) puis la ligne d'identifiants (`FOR UPDATE`). Elle revérifie que le compte est actif, non verrouillé, enrôlé (mot de passe, TOTP confirmé) et que son empreinte est celle qui a été dérivée ; sinon refus, sans compter d'échec. Le code TOTP est vérifié dans la transaction (un pas de tolérance, un pas jamais accepté deux fois). Un secret TOTP que la clé ne peut pas ouvrir (autre clé, ligne altérée) est un refus `AUTH-E001` compté comme un échec, avec le journal d'erreur `login.credential_invalid`, jamais une réponse 503 qui distinguerait ce compte ;
+3. un échec compte ; à `max_failures` échecs consécutifs, le compte est verrouillé `lockout_minutes`. Les échecs décroissent : un échec ne s'ajoute aux précédents que s'il survient moins de `lockout_minutes` après le dernier (`last_failure_at`), sinon le compte repart à un ;
+4. succès : compteurs remis à zéro, pas retenu, empreinte recalculée si ses paramètres ne sont plus ceux du binaire, certificat émis et session ouverte dans la même transaction que `login.succeeded`.
+
+Le certificat commence 60 s avant l'heure du core (horloges) et finit avec la session : sa validité dépasse donc la session d'une minute, dans la limite de 8 h 5 min de `check_user`.
+
+**Administration** : `ostena core user set-password`, `totp-enroll` puis `totp-enroll --confirm`, `totp-reset`, `unlock` ; `user list` montre l'état des identifiants ([exploitation](../exploitation/core-installation.md)).
 
 ### Clés de l'agent sur les cibles (jalon M1, avant le coffre-fort)
 

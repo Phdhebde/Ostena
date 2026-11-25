@@ -12,10 +12,13 @@ mod control;
 #[cfg(target_os = "linux")]
 mod core;
 #[cfg(target_os = "linux")]
+mod core_credential;
+#[cfg(target_os = "linux")]
 mod core_inventory;
 mod core_link;
 mod enroll;
 mod keyset_state;
+mod login;
 mod sessions;
 #[cfg(feature = "ssh")]
 mod ssh;
@@ -57,6 +60,60 @@ enum Command {
         #[command(subcommand)]
         command: CoreCommand,
     },
+    /// Open a session on the bastion: password, TOTP code, then an SSH
+    /// certificate for the session in ~/.ostena (administrator workstation).
+    Login(LoginArgs),
+    /// Close the session on the core, then delete its key and certificate.
+    Logout {
+        /// The directory of the session files, ~/.ostena by default.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
+/// `ostena login`.
+#[derive(Debug, clap::Args)]
+struct LoginArgs {
+    /// The core, host:port (port 8445 if left out). Remembered.
+    #[arg(long)]
+    core: Option<String>,
+    /// The root certificate to pin (root.pem given by the administrator).
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// The user name. Remembered.
+    #[arg(long)]
+    user: Option<String>,
+    /// Session length in hours, from 1 to 8 (the core may give less).
+    #[arg(long)]
+    hours: Option<u64>,
+    /// The directory of the session files, ~/.ostena by default.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Accept another root than the pinned one.
+    #[arg(long)]
+    replace_root: bool,
+    /// Add the Include line of the fragment at the top of ~/.ssh/config.
+    #[arg(long)]
+    install_include: bool,
+    /// Read the password, then the TOTP code, from standard input, one
+    /// line each (scripts).
+    #[arg(long)]
+    stdin: bool,
+}
+
+impl From<LoginArgs> for login::Options {
+    fn from(a: LoginArgs) -> Self {
+        Self {
+            core: a.core,
+            root: a.root,
+            user: a.user,
+            hours: a.hours,
+            dir: a.dir,
+            replace_root: a.replace_root,
+            install_include: a.install_include,
+            stdin: a.stdin,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -202,6 +259,50 @@ enum CoreUserCommand {
     },
     /// Disable a user and revoke their login sessions.
     Disable {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+    },
+    /// Set the password of a user (typed twice without echo); clears the
+    /// lockout.
+    SetPassword {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+        /// Read the password from standard input, one line (scripts).
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Generate a new TOTP secret, pending and shown once; with --confirm,
+    /// activate it with a code of the application. Needs the TOTP key of the core.
+    TotpEnroll {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+        /// Activate the pending secret with a code of the application.
+        #[arg(long)]
+        confirm: bool,
+        /// Read the code from standard input, one line (scripts).
+        #[arg(long, requires = "confirm")]
+        stdin: bool,
+    },
+    /// Remove the TOTP secret of a user: login refused until a new
+    /// enrolment is confirmed.
+    TotpReset {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+    },
+    /// Clear the failed logins and the lockout of a user.
+    Unlock {
         /// Configuration file.
         #[arg(long, default_value = CORE_CONFIG)]
         config: PathBuf,
@@ -735,43 +836,11 @@ fn main() -> ExitCode {
         }
         Some(Command::Agent { command }) => run_agent(command),
         Some(Command::Audit { command }) => run_audit(command),
+        Some(Command::Login(args)) => login::login(&args.into()),
+        Some(Command::Logout { dir }) => login::logout(dir.as_deref()),
         #[cfg(target_os = "linux")]
         Some(Command::Core { command }) => run_core(command),
-        Some(Command::Ca { command }) => match command {
-            CaCommand::Root {
-                command: RootCommand::Init { name, days, outs },
-            } => ca::root_init(&name, days, &outs),
-            CaCommand::Root {
-                command: RootCommand::Reseal { root, outs },
-            } => ca::root_reseal(&root, &outs),
-            CaCommand::Key {
-                command:
-                    KeyCommand::New {
-                        key_out,
-                        public_out,
-                    },
-            } => ca::key_new(&key_out, &public_out),
-            CaCommand::Issuing {
-                command:
-                    SignCommand::Sign {
-                        root,
-                        public_key,
-                        name,
-                        days,
-                        out,
-                    },
-            } => ca::issuing_sign(&root, &public_key, &name, days, &out),
-            CaCommand::Server {
-                command:
-                    ServerCommand::Sign {
-                        root,
-                        public_key,
-                        names,
-                        days,
-                        out,
-                    },
-            } => ca::server_sign(&root, &public_key, &names, days, &out),
-        },
+        Some(Command::Ca { command }) => run_ca(command),
     }
 }
 
@@ -786,6 +855,44 @@ fn usage_exit_code(error: &clap::Error, args: &[&str]) -> u8 {
         audit::USAGE_ERROR
     } else {
         code
+    }
+}
+
+fn run_ca(command: CaCommand) -> ExitCode {
+    match command {
+        CaCommand::Root {
+            command: RootCommand::Init { name, days, outs },
+        } => ca::root_init(&name, days, &outs),
+        CaCommand::Root {
+            command: RootCommand::Reseal { root, outs },
+        } => ca::root_reseal(&root, &outs),
+        CaCommand::Key {
+            command:
+                KeyCommand::New {
+                    key_out,
+                    public_out,
+                },
+        } => ca::key_new(&key_out, &public_out),
+        CaCommand::Issuing {
+            command:
+                SignCommand::Sign {
+                    root,
+                    public_key,
+                    name,
+                    days,
+                    out,
+                },
+        } => ca::issuing_sign(&root, &public_key, &name, days, &out),
+        CaCommand::Server {
+            command:
+                ServerCommand::Sign {
+                    root,
+                    public_key,
+                    names,
+                    days,
+                    out,
+                },
+        } => ca::server_sign(&root, &public_key, &names, days, &out),
     }
 }
 
@@ -871,6 +978,21 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
             } => inv::user_add(&config, &name, &display_name),
             CoreUserCommand::List { config } => inv::user_list(&config),
             CoreUserCommand::Disable { config, name } => inv::user_disable(&config, &name),
+            CoreUserCommand::SetPassword {
+                config,
+                name,
+                stdin,
+            } => core_credential::set_password(&config, &name, stdin),
+            CoreUserCommand::TotpEnroll {
+                config,
+                name,
+                confirm,
+                stdin,
+            } => core_credential::totp_enroll(&config, &name, confirm, stdin),
+            CoreUserCommand::TotpReset { config, name } => {
+                core_credential::totp_reset(&config, &name)
+            }
+            CoreUserCommand::Unlock { config, name } => core_credential::unlock(&config, &name),
         },
         CoreCommand::Resource { command } => match command {
             CoreResourceCommand::Add {

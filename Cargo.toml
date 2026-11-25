@@ -49,6 +49,13 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 # X.509 issuance (core CA, agent certificates); no parser (no x509-parser).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 time = { version = "0.3.55", default-features = false }
+# HTTPS login API of the core and its client `ostena login` (ADR-0015):
+# HTTP/1.1 only, no axum yet. tokio-rustls carries the TLS configurations of
+# ostena-crypto::tls; it never builds one.
+hyper = { version = "1.13.0", default-features = false, features = ["http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+tokio-rustls = { version = "0.26.6", default-features = false }
 # QUIC transport of the agent-core tunnel (ADR-0008); TLS comes from ostena-crypto::tls.
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 # SSH server (agent) and client (driver to the targets), ADR-0010. Exact version:
@@ -72,9 +79,11 @@ vsss-rs = { version = "6.0.1", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.10.1", default-features = false }
 # Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
 windows-service = "0.8.1"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Services", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Services", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }
 # Test only: proves the scope decision does not allocate.
 dhat = "0.3.3"
+# Unix only, in ostena-platform: terminal modes for hidden password input.
+libc = "0.2.191"
 # Lists the agent interface addresses (no std API for it).
 if-addrs = "0.15.0"
 clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
