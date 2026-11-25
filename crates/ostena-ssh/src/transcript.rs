@@ -84,16 +84,13 @@ impl Transcript {
 
     /// Queues the frame of `event` at the current time (0 for the start).
     async fn queue(state: &mut State, event: Event) -> Result<(), SshError> {
-        let at_us = match state.origin {
-            Some(origin) => {
-                let now = u64::try_from(origin.elapsed().as_micros()).unwrap_or(u64::MAX);
-                state.last_us = state.last_us.max(now);
-                state.last_us
-            }
-            None => {
-                state.origin = Some(Instant::now());
-                0
-            }
+        let at_us = if let Some(origin) = state.origin {
+            let now = u64::try_from(origin.elapsed().as_micros()).unwrap_or(u64::MAX);
+            state.last_us = state.last_us.max(now);
+            state.last_us
+        } else {
+            state.origin = Some(Instant::now());
+            0
         };
         let mut frame = Vec::new();
         match event {
@@ -274,7 +271,7 @@ mod tests {
             t.start(Some(&terminal), None).await.unwrap();
             t.output(b"hello\r\n").await.unwrap();
             t.resize(100, 30).await.unwrap();
-            t.output(&[b'x'; 70_000]).await.unwrap();
+            t.output(&vec![b'x'; 70_000]).await.unwrap();
             assert!(t.start(None, Some(b"id")).await.is_err());
             t.end(EndReason::Closed).await.unwrap();
             assert!(t.output(b"late").await.is_err());
