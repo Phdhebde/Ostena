@@ -54,16 +54,17 @@ fn files(dir: &Path) -> (SecretBytes, SecretBytes) {
 }
 
 fn config(dir: &Path) -> CoreConfig {
+    // Literal TOML strings: a Windows path holds backslashes.
     let d = dir.display();
     toml::from_str(&format!(
         "tunnel_listen = \"127.0.0.1:0\"\n\
-         tls_root_ca = \"{d}/root.pem\"\n\
-         tls_certificate = \"{d}/server.pem\"\n\
-         tls_private_key = {{ file = \"{d}/server.key\" }}\n\
-         issuing_certificate = \"{d}/issuing.pem\"\n\
-         issuing_private_key = {{ file = \"{d}/issuing.key\" }}\n\
-         grant_signing_key = {{ file = \"{d}/grant.key\" }}\n\
-         [audit]\nsigning_key = {{ file = \"{d}/audit.key\" }}\n"
+         tls_root_ca = '{d}/root.pem'\n\
+         tls_certificate = '{d}/server.pem'\n\
+         tls_private_key = {{ file = '{d}/server.key' }}\n\
+         issuing_certificate = '{d}/issuing.pem'\n\
+         issuing_private_key = {{ file = '{d}/issuing.key' }}\n\
+         grant_signing_key = {{ file = '{d}/grant.key' }}\n\
+         [audit]\nsigning_key = {{ file = '{d}/audit.key' }}\n"
     ))
     .unwrap()
 }
