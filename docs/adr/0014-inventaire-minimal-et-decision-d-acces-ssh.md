@@ -57,7 +57,7 @@ Comme pour les agents (ADR-0011), une commande agit sur la base pendant que le c
 
 **Classes d'audit** (ADR-0012) :
 - **accordant** : `gateway_group.updated`, `user.created`, `resource.created`, `target_account.created`, `right.granted` ; sans enregistrement, le changement est refusé (`CORE-E010`) ;
-- **protecteur** : `user.disabled`, `right.revoked`, `login_session.revoked` ; le changement est validé même si l'enregistrement échoue. La révocation est idempotente : seule la première est auditée.
+- **protecteur** : `user.disabled`, `right.revoked`, `login_session.revoked` ; le changement est validé même si l'enregistrement échoue. La révocation et la désactivation sont idempotentes : seule la première est auditée. Une désactivation répétée révoque seulement les sessions de connexion encore valides, s'il en reste (chacune auditée par `login_session.revoked`, sans second `user.disabled`).
 
 ### Décision d'un accès SSH
 

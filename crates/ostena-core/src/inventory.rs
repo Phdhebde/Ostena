@@ -374,7 +374,8 @@ pub async fn list_users(pool: &PgPool) -> Result<Vec<UserRow>, CoreError> {
 
 /// Disables the user `name` and revokes their login sessions still valid;
 /// the running core tells the agents concerned. Returns how many sessions
-/// were revoked. Disabling a disabled user revokes what is left.
+/// were revoked. Disabling a disabled user revokes what is left, if
+/// anything, and audits only that: `user.disabled` is written once.
 ///
 /// # Errors
 ///
@@ -382,15 +383,25 @@ pub async fn list_users(pool: &PgPool) -> Result<Vec<UserRow>, CoreError> {
 pub async fn disable_user(pool: &PgPool, name: &str) -> Result<usize, CoreError> {
     let mut tx = pool.begin().await?;
     let actor = audit::admin_actor(&mut tx).await?;
-    let id = sqlx::query_scalar!(
-        r#"UPDATE app_user SET state = 'disabled', disabled_at = coalesce(disabled_at, now())
-           WHERE name = $1 RETURNING id::text AS "id!""#,
+    // Lock order (ADR-0014): the user, then their login sessions.
+    let user = sqlx::query!(
+        r#"SELECT id::text AS "id!", state = 'active' AS "active!"
+           FROM app_user WHERE name = $1 FOR UPDATE"#,
         name,
     )
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| CoreError::NotFound(format!("utilisateur {name}")))?;
-    let id = uuid(&id)?;
+    let id = uuid(&user.id)?;
+    if user.active {
+        sqlx::query!(
+            "UPDATE app_user SET state = 'disabled', disabled_at = now()
+             WHERE id = $1::text::uuid",
+            id.to_string(),
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
     let sessions = sqlx::query_scalar!(
         r#"UPDATE login_session
            SET revoked_at = now(), revoked_by = $2, revocation_reason = 'utilisateur désactivé'
@@ -406,6 +417,11 @@ pub async fn disable_user(pool: &PgPool, name: &str) -> Result<usize, CoreError>
         .iter()
         .map(|s| uuid(s))
         .collect::<Result<Vec<_>, _>>()?;
+    if !user.active && sessions.is_empty() {
+        // Already disabled, nothing left: nothing changes.
+        tx.rollback().await?;
+        return Ok(0);
+    }
     for session in &sessions {
         notify_notice(&mut tx, &Notice::LoginRevoked(*session)).await?;
     }
@@ -421,14 +437,16 @@ pub async fn disable_user(pool: &PgPool, name: &str) -> Result<usize, CoreError>
         )
         .await;
     }
-    audit::append_protective(
-        &mut tx,
-        admin_event(EventKind::UserDisabled, actor)
-            .uuid(field::USER_ID, id.to_bytes())
-            .text(field::NAME, name)
-            .u64(field::REVOKED_SESSIONS, sessions.len() as u64),
-    )
-    .await;
+    if user.active {
+        audit::append_protective(
+            &mut tx,
+            admin_event(EventKind::UserDisabled, actor)
+                .uuid(field::USER_ID, id.to_bytes())
+                .text(field::NAME, name)
+                .u64(field::REVOKED_SESSIONS, sessions.len() as u64),
+        )
+        .await;
+    }
     tx.commit().await?;
     tracing::warn!(event = "user.disabled", user = %id, revoked_sessions = sessions.len());
     Ok(sessions.len())
@@ -689,7 +707,7 @@ pub async fn grant_right(
 
 /// Revokes the right `right`: no new grant under it. Sessions already
 /// open end at their maximum length (or with their login session).
-/// Revoking a revoked right changes nothing.
+/// Revoking a revoked right changes nothing, and is not audited again.
 ///
 /// # Errors
 ///
@@ -697,18 +715,28 @@ pub async fn grant_right(
 pub async fn revoke_right(pool: &PgPool, right: Uuid) -> Result<(), CoreError> {
     let mut tx = pool.begin().await?;
     let actor = audit::admin_actor(&mut tx).await?;
-    let found = sqlx::query!(
-        "UPDATE access_right SET revoked_at = coalesce(revoked_at, now()),
-                                 revoked_by = coalesce(revoked_by, $2)
-         WHERE id = $1::text::uuid",
+    let revoked = sqlx::query!(
+        "UPDATE access_right SET revoked_at = now(), revoked_by = $2
+         WHERE id = $1::text::uuid AND revoked_at IS NULL",
         right.to_string(),
         actor,
     )
     .execute(&mut *tx)
     .await?
     .rows_affected();
-    if found == 0 {
-        return Err(CoreError::NotFound(format!("droit {right}")));
+    if revoked == 0 {
+        let known = sqlx::query_scalar!(
+            r#"SELECT true AS "known!" FROM access_right WHERE id = $1::text::uuid"#,
+            right.to_string(),
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.rollback().await?;
+        return match known {
+            // Already revoked: nothing changes.
+            Some(_) => Ok(()),
+            None => Err(CoreError::NotFound(format!("droit {right}"))),
+        };
     }
     notify_audit(&mut tx).await?;
     // Protective, last statement before the commit.

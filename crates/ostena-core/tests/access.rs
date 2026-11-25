@@ -229,7 +229,16 @@ fn ssh_grant_follows_the_inventory_and_the_login_session() {
             f.code(&f.request("srv-lab01", "root")).await,
             access::NO_RIGHT
         );
+        // Again: nothing changes, audited once.
+        inventory::revoke_right(&f.pool, right.id).await.unwrap();
         assert_eq!(audit_count(&f.pool, "right.revoked").await, 1);
+        assert_eq!(
+            inventory::revoke_right(&f.pool, Uuid::from_bytes([6; 16]))
+                .await
+                .unwrap_err()
+                .code(),
+            "CORE-E009"
+        );
 
         // The user disabled (without the CLI, which also revokes sessions).
         sqlx::query("UPDATE app_user SET state = 'disabled', disabled_at = now()")
@@ -542,6 +551,23 @@ fn revocations_are_repeated_to_the_agents_that_received_grants() {
         .unwrap();
         assert!(revoked);
         assert_eq!(audit_count(&f.pool, "user.disabled").await, 1);
+        let sessions_revoked = audit_count(&f.pool, "login_session.revoked").await;
+        // Again: nothing left, nothing audited.
+        assert_eq!(inventory::disable_user(&f.pool, "alice").await.unwrap(), 0);
+        assert_eq!(audit_count(&f.pool, "user.disabled").await, 1);
+        assert_eq!(
+            audit_count(&f.pool, "login_session.revoked").await,
+            sessions_revoked
+        );
+        // A login session opened meanwhile is revoked, without a second
+        // `user.disabled`.
+        open_login(&f.pool, f.user, [0xe3; 32], 3600).await;
+        assert_eq!(inventory::disable_user(&f.pool, "alice").await.unwrap(), 1);
+        assert_eq!(audit_count(&f.pool, "user.disabled").await, 1);
+        assert_eq!(
+            audit_count(&f.pool, "login_session.revoked").await,
+            sessions_revoked + 1
+        );
         f.db.drop_database().await;
     });
 }
