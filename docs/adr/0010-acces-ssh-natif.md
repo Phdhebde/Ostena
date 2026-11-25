@@ -56,7 +56,7 @@ Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-
 
 **Déconnexion.** `ostena logout` envoie `POST /v1/logout` avec la session, le certificat, l'heure et une signature ECDSA de la clé de la session sur `"ostena-logout-v1\0" ‖ session ‖ heure`. L'heure est acceptée à ±60 s de celle du core (`LOGOUT_SKEW_SECS`). Le core révoque la session, puis le client supprime la clé et le certificat. La réponse est `204`.
 
-**Saisie.** Le mot de passe est lu sans écho sur le terminal (`ostena_platform::tty`) ; le terminal est restauré même sur erreur ou Ctrl-C (Ctrl-C annule la saisie).
+**Saisie.** Le mot de passe est lu sans écho sur le terminal (`ostena_platform::tty`) ; le terminal est restauré même sur erreur ou Ctrl-C (Ctrl-C annule la saisie), immédiatement (`TCSANOW`). Sous Unix, un `SIGHUP`, `SIGTERM`, `SIGINT` ou `SIGQUIT` reçu pendant la saisie est intercepté : la saisie s'arrête, le terminal est restauré, puis le signal est relancé avec l'action précédente, qui termine le processus comme il l'aurait fait.
 
 **Codes du core** (corps `{"protocol":1,"code":…,"message":…}`) :
 

@@ -5,7 +5,11 @@
 //!   (no echo, no line discipline, **no signals**), and the line is edited
 //!   here. Ctrl-C arrives as a byte and cancels the input
 //!   ([`io::ErrorKind::Interrupted`]) instead of killing the process with
-//!   the echo off. The previous mode is restored by a guard, on every path.
+//!   the echo off. The previous mode is restored by a guard, on every path,
+//!   at once (`TCSANOW`). A `SIGHUP`, `SIGTERM`, `SIGINT` or `SIGQUIT` sent
+//!   meanwhile is caught: the input ends, the mode is restored, the
+//!   previous actions are put back and the signal is raised again, so that
+//!   it kills the process as it would have, with the terminal usable.
 //! - Windows: the console input (`CONIN$`) loses echo, line and processed
 //!   input; Ctrl-C arrives as a character too.
 //! - Without a terminal (a pipe, a test), one line is read from the
@@ -220,8 +224,95 @@ pub(crate) mod imp {
     use std::io::{self, Read, Write};
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, RawFd};
+    use std::sync::atomic::{AtomicI32, Ordering};
 
     use ostena_common::secret::SecretString;
+
+    /// Signals that end the process by default and may come while the
+    /// echo is off.
+    pub(crate) const CAUGHT_SIGNALS: [libc::c_int; 4] =
+        [libc::SIGHUP, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT];
+
+    /// The last signal caught while [`Signals`] is installed, or 0.
+    static CAUGHT: AtomicI32 = AtomicI32::new(0);
+
+    /// Async-signal-safe: one atomic store.
+    extern "C" fn on_signal(signal: libc::c_int) {
+        CAUGHT.store(signal, Ordering::SeqCst);
+    }
+
+    /// Our handler on [`CAUGHT_SIGNALS`]; the previous actions are put back
+    /// on drop.
+    pub(crate) struct Signals {
+        previous: Vec<(libc::c_int, libc::sigaction)>,
+    }
+
+    impl Signals {
+        pub(crate) fn install() -> io::Result<Self> {
+            CAUGHT.store(0, Ordering::SeqCst);
+            let mut signals = Self {
+                previous: Vec::with_capacity(CAUGHT_SIGNALS.len()),
+            };
+            for signal in CAUGHT_SIGNALS {
+                // SAFETY: an all-zero sigaction is a valid value (no flags,
+                // default action) that the fields below complete.
+                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                // No SA_RESTART: a poll in progress is interrupted.
+                // SAFETY: `sa_mask` is a sigset_t owned by `action`.
+                unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+                let mut old = MaybeUninit::<libc::sigaction>::uninit();
+                // SAFETY: `action` is initialised, `old` is writable memory
+                // of the size of a sigaction; the handler only stores an
+                // atomic integer.
+                if unsafe { libc::sigaction(signal, &raw const action, old.as_mut_ptr()) } != 0 {
+                    // The ones installed so far are put back by the drop.
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: sigaction returned 0, so it filled `old`.
+                signals
+                    .previous
+                    .push((signal, unsafe { old.assume_init() }));
+            }
+            Ok(signals)
+        }
+
+        /// The signal caught since [`Signals::install`], if any.
+        pub(crate) fn caught() -> Option<libc::c_int> {
+            let signal = CAUGHT.load(Ordering::SeqCst);
+            (signal != 0).then_some(signal)
+        }
+    }
+
+    impl Drop for Signals {
+        fn drop(&mut self) {
+            for (signal, previous) in &self.previous {
+                // SAFETY: `previous` is the action sigaction returned for
+                // `signal`; no old action is asked for.
+                unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) };
+            }
+        }
+    }
+
+    /// Waits until `fd` can be read, a signal was caught, or 200 ms passed.
+    fn wait_readable(fd: RawFd) -> io::Result<bool> {
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, as the count says.
+        let ready = unsafe { libc::poll(&raw mut poll, 1, 200) };
+        if ready < 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(e)
+            };
+        }
+        Ok(ready > 0)
+    }
 
     /// The terminal in raw mode; the saved mode is restored on drop.
     pub(crate) struct RawMode {
@@ -260,8 +351,9 @@ pub(crate) mod imp {
     impl Drop for RawMode {
         fn drop(&mut self) {
             // SAFETY: `fd` is still open (the guard does not outlive the
-            // file), and `saved` is the termios tcgetattr returned.
-            unsafe { libc::tcsetattr(self.fd, libc::TCSAFLUSH, &raw const self.saved) };
+            // file), and `saved` is the termios tcgetattr returned. At once:
+            // TCSAFLUSH would wait for the output to drain first.
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.saved) };
         }
     }
 
@@ -269,12 +361,23 @@ pub(crate) mod imp {
     pub(crate) fn read_on(tty: &mut File, prompt: &str) -> io::Result<SecretString> {
         tty.write_all(prompt.as_bytes())?;
         tty.flush()?;
+        let signals = Signals::install()?;
+        let fd = tty.as_raw_fd();
         let result = {
-            let _raw = RawMode::enter(tty.as_raw_fd())?;
+            let _raw = RawMode::enter(fd)?;
             let mut reader: &File = tty;
             super::edit(|| {
                 let mut byte = [0u8; 1];
                 loop {
+                    if Signals::caught().is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "saisie interrompue par un signal",
+                        ));
+                    }
+                    if !wait_readable(fd)? {
+                        continue;
+                    }
                     match reader.read(&mut byte) {
                         Ok(0) => return Ok(None),
                         Ok(_) => return Ok(Some(byte[0])),
@@ -286,6 +389,13 @@ pub(crate) mod imp {
         };
         // The guard is gone: the mode is restored before anything else.
         let _ = tty.write_all(b"\n");
+        let caught = Signals::caught();
+        drop(signals);
+        if let Some(signal) = caught {
+            // SAFETY: a signal number the system delivered; the previous
+            // action applies again (by default, the end of the process).
+            unsafe { libc::raise(signal) };
+        }
         result
     }
 

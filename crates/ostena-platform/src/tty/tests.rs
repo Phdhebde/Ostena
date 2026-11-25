@@ -124,8 +124,13 @@ mod unix {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::ptr::null_mut;
 
+    use std::sync::Mutex;
+
     use super::super::imp::{RawMode, read_on};
     use super::shown;
+
+    /// The terminal tests share the process signal handlers: one at a time.
+    static TERMINAL: Mutex<()> = Mutex::new(());
 
     /// A pseudo-terminal pair: (controller, terminal).
     fn pty() -> (File, File) {
@@ -175,6 +180,7 @@ mod unix {
 
     fn typed(
         input: &[u8],
+        signal: Option<libc::c_int>,
     ) -> (
         std::io::Result<String>,
         Vec<u8>,
@@ -191,6 +197,11 @@ mod unix {
             for _ in 0..500 {
                 if lflag(&typist) & libc::ECHO == 0 {
                     typist.write_all(&input).unwrap();
+                    if let Some(signal) = signal {
+                        // SAFETY: a signal to this process, whose action
+                        // the test chose.
+                        assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
+                    }
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -215,7 +226,10 @@ mod unix {
 
     #[test]
     fn hidden_input_is_not_echoed() {
-        let (result, echoed, before, after) = typed(b"s3cret\r");
+        let _one = TERMINAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (result, echoed, before, after) = typed(b"s3cret\r", None);
         assert_eq!(result.unwrap(), "s3cret");
         let echoed = String::from_utf8_lossy(&echoed);
         assert!(echoed.starts_with("Mot de passe : "), "{echoed:?}");
@@ -223,9 +237,37 @@ mod unix {
         assert_eq!(before, after);
     }
 
+    /// SIGTERM and SIGHUP while the echo is off: the input ends, the
+    /// terminal is restored, the previous action applies again. Here it
+    /// is "ignore", so the process lives on to check it.
+    #[test]
+    fn a_signal_restores_the_terminal_then_applies() {
+        let _one = TERMINAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for signal in [libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: SIG_IGN for a signal this test sends itself.
+            let previous = unsafe { libc::signal(signal, libc::SIG_IGN) };
+            let (result, _, before, after) = typed(b"s3c", Some(signal));
+            assert_eq!(
+                result.err().map(|e| e.kind()),
+                Some(std::io::ErrorKind::Interrupted),
+                "{signal}"
+            );
+            assert_eq!(before, after, "{signal}");
+            // The previous action (ignore) is back, not our handler.
+            // SAFETY: reads the action back and puts the test's previous one.
+            let current = unsafe { libc::signal(signal, previous) };
+            assert_eq!(current, libc::SIG_IGN, "{signal}");
+        }
+    }
+
     #[test]
     fn ctrl_c_cancels_and_restores_the_terminal() {
-        let (result, _, before, after) = typed(b"s3c\x03");
+        let _one = TERMINAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (result, _, before, after) = typed(b"s3c\x03", None);
         assert_eq!(
             result.err().map(|e| e.kind()),
             Some(std::io::ErrorKind::Interrupted)
