@@ -2,7 +2,7 @@
 
 - **Statut** : Accepté. Implémenté dans le lot M1 : format et vérificateur (PR 3a), intégration au core (PR 3b).
 - **Date** : 2026-11-15
-- **Révision** : 2026-11-25, événements des transcripts et codes `AUD-E017`, `AUD-E018`, `AUD-W005`, `AUD-W006` (jalon M1, PR 8, ADR-0016)
+- **Révision** : 2026-11-25, événements des transcripts et codes `AUD-E017` à `AUD-E020`, `AUD-W005` à `AUD-W008` ; `transcript.refused` de classe protectrice (jalon M1, PR 8, ADR-0016)
 
 ## Contexte
 
@@ -142,6 +142,10 @@ Codes stables, jamais renumérotés ni réutilisés. Chaque message commence par
 | `AUD-E018` | erreur | transcript modifié depuis son scellement (taille ou SHA-256) |
 | `AUD-W005` | avertissement | fichier de transcript sans scellé dans l'export |
 | `AUD-W006` | avertissement | transcript scellé incomplet (avec son code `REC-E…`) |
+| `AUD-E019` | erreur | session SSH ouverte dans l'export (`access.session_opened`) sans `transcript.sealed`, alors qu'elle aurait dû finir (`--transcripts`) |
+| `AUD-E020` | erreur | `transcript.sealed` aux champs absents ou mal formés, ou second sceau pour la même session |
+| `AUD-W007` | avertissement | session SSH sans transcript scellé, peut-être encore ouverte à l'instant de l'export (`--transcripts`) |
+| `AUD-W008` | avertissement | sceau de transcript postérieur à la dernière tête signée (`--transcripts`) |
 
 ### Place réservée
 
@@ -170,8 +174,8 @@ Codes stables, jamais renumérotés ni réutilisés. Chaque message commence par
 | Classe | Événements | Si l'enregistrement ne peut pas être écrit |
 |---|---|---|
 | **Accordant** | `agent.enrolled`, `agent.certificate_renewed` (choisi d'après l'insertion de la ligne `agent`), `enroll.token_issued`, `enroll.token_consumed`, `audit.signing_started`, `core.migrated`, `config.waiver`, `core.started`, `audit.break_acknowledged`, `audit.exported`, `grant.key_activated`, `access.ssh_granted`, `access.session_opened`, `ssh.host_certified`, `gateway_group.updated`, `user.created`, `resource.created`, `target_account.created`, `right.granted`, `login.succeeded`, `user.password_set`, `user.totp_enrolled`, `user.unlocked`, `transcript.sealed` (avec l'état scellé de la ligne `session_transcript` ; un échec la laisse `recording`, et elle est scellée incomplète au démarrage suivant) | écrit dans la transaction du changement ; l'échec l'annule et le refuse (`TUN-E029` côté tunnel, `CORE-E010` sinon) ; le core refuse de démarrer |
-| **Protecteur** | `agent.revoked`, `enroll.token_rejected` (échecs, brûlage, code), `login_session.revoked`, `user.disabled`, `right.revoked`, `login.locked`, `user.totp_reset`, `login.refused` pour un compte connu (dans la transaction qui compte l'échec ou relit le compte) | écrit dans un point de sauvegarde ; le changement est validé quand même ; l'échec est journalisé (`audit.append_failed`, niveau erreur) et compté |
-| **Au mieux** | `tunnel.agent_connected`, `tunnel.refused` (agent identifié), `agent.renewal_refused`, `agent.revocation_applied`, `core.registry_unavailable`, `core.registry_restored`, `core.stopped`, `access.ssh_refused`, `access.session_refused`, `access.session_closed`, `ssh.host_key_refused`, `login_session.revocation_applied`, `login.refused` pour un nom inconnu (aucune ligne à verrouiller), `access.ssh_exec`, `transcript.refused` | file bornée de 256 événements, écrite par une seule tâche par lots (un verrou par lot), avec reprise ; les événements perdus sont comptés, puis consignés par `audit.events_lost` (nombre, premier et dernier instant) dès que la chaîne est de nouveau inscriptible. `core.stopped` est écrit de façon synchrone, en 2 s au plus |
+| **Protecteur** | `agent.revoked`, `enroll.token_rejected` (échecs, brûlage, code), `login_session.revoked`, `user.disabled`, `right.revoked`, `login.locked`, `user.totp_reset`, `login.refused` pour un compte connu (dans la transaction qui compte l'échec ou relit le compte), `transcript.refused` (dans sa propre transaction, après l'arrêt du flux) | écrit dans un point de sauvegarde ; le changement est validé quand même ; l'échec est journalisé (`audit.append_failed`, niveau erreur) et compté |
+| **Au mieux** | `tunnel.agent_connected`, `tunnel.refused` (agent identifié), `agent.renewal_refused`, `agent.revocation_applied`, `core.registry_unavailable`, `core.registry_restored`, `core.stopped`, `access.ssh_refused`, `access.session_refused`, `access.session_closed`, `ssh.host_key_refused`, `login_session.revocation_applied`, `login.refused` pour un nom inconnu (aucune ligne à verrouiller), `access.ssh_exec` | file bornée de 256 événements, écrite par une seule tâche par lots (un verrou par lot), avec reprise ; les événements perdus sont comptés, puis consignés par `audit.events_lost` (nombre, premier et dernier instant) dès que la chaîne est de nouveau inscriptible. `core.stopped` est écrit de façon synchrone, en 2 s au plus |
 
 Restent au seul journal : les refus d'un pair non authentifié (jeton inconnu, poignée de main refusée) et les événements des écouteurs.
 
