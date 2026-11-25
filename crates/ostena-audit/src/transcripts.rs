@@ -8,8 +8,9 @@
 //! not seal (`AUD-W005`). Every SSH session opened in the export
 //! (`access.session_opened`) must have its transcript sealed in it
 //! (`AUD-E019`), unless it may still have been running at export time
-//! (`AUD-W007`). Nothing else in the directory is read, and no secret is
-//! needed.
+//! (`AUD-W007`). A seal after the last signed head is reported for each
+//! transcript (`AUD-W008`). Nothing else in the directory is read, and no
+//! secret is needed.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -57,6 +58,14 @@ pub fn check(report: &mut Report, dir: &Path) -> Result<(), AuditError> {
         let file = seal.file_name();
         if !sealed.insert(file.clone()) {
             continue;
+        }
+        // A seal after the last signed head can still be changed together
+        // with its file.
+        if report.covered_seq.is_none_or(|covered| seal.seq > covered) {
+            report.add(Finding::TranscriptSealUncovered {
+                file: file.clone(),
+                seq: seal.seq,
+            });
         }
         let on_disk = match measure(&dir.join(&file)) {
             Ok(on_disk) => Some(on_disk),
@@ -145,7 +154,7 @@ mod tests {
             heads: 0,
             first_seq: None,
             last_seq: None,
-            covered_seq: None,
+            covered_seq: Some(100),
             findings: Vec::new(),
             errors: 0,
             warnings: 0,
@@ -235,12 +244,14 @@ mod tests {
             max_session_secs: 60,
         };
         let mut r = report(vec![sealed]);
+        // Its seal is after the last head.
+        r.covered_seq = Some(0);
         // Sealed; ended long ago; may still run (export at 10 000 s).
         r.ssh_sessions = vec![opened(1, 0), opened(2, 0), opened(3, 9_900_000)];
         check(&mut r, &dir).unwrap();
         let codes: Vec<&str> = r.findings.iter().map(Finding::code).collect();
-        assert_eq!(codes, ["AUD-E019", "AUD-W007"]);
-        assert!(r.findings[0].to_string().contains("02020202-"));
+        assert_eq!(codes, ["AUD-W008", "AUD-E019", "AUD-W007"]);
+        assert!(r.findings[1].to_string().contains("02020202-"));
         assert_eq!(r.exit_code(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }

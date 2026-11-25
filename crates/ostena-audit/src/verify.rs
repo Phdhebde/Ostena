@@ -162,6 +162,22 @@ pub enum Finding {
         /// Seq of `access.session_opened`.
         seq: u64,
     },
+    /// `AUD-E020`: a `transcript.sealed` record that is malformed, or a
+    /// second seal for the same session.
+    TranscriptSealInvalid {
+        /// Seq of the record.
+        seq: u64,
+        /// What is wrong.
+        why: &'static str,
+    },
+    /// `AUD-W008`: a transcript seal not covered by a signed head: the
+    /// record may still be changed with its file.
+    TranscriptSealUncovered {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+    },
     /// `AUD-W006`: a transcript sealed as incomplete (stream cut, core
     /// stopped): it is intact, but the session may not be in full.
     TranscriptIncomplete {
@@ -341,6 +357,8 @@ impl Finding {
             Self::TranscriptIncomplete { .. } => "AUD-W006",
             Self::TranscriptNeverSealed { .. } => "AUD-E019",
             Self::TranscriptPending { .. } => "AUD-W007",
+            Self::TranscriptSealInvalid { .. } => "AUD-E020",
+            Self::TranscriptSealUncovered { .. } => "AUD-W008",
         }
     }
 
@@ -353,7 +371,8 @@ impl Finding {
             | Self::StaleHead { .. }
             | Self::TranscriptUnsealed { .. }
             | Self::TranscriptIncomplete { .. }
-            | Self::TranscriptPending { .. } => Severity::Warning,
+            | Self::TranscriptPending { .. }
+            | Self::TranscriptSealUncovered { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -440,6 +459,10 @@ impl fmt::Display for Finding {
                 "[{code}] transcript {file} différent de son sceau (enregistrement n° {seq}) : \
                  taille ou SHA-256"
             ),
+            Self::TranscriptSealInvalid { seq, why } => write!(
+                f,
+                "[{code}] sceau de transcript invalide à l'enregistrement n° {seq} : {why}"
+            ),
             Self::TranscriptNeverSealed { file, seq } => write!(
                 f,
                 "[{code}] session SSH ouverte (enregistrement n° {seq}) sans transcript scellé \
@@ -498,6 +521,11 @@ impl Finding {
                 f,
                 "[{code}] transcript {file} scellé incomplet (enregistrement n° {seq}, {why}) : \
                  intact, mais la session n'y est peut-être pas en entier"
+            ),
+            Self::TranscriptSealUncovered { file, seq } => write!(
+                f,
+                "[{code}] sceau du transcript {file} (enregistrement n° {seq}) non couvert par \
+                 une tête signée : attendre la tête suivante et réexporter"
             ),
             Self::TranscriptPending { file, seq } => write!(
                 f,
@@ -635,6 +663,8 @@ pub struct Verifier {
     errors: u64,
     warnings: u64,
     transcripts: Vec<TranscriptSeal>,
+    /// Sessions sealed so far: a second seal is an error.
+    sealed_sessions: std::collections::HashSet<[u8; 16]>,
     ssh_sessions: Vec<SshSession>,
 }
 
@@ -662,6 +692,7 @@ impl Verifier {
             errors: 0,
             warnings: 0,
             transcripts: Vec::new(),
+            sealed_sessions: std::collections::HashSet::new(),
             ssh_sessions: Vec::new(),
         };
         for head in options.external_heads {
@@ -786,6 +817,31 @@ impl Verifier {
         Ok(())
     }
 
+    /// Keeps the SSH sessions opened and the transcript seals of the export
+    /// (ADR-0016); a malformed seal, or a second one for a session, is an
+    /// error (`AUD-E020`).
+    fn collect_transcripts(&mut self, first: &mut Option<Finding>, record: &Record) {
+        if record.event == "transcript.sealed" {
+            let why = match TranscriptSeal::of(record) {
+                Some(seal) if self.sealed_sessions.insert(seal.session) => {
+                    self.transcripts.push(seal);
+                    return;
+                }
+                Some(_) => "second sceau pour la même session",
+                None => "champs absents ou mal formés",
+            };
+            self.flag(
+                first,
+                Finding::TranscriptSealInvalid {
+                    seq: record.seq,
+                    why,
+                },
+            );
+        } else if let Some(opened) = SshSession::of(record) {
+            self.ssh_sessions.push(opened);
+        }
+    }
+
     /// Checks the next record and returns its hash.
     ///
     /// # Errors
@@ -865,12 +921,7 @@ impl Verifier {
                 }
                 self.last_time_ms = Some(record.time_ms);
                 self.check_external(&mut first, record.seq, &hash);
-                if let Some(seal) = TranscriptSeal::of(&record) {
-                    self.transcripts.push(seal);
-                }
-                if let Some(opened) = SshSession::of(&record) {
-                    self.ssh_sessions.push(opened);
-                }
+                self.collect_transcripts(&mut first, &record);
                 record.seq
             }
         };
