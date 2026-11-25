@@ -105,6 +105,9 @@ pub struct Behaviour {
     /// Present a server certificate signed by the issuing CA (with its
     /// chain), as an attacker holding that key would.
     pub rogue_server: bool,
+    /// Accept transcript streams but never read them, as a core that no
+    /// longer reads.
+    pub stall_recordings: bool,
 }
 
 /// What the test inventory answers for a granted resource.
@@ -884,14 +887,25 @@ async fn serve(
             issuer.clone(),
             state.clone(),
         ));
-        tokio::spawn(echo_channels(tunnel, state.clone()));
+        tokio::spawn(echo_channels(
+            tunnel,
+            state.clone(),
+            behaviour.stall_recordings,
+        ));
     }
 }
 
-async fn echo_channels(tunnel: Arc<CoreTunnel>, state: Arc<State>) {
+async fn echo_channels(tunnel: Arc<CoreTunnel>, state: Arc<State>, stall_recordings: bool) {
     while let Ok((session, class, mut channel)) = tunnel.accept_channel().await {
         if class == StreamClass::Recording {
-            tokio::spawn(keep_recording(session, channel, state.clone()));
+            if stall_recordings {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    drop(channel);
+                });
+            } else {
+                tokio::spawn(keep_recording(session, channel, state.clone()));
+            }
             continue;
         }
         tokio::spawn(async move {

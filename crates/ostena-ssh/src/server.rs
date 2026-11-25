@@ -78,6 +78,9 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reason of a session cut because its transcript was lost.
 const TRANSCRIPT_LOST: &str = "transcript perdu";
+/// How long the end of a transcript may take: a start and an end frame,
+/// each waiting at most [`crate::transcript::SEND_TIMEOUT`], and the lock.
+const END_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Bounds and delays of the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1101,8 +1104,9 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
                 .window_change(col_width, row_height, pix_width, pix_height)
                 .await;
             if let Some(transcript) = self.transcript() {
-                // A loss is handled by the connection: it cuts the session.
-                let _ = transcript.resize(col_width, row_height).await;
+                // Kept, recorded before the next output: the handler never
+                // waits for the core.
+                transcript.resize(col_width, row_height);
             }
         }
         Ok(())
@@ -1441,7 +1445,15 @@ async fn connection<A: Authorizer>(
         TRANSCRIPT_LOST => EndReason::Error,
         _ => EndReason::Closed,
     };
-    if let Err(e) = transcript.end(end).await
+    // Bounded: the permit and the report below are always given back.
+    let ended = tokio::time::timeout(END_TIMEOUT, transcript.end(end))
+        .await
+        .unwrap_or_else(|_| {
+            Err(SshError::TranscriptLost(
+                "fin du transcript non transmise dans le délai".into(),
+            ))
+        });
+    if let Err(e) = ended
         && reason != TRANSCRIPT_LOST
     {
         tracing::warn!(

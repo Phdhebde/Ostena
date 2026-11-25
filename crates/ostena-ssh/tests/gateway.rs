@@ -300,6 +300,55 @@ fn the_transcript_reaches_the_core_and_its_loss_is_seen() {
     });
 }
 
+/// A core that accepts the transcript stream but no longer reads it: the
+/// pump gives up after its write delay, resets the stream, and the
+/// transcript is lost (the session is cut).
+#[test]
+fn a_transcript_the_core_does_not_read_is_lost_in_the_delay() {
+    use ostena_ssh::transcript::Transcript;
+    use ostena_tunnel::recording::pump_with;
+    run(async {
+        let core = TestCore::start(
+            Limits::default(),
+            Behaviour {
+                stall_recordings: true,
+                ..Behaviour::default()
+            },
+        )
+        .unwrap();
+        let dir = dir("transcript-stalled");
+        let gateway = agent(&core, &dir, allow(&["10.0.0.0/8"])).await;
+        push(&core, &gateway, allow(&["10.20.0.0/16"]), true).await;
+        core.add_ssh_resource("srv-lab01", SshResource::new("10.20.0.5", 22, target_key()));
+        let store = MemoryReplayStore::new();
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let transcript = Transcript::with_timeout(tx, Duration::from_secs(30));
+        let pumped = tokio::spawn(pump_with(rx, session.recording, Duration::from_millis(500)));
+        transcript.start(None, None).await.unwrap();
+        let started = std::time::Instant::now();
+        let writer = tokio::spawn({
+            let transcript = transcript.clone();
+            async move {
+                // Far beyond the window of the stream.
+                for _ in 0..64 {
+                    transcript.output(&[b'x'; 16 * 1024]).await?;
+                }
+                Ok::<_, ostena_ssh::SshError>(())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), transcript.closed())
+            .await
+            .expect("transcript lost in the delay");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(pumped.await.unwrap().is_err());
+        assert_eq!(writer.await.unwrap().unwrap_err().code(), "SSH-E021");
+    });
+}
+
 #[test]
 fn a_grant_or_an_answer_that_does_not_match_the_access_is_refused() {
     run(async {

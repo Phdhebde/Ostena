@@ -940,6 +940,35 @@ fn a_session_whose_transcript_is_lost_is_cut() {
     assert_eq!(closed[0].reason, "transcript perdu");
 }
 
+/// A core that no longer reads the transcript (ADR-0016): the output
+/// waits, then the session is cut in the delay, and its permit and report
+/// are given back.
+#[test]
+fn a_session_whose_transcript_is_not_read_is_cut_in_the_delay() {
+    let runtime = runtime();
+    let Some(n) = native(
+        &runtime,
+        "native-transcript-stalled",
+        ServerSettings::default(),
+    ) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    *n.agent.authorizer.stall_transcript.lock().unwrap() = Some(std::time::Duration::from_secs(1));
+    let started = std::time::Instant::now();
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["flood"]);
+    assert!(!out.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    // Not one byte reached the user unrecorded.
+    assert!(out.stdout.is_empty(), "{} octets", out.stdout.len());
+    let lost = wait_event(n.agent.addr, "ssh.transcript_lost");
+    assert_eq!(lost[0].code, "SSH-E021");
+    let closed = wait_closed(&n, 1);
+    assert_eq!(closed[0].reason, "transcript perdu");
+    assert_eq!(n.agent.server.sessions(), 0);
+    assert_eq!(n.agent.server.in_progress(), 0);
+}
+
 #[test]
 fn a_session_being_authorised_is_in_progress_until_its_close() {
     let runtime = runtime();
