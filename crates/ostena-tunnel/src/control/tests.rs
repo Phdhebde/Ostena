@@ -96,7 +96,7 @@ fn every_valid_core_message_round_trips() {
 
 #[test]
 fn every_valid_agent_message_round_trips() {
-    let grant = "A".repeat(224);
+    let grant = "A".repeat(246);
     let messages = [
         hello(),
         AgentMessage::Ping { seq: 9 },
@@ -232,7 +232,7 @@ fn hello_fields_are_checked() {
 
 #[test]
 fn grant_and_renewal_are_checked() {
-    for grant in ["", "short", &"*".repeat(224)] {
+    for grant in ["", "short", &"*".repeat(246)] {
         let m = AgentMessage::SessionRequest {
             request_id: 1,
             grant: grant.to_owned(),
@@ -410,7 +410,7 @@ fn ssh_messages_round_trip() {
         },
         CoreMessage::SshGrant {
             request_id: 3,
-            grant: "A".repeat(224),
+            grant: "A".repeat(246),
         },
         CoreMessage::LoginRevoked {
             login_session: GROUP.into(),

@@ -72,6 +72,57 @@ impl Jti {
     }
 }
 
+/// What a grant is bound to besides its claims: the login session of the
+/// user and the account on the target (ADR-0004, format v2).
+///
+/// `SHA-256("ostena-grant-binding-v1\0" ‖ login session ‖ account length
+/// (u16, big-endian) ‖ account)`, truncated to 128 bits. The verifier
+/// recomputes it from what it knows and compares; it never reads the login
+/// session or the account back from a grant.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Binding([u8; 16]);
+
+/// Domain separation prefix of [`Binding`].
+const BINDING_DOMAIN: &[u8] = b"ostena-grant-binding-v1\0";
+
+impl Binding {
+    /// The binding of `login_session` (UUID bytes) and `account`.
+    ///
+    /// An account is at most 256 bytes on every path (SSH login, tunnel);
+    /// a longer one is cut at `u16::MAX` bytes for the length prefix, which
+    /// keeps the function total: such an account never gets a grant.
+    pub fn of(login_session: [u8; 16], account: &str) -> Self {
+        let account = account.as_bytes();
+        let account = &account[..account.len().min(usize::from(u16::MAX))];
+        let len = u16::try_from(account.len())
+            .unwrap_or(u16::MAX)
+            .to_be_bytes();
+        let digest =
+            ostena_crypto::sha256::digest_concat(&[BINDING_DOMAIN, &login_session, &len, account]);
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&digest[..16]);
+        Self(out)
+    }
+
+    /// Wraps 16 bytes.
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The 16 bytes.
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
+impl fmt::Debug for Binding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Binding(")?;
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))?;
+        f.write_str(")")
+    }
+}
+
 /// Key identifier: the first 8 bytes of SHA-256 of the public key in its
 /// uncompressed SEC1 form (65 bytes, `0x04 ‖ x ‖ y`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -124,6 +175,28 @@ mod tests {
             format!("{id:?}"),
             "ResourceId(12345678-9abc-def0-0123-456789abcdef)"
         );
+    }
+
+    #[test]
+    fn binding_separates_session_and_account() {
+        let s1 = [1u8; 16];
+        let s2 = [2u8; 16];
+        assert_eq!(Binding::of(s1, "root"), Binding::of(s1, "root"));
+        assert_ne!(Binding::of(s1, "root"), Binding::of(s2, "root"));
+        assert_ne!(Binding::of(s1, "root"), Binding::of(s1, "admin"));
+        // The length prefix keeps the account from sliding into the session.
+        assert_ne!(Binding::of(s1, "a"), Binding::of(s1, "a\0"));
+        // Fixed vector: changing the construction breaks deployed agents.
+        let digest = ostena_crypto::sha256::digest(
+            &[
+                b"ostena-grant-binding-v1\0".as_slice(),
+                &s1,
+                &[0, 4],
+                b"root",
+            ]
+            .concat(),
+        );
+        assert_eq!(Binding::of(s1, "root").to_bytes(), digest[..16]);
     }
 
     #[test]

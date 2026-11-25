@@ -694,7 +694,8 @@ impl Gateway {
 
     /// Opens a native SSH session (ADR-0010): asks the core for a grant for
     /// `access` (`ssh_grant_request`), which must name the subject of the
-    /// certificate and SSH; then the common path ([`Gateway::open_session`]:
+    /// certificate and SSH and be bound to its login session and the account
+    /// asked; then the common path ([`Gateway::open_session`]:
     /// jti consumed here, then by the core); the answer must give the account
     /// asked and the pinned host key of the target.
     ///
@@ -741,6 +742,13 @@ impl Gateway {
         }
         if verified.claims.protocol != ostena_grant::Protocol::Ssh {
             return Err(SessionError::Mismatch("protocole du grant"));
+        }
+        // The grant signs the login session and the account (format v2).
+        let binding = ostena_grant::Binding::of(access.login_session.to_bytes(), &access.account);
+        if verified.claims.binding != binding {
+            return Err(SessionError::Mismatch(
+                "liaison du grant (session de connexion, compte)",
+            ));
         }
         let answer = self.request(&grant, verified).await?;
         if answer.account.as_deref() != Some(access.account.as_str()) {

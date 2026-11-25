@@ -279,6 +279,20 @@ fn a_grant_or_an_answer_that_does_not_match_the_access_is_refused() {
         assert_eq!(refused.code(), "TUN-E010");
         assert!(refused.to_string().contains("compte"), "{refused}");
 
+        // A grant bound to another account (or login session): burned.
+        let mut other_binding = SshResource::new("10.20.0.5", 22, target_key());
+        other_binding.bind_account = Some("admin".into());
+        core.add_ssh_resource("other-binding", other_binding);
+        let refused = gateway
+            .open_ssh_session(&access("root", "other-binding"), now(), &store)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "TUN-E010");
+        assert!(refused.to_string().contains("liaison"), "{refused}");
+        let burned = core.ssh_grants().last().unwrap().clone();
+        let again = gateway.open_session(&burned, now(), &store).await;
+        assert_eq!(again.unwrap_err().code(), "GRT-E010");
+
         // Unknown resource: the core refuses with its code.
         let refused = gateway
             .open_ssh_session(&access("root", "unknown"), now(), &store)

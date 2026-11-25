@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256::SigningKey;
-use ostena_grant::{Claims, GatewayGroupId, Issuer, Protocol, ResourceId, Rights, SubjectId};
+use ostena_grant::{
+    Binding, Claims, GatewayGroupId, Issuer, Protocol, ResourceId, Rights, SubjectId,
+};
 
 fn corpus_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/grant_decode")
@@ -63,6 +65,7 @@ fn write_seed_corpus() {
         protocol: Protocol::Ssh,
         rights: Rights::CLIPBOARD_TO_TARGET,
         max_session_secs: 3600,
+        binding: Binding::of([3; 16], "root"),
     };
     let signed = issuer.issue(&claims, 1_800_000_000 - 10).expect("issued");
     let dir = corpus_dir();

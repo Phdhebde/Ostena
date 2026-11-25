@@ -24,8 +24,8 @@ use tokio::task::JoinHandle;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ostena_grant::{
-    Claims, GatewayGroupId, Issuer, KeySet, Kid, MemoryReplayStore, Protocol, ResourceId, Rights,
-    SignedGrant, SubjectId, Verifier,
+    Binding, Claims, GatewayGroupId, Issuer, KeySet, Kid, MemoryReplayStore, Protocol, ResourceId,
+    Rights, SignedGrant, SubjectId, Verifier,
 };
 
 use crate::control::{AgentMessage, CoreMessage, GrantKey, PROTOCOL_VERSION, SessionProtocol};
@@ -133,6 +133,9 @@ pub struct SshResource {
     pub grant_protocol: Protocol,
     /// Answer another account than the one asked (a faulty core).
     pub answer_account: Option<String>,
+    /// Bind the grant to another account than the one asked (a faulty
+    /// core: the agent burns the grant, `TUN-E010`).
+    pub bind_account: Option<String>,
     /// Answer the session parameters without the target host key (a
     /// faulty core: the agent refuses the message, `TUN-E010`).
     pub omit_target_key: bool,
@@ -149,6 +152,7 @@ impl SshResource {
             grant_subject: None,
             grant_protocol: Protocol::Ssh,
             answer_account: None,
+            bind_account: None,
             omit_target_key: false,
         }
     }
@@ -176,6 +180,7 @@ impl Grants {
         subject: Uuid,
         protocol: Protocol,
         max_session_secs: u32,
+        binding: Binding,
         target: Target,
     ) -> Result<String, TunnelError> {
         let config = |e: ostena_crypto::CryptoError| TunnelError::Config(e.to_string());
@@ -190,6 +195,7 @@ impl Grants {
             protocol,
             rights: Rights::NONE,
             max_session_secs,
+            binding,
         };
         Ok(self
             .issuer
@@ -205,6 +211,7 @@ impl Grants {
         let AgentMessage::SshGrantRequest {
             request_id,
             subject,
+            login_session,
             account,
             resource,
             ..
@@ -230,9 +237,15 @@ impl Grants {
             .lock()
             .ok()
             .and_then(|r| r.get(resource).cloned());
-        let (Some(found), Some(subject)) = (found, Uuid::parse(subject)) else {
+        let (Some(found), Some(subject), Some(login_session)) =
+            (found, Uuid::parse(subject), Uuid::parse(login_session))
+        else {
             return refused("INV-E001", "ressource inconnue de l'inventaire");
         };
+        let binding = Binding::of(
+            login_session.to_bytes(),
+            found.bind_account.as_deref().unwrap_or(account),
+        );
         let target = Target {
             host: found.host.clone(),
             port: found.port,
@@ -247,6 +260,7 @@ impl Grants {
             found.grant_subject.unwrap_or(subject),
             found.grant_protocol,
             found.max_session_secs,
+            binding,
             target,
         ) {
             Ok(grant) => {
@@ -699,9 +713,11 @@ impl TestCore {
             port,
             ssh,
         };
+        // No login session here: bound to the subject and the account.
+        let binding = Binding::of(subject.to_bytes(), "ostena");
         self.state
             .grants
-            .issue(group, subject, protocol, 3600, target)
+            .issue(group, subject, protocol, 3600, binding, target)
     }
 
     /// The authority of the user certificates, pushed in
