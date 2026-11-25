@@ -542,6 +542,21 @@ fn native_ssh_through_the_real_agent() {
         "{text}"
     );
     assert!(text.contains("Identité SSH : prête"), "{text}");
+
+    // A trust the agent cannot apply (no host certificate) withdraws the
+    // identity: no connection before the banner, not even with a valid
+    // certificate of the old user authority.
+    runtime.block_on(core.push_ssh_trust(3, None));
+    assert!(until(|| agent.log.lock().unwrap().iter().any(|l| l
+        .contains("\"event\":\"agent.ssh_identity_refused\"")
+        && l.contains("\"withdrawn\":true"))));
+    let out = ssh(&client, &user, &fresh, port, "root@unknown", "true");
+    assert!(!out.status.success());
+    agent.wait_event("ssh.connection_refused");
+    let out = agent.cli(&["status", "--pid", &agent.child.id().to_string()]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Identité SSH : aucune"), "{text}");
+    assert!(text.contains("version 3 reçue, non applicable"), "{text}");
     stop_cleanly(agent);
 }
 

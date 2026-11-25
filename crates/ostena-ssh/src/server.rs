@@ -160,6 +160,11 @@ impl SshIdentity {
             user_cas,
         })
     }
+
+    /// The authorities the user certificates are checked against.
+    pub fn user_authorities(&self) -> &[VerifyingKey] {
+        &self.user_cas
+    }
 }
 
 /// An access to authorise: who, as which account, on which resource.

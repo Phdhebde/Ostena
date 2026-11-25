@@ -243,7 +243,23 @@ fn ssh_details(ssh: &serde_json::Value) {
             )
         }
         (Some(true), None) => "prête".to_owned(),
-        _ => "pas encore reçue du core (aucune connexion SSH possible)".to_owned(),
+        _ => match ssh["identity_refusal"].as_str() {
+            Some(reason) => format!("aucune : {reason} (aucune connexion SSH possible)"),
+            None => "pas encore reçue du core (aucune connexion SSH possible)".to_owned(),
+        },
+    };
+    let identity = match (
+        ssh["trust_version"].as_u64(),
+        ssh["trust_version_received"].as_u64(),
+    ) {
+        (Some(applied), Some(received)) if applied != received => format!(
+            "{identity}, confiance version {applied} (version {received} reçue, non applicable)"
+        ),
+        (Some(applied), _) => format!("{identity}, confiance version {applied}"),
+        (None, Some(received)) => {
+            format!("{identity}, confiance version {received} reçue, non applicable")
+        }
+        (None, None) => identity,
     };
     say(
         false,

@@ -34,6 +34,8 @@ use tokio::task::JoinHandle;
 const LISTEN_FAILED: &str = "AGT-E010";
 /// Code of revocations lost by the agent.
 const REVOCATIONS_LOST: &str = "SSH-E020";
+/// Code of an identity the agent cannot build from the pushed trust.
+const IDENTITY_REFUSED: &str = "SSH-E018";
 
 /// The agent's link to the core, as the SSH server needs it.
 #[derive(Clone)]
@@ -168,30 +170,6 @@ pub(crate) fn ensure_key(path: &Path, role: &str) -> Result<SecretBytes, String>
     Ok(file)
 }
 
-/// Builds the identity of the server from the pushed trust; `None` without
-/// a host certificate yet.
-fn identity_of(
-    host_key: &SecretBytes,
-    trust: &ostena_tunnel::ssh::SshTrust,
-    now: u64,
-) -> Option<Result<SshIdentity, String>> {
-    let certificate = trust.host_certificate.as_deref()?;
-    Some(
-        keys::load(host_key)
-            .map_err(|e| e.to_string())
-            .and_then(|key| {
-                SshIdentity::new(
-                    key,
-                    certificate,
-                    &trust.host_cas,
-                    trust.user_cas.clone(),
-                    now,
-                )
-                .map_err(|e| e.to_string())
-            }),
-    )
-}
-
 /// Writes the host certificate next to the keys, for the operators
 /// (`ssh-keygen -L -f`): a public file, replaced atomically.
 fn write_host_certificate(path: &Path, certificate: &[u8]) -> std::io::Result<()> {
@@ -209,50 +187,124 @@ fn write_host_certificate(path: &Path, certificate: &[u8]) -> std::io::Result<()
     std::fs::rename(&tmp, path)
 }
 
-/// Follows the trust pushed by the core and publishes the identity of the
-/// server; a certificate that does not fit keeps the previous identity.
-fn follow_trust(
-    mut trust: watch::Receiver<Option<Arc<ostena_tunnel::ssh::SshTrust>>>,
+/// Builds the identity of the server from the pushed trust.
+///
+/// # Errors
+///
+/// No host certificate in the trust, or an identity that cannot be built
+/// (`SSH-E018`): certificate refused, no user authority…
+fn identity_of(
+    host_key: &SecretBytes,
+    trust: &ostena_tunnel::ssh::SshTrust,
+    now: u64,
+) -> Result<SshIdentity, String> {
+    let certificate = trust
+        .host_certificate
+        .as_deref()
+        .ok_or_else(|| "pas de certificat d'hôte dans la confiance poussée".to_owned())?;
+    let key = keys::load(host_key).map_err(|e| e.to_string())?;
+    SshIdentity::new(
+        key,
+        certificate,
+        &trust.host_cas,
+        trust.user_cas.clone(),
+        now,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// The identity of the server as the status shows it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct IdentityState {
+    /// Version of the trust whose identity is in effect.
+    applied: Option<u64>,
+    /// End of validity of the host certificate in effect.
+    valid_before: Option<u64>,
+    /// Why there is no identity since the last push.
+    refusal: Option<String>,
+}
+
+/// Where the identity of the server is published.
+struct IdentitySink {
     host_key: SecretBytes,
     certificate_path: std::path::PathBuf,
     identity: watch::Sender<Option<Arc<SshIdentity>>>,
-    certificate_end: Arc<std::sync::Mutex<Option<u64>>>,
+    state: Arc<std::sync::Mutex<IdentityState>>,
+}
+
+impl IdentitySink {
+    fn set_state(&self, state: IdentityState) {
+        if let Ok(mut slot) = self.state.lock() {
+            *slot = state;
+        }
+    }
+
+    /// Applies `trust` at `now`. Fail closed: a push the agent cannot apply
+    /// (no host certificate, certificate refused, no user authority)
+    /// withdraws the previous identity, with its user authorities; the
+    /// server then refuses every connection before the banner, as without
+    /// identity.
+    fn apply(&self, trust: &ostena_tunnel::ssh::SshTrust, now: u64) {
+        match identity_of(&self.host_key, trust, now) {
+            Ok(built) => {
+                let certificate = trust.host_certificate.as_deref().unwrap_or_default();
+                let end = cert::parse(certificate).ok().map(|c| c.valid_before);
+                self.identity.send_replace(Some(Arc::new(built)));
+                self.set_state(IdentityState {
+                    applied: Some(trust.version),
+                    valid_before: end,
+                    refusal: None,
+                });
+                tracing::info!(
+                    event = "agent.ssh_identity_ready",
+                    trust_version = trust.version,
+                    authorities = trust.user_cas.len(),
+                    host_authorities = trust.host_cas.len(),
+                    valid_before = end,
+                );
+                if let Err(e) = write_host_certificate(&self.certificate_path, certificate) {
+                    tracing::warn!(
+                        event = "agent.ssh_host_certificate_unwritten",
+                        path = %self.certificate_path.display(),
+                        "certificat d'hôte non écrit : {e}"
+                    );
+                }
+            }
+            Err(reason) => {
+                let withdrawn = self.identity.send_replace(None).is_some();
+                self.set_state(IdentityState {
+                    applied: None,
+                    valid_before: None,
+                    refusal: Some(reason.clone()),
+                });
+                // A trust pushed before the host certificate is issued is
+                // the normal start: nothing to report.
+                if withdrawn || trust.host_certificate.is_some() {
+                    tracing::warn!(
+                        event = "agent.ssh_identity_refused",
+                        code = IDENTITY_REFUSED,
+                        trust_version = trust.version,
+                        withdrawn,
+                        "[{IDENTITY_REFUSED}] {reason} ; aucune connexion SSH acceptée jusqu'à \
+                         une confiance applicable"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Follows the trust pushed by the core and publishes the identity of the
+/// server (see [`IdentitySink::apply`]).
+fn follow_trust(
+    mut trust: watch::Receiver<Option<Arc<ostena_tunnel::ssh::SshTrust>>>,
+    sink: IdentitySink,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let current = trust.borrow_and_update().clone();
             if let Some(trust) = current {
-                match identity_of(&host_key, &trust, ostena_grant::unix_now()) {
-                    None => {}
-                    Some(Ok(built)) => {
-                        let certificate = trust.host_certificate.as_deref().unwrap_or_default();
-                        let end = cert::parse(certificate).ok().map(|c| c.valid_before);
-                        if let Ok(mut slot) = certificate_end.lock() {
-                            *slot = end;
-                        }
-                        identity.send_replace(Some(Arc::new(built)));
-                        tracing::info!(
-                            event = "agent.ssh_identity_ready",
-                            trust_version = trust.version,
-                            authorities = trust.user_cas.len(),
-                            host_authorities = trust.host_cas.len(),
-                            valid_before = end,
-                        );
-                        if let Err(e) = write_host_certificate(&certificate_path, certificate) {
-                            tracing::warn!(
-                                event = "agent.ssh_host_certificate_unwritten",
-                                path = %certificate_path.display(),
-                                "certificat d'hôte non écrit : {e}"
-                            );
-                        }
-                    }
-                    Some(Err(e)) => tracing::warn!(
-                        event = "agent.ssh_identity_refused",
-                        code = "SSH-E018",
-                        trust_version = trust.version,
-                        "{e} ; l'identité précédente est gardée"
-                    ),
-                }
+                sink.apply(&trust, ostena_grant::unix_now());
             }
             if trust.changed().await.is_err() {
                 return;
@@ -362,7 +414,7 @@ pub(crate) struct Report {
     server: SshServer<TunnelAuthorizer>,
     listen: Vec<SocketAddr>,
     identity: watch::Receiver<Option<Arc<SshIdentity>>>,
-    certificate_end: Arc<std::sync::Mutex<Option<u64>>>,
+    state: Arc<std::sync::Mutex<IdentityState>>,
     gateway: Arc<OnceLock<Gateway>>,
 }
 
@@ -374,12 +426,18 @@ impl Report {
 
     /// The `ssh` block of the status.
     pub(crate) fn status(&self) -> Value {
+        let state = self.state.lock().map(|s| s.clone()).unwrap_or_default();
         json!({
             "listen": self.listen.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "sessions": self.server.sessions(),
             "identity": self.identity.borrow().is_some(),
-            "host_certificate_valid_before": self.certificate_end.lock().ok().and_then(|e| *e),
-            "trust_version": self.gateway.get().and_then(|g| g.state().versions().ssh_trust),
+            "host_certificate_valid_before": state.valid_before,
+            "identity_refusal": state.refusal,
+            "trust_version": state.applied,
+            "trust_version_received": self
+                .gateway
+                .get()
+                .and_then(|g| g.state().versions().ssh_trust),
         })
     }
 }
@@ -469,15 +527,17 @@ pub(crate) async fn start(
         }));
     }
 
-    let certificate_end = Arc::new(std::sync::Mutex::new(None));
+    let state = Arc::new(std::sync::Mutex::new(IdentityState::default()));
     let mut helpers = Vec::new();
     if let Some(gateway) = core.gateway.get() {
         helpers.push(follow_trust(
             gateway.state().subscribe_ssh_trust(),
-            host,
-            host_certificate,
-            identity_tx,
-            certificate_end.clone(),
+            IdentitySink {
+                host_key: host,
+                certificate_path: host_certificate,
+                identity: identity_tx,
+                state: state.clone(),
+            },
         ));
         helpers.push(tokio::spawn(follow_revocations(
             gateway.subscribe_login_revocations(),
@@ -498,7 +558,7 @@ pub(crate) async fn start(
             server,
             listen,
             identity,
-            certificate_end,
+            state,
             gateway: core.gateway,
         }),
         stop,
@@ -822,5 +882,138 @@ mod tests {
                 .unwrap()
                 .contains(&STANDARD.encode(b"other"))
         );
+    }
+
+    /// A host key, its host authority, and what applying a trust publishes.
+    struct Trusted {
+        sink: IdentitySink,
+        identity: watch::Receiver<Option<Arc<SshIdentity>>>,
+        host: ostena_crypto::p256::VerifyingKey,
+        host_ca: SigningKey,
+        _dir: Dir,
+    }
+
+    impl Trusted {
+        fn new(name: &str) -> Self {
+            let dir = dir(name);
+            let host_key = ensure_key(&dir.0.join("ssh_host_key"), "host").unwrap();
+            let host = keys::decode(&host_key).unwrap().0.verifying_key();
+            let (tx, identity) = watch::channel(None);
+            Self {
+                sink: IdentitySink {
+                    host_key,
+                    certificate_path: dir.0.join("ssh_host_certificate"),
+                    identity: tx,
+                    state: Arc::default(),
+                },
+                identity,
+                host,
+                host_ca: SigningKey::generate().unwrap().0,
+                _dir: dir,
+            }
+        }
+
+        fn certificate(&self, by: &SigningKey, valid_after: u64, valid_before: u64) -> Vec<u8> {
+            cert::issue(
+                &cert::Template {
+                    kind: cert::Kind::Host,
+                    public: self.host,
+                    serial: 1,
+                    key_id: "agent".into(),
+                    principals: vec!["gw01".into()],
+                    valid_after,
+                    valid_before,
+                    critical_options: vec![],
+                    extensions: vec![],
+                },
+                by,
+            )
+            .unwrap()
+        }
+
+        fn trust(
+            &self,
+            version: u64,
+            certificate: Option<Vec<u8>>,
+            user_cas: &[&SigningKey],
+        ) -> ostena_tunnel::ssh::SshTrust {
+            ostena_tunnel::ssh::SshTrust {
+                version,
+                user_cas: user_cas.iter().map(|k| k.verifying_key()).collect(),
+                host_cas: vec![self.host_ca.verifying_key()],
+                host_certificate: certificate,
+            }
+        }
+
+        fn user_cas(&self) -> Option<Vec<ostena_crypto::p256::VerifyingKey>> {
+            self.identity
+                .borrow()
+                .as_ref()
+                .map(|i| i.user_authorities().to_vec())
+        }
+
+        fn state(&self) -> IdentityState {
+            self.sink.state.lock().unwrap().clone()
+        }
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    #[test]
+    fn a_trust_the_agent_cannot_apply_withdraws_the_identity() {
+        let t = Trusted::new("trust-withdrawn");
+        let old_ca = SigningKey::generate().unwrap().0;
+        let new_ca = SigningKey::generate().unwrap().0;
+        let valid = t.certificate(&t.host_ca, NOW - 60, NOW + 86_400);
+
+        // Before the host certificate is issued: no identity, nothing to
+        // withdraw.
+        t.sink.apply(&t.trust(1, None, &[&old_ca]), NOW);
+        assert_eq!(t.user_cas(), None);
+        assert_eq!(t.state().applied, None);
+
+        t.sink
+            .apply(&t.trust(2, Some(valid.clone()), &[&old_ca]), NOW);
+        assert_eq!(t.user_cas(), Some(vec![old_ca.verifying_key()]));
+        assert_eq!(
+            t.state(),
+            IdentityState {
+                applied: Some(2),
+                valid_before: Some(NOW + 86_400),
+                refusal: None
+            }
+        );
+
+        // The same certificate with other user authorities: the new ones
+        // apply.
+        t.sink
+            .apply(&t.trust(3, Some(valid.clone()), &[&new_ca]), NOW);
+        assert_eq!(t.user_cas(), Some(vec![new_ca.verifying_key()]));
+        assert_eq!(t.state().applied, Some(3));
+
+        // Without a host certificate: the old authorities do not stay.
+        t.sink.apply(&t.trust(4, None, &[&new_ca]), NOW);
+        assert_eq!(t.user_cas(), None);
+        let state = t.state();
+        assert_eq!(state.applied, None, "the status shows no applied version");
+        assert!(state.refusal.unwrap().contains("certificat d'hôte"));
+
+        t.sink
+            .apply(&t.trust(5, Some(valid.clone()), &[&new_ca]), NOW);
+        assert!(t.user_cas().is_some());
+        // A certificate signed by another authority: withdrawn as well.
+        let stranger = SigningKey::generate().unwrap().0;
+        let foreign = t.certificate(&stranger, NOW - 60, NOW + 86_400);
+        t.sink.apply(&t.trust(6, Some(foreign), &[&new_ca]), NOW);
+        assert_eq!(t.user_cas(), None);
+        assert!(t.state().refusal.unwrap().contains("SSH-E018"));
+
+        // No user authority: withdrawn too.
+        t.sink
+            .apply(&t.trust(7, Some(valid.clone()), &[&new_ca]), NOW);
+        assert!(t.user_cas().is_some());
+        t.sink.apply(&t.trust(8, Some(valid), &[]), NOW);
+        assert_eq!(t.user_cas(), None);
+        assert_eq!(t.state().applied, None);
     }
 }
