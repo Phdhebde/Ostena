@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO session_transcript (session_id, agent_id, started_at)\n         SELECT s.id, s.agent_id, $3\n         FROM access_session s JOIN access_grant g ON g.jti = s.jti\n         WHERE s.id = $1::text::uuid AND s.agent_id = $2::text::uuid\n           AND s.closed_at IS NULL AND g.protocol = 'ssh'\n         ON CONFLICT (session_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4f01deb834366b1b837ad029395290fd7cf095d2abd235950c5a54eee0d17a63"
+}

@@ -506,6 +506,20 @@ impl russh::server::Handler for EchoTarget {
         if data == b"hold" {
             return Ok(());
         }
+        if data == b"flood" {
+            // Output, then the channel stays open.
+            for _ in 0..8 {
+                session.data(channel, vec![b'x'; 16 * 1024])?;
+            }
+            return Ok(());
+        }
+        if data == b"signal" {
+            // The command is killed.
+            session.exit_signal_request(channel, russh::Sig::KILL, false, "", "")?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            return Ok(());
+        }
         if data == b"open-channels" {
             // A hostile target opens channels towards the agent.
             let handle = session.handle();
@@ -607,6 +621,28 @@ pub struct TestAuthorizer {
     pub delay: Mutex<Option<Duration>>,
     pub requests: Mutex<Vec<ostena_ssh::server::AccessRequest>>,
     pub closed: Mutex<Vec<ostena_ssh::server::SessionSummary>>,
+    /// Transcript streams received, by session.
+    pub transcripts: Arc<Mutex<std::collections::HashMap<[u8; 16], Vec<u8>>>>,
+    /// Drops the transcript queue this long after the authorisation, as a
+    /// lost tunnel does.
+    pub lose_transcript_after: Mutex<Option<Duration>>,
+    /// Never reads the transcript queue, as a core that no longer reads:
+    /// a frame waits this long for room, then the transcript is lost.
+    pub stall_transcript: Mutex<Option<Duration>>,
+}
+
+impl TestAuthorizer {
+    /// The transcript stream of `session`, decoded strictly.
+    pub fn transcript(&self, session: &[u8; 16]) -> Vec<ostena_recorder::Frame> {
+        let bytes = self.transcripts.lock().unwrap().get(session).cloned();
+        let mut decoder = ostena_recorder::Decoder::new(ostena_recorder::Limits::default());
+        decoder.feed(&bytes.unwrap_or_default());
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            frames.push(frame);
+        }
+        frames
+    }
 }
 
 impl ostena_ssh::server::Authorizer for TestAuthorizer {
@@ -634,12 +670,52 @@ impl ostena_ssh::server::Authorizer for TestAuthorizer {
             .lock()
             .unwrap()
             .unwrap_or(Duration::from_secs(3600));
+        let session_id = ostena_crypto::rand::array().unwrap();
+        if let Some(wait) = *self.stall_transcript.lock().unwrap() {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            // Kept open, never read.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                drop(rx);
+            });
+            return Ok(ostena_ssh::server::Authorized {
+                session_id,
+                target,
+                target_host_key: host_key,
+                account: request.account,
+                max_session,
+                transcript: ostena_ssh::transcript::Transcript::with_timeout(tx, wait),
+            });
+        }
+        let (transcript, mut rx) = ostena_ssh::transcript::Transcript::channel(8);
+        let store = self.transcripts.clone();
+        let lose = *self.lose_transcript_after.lock().unwrap();
+        tokio::spawn(async move {
+            let deadline = lose.map(|d| tokio::time::Instant::now() + d);
+            loop {
+                let frame = match deadline {
+                    Some(at) => match tokio::time::timeout_at(at, rx.recv()).await {
+                        Ok(frame) => frame,
+                        Err(_) => return,
+                    },
+                    None => rx.recv().await,
+                };
+                let Some(frame) = frame else { return };
+                store
+                    .lock()
+                    .unwrap()
+                    .entry(session_id)
+                    .or_default()
+                    .extend_from_slice(&frame);
+            }
+        });
         Ok(ostena_ssh::server::Authorized {
-            session_id: ostena_crypto::rand::array().unwrap(),
+            session_id,
             target,
             target_host_key: host_key,
             account: request.account,
             max_session,
+            transcript,
         })
     }
 

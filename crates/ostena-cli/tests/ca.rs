@@ -232,6 +232,32 @@ fn one_share_or_shares_of_another_root_sign_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The command key (ADR-0016): 32 random bytes, private, never overwritten.
+#[test]
+fn key_new_mac_writes_32_private_bytes_once() {
+    let dir = temp("mac");
+    let out = dir.join("mac.key");
+    let first = ostena(&["ca", "key", "new-mac", "--out", s(&out)], "");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let key = std::fs::read(&out).unwrap();
+    assert_eq!(key.len(), 32);
+    assert!(key.iter().any(|b| *b != key[0]));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    let again = ostena(&["ca", "key", "new-mac", "--out", s(&out)], "");
+    assert!(!again.status.success());
+    assert_eq!(std::fs::read(&out).unwrap(), key);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn root_init_needs_two_media_and_never_overwrites() {
     let dir = temp("guard");

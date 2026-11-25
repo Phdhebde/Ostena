@@ -89,6 +89,14 @@ pub struct CoreSshConfig {
     /// after two thirds.
     #[serde(default = "default_host_certificate_days")]
     pub host_certificate_days: u32,
+    /// Directory of the session transcripts (ADR-0016), absolute: one
+    /// asciicast file per session, created by the core, read-only once
+    /// sealed. Every SSH session is recorded there.
+    pub transcripts_dir: PathBuf,
+    /// The 256-bit key of the keyed hash of the commands (HMAC-SHA-256,
+    /// `access.ssh_exec`, ADR-0016): exactly 32 random bytes
+    /// (`ostena ca key new-mac`). One use, like every key of the core.
+    pub command_mac_key: KeySource,
 }
 
 /// Default port of the SSH server of the agents, written into the
@@ -314,6 +322,7 @@ impl CoreConfig {
         if let Some(ssh) = &self.ssh {
             keys.push(("core.ssh.user_ca_key", &ssh.user_ca_key));
             keys.push(("core.ssh.host_ca_key", &ssh.host_ca_key));
+            keys.push(("core.ssh.command_mac_key", &ssh.command_mac_key));
         }
         if let Some(login) = &self.login {
             keys.push(("core.login.totp_key", &login.totp_key));
@@ -497,6 +506,7 @@ fn key_rules(core: &CoreConfig, out: &mut Vec<Violation>) {
         }
     }
     if let Some(ssh) = &core.ssh {
+        path_rule(out, "core.ssh.transcripts_dir", &ssh.transcripts_dir);
         bounds(
             out,
             "core.ssh.host_certificate_days",

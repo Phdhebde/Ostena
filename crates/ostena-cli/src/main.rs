@@ -544,6 +544,10 @@ enum AuditCommand {
         /// must contain the record it covers.
         #[arg(long = "head")]
         heads: Vec<String>,
+        /// Directory of the session transcripts: each transcript sealed in
+        /// the export must be there and match its seal (ADR-0016).
+        #[arg(long)]
+        transcripts: Option<PathBuf>,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -650,6 +654,13 @@ enum KeyCommand {
         /// Public key file to carry to the ceremony.
         #[arg(long)]
         public_out: PathBuf,
+    },
+    /// Generate the 256-bit key of the keyed hash of the commands
+    /// (`core.ssh.command_mac_key`): 32 random bytes, mode 0600.
+    NewMac {
+        /// Key file to create.
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -915,6 +926,9 @@ fn run_ca(command: CaCommand) -> ExitCode {
                     public_out,
                 },
         } => ca::key_new(&key_out, &public_out),
+        CaCommand::Key {
+            command: KeyCommand::NewMac { out },
+        } => ca::mac_key_new(&out),
         CaCommand::Issuing {
             command:
                 SignCommand::Sign {
@@ -961,6 +975,7 @@ fn run_audit(command: AuditCommand) -> ExitCode {
             export,
             keys,
             heads,
+            transcripts,
             json,
             clock_tolerance_ms,
             head_gap_tolerance_secs,
@@ -968,6 +983,7 @@ fn run_audit(command: AuditCommand) -> ExitCode {
             export: &export,
             keys: &keys,
             heads: &heads,
+            transcripts: transcripts.as_deref(),
             json,
             clock_tolerance_ms,
             head_gap_tolerance_secs,

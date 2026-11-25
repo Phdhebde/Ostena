@@ -16,7 +16,7 @@ use crate::AuditError;
 use crate::export::{ExportReader, Frame};
 use crate::head::{Head, TrustedKeys};
 use crate::ids::ChainId;
-use crate::record::{Digest, Record, ZERO_DIGEST, record_hash};
+use crate::record::{Digest, Record, Value, ZERO_DIGEST, record_hash};
 
 /// Largest number of findings kept in a report; the others are only counted.
 pub const MAX_FINDINGS: usize = 1000;
@@ -124,6 +124,215 @@ pub enum Finding {
         /// Accepted age, seconds.
         allowed_secs: u64,
     },
+    /// `AUD-E017`: a transcript sealed in the chain is absent from the
+    /// transcript directory.
+    TranscriptMissing {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+    },
+    /// `AUD-E018`: a transcript differs from its seal (size or SHA-256).
+    TranscriptAltered {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+    },
+    /// `AUD-W005`: a transcript file without a seal in the export (not
+    /// sealed yet, sealed outside the export, or added).
+    TranscriptUnsealed {
+        /// Its file name.
+        file: String,
+    },
+    /// `AUD-E019`: an SSH session opened in the export (`access.session_opened`)
+    /// whose transcript is not sealed in it, though the session must have
+    /// ended before the export.
+    TranscriptNeverSealed {
+        /// The file its transcript would have.
+        file: String,
+        /// Seq of `access.session_opened`.
+        seq: u64,
+    },
+    /// `AUD-W007`: an SSH session opened in the export, not sealed in it,
+    /// that may still have been running at export time.
+    TranscriptPending {
+        /// The file its transcript would have.
+        file: String,
+        /// Seq of `access.session_opened`.
+        seq: u64,
+    },
+    /// `AUD-E020`: a `transcript.sealed` record that is malformed, or a
+    /// second seal for the same session.
+    TranscriptSealInvalid {
+        /// Seq of the record.
+        seq: u64,
+        /// What is wrong.
+        why: &'static str,
+    },
+    /// `AUD-W008`: a transcript seal not covered by a signed head: the
+    /// record may still be changed with its file.
+    TranscriptSealUncovered {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+    },
+    /// `AUD-W006`: a transcript sealed as incomplete (stream cut, core
+    /// stopped): it is intact, but the session may not be in full.
+    TranscriptIncomplete {
+        /// Its file name.
+        file: String,
+        /// Seq of its seal.
+        seq: u64,
+        /// Why (`REC-E…`).
+        code: String,
+    },
+}
+
+/// An SSH session opened in the export (`access.session_opened`): its
+/// transcript must be sealed once it ends (ADR-0016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshSession {
+    /// Seq of the record.
+    pub seq: u64,
+    /// The access session.
+    pub session: [u8; 16],
+    /// Time of the record, Unix milliseconds.
+    pub opened_ms: u64,
+    /// Its maximum length, seconds.
+    pub max_session_secs: u64,
+}
+
+impl SshSession {
+    /// The SSH session opened by `record`, if it is an
+    /// `access.session_opened` record of SSH (every session of the jalon
+    /// M1; a record without a protocol is one).
+    fn of(record: &Record) -> Option<Self> {
+        if record.event != "access.session_opened" {
+            return None;
+        }
+        let get = |name: &str| {
+            record
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| &f.value)
+        };
+        match get(crate::field::PROTOCOL) {
+            None => {}
+            Some(Value::Text(p)) if p == "ssh" => {}
+            Some(_) => return None,
+        }
+        let session = match get(crate::field::ACCESS_SESSION)? {
+            Value::Uuid(u) => *u,
+            _ => return None,
+        };
+        let max_session_secs = match get(crate::field::MAX_SESSION_SECS) {
+            Some(Value::U64(n)) => *n,
+            _ => u64::MAX,
+        };
+        Some(Self {
+            seq: record.seq,
+            session,
+            opened_ms: record.time_ms,
+            max_session_secs,
+        })
+    }
+
+    /// When it ended at the latest, with `margin_ms` for the end of its
+    /// transcript.
+    pub fn ended_by_ms(&self, margin_ms: u64) -> u64 {
+        self.opened_ms
+            .saturating_add(self.max_session_secs.saturating_mul(1000))
+            .saturating_add(margin_ms)
+    }
+
+    /// The file name of its transcript.
+    pub fn file_name(&self) -> String {
+        file_name(&self.session)
+    }
+}
+
+/// The file name of the transcript of `session`: `<uuid>.cast`.
+fn file_name(session: &[u8; 16]) -> String {
+    let h = |range: std::ops::Range<usize>| {
+        session[range].iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    };
+    format!(
+        "{}-{}-{}-{}-{}.cast",
+        h(0..4),
+        h(4..6),
+        h(6..8),
+        h(8..10),
+        h(10..16)
+    )
+}
+
+/// A transcript seal read from a `transcript.sealed` record (ADR-0016).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptSeal {
+    /// Seq of the record.
+    pub seq: u64,
+    /// The access session, which names the file (`<uuid>.cast`).
+    pub session: [u8; 16],
+    /// Size and SHA-256 of the file; `None` when the core wrote no file
+    /// (it could not be created, or was gone): the file must then be
+    /// absent.
+    pub digest: Option<(u64, [u8; 32])>,
+    /// Ended by its end frame.
+    pub complete: bool,
+    /// Why it is incomplete.
+    pub code: Option<String>,
+}
+
+impl TranscriptSeal {
+    /// The seal carried by `record`, if it is a well-formed
+    /// `transcript.sealed` record.
+    fn of(record: &Record) -> Option<Self> {
+        if record.event != "transcript.sealed" {
+            return None;
+        }
+        let get = |name: &str| {
+            record
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| &f.value)
+        };
+        let session = match get(crate::field::ACCESS_SESSION)? {
+            Value::Uuid(u) => *u,
+            _ => return None,
+        };
+        let digest = match (get(crate::field::SIZE), get(crate::field::SHA256)) {
+            (Some(Value::U64(size)), Some(Value::Bytes(b))) => {
+                Some((*size, <[u8; 32]>::try_from(b.as_slice()).ok()?))
+            }
+            (None, None) => None,
+            _ => return None,
+        };
+        let complete = matches!(get(crate::field::COMPLETE), Some(Value::Bool(true)));
+        let code = match get(crate::field::CODE) {
+            Some(Value::Text(t)) => Some(t.clone()),
+            _ => None,
+        };
+        Some(Self {
+            seq: record.seq,
+            session,
+            digest,
+            complete,
+            code,
+        })
+    }
+
+    /// The file name of the transcript: `<uuid>.cast`.
+    pub fn file_name(&self) -> String {
+        file_name(&self.session)
+    }
 }
 
 impl Finding {
@@ -142,6 +351,14 @@ impl Finding {
             Self::ClockBackwards { .. } => "AUD-W002",
             Self::HeadGap { .. } => "AUD-W003",
             Self::StaleHead { .. } => "AUD-W004",
+            Self::TranscriptMissing { .. } => "AUD-E017",
+            Self::TranscriptAltered { .. } => "AUD-E018",
+            Self::TranscriptUnsealed { .. } => "AUD-W005",
+            Self::TranscriptIncomplete { .. } => "AUD-W006",
+            Self::TranscriptNeverSealed { .. } => "AUD-E019",
+            Self::TranscriptPending { .. } => "AUD-W007",
+            Self::TranscriptSealInvalid { .. } => "AUD-E020",
+            Self::TranscriptSealUncovered { .. } => "AUD-W008",
         }
     }
 
@@ -151,7 +368,11 @@ impl Finding {
             Self::UncoveredTail { .. }
             | Self::ClockBackwards { .. }
             | Self::HeadGap { .. }
-            | Self::StaleHead { .. } => Severity::Warning,
+            | Self::StaleHead { .. }
+            | Self::TranscriptUnsealed { .. }
+            | Self::TranscriptIncomplete { .. }
+            | Self::TranscriptPending { .. }
+            | Self::TranscriptSealUncovered { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -228,6 +449,25 @@ impl fmt::Display for Finding {
                 "[{code}] export partiel commençant à l'enregistrement n° {first_seq} sans tête \
                  d'ancrage de confiance qui le précède directement"
             ),
+            Self::TranscriptMissing { file, seq } => write!(
+                f,
+                "[{code}] transcript {file} scellé par l'enregistrement n° {seq}, absent du \
+                 répertoire"
+            ),
+            Self::TranscriptAltered { file, seq } => write!(
+                f,
+                "[{code}] transcript {file} différent de son sceau (enregistrement n° {seq}) : \
+                 taille ou SHA-256"
+            ),
+            Self::TranscriptSealInvalid { seq, why } => write!(
+                f,
+                "[{code}] sceau de transcript invalide à l'enregistrement n° {seq} : {why}"
+            ),
+            Self::TranscriptNeverSealed { file, seq } => write!(
+                f,
+                "[{code}] session SSH ouverte (enregistrement n° {seq}) sans transcript scellé \
+                 dans l'export, alors qu'elle était forcément terminée : {file}"
+            ),
             _ => self.fmt_warning(f, code),
         }
     }
@@ -267,6 +507,30 @@ impl Finding {
                 f,
                 "[{code}] la dernière tête (n° {head_no}) a {age_secs} s au moment de l'export, \
                  plus que deux battements ({allowed_secs} s) : fin de chaîne peut-être tronquée"
+            ),
+            Self::TranscriptUnsealed { file } => write!(
+                f,
+                "[{code}] transcript {file} sans sceau dans l'export (pas encore scellé, scellé \
+                 hors de l'export, ou ajouté)"
+            ),
+            Self::TranscriptIncomplete {
+                file,
+                seq,
+                code: why,
+            } => write!(
+                f,
+                "[{code}] transcript {file} scellé incomplet (enregistrement n° {seq}, {why}) : \
+                 intact, mais la session n'y est peut-être pas en entier"
+            ),
+            Self::TranscriptSealUncovered { file, seq } => write!(
+                f,
+                "[{code}] sceau du transcript {file} (enregistrement n° {seq}) non couvert par \
+                 une tête signée : attendre la tête suivante et réexporter"
+            ),
+            Self::TranscriptPending { file, seq } => write!(
+                f,
+                "[{code}] session SSH ouverte (enregistrement n° {seq}) sans transcript scellé \
+                 dans l'export, peut-être encore en cours à l'export : {file}"
             ),
             // Errors are written by `Display::fmt`.
             _ => write!(f, "[{code}]"),
@@ -316,9 +580,28 @@ pub struct Report {
     pub errors: u64,
     /// Warnings found, beyond the cap included.
     pub warnings: u64,
+    /// The transcript seals of the export, in chain order, for
+    /// [`crate::transcripts::check`].
+    pub transcripts: Vec<TranscriptSeal>,
+    /// The SSH sessions opened in the export, in chain order, for
+    /// [`crate::transcripts::check`].
+    pub ssh_sessions: Vec<SshSession>,
+    /// Time of the export, Unix milliseconds, when known.
+    pub export_time_ms: Option<u64>,
 }
 
 impl Report {
+    /// Adds a finding found outside the chain (transcripts).
+    pub fn add(&mut self, finding: Finding) {
+        match finding.severity() {
+            Severity::Error => self.errors += 1,
+            Severity::Warning => self.warnings += 1,
+        }
+        if self.findings.len() < MAX_FINDINGS {
+            self.findings.push(finding);
+        }
+    }
+
     /// 0: intact and covered; 1: at least one error; 2: warnings only.
     pub fn exit_code(&self) -> u8 {
         if self.errors > 0 {
@@ -379,6 +662,10 @@ pub struct Verifier {
     findings: Vec<Finding>,
     errors: u64,
     warnings: u64,
+    transcripts: Vec<TranscriptSeal>,
+    /// Sessions sealed so far: a second seal is an error.
+    sealed_sessions: std::collections::HashSet<[u8; 16]>,
+    ssh_sessions: Vec<SshSession>,
 }
 
 impl Verifier {
@@ -404,6 +691,9 @@ impl Verifier {
             findings: Vec::new(),
             errors: 0,
             warnings: 0,
+            transcripts: Vec::new(),
+            sealed_sessions: std::collections::HashSet::new(),
+            ssh_sessions: Vec::new(),
         };
         for head in options.external_heads {
             match head.verify(&verifier.keys) {
@@ -527,6 +817,31 @@ impl Verifier {
         Ok(())
     }
 
+    /// Keeps the SSH sessions opened and the transcript seals of the export
+    /// (ADR-0016); a malformed seal, or a second one for a session, is an
+    /// error (`AUD-E020`).
+    fn collect_transcripts(&mut self, first: &mut Option<Finding>, record: &Record) {
+        if record.event == "transcript.sealed" {
+            let why = match TranscriptSeal::of(record) {
+                Some(seal) if self.sealed_sessions.insert(seal.session) => {
+                    self.transcripts.push(seal);
+                    return;
+                }
+                Some(_) => "second sceau pour la même session",
+                None => "champs absents ou mal formés",
+            };
+            self.flag(
+                first,
+                Finding::TranscriptSealInvalid {
+                    seq: record.seq,
+                    why,
+                },
+            );
+        } else if let Some(opened) = SshSession::of(record) {
+            self.ssh_sessions.push(opened);
+        }
+    }
+
     /// Checks the next record and returns its hash.
     ///
     /// # Errors
@@ -606,6 +921,7 @@ impl Verifier {
                 }
                 self.last_time_ms = Some(record.time_ms);
                 self.check_external(&mut first, record.seq, &hash);
+                self.collect_transcripts(&mut first, &record);
                 record.seq
             }
         };
@@ -765,6 +1081,9 @@ impl Verifier {
             findings: self.findings,
             errors: self.errors,
             warnings: self.warnings,
+            transcripts: self.transcripts,
+            ssh_sessions: self.ssh_sessions,
+            export_time_ms,
         }
     }
 }

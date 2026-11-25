@@ -403,11 +403,12 @@ fn native_session_with_a_certificate_reaches_the_target() {
     let opened = events_on(n.agent.addr, "ssh.session_opened");
     assert_eq!(opened.len(), 1);
     assert_eq!(opened[0].field("account"), "root");
-    // The command is logged by its length and digest, never its text.
+    // The command is logged by its length only, never its text nor a
+    // plain digest (ADR-0016): the text is in the transcript.
     let exec = events_on(n.agent.addr, "ssh.exec");
     assert_eq!(exec.len(), 1);
     assert_eq!(exec[0].field("length"), "11");
-    assert_eq!(exec[0].field("sha256").len(), 64);
+    assert!(!exec[0].fields.contains_key("sha256"));
     assert!(exec[0].fields.values().all(|v| !v.contains("hello")));
     let mut closed = Vec::new();
     for _ in 0..100 {
@@ -419,6 +420,33 @@ fn native_session_with_a_certificate_reaches_the_target() {
     }
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].bytes_from_target, 16);
+    // The transcript: the command, the output relayed, the end.
+    let frames = n.agent.authorizer.transcript(&closed[0].session_id);
+    assert!(matches!(
+        &frames[0].event,
+        ostena_recorder::Event::Start { command: Some(c), .. } if c == b"hello world"
+    ));
+    let output: Vec<u8> = frames
+        .iter()
+        .filter_map(|f| match &f.event {
+            ostena_recorder::Event::Output(d) => Some(d.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(output, b"ran:hello world\n");
+    // The exit status of the target, before the end.
+    assert_eq!(
+        frames[frames.len() - 2].event,
+        ostena_recorder::Event::Exit(ostena_recorder::Exit::Status(0))
+    );
+    assert_eq!(
+        frames.last().unwrap().event,
+        ostena_recorder::Event::End {
+            reason: ostena_recorder::EndReason::Closed,
+            output_bytes: 16
+        }
+    );
     for _ in 0..100 {
         if n.agent.server.sessions() == 0 {
             break;
@@ -890,6 +918,104 @@ fn a_revocation_during_the_authorisation_cuts_the_session() {
     assert_eq!(closed.len(), 1);
     assert_eq!(closed[0].reason, "révoquée");
     assert!(!wait_event(n.agent.addr, "ssh.session_revoked").is_empty());
+}
+
+/// Fail closed (ADR-0016): a session whose transcript can no longer reach
+/// the core is cut, and its end says why.
+#[test]
+fn a_session_whose_transcript_is_lost_is_cut() {
+    let runtime = runtime();
+    let Some(n) = native(
+        &runtime,
+        "native-transcript-lost",
+        ServerSettings::default(),
+    ) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    *n.agent.authorizer.lose_transcript_after.lock().unwrap() =
+        Some(std::time::Duration::from_secs(1));
+    let started = std::time::Instant::now();
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["hold"]);
+    assert!(!out.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    let lost = wait_event(n.agent.addr, "ssh.transcript_lost");
+    assert_eq!(lost[0].code, "SSH-E021");
+    let closed = wait_closed(&n, 1);
+    assert_eq!(closed[0].reason, "transcript perdu");
+}
+
+/// A transcript lost before the shell starts: the session is cut, and the
+/// journal says the transcript was lost, not that a channel was refused.
+#[test]
+fn a_transcript_lost_before_the_start_is_logged_as_lost() {
+    let runtime = runtime();
+    let Some(n) = native(
+        &runtime,
+        "native-transcript-lost-early",
+        ServerSettings::default(),
+    ) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    *n.agent.authorizer.lose_transcript_after.lock().unwrap() = Some(std::time::Duration::ZERO);
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["hold"]);
+    assert!(!out.status.success());
+    let lost = wait_event(n.agent.addr, "ssh.transcript_lost");
+    assert_eq!(lost[0].code, "SSH-E021");
+    assert_eq!(wait_closed(&n, 1)[0].reason, "transcript perdu");
+    assert!(events_on(n.agent.addr, "ssh.channel_refused").is_empty());
+}
+
+/// The exit signal of the target is relayed and recorded.
+#[test]
+fn the_exit_signal_is_recorded() {
+    let runtime = runtime();
+    let Some(n) = native(&runtime, "native-exit-signal", ServerSettings::default()) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["signal"]);
+    assert!(!out.status.success());
+    let closed = wait_closed(&n, 1);
+    let frames = n.agent.authorizer.transcript(&closed[0].session_id);
+    assert!(
+        frames.iter().any(|f| f.event
+            == ostena_recorder::Event::Exit(ostena_recorder::Exit::Signal {
+                name: "KILL".into(),
+                core_dumped: false
+            })),
+        "{frames:?}"
+    );
+}
+
+/// A core that no longer reads the transcript (ADR-0016): the output
+/// waits, then the session is cut in the delay, and its permit and report
+/// are given back.
+#[test]
+fn a_session_whose_transcript_is_not_read_is_cut_in_the_delay() {
+    let runtime = runtime();
+    let Some(n) = native(
+        &runtime,
+        "native-transcript-stalled",
+        ServerSettings::default(),
+    ) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    *n.agent.authorizer.stall_transcript.lock().unwrap() = Some(std::time::Duration::from_secs(1));
+    let started = std::time::Instant::now();
+    let out = n.run("root@srv-lab01", Some(&certificate), &[], &["flood"]);
+    assert!(!out.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    // Not one byte reached the user unrecorded.
+    assert!(out.stdout.is_empty(), "{} octets", out.stdout.len());
+    let lost = wait_event(n.agent.addr, "ssh.transcript_lost");
+    assert_eq!(lost[0].code, "SSH-E021");
+    let closed = wait_closed(&n, 1);
+    assert_eq!(closed[0].reason, "transcript perdu");
+    assert_eq!(n.agent.server.sessions(), 0);
+    assert_eq!(n.agent.server.in_progress(), 0);
 }
 
 #[test]

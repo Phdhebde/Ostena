@@ -126,6 +126,15 @@ event_kinds! {
     /// A gateway group was created or changed (name, SSH host names,
     /// scope policy).
     GatewayGroupUpdated => "gateway_group.updated",
+    /// The command of an SSH `exec`, by its keyed hash and length
+    /// (ADR-0016): its text is in the transcript.
+    AccessSshExec => "access.ssh_exec",
+    /// A session transcript was sealed: its file, SHA-256 and size, complete
+    /// or not (ADR-0016).
+    TranscriptSealed => "transcript.sealed",
+    /// A transcript stream was refused (unknown session, malformed, limit,
+    /// storage).
+    TranscriptRefused => "transcript.refused",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -241,6 +250,22 @@ pub mod field {
     pub const HMAC: &str = "hmac";
     /// End of an account lockout, Unix seconds.
     pub const LOCKED_UNTIL: &str = "locked_until";
+    /// SHA-256 of a file (transcript).
+    pub const SHA256: &str = "sha256";
+    /// Size of a file, in bytes.
+    pub const SIZE: &str = "size";
+    /// Number of events (transcript lines after the header).
+    pub const EVENTS: &str = "events";
+    /// Invalid UTF-8 sequences replaced by U+FFFD.
+    pub const INVALID_UTF8: &str = "invalid_utf8";
+    /// Bytes of output recorded.
+    pub const OUTPUT_BYTES: &str = "output_bytes";
+    /// Keyed hash (HMAC-SHA-256) of a command.
+    pub const COMMAND_HMAC: &str = "command_hmac";
+    /// Length, in bytes.
+    pub const LENGTH: &str = "length";
+    /// Whether a transcript is complete (ended by its end frame).
+    pub const COMPLETE: &str = "complete";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -298,6 +323,14 @@ pub mod field {
         REVOKED_SESSIONS,
         HMAC,
         LOCKED_UNTIL,
+        SHA256,
+        SIZE,
+        EVENTS,
+        INVALID_UTF8,
+        OUTPUT_BYTES,
+        COMMAND_HMAC,
+        LENGTH,
+        COMPLETE,
     ];
 }
 
@@ -467,7 +500,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 46);
+        assert_eq!(names.len(), 49);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

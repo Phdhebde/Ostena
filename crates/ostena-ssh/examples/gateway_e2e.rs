@@ -118,13 +118,19 @@ impl Authorizer for ViaGateway {
             .open_ssh_session(&access, ostena_grant::unix_now(), &self.store)
             .await
         {
-            Ok(session) => Ok(Authorized {
-                session_id: session.session.session_id.to_bytes(),
-                target: session.session.target,
-                target_host_key: session.target_host_key,
-                account: session.account,
-                max_session: Duration::from_secs(session.session.max_session_secs.into()),
-            }),
+            Ok(session) => {
+                let (transcript, rx) =
+                    ostena_ssh::transcript::Transcript::channel(ostena_tunnel::recording::QUEUE);
+                tokio::spawn(ostena_tunnel::recording::pump(rx, session.recording));
+                Ok(Authorized {
+                    session_id: session.session.session_id.to_bytes(),
+                    target: session.session.target,
+                    target_host_key: session.target_host_key,
+                    account: session.account,
+                    max_session: Duration::from_secs(session.session.max_session_secs.into()),
+                    transcript,
+                })
+            }
             Err(e) => Err(Refusal {
                 code: e.code(),
                 message: e.to_string(),

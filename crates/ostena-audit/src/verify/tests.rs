@@ -542,3 +542,63 @@ fn every_finding_displays_its_code() {
         );
     }
 }
+
+impl Chain {
+    fn event(&mut self, event: Event) -> Item {
+        self.time_ms += 1000;
+        let appended = self.tip.append(event, self.time_ms).unwrap();
+        self.records.push((appended.seq, appended.body.clone()));
+        Item::Record(appended.body)
+    }
+}
+
+fn sealed(session: u8) -> Event {
+    Event::new(
+        EventKind::TranscriptSealed,
+        Outcome::Success,
+        ActorKind::Agent,
+        "agent",
+    )
+    .uuid(crate::field::ACCESS_SESSION, [session; 16])
+    .bytes(crate::field::SHA256, [0u8; 32])
+    .u64(crate::field::SIZE, 0)
+    .bool(crate::field::COMPLETE, true)
+}
+
+/// A malformed seal, or a second seal for one session, is an error; the
+/// sessions opened and the seals are collected for the transcript check.
+#[test]
+fn transcript_seals_are_well_formed_and_unique() {
+    let mut chain = Chain::new();
+    let opened = Event::new(
+        EventKind::AccessSessionOpened,
+        Outcome::Success,
+        ActorKind::User,
+        "user",
+    )
+    .uuid(crate::field::ACCESS_SESSION, [1; 16])
+    .text(crate::field::PROTOCOL, "ssh")
+    .u64(crate::field::MAX_SESSION_SECS, 60);
+    // Half a digest: a size without a SHA-256.
+    let half = Event::new(
+        EventKind::TranscriptSealed,
+        Outcome::Success,
+        ActorKind::Agent,
+        "agent",
+    )
+    .uuid(crate::field::ACCESS_SESSION, [2; 16])
+    .u64(crate::field::SIZE, 3);
+    let items = vec![
+        chain.event(opened),
+        chain.event(sealed(1)),
+        chain.event(sealed(1)),
+        chain.event(half),
+        chain.head(),
+    ];
+    let report = chain.verify(&items, 1, Options::default());
+    assert_eq!(codes(&report), ["AUD-E020", "AUD-E020"]);
+    assert_eq!(report.transcripts.len(), 1);
+    assert_eq!(report.ssh_sessions.len(), 1);
+    assert_eq!(report.ssh_sessions[0].session, [1; 16]);
+    assert!(report.export_time_ms.is_some());
+}

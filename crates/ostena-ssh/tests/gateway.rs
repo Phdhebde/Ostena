@@ -241,6 +241,114 @@ fn ssh_session_consumes_the_jti_on_both_sides() {
     });
 }
 
+/// The transcript stream of an SSH session reaches the core, finished;
+/// once the connection is lost, the transcript of a live session sees it
+/// at once (fail closed, ADR-0016).
+#[test]
+fn the_transcript_reaches_the_core_and_its_loss_is_seen() {
+    use ostena_recorder::{Decoder, EndReason, Limits as RecLimits};
+    use ostena_ssh::transcript::Transcript;
+    use ostena_tunnel::recording::{QUEUE, pump};
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("transcript");
+        let gateway = agent(&core, &dir, allow(&["10.0.0.0/8"])).await;
+        push(&core, &gateway, allow(&["10.20.0.0/16"]), true).await;
+        core.add_ssh_resource("srv-lab01", SshResource::new("10.20.0.5", 22, target_key()));
+        let store = MemoryReplayStore::new();
+
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let id = session.session.session_id;
+        let (transcript, rx) = Transcript::channel(QUEUE);
+        let pumped = tokio::spawn(pump(rx, session.recording));
+        transcript.start(None, Some(b"uname -a")).await.unwrap();
+        transcript.output(b"Linux srv-lab01\n").await.unwrap();
+        transcript.end(EndReason::Closed).await.unwrap();
+        drop(transcript);
+        pumped.await.unwrap().unwrap();
+        let (bytes, finished) = core.recording(id).unwrap();
+        assert!(finished);
+        let mut decoder = Decoder::new(RecLimits::default());
+        decoder.feed(&bytes);
+        let mut frames = 0;
+        while decoder.next_frame().unwrap().is_some() {
+            frames += 1;
+        }
+        decoder.finish().unwrap();
+        assert_eq!(frames, 3);
+
+        // A live session, then the core goes away.
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let (transcript, rx) = Transcript::channel(QUEUE);
+        let pumped = tokio::spawn(pump(rx, session.recording));
+        transcript.start(None, None).await.unwrap();
+        core.stop();
+        tokio::time::timeout(Duration::from_secs(20), transcript.closed())
+            .await
+            .expect("loss of the tunnel seen by the transcript");
+        assert!(pumped.await.unwrap().is_err());
+        assert_eq!(
+            transcript.output(b"x").await.unwrap_err().code(),
+            "SSH-E021"
+        );
+    });
+}
+
+/// A core that accepts the transcript stream but no longer reads it: the
+/// pump gives up after its write delay, resets the stream, and the
+/// transcript is lost (the session is cut).
+#[test]
+fn a_transcript_the_core_does_not_read_is_lost_in_the_delay() {
+    use ostena_ssh::transcript::Transcript;
+    use ostena_tunnel::recording::pump_with;
+    run(async {
+        let core = TestCore::start(
+            Limits::default(),
+            Behaviour {
+                stall_recordings: true,
+                ..Behaviour::default()
+            },
+        )
+        .unwrap();
+        let dir = dir("transcript-stalled");
+        let gateway = agent(&core, &dir, allow(&["10.0.0.0/8"])).await;
+        push(&core, &gateway, allow(&["10.20.0.0/16"]), true).await;
+        core.add_ssh_resource("srv-lab01", SshResource::new("10.20.0.5", 22, target_key()));
+        let store = MemoryReplayStore::new();
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let transcript = Transcript::with_timeout(tx, Duration::from_secs(30));
+        let pumped = tokio::spawn(pump_with(rx, session.recording, Duration::from_millis(500)));
+        transcript.start(None, None).await.unwrap();
+        let started = std::time::Instant::now();
+        let writer = tokio::spawn({
+            let transcript = transcript.clone();
+            async move {
+                // Far beyond the window of the stream.
+                for _ in 0..64 {
+                    transcript.output(&[b'x'; 16 * 1024]).await?;
+                }
+                Ok::<_, ostena_ssh::SshError>(())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), transcript.closed())
+            .await
+            .expect("transcript lost in the delay");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(pumped.await.unwrap().is_err());
+        assert_eq!(writer.await.unwrap().unwrap_err().code(), "SSH-E021");
+    });
+}
+
 #[test]
 fn a_grant_or_an_answer_that_does_not_match_the_access_is_refused() {
     run(async {
@@ -278,6 +386,15 @@ fn a_grant_or_an_answer_that_does_not_match_the_access_is_refused() {
             .unwrap_err();
         assert_eq!(refused.code(), "TUN-E010");
         assert!(refused.to_string().contains("compte"), "{refused}");
+        // The core opened that session: the agent closes it there. The
+        // refusals before it opened nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while core.sessions_closed().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let closed = core.sessions_closed();
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert!(closed[0].1.contains("compte"), "{closed:?}");
 
         // A grant bound to another account (or login session): burned.
         let mut other_binding = SshResource::new("10.20.0.5", 22, target_key());

@@ -43,7 +43,9 @@ use crate::error::CoreError;
 use crate::grant_keys::GrantAuthority;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
+use crate::transcripts::{self, Transcripts};
 use crate::{login, pushes, rate};
+use ostena_crypto::hmac::HmacKey;
 
 /// Full reload of the registry copy.
 pub const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
@@ -87,6 +89,9 @@ pub struct Keys {
     pub ssh: Option<Arc<SshAuthorities>>,
     /// The key of the TOTP secrets, if `[core.login]` is set (ADR-0010).
     pub totp: Option<Arc<TotpKey>>,
+    /// The transcript directory and the command key, with `[core.ssh]`
+    /// (ADR-0016): no SSH without them.
+    pub transcripts: Option<Arc<Transcripts>>,
 }
 
 impl std::fmt::Debug for Keys {
@@ -103,6 +108,27 @@ fn read(path: &Path) -> Result<Vec<u8>, CoreError> {
 
 /// Reads a private key: a plain file (`CFG-P012`), or a systemd credential
 /// from `credentials` (`$CREDENTIALS_DIRECTORY`).
+/// The transcript directory and the command key of `[core.ssh]`
+/// (ADR-0016): no SSH without them.
+fn load_transcripts(
+    config: &CoreConfig,
+    credentials: Option<&Path>,
+) -> Result<Option<Arc<Transcripts>>, CoreError> {
+    let Some(ssh) = &config.ssh else {
+        return Ok(None);
+    };
+    let field = "core.ssh.command_mac_key";
+    let mac = HmacKey::new(&read_key(field, &ssh.command_mac_key, credentials)?).map_err(|e| {
+        CoreError::Keys(format!(
+            "{field} : {e} (32 octets aléatoires attendus : ostena ca key new-mac)"
+        ))
+    })?;
+    Ok(Some(Arc::new(Transcripts::open(
+        &ssh.transcripts_dir,
+        mac,
+    )?)))
+}
+
 fn read_key(
     field: &str,
     source: &KeySource,
@@ -175,6 +201,7 @@ impl Keys {
             )?),
             None => None,
         };
+        let transcripts = load_transcripts(config, credentials)?;
         // One key, one use, whatever the files (CFG-V016 compares sources).
         let issuing_public = SigningKey::from_pkcs8(&issuing_key)
             .map_err(|e| keys("core.issuing_private_key", &e))?
@@ -227,6 +254,7 @@ impl Keys {
             grant: Arc::new(Issuer::new(grant)),
             ssh: ssh.map(Arc::new),
             totp,
+            transcripts,
         })
     }
 }
@@ -353,11 +381,13 @@ struct Shared {
     recorder: Arc<Recorder>,
     grants: GrantAuthority,
     ssh: Option<Arc<SshAuthorities>>,
+    transcripts: Option<Arc<Transcripts>>,
     /// Asks for a replay of what lost notices would have applied.
     resync: tokio::sync::Notify,
     /// Per-agent limits of `ssh_grant_request` and `ssh_host_key`.
     grant_requests: rate::Limiter,
     host_keys: rate::Limiter,
+    stream_refusals: rate::Limiter,
 }
 
 /// What the start of the core writes to the audit chain besides
@@ -501,25 +531,15 @@ impl RunningCore {
         // A broken segment refuses the start (CORE-E011).
         signer.sign_now().await?;
         write_granting(&store, start_events(&signer, info)).await?;
+        recover_transcripts(keys, &store, &recorder).await?;
         // The grant key: activated (granting record) if new.
         let (grants, activated) = GrantAuthority::load(store.pool(), keys.grant.clone()).await?;
         if let Some(appended) = activated {
             recorder.critical(&[appended]);
         }
         let startup = |e: TunnelError| CoreError::Startup(e.to_string());
-        let tls = tls::server_config(
-            &keys.server,
-            ClientAuth::Required {
-                issuing_cas: vec![keys.issuing.trust_anchor()],
-                authorizer: cache.clone(),
-            },
-            &[ALPN],
-        )
-        .map_err(|e| CoreError::Startup(e.to_string()))?;
         let limits = Limits::default();
-        let listener =
-            Arc::new(CoreListener::bind(config.tunnel_listen, tls, limits).map_err(startup)?);
-        let tunnel_addr = listener.local_addr().map_err(startup)?;
+        let (listener, tunnel_addr) = bind_tunnel(config, keys, &cache, limits)?;
         let certificate_lifetime = u64::from(config.agent_certificate_days) * DAY;
         let enrollment = EnrollmentService::new(
             config.enrollment_listen(),
@@ -542,9 +562,11 @@ impl RunningCore {
             recorder: recorder.clone(),
             grants,
             ssh: keys.ssh.clone(),
+            transcripts: keys.transcripts.clone(),
             resync: tokio::sync::Notify::new(),
             grant_requests: rate::Limiter::new(rate::GRANT_REQUESTS),
             host_keys: rate::Limiter::new(rate::HOST_KEYS),
+            stream_refusals: rate::Limiter::new(rate::STREAM_REFUSALS),
         });
         write_granting(
             &shared.store,
@@ -740,6 +762,7 @@ async fn accept(listener: Arc<CoreListener>, shared: Arc<Shared>) {
                 truncate(&accepted.hello.agent_version),
             ),
         );
+        tokio::spawn(streams(tunnel.clone(), entry.agent, shared.clone()));
         tokio::spawn(control(
             tunnel,
             fingerprint,
@@ -747,6 +770,111 @@ async fn accept(listener: Arc<CoreListener>, shared: Arc<Shared>) {
             entry.group,
             shared.clone(),
         ));
+    }
+}
+
+/// Refuses SSH without its transcripts (ADR-0016), then seals as
+/// incomplete the transcripts left unsealed by the previous stop.
+async fn recover_transcripts(
+    keys: &Keys,
+    store: &PgStore,
+    recorder: &Recorder,
+) -> Result<(), CoreError> {
+    if keys.ssh.is_some() && keys.transcripts.is_none() {
+        return Err(CoreError::Startup(format!(
+            "[{}] [core.ssh] sans répertoire de transcripts ni clé d'empreinte des commandes",
+            transcripts::REFUSED
+        )));
+    }
+    if let Some(transcripts) = &keys.transcripts {
+        let recovered =
+            transcripts::recover(store.pool(), recorder, transcripts, unix_now()).await?;
+        if recovered > 0 {
+            tracing::warn!(
+                event = "transcript.recovered",
+                count = recovered,
+                code = transcripts::INCOMPLETE,
+                "transcripts interrompus par l'arrêt précédent, scellés incomplets"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Counts a refused session stream of `agent`: `true` if it is within the
+/// limit and is reported on its own. Beyond it, the tunnel of the agent is
+/// closed, and one aggregated line is logged per minute at most
+/// (`tunnel.streams_limited`) instead of one event per refusal.
+fn refusal_allowed(shared: &Shared, tunnel: &CoreTunnel, agent: Uuid) -> bool {
+    match shared
+        .stream_refusals
+        .check(agent, std::time::Instant::now())
+    {
+        rate::Decision::Allowed => true,
+        rate::Decision::Refused { log } => {
+            if let Some(refused) = log {
+                tracing::warn!(
+                    event = "tunnel.streams_limited",
+                    agent = %agent,
+                    refused,
+                    code = transcripts::REFUSED,
+                    "flux de session refusés au-delà de la limite : tunnel de l'agent fermé"
+                );
+            }
+            tunnel.close(TunnelError::Protocol(
+                "trop de flux de session refusés".into(),
+            ));
+            false
+        }
+    }
+}
+
+/// The session streams an agent opens: transcripts (ADR-0016) are received
+/// and sealed; any other class is refused, the core relays no session data
+/// yet.
+async fn streams(tunnel: Arc<CoreTunnel>, agent: Uuid, shared: Arc<Shared>) {
+    loop {
+        let (session, class, mut channel) = match tunnel.accept_channel().await {
+            Ok(accepted) => accepted,
+            Err(TunnelError::Protocol(e)) => {
+                tracing::warn!(event = "tunnel.channel_refused", agent = %agent, "{e}");
+                continue;
+            }
+            Err(TunnelError::Version(v)) => {
+                tracing::warn!(event = "tunnel.channel_refused", agent = %agent, version = v);
+                continue;
+            }
+            Err(_) => return,
+        };
+        if let (Some(store), ostena_tunnel::StreamClass::Recording) = (&shared.transcripts, class) {
+            let shared = shared.clone();
+            let store = store.clone();
+            let tunnel = tunnel.clone();
+            tokio::spawn(async move {
+                transcripts::receive(
+                    shared.store.pool(),
+                    &shared.recorder,
+                    &store,
+                    agent,
+                    session,
+                    channel,
+                    unix_now,
+                    || refusal_allowed(&shared, &tunnel, agent),
+                )
+                .await;
+            });
+        } else {
+            if refusal_allowed(&shared, &tunnel, agent) {
+                tracing::warn!(
+                    event = "tunnel.channel_refused",
+                    agent = %agent,
+                    session = %session,
+                    class = ?class,
+                    "flux de session refusé par le core"
+                );
+            }
+            ostena_tunnel::recording::refuse(&mut channel);
+        }
     }
 }
 
@@ -1036,6 +1164,30 @@ async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
             "{e}"
         ),
     }
+}
+
+/// Binds the tunnel listener: agents authenticated by a certificate of the
+/// issuing CA, checked against the registry cache.
+fn bind_tunnel(
+    config: &CoreConfig,
+    keys: &Keys,
+    cache: &Arc<AgentCache>,
+    limits: Limits,
+) -> Result<(Arc<CoreListener>, SocketAddr), CoreError> {
+    let startup = |e: TunnelError| CoreError::Startup(e.to_string());
+    let tls = tls::server_config(
+        &keys.server,
+        ClientAuth::Required {
+            issuing_cas: vec![keys.issuing.trust_anchor()],
+            authorizer: cache.clone(),
+        },
+        &[ALPN],
+    )
+    .map_err(|e| CoreError::Startup(e.to_string()))?;
+    let listener =
+        Arc::new(CoreListener::bind(config.tunnel_listen, tls, limits).map_err(startup)?);
+    let tunnel_addr = listener.local_addr().map_err(startup)?;
+    Ok((listener, tunnel_addr))
 }
 
 /// Control messages of one agent: the pushes when it connects, then

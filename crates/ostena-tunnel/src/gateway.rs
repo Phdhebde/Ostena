@@ -490,9 +490,9 @@ pub struct SshAccess {
     pub client_address: std::net::SocketAddr,
 }
 
-/// An SSH session the agent may open: the common session, the account and
-/// the pinned host key of the target.
-#[derive(Debug, Clone)]
+/// An SSH session the agent may open: the common session, the account,
+/// the pinned host key of the target and the stream of its transcript.
+#[derive(Debug)]
 pub struct SshSession {
     /// Grant verified, jti consumed on both sides, target pinned.
     pub session: Session,
@@ -500,6 +500,9 @@ pub struct SshSession {
     pub account: String,
     /// Host key of the target, pinned in the inventory of the core.
     pub target_host_key: VerifyingKey,
+    /// The transcript stream to the core (ADR-0016), opened before the
+    /// session: without it, no session ([`crate::recording`]).
+    pub recording: crate::Channel,
 }
 
 fn same_protocol(answer: SessionProtocol, grant: ostena_grant::Protocol) -> bool {
@@ -699,7 +702,8 @@ impl Gateway {
     /// certificate and SSH and be bound to its login session and the account
     /// asked; then the common path ([`Gateway::open_session`]:
     /// jti consumed here, then by the core); the answer must give the account
-    /// asked and the pinned host key of the target.
+    /// asked and the pinned host key of the target. Last, the transcript
+    /// stream of the session is opened on the connection in use (ADR-0016).
     ///
     /// # Errors
     ///
@@ -753,19 +757,55 @@ impl Gateway {
             ));
         }
         let answer = self.request(&grant, verified).await?;
-        if answer.account.as_deref() != Some(access.account.as_str()) {
-            return Err(SessionError::Mismatch("compte"));
+        // The core opened the session: past here, a failure closes it there.
+        let opened = async {
+            if answer.account.as_deref() != Some(access.account.as_str()) {
+                return Err(SessionError::Mismatch("compte"));
+            }
+            let target_host_key = answer
+                .target_p256_public
+                .as_deref()
+                .and_then(|k| p256_point("target_p256_public", k).ok())
+                .ok_or(SessionError::Mismatch("clé d'hôte de la cible"))?;
+            let recording = self
+                .link
+                .open_channel(answer.session.session_id, crate::StreamClass::Recording)
+                .await
+                .map_err(SessionError::Tunnel)?;
+            Ok((target_host_key, recording))
         }
-        let target_host_key = answer
-            .target_p256_public
-            .as_deref()
-            .and_then(|k| p256_point("target_p256_public", k).ok())
-            .ok_or(SessionError::Mismatch("clé d'hôte de la cible"))?;
-        Ok(SshSession {
-            session: answer.session,
-            account: access.account.clone(),
-            target_host_key,
-        })
+        .await;
+        match opened {
+            Ok((target_host_key, recording)) => Ok(SshSession {
+                session: answer.session,
+                account: access.account.clone(),
+                target_host_key,
+                recording,
+            }),
+            Err(e) => {
+                self.abandon(answer.session.session_id, &e).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Reports to the core that session `session_id`, which it opened, ends
+    /// before it started (best effort: on a lost tunnel, the report is lost too).
+    async fn abandon(&self, session_id: Uuid, error: &SessionError) {
+        let message = AgentMessage::SessionClosed {
+            session_id: session_id.to_string(),
+            reason: format!("ouverture interrompue : {error}"),
+            bytes_to_target: 0,
+            bytes_from_target: 0,
+        };
+        if let Err(e) = self.link.send(&message).await {
+            tracing::warn!(
+                event = "agent.session_report_lost",
+                session = %session_id,
+                code = e.code(),
+                "bilan de session non transmis au core : {e}"
+            );
+        }
     }
 }
 

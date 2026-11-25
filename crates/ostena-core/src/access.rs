@@ -710,6 +710,7 @@ pub async fn open_session(
     .uuid(field::LOGIN_SESSION, login.to_bytes())
     .uuid(field::RESOURCE_ID, allowed.resource.to_bytes())
     .uuid(field::RIGHT_ID, allowed.right.to_bytes())
+    .text(field::PROTOCOL, "ssh")
     .text(field::ACCOUNT, truncate(&row.account))
     .text(field::HOST, truncate(&allowed.host))
     .u64(field::PORT, u64::from(allowed.port))

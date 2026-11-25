@@ -47,6 +47,11 @@ pub enum SshError {
     /// A server limit is reached.
     #[error("[SSH-E019] limite du serveur SSH atteinte : {0}")]
     Limit(&'static str),
+    /// The transcript can no longer be handed to the core: the session is
+    /// cut (ADR-0016, fail closed). `SSH-E020` belongs to the agent
+    /// (revocations lost).
+    #[error("[SSH-E021] transcript non transmissible au core, session coupée : {0}")]
+    TranscriptLost(String),
 }
 
 impl SshError {
@@ -63,6 +68,7 @@ impl SshError {
             Self::Refused(_) => "SSH-E017",
             Self::Identity(_) => "SSH-E018",
             Self::Limit(_) => "SSH-E019",
+            Self::TranscriptLost(_) => "SSH-E021",
         }
     }
 }
@@ -93,5 +99,8 @@ mod tests {
             assert_eq!(e.code(), code);
             assert!(e.to_string().starts_with(&format!("[{code}]")), "{e}");
         }
+        let lost = SshError::TranscriptLost("x".into());
+        assert_eq!(lost.code(), "SSH-E021");
+        assert!(lost.to_string().starts_with("[SSH-E021]"));
     }
 }

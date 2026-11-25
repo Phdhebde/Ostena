@@ -7,6 +7,7 @@
 - **Révision** : 2026-11-25, engagements de la PR 6 : chargement différé d'`oleaut32`, contrôles des imports et des modules chargés, remesure de l'empreinte ; écart d'empreinte accepté par le responsable du projet
 - **Révision** : 2026-11-25, profil de release compilé en taille, chemin chaud gardé à `opt-level = 3` (PR 6bis)
 - **Révision** : 2026-11-25, identités locales : mots de passe, TOTP et écart HMAC-SHA-1 (amendement accepté, décision du responsable du projet, 2026-11-25)
+- **Révision** : 2026-11-25, HMAC-SHA-256 pour les empreintes à clé de l'audit (ADR-0016)
 
 ## Contexte
 
@@ -53,7 +54,8 @@ L'encadré « Attention » du § 2.2.3 rappelle qu'ECDSA n'est pas fortement ré
 
 **Aléa et dérivation** :
 - aléa du système d'exploitation via `aws-lc-rs` ;
-- HKDF-SHA-256 (déjà dans `ostena-crypto`).
+- HKDF-SHA-256 (déjà dans `ostena-crypto`) ;
+- HMAC-SHA-256 sous une clé de 256 bits tirée par l'outil, pour les empreintes à clé des valeurs auditées qui ne doivent pas se retrouver par dictionnaire, comme la commande d'une session (ADR-0016). HMAC avec SHA-2 est un mécanisme d'intégrité symétrique conforme du [PG-083] ; la référence exacte du paragraphe reste à relever avec la prochaine revue du guide.
 
 **Scellement de la clé racine hors ligne** (`ostena-crypto::sealed`, cérémonie de l'ADR-0008) :
 - **AES-256-GCM** (conforme, § 2.1.2.1), sous une clé dérivée par PBKDF2-HMAC-SHA256 avec 600 000 itérations et un sel aléatoire de 128 bits ;
@@ -262,7 +264,7 @@ Variantes refusées :
 - **`"s"` + chemin chaud étendu** (22 crates de plus à 3 : `ssh-key`, `der`, `ostena-scope`, `tracing`, etc.) : l'établissement de session revient au niveau actuel, mais l'aller-retour p99 médian dépasse le critère (190 µs, +13 %) et le gain d'empreinte diminue (9,07 Mio connecté). Refusé.
 - **`opt-level = "z"`** : non essayé. Le « s » global échoue déjà sur le débit ; « z » ne réduirait que le code froid, déjà en « s » dans la variante retenue.
 
-**Décision** : le profil de release compile en taille (`opt-level = "s"`), sauf les crates du chemin de données et de l'établissement de session, gardées à `opt-level = 3` par des surcharges par paquet dans `Cargo.toml` : runtime (`tokio`, `mio`, `bytes`, `futures-util`), relais SSH (`russh`, `russh-cryptovec`, `ssh-cipher`, `ssh-encoding`, `ostena-ssh`, `ostena-tunnel`, `ostena-crypto`), chiffrement symétrique, MAC et hachage, échange de clés et signatures (courbes NIST, X25519, Ed25519, ML-KEM, SHA-3), TLS et QUIC du tunnel (`aws-lc-rs`, `aws-lc-sys` dont le code C, `rustls`, `quinn*`). Le profil `bench` en hérite : les bancs mesurent le binaire livré. Aucun critère n'est franchi ; l'agent avec SSH gagne 0,5 à 1,4 Mio de mémoire résidente au repos et le binaire 2 Mo. Le coût propre du SSH (avec − sans) ne baisse pas : les deux binaires rétrécissent ensemble. Les plafonds d'`xtask` restent inchangés. Une crate ajoutée au chemin chaud (pilote RDP, nouveau chiffrement) rejoint cette liste, avec une mesure des bancs.
+**Décision** : le profil de release compile en taille (`opt-level = "s"`), sauf les crates du chemin de données et de l'établissement de session, gardées à `opt-level = 3` par des surcharges par paquet dans `Cargo.toml` : runtime (`tokio`, `mio`, `bytes`, `futures-util`), relais SSH (`russh`, `russh-cryptovec`, `ssh-cipher`, `ssh-encoding`, `ostena-ssh`, `ostena-tunnel`, `ostena-crypto`, et `ostena-recorder`, qui encode le transcript de chaque sortie avant son relais, ADR-0016), chiffrement symétrique, MAC et hachage, échange de clés et signatures (courbes NIST, X25519, Ed25519, ML-KEM, SHA-3), TLS et QUIC du tunnel (`aws-lc-rs`, `aws-lc-sys` dont le code C, `rustls`, `quinn*`). Le profil `bench` en hérite : les bancs mesurent le binaire livré. Aucun critère n'est franchi ; l'agent avec SSH gagne 0,5 à 1,4 Mio de mémoire résidente au repos et le binaire 2 Mo. Le coût propre du SSH (avec − sans) ne baisse pas : les deux binaires rétrécissent ensemble. Les plafonds d'`xtask` restent inchangés. Une crate ajoutée au chemin chaud (pilote RDP, nouveau chiffrement) rejoint cette liste, avec une mesure des bancs.
 
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 

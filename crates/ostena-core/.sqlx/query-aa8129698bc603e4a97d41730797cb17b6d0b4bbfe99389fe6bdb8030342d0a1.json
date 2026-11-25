@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE session_transcript SET command_hmac = $2, command_len = $3, command_kid = $4\n         WHERE session_id = $1::text::uuid AND state = 'recording'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aa8129698bc603e4a97d41730797cb17b6d0b4bbfe99389fe6bdb8030342d0a1"
+}

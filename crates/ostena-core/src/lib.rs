@@ -24,5 +24,6 @@ pub mod ssh_ca;
 pub mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod transcripts;
 
 pub use error::CoreError;

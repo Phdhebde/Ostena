@@ -16,6 +16,8 @@ ostena-common.workspace = true
 ostena-crypto.workspace = true
 # Kid of a certificate authority, computed as for the grant keys.
 ostena-grant.workspace = true
+# Transcript frames (ADR-0016): pure codec, no runtime.
+ostena-recorder.workspace = true
 # PinnedTarget: the driver dials nothing else (anti-SSRF by type).
 ostena-scope = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }

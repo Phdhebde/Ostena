@@ -125,7 +125,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
-        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015",
+        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1133,7 +1133,8 @@ fn core_grant_key_is_required() {
 fn core_ssh_section_and_v016_reused_keys() {
     let c = core_with(
         "[core.ssh]\nuser_ca_key = { credential = \"ssh-user.key\" }\n\
-         host_ca_key = { file = \"/var/lib/ostena/ca/ssh-host.key\" }\n",
+         host_ca_key = { file = \"/var/lib/ostena/ca/ssh-host.key\" }\n\
+         transcripts_dir = \"/var/lib/ostena/transcripts\"\ncommand_mac_key = { credential = \"mac.key\" }\n",
     );
     assert_eq!(core_codes(&c), Vec::new());
     let core = c.core.clone().unwrap();
@@ -1141,6 +1142,11 @@ fn core_ssh_section_and_v016_reused_keys() {
     assert_eq!(ssh.host_certificate_days, 30);
     let names: Vec<_> = core.keys().iter().map(|(n, _)| *n).collect();
     assert!(names.contains(&"core.ssh.user_ca_key") && names.contains(&"core.ssh.host_ca_key"));
+    assert!(names.contains(&"core.ssh.command_mac_key"));
+    assert_eq!(
+        ssh.transcripts_dir,
+        std::path::Path::new("/var/lib/ostena/transcripts")
+    );
     // The SSH keys follow the key rules: a plain file is waived, then refused.
     let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END - 1);
     assert!(
@@ -1150,16 +1156,23 @@ fn core_ssh_section_and_v016_reused_keys() {
     // The same source for two keys.
     let c = core_with(
         "[core.ssh]\nuser_ca_key = { credential = \"grant.key\" }\n\
-         host_ca_key = { credential = \"grant.key\" }\n",
+         host_ca_key = { credential = \"grant.key\" }\n\
+         transcripts_dir = \"/var/lib/ostena/transcripts\"\ncommand_mac_key = { credential = \"mac.key\" }\n",
     );
     assert_eq!(
         core_codes(&c),
         vec![Code::CoreKeyReused, Code::CoreKeyReused]
     );
+    // A relative transcript directory.
+    let c = core_with(
+        "[core.ssh]\nuser_ca_key = { credential = \"u\" }\nhost_ca_key = { credential = \"h\" }\n\
+         transcripts_dir = \"transcripts\"\ncommand_mac_key = { credential = \"m\" }\n",
+    );
+    assert_eq!(core_codes(&c), vec![Code::RelativePath]);
     // Bounds and strictness.
     let c = core_with(
         "[core.ssh]\nuser_ca_key = { credential = \"u\" }\nhost_ca_key = { credential = \"h\" }\n\
-         host_certificate_days = 91\n",
+         host_certificate_days = 91\ntranscripts_dir = \"/var/lib/ostena/transcripts\"\ncommand_mac_key = { credential = \"mac.key\" }\n",
     );
     assert_eq!(core_codes(&c), vec![Code::CoreBounds]);
     for extra in [
@@ -1348,6 +1361,46 @@ fn p012_key_files_are_waived_until_2027_04_30_then_refused() {
     );
 }
 
+/// The transcript directory is private once it exists; before, its parent
+/// must not be writable by others (ADR-0016).
+#[test]
+fn p016_transcript_directory_through_the_injected_checker() {
+    let dir = TempDir::new("core-transcripts");
+    let transcripts = dir.0.join("transcripts");
+    let text = |path: &Path| {
+        format!(
+            "{CORE}[core.ssh]\nuser_ca_key = {{ credential = \"ssh-user.key\" }}\n\
+             host_ca_key = {{ credential = \"ssh-host.key\" }}\n\
+             transcripts_dir = '{}'\ncommand_mac_key = {{ credential = \"mac.key\" }}\n",
+            path.display()
+        )
+    };
+    let path = dir.write(&text(&transcripts));
+    let ok = FakeChecker {
+        writable: vec![],
+        exposed: vec![],
+    };
+    assert!(load_with(&path, &ok).is_ok());
+    // Not created yet: its parent is checked.
+    let parent_open = FakeChecker {
+        writable: vec![dir.0.clone()],
+        exposed: vec![],
+    };
+    assert_eq!(
+        load_with(&path, &parent_open).unwrap_err().codes(),
+        vec![Code::TranscriptsExposed]
+    );
+    // Created: it must be private.
+    std::fs::create_dir(&transcripts).unwrap();
+    let exposed = FakeChecker {
+        writable: vec![],
+        exposed: vec![transcripts.clone()],
+    };
+    let err = load_with(&path, &exposed).unwrap_err();
+    assert_eq!(err.codes(), vec![Code::TranscriptsExposed]);
+    assert!(err.to_string().contains("core.ssh.transcripts_dir"));
+}
+
 #[test]
 fn p011_key_files_through_the_injected_checker() {
     let dir = TempDir::new("core-perms");
@@ -1383,6 +1436,8 @@ const LOGIN: &str = r#"
 [core.ssh]
 user_ca_key = { credential = "ssh-user.key" }
 host_ca_key = { credential = "ssh-host.key" }
+transcripts_dir = "/var/lib/ostena/transcripts"
+command_mac_key = { credential = "mac.key" }
 
 [core.login]
 listen = "0.0.0.0:8445"
@@ -1495,7 +1550,7 @@ fn v017_core_login_rules() {
 
 #[test]
 fn core_login_key_is_a_key_of_its_own() {
-    for other in ["server.key", "issuing.key", "audit.key"] {
+    for other in ["server.key", "issuing.key", "audit.key", "mac.key"] {
         let c = core_with(&LOGIN.replace("totp.key", other));
         // One key, one use (CFG-V016).
         assert_eq!(core_codes(&c), vec![Code::CoreKeyReused], "{other}");

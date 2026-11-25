@@ -176,8 +176,11 @@ impl Drop for Lab {
 /// The keys of the core besides TLS, as credentials in `dir/credentials`:
 /// the head signing key of the audit chain (its public key in
 /// `dir/audit.pub`, for the auditor), the grant signing key and the two SSH
-/// authorities (what `ostena ca key new` writes).
+/// authorities (what `ostena ca key new` writes), and the command key (what
+/// `ostena ca key new-mac` writes).
 fn write_service_keys(dir: &Path) {
+    let mac = ostena_crypto::rand::array::<32>().unwrap();
+    write_private(&dir.join("credentials").join("mac.key"), &mac);
     for name in ["audit.key", "grant.key", "user_ca.key", "host_ca.key"] {
         let (key, pkcs8) = SigningKey::generate().unwrap();
         if name == "audit.key" {
@@ -196,12 +199,25 @@ fn write_service_keys(dir: &Path) {
     }
 }
 
+/// Creates `dir`, the directory of the agent, and the transcript directory
+/// private (CFG-P016), as an installation does: absent, the directories
+/// above it would be checked, and the system temporary directory is
+/// writable by all.
+fn create_dirs(dir: &Path) {
+    std::fs::create_dir_all(dir.join("agent")).unwrap();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir.join("transcripts")).unwrap();
+}
+
 /// The PKI after a ceremony, the core configuration on `db`, and an agent
 /// configuration pointing at it.
 fn lab(db: &TestDb) -> Lab {
     let dir = std::env::temp_dir().join(format!("ostena-core-demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("agent")).unwrap();
+    create_dirs(&dir);
     let pki = TestPki::new("Ostena demo").unwrap();
     let (server_key, server_pkcs8) = SigningKey::generate().unwrap();
     let server = pki
@@ -265,7 +281,9 @@ fn lab(db: &TestDb) -> Lab {
              issuing_certificate = \"{}\"\nissuing_private_key = {{ credential = \"issuing.key\" }}\n\
              grant_signing_key = {{ credential = \"grant.key\" }}\n\n\
              [core.ssh]\nuser_ca_key = {{ credential = \"user_ca.key\" }}\n\
-             host_ca_key = {{ credential = \"host_ca.key\" }}\n\n\
+             host_ca_key = {{ credential = \"host_ca.key\" }}\n\
+             command_mac_key = {{ credential = \"mac.key\" }}\n\
+             transcripts_dir = \"{}\"\n\n\
              [core.login]\nlisten = \"127.0.0.1:{login_port}\"\n\
              totp_key = {{ credential = \"totp.key\" }}\nssh_hosts = [\"bastion.lab\"]\n\n\
              [core.audit]\nsigning_key = {{ credential = \"audit.key\" }}\nhead_interval_secs = 1\n\
@@ -274,6 +292,7 @@ fn lab(db: &TestDb) -> Lab {
             p("root.pem"),
             p("server.pem"),
             p("issuing.pem"),
+            p("transcripts"),
             database.port,
             database.name,
             database.user,

@@ -28,6 +28,7 @@ use ostena_grant::{
     Rights, SignedGrant, SubjectId, Verifier,
 };
 
+use crate::channel::StreamClass;
 use crate::control::{AgentMessage, CoreMessage, GrantKey, PROTOCOL_VERSION, SessionProtocol};
 use crate::enroll::{
     AgentRegistry, DEFAULT_CERTIFICATE_LIFETIME, EnrollmentService, EnrollmentToken,
@@ -38,7 +39,7 @@ use crate::ids::Uuid;
 use crate::limits::Limits;
 use crate::link::{Clock, SystemClock};
 use crate::renewal;
-use crate::tunnel::{ALPN, AgentConfig, CoreListener, CoreTunnel, Hello};
+use crate::tunnel::{ALPN, AgentConfig, Channel, CoreListener, CoreTunnel, Hello};
 
 /// Text present in any binary that links the test core.
 pub const MARKER: &str = "ostena-testing-core: never in a release build";
@@ -104,6 +105,9 @@ pub struct Behaviour {
     /// Present a server certificate signed by the issuing CA (with its
     /// chain), as an attacker holding that key would.
     pub rogue_server: bool,
+    /// Accept transcript streams but never read them, as a core that no
+    /// longer reads.
+    pub stall_recordings: bool,
 }
 
 /// What the test inventory answers for a granted resource.
@@ -291,6 +295,11 @@ struct State {
     errors: Mutex<Vec<TunnelError>>,
     tunnels: Mutex<Vec<([u8; 32], Arc<CoreTunnel>)>>,
     grants: Grants,
+    /// Transcript streams received, by session, and whether each ended
+    /// cleanly (finished by the agent).
+    recordings: Mutex<HashMap<Uuid, (Vec<u8>, bool)>>,
+    /// Session reports received: session and reason.
+    closed: Mutex<Vec<(String, String)>>,
 }
 
 impl State {
@@ -303,6 +312,8 @@ impl State {
         Ok(Self {
             errors: Mutex::default(),
             tunnels: Mutex::default(),
+            recordings: Mutex::default(),
+            closed: Mutex::default(),
             grants: Grants {
                 issuer: Issuer::new(generate()?),
                 replay: MemoryReplayStore::new(),
@@ -568,6 +579,12 @@ impl TestCore {
         }
     }
 
+    /// The transcript stream received for `session`, and whether the agent
+    /// finished it; `None` before its first byte.
+    pub fn recording(&self, session: Uuid) -> Option<(Vec<u8>, bool)> {
+        self.state.recordings.lock().ok()?.get(&session).cloned()
+    }
+
     /// Open tunnels.
     pub fn tunnels(&self) -> usize {
         self.state
@@ -787,6 +804,15 @@ impl TestCore {
             .unwrap_or_default()
     }
 
+    /// The session reports received (session, reason), oldest first.
+    pub fn sessions_closed(&self) -> Vec<(String, String)> {
+        self.state
+            .closed
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
     /// The SSH grants issued (text form), oldest first.
     pub fn ssh_grants(&self) -> Vec<String> {
         self.state
@@ -873,12 +899,27 @@ async fn serve(
             issuer.clone(),
             state.clone(),
         ));
-        tokio::spawn(echo_channels(tunnel));
+        tokio::spawn(echo_channels(
+            tunnel,
+            state.clone(),
+            behaviour.stall_recordings,
+        ));
     }
 }
 
-async fn echo_channels(tunnel: Arc<CoreTunnel>) {
-    while let Ok((_, _, mut channel)) = tunnel.accept_channel().await {
+async fn echo_channels(tunnel: Arc<CoreTunnel>, state: Arc<State>, stall_recordings: bool) {
+    while let Ok((session, class, mut channel)) = tunnel.accept_channel().await {
+        if class == StreamClass::Recording {
+            if stall_recordings {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    drop(channel);
+                });
+            } else {
+                tokio::spawn(keep_recording(session, channel, state.clone()));
+            }
+            continue;
+        }
         tokio::spawn(async move {
             let mut buf = vec![0u8; 16 * 1024];
             while let Ok(Some(n)) = channel.recv.read(&mut buf).await {
@@ -888,6 +929,25 @@ async fn echo_channels(tunnel: Arc<CoreTunnel>) {
             }
             let _ = channel.send.finish();
         });
+    }
+}
+
+/// Keeps what a transcript stream carries, without decoding it.
+async fn keep_recording(session: Uuid, mut channel: Channel, state: Arc<State>) {
+    let mut buf = vec![0u8; 16 * 1024];
+    let clean = loop {
+        match channel.recv.read(&mut buf).await {
+            Ok(Some(n)) => {
+                if let Ok(mut r) = state.recordings.lock() {
+                    r.entry(session).or_default().0.extend_from_slice(&buf[..n]);
+                }
+            }
+            Ok(None) => break true,
+            Err(_) => break false,
+        }
+    };
+    if let Ok(mut r) = state.recordings.lock() {
+        r.entry(session).or_default().1 = clean;
     }
 }
 
@@ -912,6 +972,14 @@ async fn control(
                 let group = registry.entry(&fingerprint).map(|e| e.group);
                 let reply = state.grants.ssh_grant(group, &request);
                 let _ = tunnel.send(&reply).await;
+                continue;
+            }
+            AgentMessage::SessionClosed {
+                session_id, reason, ..
+            } => {
+                if let Ok(mut closed) = state.closed.lock() {
+                    closed.push((session_id, reason));
+                }
                 continue;
             }
             AgentMessage::SshHostKey { p256_public, proof } => {

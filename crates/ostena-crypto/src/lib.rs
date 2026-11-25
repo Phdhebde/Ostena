@@ -12,6 +12,7 @@
 //! - [`sealed`] — sealing of the offline root key;
 //! - [`rand`] — operating system randomness;
 //! - [`hkdf`] — HKDF-SHA-256;
+//! - [`hmac`] — HMAC-SHA-256 under a 256-bit key;
 //! - [`sha256`] — digests;
 //! - [`release`] — signed release manifests (ADR-0017).
 
@@ -19,6 +20,7 @@
 
 pub mod aead;
 pub mod hkdf;
+pub mod hmac;
 pub mod p256;
 pub mod password;
 pub mod pki;

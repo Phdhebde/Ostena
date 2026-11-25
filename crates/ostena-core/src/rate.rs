@@ -39,6 +39,14 @@ pub const HOST_KEYS: Rate = Rate {
     refill: Duration::from_secs(60),
 };
 
+/// Session streams the core refuses (ADR-0016): 8 at once, then one every
+/// 15 s, per agent. A refusal is rare (a race with the close of a
+/// session); beyond the limit, the tunnel of the agent is closed.
+pub const STREAM_REFUSALS: Rate = Rate {
+    burst: 8,
+    refill: Duration::from_secs(15),
+};
+
 /// What [`Limiter::check`] decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {

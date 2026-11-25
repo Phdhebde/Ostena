@@ -19,4 +19,5 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0013](0013-applications-web-et-navigateur-isole.md) | Applications web par navigateur isolé | Proposé |
 | [0014](0014-inventaire-minimal-et-decision-d-acces-ssh.md) | Inventaire minimal et décision d'accès SSH du core | Accepté |
 | [0015](0015-transport-https-de-l-api-du-core.md) | Transport HTTPS de l'API du core | Accepté |
+| [0016](0016-transcripts-des-sessions.md) | Transcripts des sessions | Accepté |
 | [0017](0017-signature-des-livrables.md) | Signature des livrables | Accepté |

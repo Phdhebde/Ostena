@@ -37,9 +37,19 @@ struct Model {
 fn event(seq: u64) -> Event {
     let kinds = EventKind::ALL;
     let kind = kinds[usize::try_from(seq).unwrap() % kinds.len()];
-    Event::new(kind, Outcome::Success, ActorKind::Admin, "alice")
+    let event = Event::new(kind, Outcome::Success, ActorKind::Admin, "alice")
         .u64(field::FIRST_SEQ, seq)
-        .text(field::REASON, "modèle")
+        .text(field::REASON, "modèle");
+    // A transcript seal is checked for its fields, one per session.
+    if kind == EventKind::TranscriptSealed {
+        let mut session = [0u8; 16];
+        session[..8].copy_from_slice(&seq.to_be_bytes());
+        return event
+            .uuid(field::ACCESS_SESSION, session)
+            .bytes(field::SHA256, [0u8; 32])
+            .u64(field::SIZE, 0);
+    }
+    event
 }
 
 /// `n` records; a head after record 1, after the last record, and after

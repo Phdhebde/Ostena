@@ -3,6 +3,7 @@
 - **Statut** : Accepté
 - **Date** : 2026-11-11
 - **Révisé** : 2026-11-11 — section `[agent]` (`CFG-V006` à `V010`, `CFG-P007` à `P010`) et `CFG-P006` sous Windows
+- **Révisé** : 2026-11-25 — `CFG-P016`, droits du répertoire des transcripts (ADR-0016)
 
 ## Contexte
 
@@ -65,6 +66,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P012` | production, **dérogation datée** | clé du core lue en clair dans un fichier au lieu d'un credential systemd chiffré : accepté et journalisé (`config.waiver`) jusqu'au 2027-04-30 inclus, refusé ensuite (ADR-0011) |
 | `CFG-P014` | production | PostgreSQL joint en TCP au lieu du socket Unix local avec l'authentification `peer` (ADR-0011) |
 | `CFG-P015` | production, **écart accepté** | TOTP HMAC-SHA-1 (`core.login.totp_algorithm = "sha1"`, la valeur par défaut) : jamais refusé, journalisé (`config.waiver`) et écrit dans l'audit (`config.waiver`) à chaque démarrage, sans échéance (ADR-0009) ; `"sha256"` le supprime |
+| `CFG-P016` | production | `core.ssh.transcripts_dir` accessible au-delà du compte du service : il doit appartenir à root ou au compte du service, sans aucun droit pour le groupe ni les autres (0700) ; tant qu'il n'existe pas, son parent ne doit être modifiable que par eux (ADR-0016) |
 
 `CFG-P013` (credential non lié au TPM 2.0, ADR-0008) est réservé : il n'est pas encore contrôlé, ce qui sera fait avec la lecture des credentials chiffrés après M1.
 

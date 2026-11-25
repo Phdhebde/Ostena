@@ -27,14 +27,18 @@ use ostena_core::cache::AgentCache;
 use ostena_core::server::{Keys, RunningCore, StartInfo};
 use ostena_core::ssh_ca::SshAuthorities;
 use ostena_core::store::PgStore;
+use ostena_core::transcripts::Transcripts;
 use ostena_core::{inventory, login, schema};
+use ostena_crypto::hmac::HmacKey;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::testing::{TestPki, valid};
 use ostena_crypto::pki::{pem_certificate, pem_private_key};
 use ostena_crypto::tls::{self, Identity};
 use ostena_grant::{Issuer, MemoryReplayStore};
 use ostena_platform::private_file::{self, Reader};
+use ostena_recorder::EndReason;
 use ostena_scope::{LocalAddresses, SharedLocalAddresses};
+use ostena_ssh::transcript::Transcript;
 use ostena_tunnel::enroll::AgentRegistry;
 use ostena_tunnel::gateway::{Gateway, GatewayParams, GatewayState, SshAccess};
 use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, SystemClock};
@@ -81,7 +85,7 @@ fn config(port: u16) -> CoreConfig {
     .unwrap()
 }
 
-fn keys(pki: TestPki) -> Keys {
+fn keys(pki: TestPki, transcripts: &Path) -> Keys {
     let (server_key, server_pkcs8) = SigningKey::generate().unwrap();
     let server = pki
         .root
@@ -102,6 +106,52 @@ fn keys(pki: TestPki) -> Keys {
             .unwrap(),
         )),
         totp: None,
+        transcripts: Some(Arc::new(
+            Transcripts::open(
+                transcripts,
+                HmacKey::new(&HmacKey::generate().unwrap()).unwrap(),
+            )
+            .unwrap(),
+        )),
+    }
+}
+
+/// Runs the transcript of a session as the agent SSH server does: pump on
+/// the recording stream, then `events` recorded through `Transcript`.
+fn record(
+    stream: ostena_tunnel::Channel,
+) -> (
+    Transcript,
+    tokio::task::JoinHandle<Result<(), ostena_tunnel::TunnelError>>,
+) {
+    let (transcript, rx) = Transcript::channel(ostena_tunnel::recording::QUEUE);
+    (
+        transcript,
+        tokio::spawn(ostena_tunnel::recording::pump(rx, stream)),
+    )
+}
+
+/// The state of the transcript row of `session`.
+async fn transcript_state(pool: &sqlx::PgPool, session: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT state FROM session_transcript WHERE session_id = $1::uuid")
+        .bind(session.to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+async fn until_sealed(pool: &sqlx::PgPool, session: Uuid) -> String {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        match transcript_state(pool, session).await {
+            Some(state) if state != "recording" => return state,
+            _ => {}
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "transcript {session} non scellé"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -224,7 +274,8 @@ fn ssh_access_and_login_revocation_end_to_end() {
             )
             .unwrap();
         let fingerprint = tls::fingerprint(&agent_cert);
-        let keys = keys(pki);
+        let transcripts_dir = dir.0.join("transcripts");
+        let keys = keys(pki, &transcripts_dir);
         let store = PgStore::new(pool.clone(), Arc::new(AgentCache::default()));
         ostena_core::audit::ensure_genesis(&pool).await.unwrap();
         store.register(fingerprint, group, agent_id).await.unwrap();
@@ -308,6 +359,91 @@ fn ssh_access_and_login_revocation_end_to_end() {
         assert_eq!(opened.account, "root");
         assert_eq!(opened.target_host_key, target);
         assert_eq!(opened.session.max_session_secs, 1800);
+
+        // Its transcript (ADR-0016): received, written, sealed.
+        let session_id = opened.session.session_id;
+        let (transcript, pumped) = record(opened.recording);
+        transcript
+            .start(None, Some(b"cat /etc/shadow"))
+            .await
+            .unwrap();
+        transcript
+            .output(b"root:*:19000:0:99999:7:::\n")
+            .await
+            .unwrap();
+        transcript.end(EndReason::Closed).await.unwrap();
+        drop(transcript);
+        pumped.await.unwrap().unwrap();
+        assert_eq!(until_sealed(&pool, session_id).await, "sealed");
+        let file = keys.transcripts.as_ref().unwrap().path(session_id);
+        let written = std::fs::read(&file).unwrap();
+        let text = String::from_utf8(written.clone()).unwrap();
+        assert!(text.starts_with("{\"version\":2,"), "{text}");
+        assert!(text.contains("cat /etc/shadow") && text.contains("root:*:19000"));
+        let (sha256, size, hmac, kid): (Vec<u8>, i64, Vec<u8>, String) = sqlx::query_as(
+            "SELECT sha256, size, command_hmac, command_kid FROM session_transcript
+             WHERE session_id = $1::uuid",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sha256, ostena_crypto::sha256::digest(&written));
+        assert_eq!(usize::try_from(size).unwrap(), written.len());
+        assert_eq!(
+            hmac,
+            keys.transcripts
+                .as_ref()
+                .unwrap()
+                .command_tag(session_id, b"cat /etc/shadow")
+        );
+        let key_id = keys.transcripts.as_ref().unwrap().key_id();
+        assert_eq!(kid, key_id);
+        assert_eq!(key_id.len(), 16);
+        // The seal carries the keyed hash and the key identifier (R2).
+        let fields: Vec<u8> = sqlx::query_scalar(
+            "SELECT body FROM audit_record WHERE event = 'transcript.sealed' ORDER BY seq DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let sealed_record = ostena_audit::Record::decode(&fields).unwrap();
+        let get = |name: &str| {
+            sealed_record
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.value.clone())
+        };
+        assert_eq!(
+            get("command_hmac"),
+            Some(ostena_audit::Value::Bytes(hmac.clone()))
+        );
+        assert_eq!(
+            get("kid"),
+            Some(ostena_audit::Value::Text(key_id.to_owned()))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o400);
+        }
+
+        // A stream for a session of nobody: refused, the agent sees it.
+        let foreign = link
+            .open_channel(
+                Uuid::random().unwrap(),
+                ostena_tunnel::StreamClass::Recording,
+            )
+            .await
+            .unwrap();
+        let (transcript, pumped) = record(foreign);
+        transcript.start(None, None).await.unwrap();
+        tokio::time::timeout(WAIT, transcript.closed())
+            .await
+            .unwrap();
+        assert!(pumped.await.unwrap().is_err());
         // No right on backup: the precise code reaches the agent.
         let refused = gateway
             .open_ssh_session(&access(first, cert, "backup"), now(), &replay)
@@ -330,11 +466,24 @@ fn ssh_access_and_login_revocation_end_to_end() {
         // again when it reconnects.
         let second_cert = [0xd7; 32];
         let second = open_login(&pool, user, second_cert).await;
-        gateway
+        let live = gateway
             .open_ssh_session(&access(second, second_cert, "root"), now(), &replay)
             .await
             .unwrap();
+        let live_id = live.session.session_id;
+        let (live_transcript, live_pumped) = record(live.recording);
+        live_transcript.start(None, None).await.unwrap();
+        live_transcript.output(b"$ ").await.unwrap();
+        until("transcript en cours", || {
+            keys.transcripts.as_ref().unwrap().path(live_id).exists()
+        })
+        .await;
         core.stop().await;
+        // Fail closed: the stop of the core cuts the live session.
+        tokio::time::timeout(WAIT, live_transcript.closed())
+            .await
+            .unwrap();
+        assert!(live_pumped.await.unwrap().is_err());
         login::revoke_session(&pool, second, "révocation hors ligne")
             .await
             .unwrap();
@@ -352,11 +501,62 @@ fn ssh_access_and_login_revocation_end_to_end() {
             }
         };
         revoked(&mut revocations, second).await;
+        // Cut by the stop: sealed incomplete, by the core that stopped or
+        // at this start.
+        assert_eq!(until_sealed(&pool, live_id).await, "incomplete");
+
+        // Refused streams beyond the limit: the core closes the tunnel of
+        // the agent, which reconnects.
+        let connections = link.status().connections;
+        let mut sent = 0;
+        while link.status().connections == connections {
+            assert!(sent < 40, "tunnel jamais fermé");
+            sent += 1;
+            let Ok(foreign) = link
+                .open_channel(
+                    Uuid::random().unwrap(),
+                    ostena_tunnel::StreamClass::Recording,
+                )
+                .await
+            else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let (transcript, pumped) = record(foreign);
+            let _ = transcript.start(None, None).await;
+            let _ = tokio::time::timeout(WAIT, transcript.closed()).await;
+            drop(transcript);
+            let _ = pumped.await;
+        }
+        assert!(sent > 8, "{sent}");
         core.stop().await;
+
+        // The audit export and the transcript directory verify offline.
+        let (export, _) = ostena_core::audit::export(&pool, Vec::new(), None)
+            .await
+            .unwrap();
+        let mut trusted = ostena_audit::TrustedKeys::new();
+        trusted.insert(keys.audit.verifying_key()).unwrap();
+        let mut report = ostena_audit::verify_export(
+            export.as_slice(),
+            trusted,
+            ostena_audit::Options::default(),
+        )
+        .unwrap();
+        assert_eq!(report.transcripts.len(), 2);
+        ostena_audit::transcripts::check(&mut report, &transcripts_dir).unwrap();
+        let codes: Vec<&str> = report
+            .findings
+            .iter()
+            .map(ostena_audit::Finding::code)
+            .collect();
+        assert!(!codes.iter().any(|c| c.starts_with("AUD-E")), "{codes:?}");
+        assert!(codes.contains(&"AUD-W006"), "{codes:?}");
 
         let events: Vec<String> = sqlx::query_scalar(
             "SELECT event FROM audit_record WHERE event LIKE 'access.%'
-                OR event LIKE 'ssh.%' OR event LIKE 'login_session.%' ORDER BY seq",
+                OR event LIKE 'ssh.%' OR event LIKE 'login_session.%'
+                OR event LIKE 'transcript.%' ORDER BY seq",
         )
         .fetch_all(&pool)
         .await
@@ -366,6 +566,7 @@ fn ssh_access_and_login_revocation_end_to_end() {
             "access.ssh_granted",
             "access.session_opened",
             "access.ssh_refused",
+            "access.ssh_exec",
             "login_session.revoked",
             "login_session.revocation_applied",
         ] {
@@ -414,7 +615,7 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
             )
             .unwrap();
         let fingerprint = tls::fingerprint(&agent_cert);
-        let keys = keys(pki);
+        let keys = keys(pki, &dir.0.join("transcripts"));
         let store = PgStore::new(pool.clone(), Arc::new(AgentCache::default()));
         ostena_core::audit::ensure_genesis(&pool).await.unwrap();
         store.register(fingerprint, group, agent_id).await.unwrap();

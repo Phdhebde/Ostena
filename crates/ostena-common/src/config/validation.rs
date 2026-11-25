@@ -92,11 +92,14 @@ pub enum Code {
     /// Core: TOTP with HMAC-SHA-1, the default; an accepted deviation
     /// (ADR-0009), logged at every start and never refused.
     TotpSha1,
+    /// Core: transcript directory readable beyond the service account, or
+    /// its parent writable by another account (ADR-0016).
+    TranscriptsExposed,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -130,6 +133,7 @@ impl Code {
         Self::CoreKeyReused,
         Self::CoreLogin,
         Self::TotpSha1,
+        Self::TranscriptsExposed,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -168,6 +172,7 @@ impl Code {
             Self::CoreKeyReused => "CFG-V016",
             Self::CoreLogin => "CFG-V017",
             Self::TotpSha1 => "CFG-P015",
+            Self::TranscriptsExposed => "CFG-P016",
         }
     }
 
@@ -189,6 +194,7 @@ impl Code {
                 | Self::ReplayJournalExposed
                 | Self::InfrastructureUnresolved
                 | Self::TotpSha1
+                | Self::TranscriptsExposed
         )
     }
 }
