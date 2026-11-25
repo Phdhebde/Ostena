@@ -15,6 +15,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4.13"
 ostena-audit = { path = "../crates/ostena-audit" }
 ostena-common = { path = "../crates/ostena-common" }
+ostena-crypto = { path = "../crates/ostena-crypto" }
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
 ostena-scope = { path = "../crates/ostena-scope" }
@@ -59,6 +60,13 @@ bench = false
 [[bin]]
 name = "scope_policy"
 path = "fuzz_targets/scope_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "release_manifest"
+path = "fuzz_targets/release_manifest.rs"
 test = false
 doc = false
 bench = false
