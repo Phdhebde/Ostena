@@ -191,10 +191,10 @@ fn refuses_unknown_outcome_and_actor_kind() {
         "AUD-E001"
     );
     assert_eq!(
-        refused(&Raw::valid().with(|r| r.actor_kind = 4)).code(),
+        refused(&Raw::valid().with(|r| r.actor_kind = 5)).code(),
         "AUD-E001"
     );
-    for (outcome, kind) in [(0, 0), (1, 1), (2, 2), (2, 3)] {
+    for (outcome, kind) in [(0, 0), (1, 1), (2, 2), (2, 3), (0, 4)] {
         let raw = Raw::valid().with(|r| {
             r.outcome = outcome;
             r.actor_kind = kind;
@@ -421,7 +421,7 @@ fn record() -> impl Strategy<Value = Record> {
         any::<[u8; 32]>(),
         any::<u64>(),
         0u8..3,
-        0u8..4,
+        0u8..5,
         "[a-zA-Z0-9 é@.:-]{0,40}",
         "[a-z0-9_.]{3,64}",
         prop::collection::btree_map("[a-z0-9_]{1,32}", value(), 0..=8),

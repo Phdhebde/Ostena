@@ -75,6 +75,41 @@ event_kinds! {
     TunnelAgentConnected => "tunnel.agent_connected",
     /// An agent tunnel was refused.
     TunnelRefused => "tunnel.refused",
+    /// A grant signing key joined the key set pushed to the agents.
+    GrantKeyActivated => "grant.key_activated",
+    /// A native SSH access was granted: a grant issued to an agent.
+    AccessSshGranted => "access.ssh_granted",
+    /// A native SSH access was refused (code, reason).
+    AccessSshRefused => "access.ssh_refused",
+    /// A session opened: grant checked, jti consumed by the core.
+    AccessSessionOpened => "access.session_opened",
+    /// A session request was refused (code, reason).
+    AccessSessionRefused => "access.session_refused",
+    /// A session ended (reason, bytes).
+    AccessSessionClosed => "access.session_closed",
+    /// The SSH host key of an agent was certified.
+    SshHostCertified => "ssh.host_certified",
+    /// The SSH host key of an agent was not certified (code, reason).
+    SshHostKeyRefused => "ssh.host_key_refused",
+    /// A login session was revoked.
+    LoginSessionRevoked => "login_session.revoked",
+    /// The agents concerned by a login revocation were told.
+    LoginSessionRevocationApplied => "login_session.revocation_applied",
+    /// A user was created.
+    UserCreated => "user.created",
+    /// A user was disabled (their login sessions revoked).
+    UserDisabled => "user.disabled",
+    /// A resource was added to the inventory.
+    ResourceCreated => "resource.created",
+    /// A target account was added to a resource.
+    TargetAccountCreated => "target_account.created",
+    /// A right was granted.
+    RightGranted => "right.granted",
+    /// A right was revoked.
+    RightRevoked => "right.revoked",
+    /// A gateway group was created or changed (name, SSH host names,
+    /// scope policy).
+    GatewayGroupUpdated => "gateway_group.updated",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -138,6 +173,54 @@ pub mod field {
     pub const LAST_MS: &str = "last_ms";
     /// Number of heads (in an export).
     pub const HEAD_COUNT: &str = "head_count";
+    /// User UUID.
+    pub const USER_ID: &str = "user_id";
+    /// Login session UUID (`ostena login`).
+    pub const LOGIN_SESSION: &str = "login_session";
+    /// Resource UUID.
+    pub const RESOURCE_ID: &str = "resource_id";
+    /// Target account UUID.
+    pub const ACCOUNT_ID: &str = "account_id";
+    /// Right UUID.
+    pub const RIGHT_ID: &str = "right_id";
+    /// Session UUID (an access, not a login session).
+    pub const ACCESS_SESSION: &str = "access_session";
+    /// Grant identifier (16 bytes).
+    pub const JTI: &str = "jti";
+    /// A name: user, resource, group.
+    pub const NAME: &str = "name";
+    /// Display name of a user.
+    pub const DISPLAY_NAME: &str = "display_name";
+    /// Resource name, as asked.
+    pub const RESOURCE: &str = "resource";
+    /// Account on a target.
+    pub const ACCOUNT: &str = "account";
+    /// Protocol (`ssh`, `rdp`, `vnc`, `web`).
+    pub const PROTOCOL: &str = "protocol";
+    /// Target host.
+    pub const HOST: &str = "host";
+    /// Target port.
+    pub const PORT: &str = "port";
+    /// SHA-256 of a user certificate.
+    pub const CERTIFICATE_SHA256: &str = "certificate_sha256";
+    /// Address of a client, `ip:port`.
+    pub const CLIENT_ADDR: &str = "client_addr";
+    /// Maximum session length, seconds.
+    pub const MAX_SESSION_SECS: &str = "max_session_secs";
+    /// End of validity of a right, Unix seconds.
+    pub const VALID_UNTIL: &str = "valid_until";
+    /// SSH host names of a gateway group, comma separated.
+    pub const HOST_NAMES: &str = "host_names";
+    /// Version of a pushed scope policy.
+    pub const POLICY_VERSION: &str = "policy_version";
+    /// Bytes sent to the target.
+    pub const BYTES_TO_TARGET: &str = "bytes_to_target";
+    /// Bytes received from the target.
+    pub const BYTES_FROM_TARGET: &str = "bytes_from_target";
+    /// Number of agents told.
+    pub const NOTIFIED_AGENTS: &str = "notified_agents";
+    /// Number of login sessions revoked.
+    pub const REVOKED_SESSIONS: &str = "revoked_sessions";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -169,6 +252,30 @@ pub mod field {
         FIRST_MS,
         LAST_MS,
         HEAD_COUNT,
+        USER_ID,
+        LOGIN_SESSION,
+        RESOURCE_ID,
+        ACCOUNT_ID,
+        RIGHT_ID,
+        ACCESS_SESSION,
+        JTI,
+        NAME,
+        DISPLAY_NAME,
+        RESOURCE,
+        ACCOUNT,
+        PROTOCOL,
+        HOST,
+        PORT,
+        CERTIFICATE_SHA256,
+        CLIENT_ADDR,
+        MAX_SESSION_SECS,
+        VALID_UNTIL,
+        HOST_NAMES,
+        POLICY_VERSION,
+        BYTES_TO_TARGET,
+        BYTES_FROM_TARGET,
+        NOTIFIED_AGENTS,
+        REVOKED_SESSIONS,
     ];
 }
 
@@ -338,7 +445,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 22);
+        assert_eq!(names.len(), 39);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())
