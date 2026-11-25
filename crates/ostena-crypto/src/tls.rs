@@ -134,6 +134,15 @@ impl fmt::Display for RegistryUnavailable {
 
 impl std::error::Error for RegistryUnavailable {}
 
+/// Classifies a handshake error carried by an I/O error (as returned by
+/// the TLS streams of tokio-rustls); `None` if it is not a TLS error.
+pub fn classify_io(error: &std::io::Error) -> Option<HandshakeFailure> {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .map(classify)
+}
+
 /// Classifies a handshake error, seen from either side.
 pub fn classify(error: &rustls::Error) -> HandshakeFailure {
     use rustls::Error as E;

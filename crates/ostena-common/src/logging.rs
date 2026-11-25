@@ -286,6 +286,18 @@ fn rfc3339(time: SystemTime) -> String {
     )
 }
 
+/// UTC date and time `YYYY-MM-DD HH:MM:SS UTC` of `unix_secs`, for messages.
+pub fn utc_text(unix_secs: u64) -> String {
+    let (year, month, day) = civil_from_days(unix_secs / 86_400);
+    let rem = unix_secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 /// Days since 1970-01-01 to (year, month, day), proleptic Gregorian calendar.
 /// Algorithm from H. Hinnant, "chrono-Compatible Low-Level Date Algorithms".
 fn civil_from_days(days: u64) -> (u64, u64, u64) {
@@ -307,6 +319,13 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn utc_text_formats_dates() {
+        assert_eq!(utc_text(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc_text(1_800_028_800), "2027-01-15 16:00:00 UTC");
+        assert_eq!(utc_text(951_782_400), "2000-02-29 00:00:00 UTC");
+    }
 
     #[derive(Clone, Default)]
     struct Buffer(Arc<Mutex<Vec<u8>>>);

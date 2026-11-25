@@ -627,3 +627,14 @@ fn identity_and_anchor_from_pem() {
     assert_eq!(anchor.certificate(), f.pki.root_anchor().certificate());
     assert!(TrustAnchor::from_pem(b"not pem").is_err());
 }
+
+#[test]
+fn classify_io_finds_the_tls_error() {
+    let tls = std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer),
+    );
+    assert_eq!(classify_io(&tls), Some(HandshakeFailure::UnknownIssuer));
+    let plain = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+    assert_eq!(classify_io(&plain), None);
+}
