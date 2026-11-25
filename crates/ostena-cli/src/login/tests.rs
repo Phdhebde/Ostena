@@ -93,9 +93,23 @@ fn ssh_fragment_and_known_hosts() {
     let text = ssh_config(dir, &response());
     assert!(text.contains("Host bastion.example *.bastion.example\n"));
     assert!(text.contains("    Port 2222\n"));
-    assert!(text.contains("    IdentityFile \"/home/jdupont/.ostena/id_ecdsa\"\n"));
-    assert!(text.contains("    CertificateFile \"/home/jdupont/.ostena/id_ecdsa-cert.pub\"\n"));
-    assert!(text.contains("    UserKnownHostsFile \"/home/jdupont/.ostena/known_hosts\"\n"));
+    // The paths as the platform joins them (OpenSSH for Windows reads
+    // both separators), each quoted, one per line.
+    for (option, name) in [
+        ("IdentityFile", KEY),
+        ("CertificateFile", CERTIFICATE),
+        ("UserKnownHostsFile", KNOWN_HOSTS),
+    ] {
+        let path = dir.join(name);
+        let line = format!("    {option} \"{}\"\n", path.display());
+        assert!(text.contains(&line), "{line:?} absent : {text}");
+    }
+    #[cfg(unix)]
+    {
+        assert!(text.contains("    IdentityFile \"/home/jdupont/.ostena/id_ecdsa\"\n"));
+        assert!(text.contains("    CertificateFile \"/home/jdupont/.ostena/id_ecdsa-cert.pub\"\n"));
+        assert!(text.contains("    UserKnownHostsFile \"/home/jdupont/.ostena/known_hosts\"\n"));
+    }
     assert!(text.contains("    StrictHostKeyChecking yes\n"));
     assert!(text.contains("    ForwardAgent no\n"));
     assert!(text.contains("2027-01-15 16:00:00 UTC"), "{text}");
