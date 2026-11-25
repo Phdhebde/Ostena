@@ -467,6 +467,16 @@ impl<A: Authorizer> SshServer<A> {
             .map(|l| l.values().filter(|s| s.active).count())
             .unwrap_or_default()
     }
+
+    /// Sessions authorised or being authorised, until their end is handed
+    /// to [`Authorizer::closed`]: what a stop waits for.
+    pub fn in_progress(&self) -> usize {
+        self.shared
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
 }
 
 /// What the handler tells the connection task.

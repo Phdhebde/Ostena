@@ -89,7 +89,7 @@ Un trait commun, `ServiceManager`, masque la différence entre le SCM et systemd
 
 Sur `SIGTERM` ou `SIGINT`, Ctrl-C, ou l'arrêt par le SCM, l'agent suit cette séquence :
 1. il passe en arrêt (`STOPPING=1` pour systemd) et refuse les nouvelles sessions ;
-2. il demande aux sessions en cours de se terminer et leur laisse `agent.shutdown_grace_secs` (1 à 300 s), puis interrompt les autres. Le serveur SSH natif (ADR-0010) cesse d'écouter et déconnecte ses sessions, dont la fin est signalée au core dans ce délai (`agent.ssh_stopped`) ;
+2. il demande aux sessions en cours de se terminer et leur laisse `agent.shutdown_grace_secs` (1 à 300 s), puis interrompt les autres. Le serveur SSH natif (ADR-0010) cesse d'écouter et déconnecte ses sessions dans le même délai, qui couvre toutes les sessions (pas un délai par type) ; leur fin, y compris celle des sessions en cours d'autorisation, est signalée au core avant la fermeture du lien, dans ce délai (`agent.ssh_stopped`) ;
 3. il ferme le plan de contrôle (le socket est supprimé) ;
 4. il fait un `fsync` du journal anti-rejeu et libère son verrou.
 

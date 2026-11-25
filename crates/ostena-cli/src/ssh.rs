@@ -6,6 +6,7 @@
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,46 @@ pub(crate) struct CoreSide {
 struct TunnelAuthorizer {
     core: CoreSide,
     journal: Arc<FileReplayStore>,
+    reports: Reports,
+}
+
+/// Session reports (`SessionClosed`) being sent to the core by detached
+/// tasks, counted so that a stop waits for them before closing the link.
+#[derive(Debug, Default, Clone)]
+struct Reports(Arc<AtomicUsize>);
+
+/// One report being sent; counted until dropped.
+struct Sending(Arc<AtomicUsize>);
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Reports {
+    fn sending(&self) -> Sending {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Sending(self.0.clone())
+    }
+
+    fn pending(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Waits while `busy`, until `deadline` at most; returns whether it ended
+/// idle.
+async fn wait_idle(deadline: Instant, busy: impl Fn() -> bool) -> bool {
+    loop {
+        if !busy() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn refusal(code: &str, message: &str) -> Refusal {
@@ -100,7 +141,9 @@ impl Authorizer for TunnelAuthorizer {
             bytes_to_target: summary.bytes_to_target,
             bytes_from_target: summary.bytes_from_target,
         };
+        let sending = self.reports.sending();
         tokio::spawn(async move {
+            let _sending = sending;
             if let Err(e) = link.send(&message).await {
                 tracing::warn!(
                     event = "agent.session_report_lost",
@@ -404,6 +447,7 @@ pub(crate) async fn follow_revocations(
 /// The running SSH server of the agent.
 pub(crate) struct SshService {
     report: Arc<Report>,
+    reports: Reports,
     stop: watch::Sender<bool>,
     listeners: Vec<JoinHandle<()>>,
     helpers: Vec<JoinHandle<()>>,
@@ -504,6 +548,7 @@ pub(crate) async fn start(
     }
 
     let (identity_tx, identity) = watch::channel(None);
+    let reports = Reports::default();
     let server = SshServer::new(
         settings(ssh),
         identity.clone(),
@@ -511,6 +556,7 @@ pub(crate) async fn start(
         Arc::new(TunnelAuthorizer {
             core: core.clone(),
             journal,
+            reports: reports.clone(),
         }),
     );
     let (stop, stop_rx) = watch::channel(false);
@@ -561,6 +607,7 @@ pub(crate) async fn start(
             state,
             gateway: core.gateway,
         }),
+        reports,
         stop,
         listeners,
         helpers,
@@ -573,27 +620,30 @@ impl SshService {
         self.report.clone()
     }
 
-    /// Stops listening, disconnects the sessions and waits for them to be
-    /// closed (reported to the core) within `grace`; returns how many were
-    /// open at the stop.
-    pub(crate) async fn stop(self, grace: Duration) -> usize {
+    /// Stops listening, disconnects the sessions, and waits until
+    /// `deadline` for the sessions, those being authorised included, to end
+    /// and for their reports to be sent to the core (the link is closed
+    /// after); returns how many were in progress at the stop.
+    pub(crate) async fn stop(self, deadline: Instant) -> usize {
         let server = &self.report.server;
-        let open = server.sessions();
+        let open = server.in_progress();
         self.stop.send_replace(true);
         for listener in self.listeners {
             let _ = listener.await;
         }
-        let deadline = Instant::now() + grace;
-        while server.sessions() > 0 && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let reports = &self.reports;
+        wait_idle(deadline, || {
+            server.in_progress() > 0 || reports.pending() > 0
+        })
+        .await;
         for helper in self.helpers {
             helper.abort();
         }
         tracing::info!(
             event = "agent.ssh_stopped",
             sessions = open,
-            remaining = server.sessions()
+            remaining = server.in_progress(),
+            reports_unsent = reports.pending()
         );
         open
     }
@@ -708,8 +758,6 @@ pub(crate) fn show_key(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
 
     #[derive(Default, Clone)]
@@ -1015,5 +1063,36 @@ mod tests {
         t.sink.apply(&t.trust(8, Some(valid), &[]), NOW);
         assert_eq!(t.user_cas(), None);
         assert_eq!(t.state().applied, None);
+    }
+
+    #[test]
+    fn a_stop_waits_for_the_reports_being_sent_within_the_grace() {
+        block_on(async {
+            let reports = Reports::default();
+            assert!(wait_idle(Instant::now(), || reports.pending() > 0).await);
+            let sending = reports.sending();
+            let task = tokio::spawn(async move {
+                let _sending = sending;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+            assert_eq!(reports.pending(), 1);
+            let started = Instant::now();
+            assert!(
+                wait_idle(started + Duration::from_secs(5), || reports.pending() > 0).await,
+                "sent before the deadline"
+            );
+            assert!(started.elapsed() >= Duration::from_millis(150));
+            task.await.unwrap();
+
+            // A report that never ends: the wait stops at the deadline.
+            let _stuck = reports.sending();
+            let started = Instant::now();
+            assert!(
+                !wait_idle(started + Duration::from_millis(100), || reports.pending()
+                    > 0)
+                .await
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
     }
 }

@@ -624,10 +624,19 @@ async fn serve_until_stopped(
         sessions = info.sessions.active(),
         grace_secs = grace.as_secs()
     );
+    // One grace for every session, SSH or not: both stop at once, and the
+    // SSH reports are sent before the link closes.
     #[cfg(feature = "ssh")]
-    if let Some(ssh) = ssh {
-        ssh.stop(grace).await;
-    }
+    let report = {
+        let deadline = Instant::now() + grace;
+        let ssh = async {
+            if let Some(ssh) = ssh {
+                ssh.stop(deadline).await;
+            }
+        };
+        tokio::join!(ssh, info.sessions.shutdown(grace)).1
+    };
+    #[cfg(not(feature = "ssh"))]
     let report = info.sessions.shutdown(grace).await;
     tracing::info!(
         event = "agent.sessions_closed",
