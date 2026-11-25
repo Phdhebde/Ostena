@@ -146,6 +146,8 @@ package.ssh-cipher.opt-level = 3
 package.ssh-encoding.opt-level = 3
 package.ostena-ssh.opt-level = 3
 package.ostena-tunnel.opt-level = 3
+# Transcript frames, encoded for each output before it is relayed (ADR-0016).
+package.ostena-recorder.opt-level = 3
 package.ostena-crypto.opt-level = 3
 
 # Symmetric ciphers, MACs and hashes of the SSH transport.
