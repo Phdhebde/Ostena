@@ -16,3 +16,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0010](0010-acces-ssh-natif.md) | Accès SSH natif | Accepté en partie |
 | [0011](0011-socle-du-core-et-postgresql.md) | Socle du core et base PostgreSQL | Accepté |
 | [0012](0012-chaine-d-audit-du-core.md) | Chaîne d'audit du core | Accepté |
+| [0013](0013-applications-web-et-navigateur-isole.md) | Applications web par navigateur isolé | Proposé |
