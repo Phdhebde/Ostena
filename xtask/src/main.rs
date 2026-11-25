@@ -6,6 +6,7 @@
 // A developer tool: reporting progress on the console is its job.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod pe;
 mod secrets;
 
 use std::error::Error;
@@ -24,12 +25,14 @@ Tasks:
   check-secrets  Check that every secret exposure is justified
   vendor         Vendor all dependencies into vendor/ for offline builds
   sbom           Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
-  footprint      Measure the idle memory of the agent (release build)
+  footprint      Measure the idle memory of the agent, with and without SSH (release
+                 build); fail on a blocking regression (ADR-0009)
   fuzz [SECS] [TARGET...]
                  Run fuzz targets, each for SECS (default 60, all targets)
   check-release [BINARY]
                  Fail if a test-only feature is in the release build of ostena-cli,
-                 or if BINARY contains the test core
+                 if the SSH server is not linked, or if BINARY contains the test
+                 core, lacks the SSH server or imports a GUI or COM DLL statically
   help           Print this message
 ";
 
@@ -216,16 +219,44 @@ const FOOTPRINT_TARGET_MIB: f64 = 20.0;
 /// The gateway group of the measured agent.
 const FOOTPRINT_GROUP: &str = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
 
-/// Measures the idle footprint of a release agent in three states: without
-/// a link to the core, with a link that cannot connect, and connected to a
-/// test core (the `test_core` example, in its own process). Each agent runs
-/// in the foreground with a development configuration; its
-/// `agent.idle_footprint` event (5 s after start) gives the resident memory.
-fn footprint() -> Result<()> {
-    use std::io::BufRead;
-    use std::process::Stdio;
+/// A footprint regression blocks when it exceeds both (CLAUDE.md,
+/// ADR-0009): a relative bound, in percent...
+const REGRESSION_PERCENT: u64 = 10;
+/// ... and an absolute one, in bytes.
+const REGRESSION_BYTES: u64 = 1024 * 1024;
 
+/// One idle measure of an agent.
+struct Measure {
+    /// Resident memory (`agent.idle_footprint`).
+    bytes: u64,
+    /// Linux breakdown, empty elsewhere.
+    detail: String,
+    /// Shared libraries (Linux) or DLLs (Windows) loaded, lower case.
+    modules: Vec<String>,
+}
+
+/// Builds the release agent, the reference without SSH (kept next to it as
+/// `ostena-without-ssh`) and the test core; returns their paths.
+fn footprint_binaries() -> Result<(PathBuf, PathBuf, PathBuf)> {
     let root = workspace_root()?;
+    let release = root.join("target/release");
+    let exe = release.join(format!("ostena{}", std::env::consts::EXE_SUFFIX));
+    let reference = release.join(format!(
+        "ostena-without-ssh{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    // The reference first: the release binary stays in target/release.
+    let mut build = cargo();
+    build.args([
+        "build",
+        "--release",
+        "--locked",
+        "--package",
+        "ostena-cli",
+        "--no-default-features",
+    ]);
+    run(build)?;
+    fs::copy(&exe, &reference)?;
     let mut build = cargo();
     build.args(["build", "--release", "--locked", "--package", "ostena-cli"]);
     run(build)?;
@@ -242,11 +273,31 @@ fn footprint() -> Result<()> {
         "test_core",
     ]);
     run(build)?;
-    let release = root.join("target/release");
-    let exe = release.join(format!("ostena{}", std::env::consts::EXE_SUFFIX));
     let test_core = release
         .join("examples")
         .join(format!("test_core{}", std::env::consts::EXE_SUFFIX));
+    Ok((exe, reference, test_core))
+}
+
+/// Measures the idle footprint of a release agent in three states: without
+/// a link to the core, with a link that cannot connect, and connected to a
+/// test core (the `test_core` example, in its own process). Each state is
+/// measured twice: an agent built without SSH (feature `ssh` off: the
+/// reference), and the release agent with `[agent.ssh]` listening. Each
+/// agent runs in the foreground with a development configuration; its
+/// `agent.idle_footprint` event (5 s after start) gives the resident
+/// memory.
+///
+/// Fails (ADR-0009) when, in any state, the agent with SSH:
+/// - takes more than both +10 % and +1 MiB over the reference;
+/// - loads a library or DLL the reference does not load;
+/// - loads a GUI or COM DLL (`user32`, `gdi32`, `win32u`, `combase`,
+///   `ole32`, `oleaut32`).
+fn footprint() -> Result<()> {
+    use std::io::BufRead;
+    use std::process::Stdio;
+
+    let (exe, reference, test_core) = footprint_binaries()?;
 
     let dir = std::env::temp_dir().join(format!("ostena-footprint-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -273,31 +324,108 @@ fn footprint() -> Result<()> {
                 ("connected", Some(address.as_str())),
             ]
             .into_iter()
-            .map(|(state, core)| Ok((state, measure(&exe, &dir, core)?)))
+            .map(|(state, core)| {
+                let without = measure(&reference, &dir, core, None)?;
+                let with = measure(&exe, &dir, core, Some(free_port()?))?;
+                Ok((state, without, with))
+            })
             .collect::<Result<Vec<_>>>()
         });
     drop(core.stdin.take());
     let _ = core.wait();
     let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_file(&reference);
 
-    for (state, (bytes, detail)) in measures? {
+    let mut failures = Vec::new();
+    for (state, without, with) in measures? {
+        for (name, m) in [("without SSH", &without), ("with SSH", &with)] {
+            let mib = mib(m.bytes);
+            let verdict = if mib <= FOOTPRINT_TARGET_MIB {
+                "within"
+            } else {
+                "ABOVE"
+            };
+            println!(
+                "idle footprint ({state}, {name}): {mib:.2} MiB resident ({verdict} the \
+                 indicative {FOOTPRINT_TARGET_MIB} MiB target){}",
+                m.detail
+            );
+        }
+        let delta = with.bytes.saturating_sub(without.bytes);
         #[expect(clippy::cast_precision_loss, reason = "display only")]
-        let mib = bytes as f64 / 1_048_576.0;
-        let verdict = if mib <= FOOTPRINT_TARGET_MIB {
-            "within"
-        } else {
-            "ABOVE"
-        };
+        let percent = delta as f64 * 100.0 / without.bytes.max(1) as f64;
         println!(
-            "idle footprint ({state}): {mib:.1} MiB resident ({verdict} the indicative {FOOTPRINT_TARGET_MIB} MiB target){detail}"
+            "  SSH cost ({state}): {:+.2} MiB ({percent:+.1} %), modules: {} without, {} with",
+            mib(delta),
+            without.modules.len(),
+            with.modules.len()
         );
+        failures.extend(compare(state, &without, &with));
     }
-    Ok(())
+    if failures.is_empty() {
+        println!(
+            "footprint: no blocking regression (+{REGRESSION_PERCENT} % and +1 MiB), no \
+             module loaded in addition, no GUI or COM DLL"
+        );
+        Ok(())
+    } else {
+        Err(format!("footprint (ADR-0009):\n  {}", failures.join("\n  ")).into())
+    }
+}
+
+#[expect(clippy::cast_precision_loss, reason = "display only")]
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / 1_048_576.0
+}
+
+/// The blocking differences between the reference and the agent with SSH.
+fn compare(state: &str, without: &Measure, with: &Measure) -> Vec<String> {
+    let mut failures = Vec::new();
+    let delta = with.bytes.saturating_sub(without.bytes);
+    if delta > REGRESSION_BYTES && delta * 100 > without.bytes * REGRESSION_PERCENT {
+        failures.push(format!(
+            "{state}: the agent with SSH takes {delta} bytes more than without (over both \
+             +{REGRESSION_PERCENT} % and +1 MiB)",
+        ));
+    }
+    let extra: Vec<&str> = with
+        .modules
+        .iter()
+        .filter(|m| !without.modules.contains(m))
+        .map(String::as_str)
+        .collect();
+    if !extra.is_empty() {
+        failures.push(format!(
+            "{state}: loaded with SSH only: {}",
+            extra.join(", ")
+        ));
+    }
+    let forbidden: Vec<&str> = with
+        .modules
+        .iter()
+        .map(String::as_str)
+        .filter(|m| pe::FORBIDDEN.contains(m))
+        .collect();
+    if !forbidden.is_empty() {
+        failures.push(format!(
+            "{state}: GUI or COM DLLs loaded at rest: {}",
+            forbidden.join(", ")
+        ));
+    }
+    failures
+}
+
+/// A TCP port free on the loopback now.
+fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port())
 }
 
 /// Runs one agent until its `agent.idle_footprint` event; `core` is the
-/// core address, `None` for an agent without link (no `tls_core_ca`).
-fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<(u64, String)> {
+/// core address, `None` for an agent without link (no `tls_core_ca`);
+/// `ssh` the port of `[agent.ssh]`, `None` for none.
+fn measure(exe: &Path, dir: &Path, core: Option<&str>, ssh: Option<u16>) -> Result<Measure> {
     use std::io::BufRead;
     use std::process::Stdio;
 
@@ -310,10 +438,13 @@ fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<(u64, String)> 
     let ca = core.map_or_else(String::new, |_| {
         format!("tls_core_ca = \"{}\"\n", path("root.pem"))
     });
+    let ssh_section = ssh.map_or_else(String::new, |port| {
+        format!("\n[agent.ssh]\nlisten = [\"127.0.0.1:{port}\"]\n")
+    });
     let config = format!(
         "mode = \"development\"\n\n[agent]\ngateway_group = \"{FOOTPRINT_GROUP}\"\n\
          core_address = \"{}\"\ntls_certificate = \"{}\"\ntls_private_key = \"{}\"\n{ca}\
-         replay_journal = \"{}\"\ncontrol_endpoint = \"{endpoint}\"\n",
+         replay_journal = \"{}\"\ncontrol_endpoint = \"{endpoint}\"\n{ssh_section}",
         core.unwrap_or("core.invalid:8443"),
         path("agent.crt"),
         path("agent.key"),
@@ -330,18 +461,21 @@ fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<(u64, String)> 
         .spawn()?;
     let stdout = child.stdout.take().ok_or("no agent output")?;
     let mut connected = false;
+    let mut ssh_started = false;
     let mut footprint = None;
     for line in std::io::BufReader::new(stdout)
         .lines()
         .map_while(std::result::Result::ok)
     {
         connected |= line.contains("agent.core_connected");
+        ssh_started |= line.contains("agent.ssh_started");
         if line.contains("agent.idle_footprint") {
             footprint = Some(line);
             break;
         }
     }
     let detail = breakdown(child.id());
+    let modules = modules(child.id());
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_file(dir.join("state/replay.journal"));
@@ -349,8 +483,59 @@ fn measure(exe: &Path, dir: &Path, core: Option<&str>) -> Result<(u64, String)> 
     if core.is_some_and(|c| c != "127.0.0.1:9") && !connected {
         return Err("the agent did not connect to the test core".into());
     }
+    if ssh.is_some() && !ssh_started {
+        return Err("the SSH server of the agent did not start".into());
+    }
     let bytes = resident_bytes_of(&line).ok_or_else(|| format!("no resident_bytes in: {line}"))?;
-    Ok((bytes, detail))
+    Ok(Measure {
+        bytes,
+        detail,
+        modules,
+    })
+}
+
+/// The shared libraries (Linux, `/proc/<pid>/maps`) or DLLs (Windows, through
+/// PowerShell) loaded by `pid`, lower case, sorted. Empty elsewhere or if
+/// they cannot be listed.
+fn modules(pid: u32) -> Vec<String> {
+    let mut found: Vec<String> = if cfg!(windows) {
+        let script =
+            format!("(Get-Process -Id {pid}).Modules | ForEach-Object {{ $_.ModuleName }}");
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .map(|o| parse_module_names(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default()
+    } else {
+        fs::read_to_string(format!("/proc/{pid}/maps"))
+            .map(|maps| parse_maps(&maps))
+            .unwrap_or_default()
+    };
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// One module name per line (PowerShell), the executable excluded.
+fn parse_module_names(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim().to_ascii_lowercase())
+        .filter(|l| {
+            Path::new(l)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("dll"))
+        })
+        .collect()
+}
+
+/// The shared libraries of a `/proc/<pid>/maps`.
+fn parse_maps(maps: &str) -> Vec<String> {
+    maps.lines()
+        .filter_map(|l| l.split_whitespace().nth(5))
+        .filter_map(|p| p.rsplit('/').next())
+        .filter(|name| name.contains(".so"))
+        .map(str::to_ascii_lowercase)
+        .collect()
 }
 
 /// Linux: anonymous (heap, stacks) and file-backed (code of the binary and
@@ -389,8 +574,15 @@ fn resident_bytes_of(line: &str) -> Option<u64> {
 /// (`ostena_tunnel::testing::MARKER`).
 const TESTING_MARKER: &[u8] = b"ostena-testing-core";
 
+/// The SSH identification every Ostena SSH end sends
+/// (`ostena_ssh::config::IDENTIFICATION`): present in a binary that links
+/// the SSH server.
+const SSH_MARKER: &[u8] = b"SSH-2.0-Ostena";
+
 /// Fails if a test-only feature (`testing`) of an Ostena crate is enabled in
-/// the release build of ostena-cli, or if `binary` contains the test core.
+/// the release build of ostena-cli, if the SSH server is not linked into
+/// it, or, for `binary`: if it contains the test core, lacks the SSH server,
+/// or (Windows) imports a GUI or COM DLL statically (ADR-0009).
 fn check_release(binary: Option<&str>) -> Result<()> {
     let root = workspace_root()?;
     let args = [
@@ -420,8 +612,14 @@ fn check_release(binary: Option<&str>) -> Result<()> {
     }
     eprintln!("no test-only feature in the release build of ostena-cli");
     match ssh_without_library(&String::from_utf8_lossy(&out.stdout)) {
-        SshLink::Absent => eprintln!("ostena-ssh not linked into ostena-cli yet"),
         SshLink::WithLibrary => eprintln!("ostena-ssh linked with its SSH library (feature russh)"),
+        SshLink::Absent => {
+            return Err(
+                "ostena-ssh is not in the release build of ostena-cli (feature `ssh` off?): the \
+                 agent would have no SSH server (ADR-0010)"
+                    .into(),
+            );
+        }
         SshLink::WithoutLibrary => {
             return Err(
                 "ostena-ssh is linked without its feature `russh`: the release binary would \
@@ -436,7 +634,38 @@ fn check_release(binary: Option<&str>) -> Result<()> {
             return Err(format!("{path} contains the test core").into());
         }
         eprintln!("{path}: no test core");
+        if !contains(&bytes, SSH_MARKER) {
+            return Err(
+                format!("{path} has no SSH server (built without the feature `ssh`?)").into(),
+            );
+        }
+        eprintln!("{path}: SSH server linked");
+        if pe::is_pe(&bytes) {
+            check_windows_imports(path, &bytes)?;
+        }
     }
+    Ok(())
+}
+
+/// ADR-0009: no GUI or COM DLL in the static imports of the Windows binary;
+/// `oleaut32.dll`, imported by the SSH library, must be delay-loaded.
+fn check_windows_imports(path: &str, bytes: &[u8]) -> Result<()> {
+    let imports = pe::imports(bytes).map_err(|e| format!("{path}: {e}"))?;
+    eprintln!("{path}: static imports: {}", imports.static_dlls.join(", "));
+    eprintln!("{path}: delay-loaded: {}", imports.delayed.join(", "));
+    let forbidden = imports.forbidden();
+    if !forbidden.is_empty() {
+        return Err(format!(
+            "{path} imports GUI or COM DLLs statically: {} (ADR-0009: delay-load them, see \
+             crates/ostena-cli/build.rs)",
+            forbidden.join(", ")
+        )
+        .into());
+    }
+    eprintln!(
+        "{path}: no GUI or COM DLL imported statically ({})",
+        pe::FORBIDDEN.join(", ")
+    );
     Ok(())
 }
 
@@ -457,7 +686,7 @@ fn testing_features(tree: &str) -> Vec<String> {
 /// How `ostena-ssh` is linked into the release build.
 #[derive(Debug, PartialEq, Eq)]
 enum SshLink {
-    /// Not a dependency (yet).
+    /// Not a dependency: refused, the agent would have no SSH server.
     Absent,
     /// With the `russh` feature, as the agent needs it.
     WithLibrary,
@@ -620,6 +849,69 @@ mod tests {
                 "ostena-crypto feature \"testing\"",
                 "ostena-tunnel feature \"testing\""
             ]
+        );
+    }
+
+    fn measure_of(bytes: u64, modules: &[&str]) -> Measure {
+        Measure {
+            bytes,
+            detail: String::new(),
+            modules: modules.iter().map(|m| (*m).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn footprint_regression_blocks_over_both_bounds_only() {
+        const MIB: u64 = 1024 * 1024;
+        let base = measure_of(7 * MIB, &["kernel32.dll"]);
+        let none: Vec<String> = Vec::new();
+        // +0.84 MiB (+12 %): under 1 MiB, not blocking.
+        let small = measure_of(7 * MIB + 880_000, &["kernel32.dll"]);
+        assert_eq!(compare("s", &base, &small), none);
+        // +1.5 MiB on 30 MiB (+5 %): not blocking.
+        let big = measure_of(30 * MIB, &[]);
+        assert_eq!(
+            compare("s", &big, &measure_of(31 * MIB + MIB / 2, &[])),
+            none
+        );
+        // +1.5 MiB on 7 MiB: blocking.
+        let failures = compare(
+            "s",
+            &base,
+            &measure_of(8 * MIB + MIB / 2, &["kernel32.dll"]),
+        );
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        // Smaller with SSH: fine.
+        let smaller = measure_of(6 * MIB, &["kernel32.dll"]);
+        assert_eq!(compare("s", &base, &smaller), none);
+    }
+
+    #[test]
+    fn footprint_refuses_extra_and_com_modules() {
+        let base = measure_of(100, &["kernel32.dll", "ws2_32.dll"]);
+        let with = measure_of(
+            100,
+            &["combase.dll", "kernel32.dll", "oleaut32.dll", "ws2_32.dll"],
+        );
+        let failures = compare("connected", &base, &with);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(failures[0].contains("combase.dll, oleaut32.dll"));
+        assert!(failures[1].contains("GUI or COM"));
+    }
+
+    #[test]
+    fn reads_loaded_modules() {
+        let maps = "\
+55d0c0a00000-55d0c0a20000 r--p 00000000 08:01 1234 /usr/local/bin/ostena
+7f00a0000000-7f00a0020000 r-xp 00000000 08:01 42 /usr/lib/x86_64-linux-gnu/libc.so.6
+7f00a0100000-7f00a0120000 r--p 00000000 08:01 43 /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2
+7f00a0200000-7f00a0220000 rw-p 00000000 00:00 0
+7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0 [stack]
+";
+        assert_eq!(parse_maps(maps), ["libc.so.6", "ld-linux-x86-64.so.2"]);
+        assert_eq!(
+            parse_module_names("ostena.exe\r\nntdll.dll\r\nKERNEL32.DLL\r\n\r\n"),
+            ["ntdll.dll", "kernel32.dll"]
         );
     }
 
