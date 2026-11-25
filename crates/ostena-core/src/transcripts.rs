@@ -21,8 +21,12 @@
 //! A transcript left unsealed by a stop of the core is sealed as
 //! incomplete at the next start ([`recover`]), from the file as it is.
 //!
-//! The file is written with blocking calls behind a 64 KiB buffer: a write
-//! reaches the kernel cache, not the disk, until the final sync.
+//! The stream is read and decoded on the async workers; the file is
+//! written by a blocking task ([`tokio::task::spawn_blocking`]) fed through
+//! a bounded queue, behind a 64 KiB buffer: a slow disk slows down the
+//! stream of its session (back-pressure up to the agent), never the
+//! workers. A write reaches the kernel cache, not the disk, until the
+//! final sync; the directory is synced after the file is created.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read};
@@ -30,9 +34,10 @@ use std::path::{Path, PathBuf};
 
 use ostena_audit::{Event, EventKind, Outcome, field};
 use ostena_crypto::hmac::HmacKey;
-use ostena_recorder::{CastWriter, Decoder, EndReason, Limits, RecorderError, Sealed};
+use ostena_recorder::{CastWriter, Decoder, EndReason, Frame, Limits, RecorderError, Sealed};
 use ostena_tunnel::{Channel, Uuid};
 use sqlx::PgPool;
+use tokio::sync::mpsc;
 
 use crate::audit::{self, Recorder};
 use crate::error::CoreError;
@@ -53,6 +58,8 @@ const EXEC_DOMAIN: &[u8] = b"ostena/ssh-exec/v1\0";
 const READ_CHUNK: usize = 16 * 1024;
 /// Buffer of the file writer.
 const WRITE_BUFFER: usize = 64 * 1024;
+/// Frames queued between the stream and the file writer.
+const WRITE_QUEUE: usize = 16;
 
 /// The transcript directory and the key of the command hashes.
 pub struct Transcripts {
@@ -268,6 +275,8 @@ async fn register(pool: &PgPool, agent: Uuid, session: Uuid, now: u64) -> Result
     Ok(inserted == 1)
 }
 
+/// Creates the file of a transcript, private, never over another, then
+/// syncs its directory so that the file survives a crash.
 fn create(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -276,7 +285,59 @@ fn create(path: &Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir)?;
+    }
+    Ok(file)
+}
+
+/// Syncs a directory (its entries). Not possible on Windows, where the
+/// metadata are journaled by NTFS.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Writes the frames of `frames` to `file` until the queue is closed, then
+/// flushes, syncs and makes the file read-only: blocking, run by
+/// [`tokio::task::spawn_blocking`]. The buffer is flushed whenever the
+/// queue is empty. Stops at the first error.
+///
+/// # Errors
+///
+/// [`RecorderError::Io`] (`REC-E004`), or an error of the writer.
+fn write_file(
+    file: File,
+    path: &Path,
+    session: Uuid,
+    mut frames: mpsc::Receiver<Frame>,
+) -> Result<Sealed, RecorderError> {
+    let mut writer = CastWriter::new(
+        BufWriter::with_capacity(WRITE_BUFFER, file),
+        session.to_bytes(),
+    );
+    while let Some(frame) = frames.blocking_recv() {
+        writer.push(&frame)?;
+        if frames.is_empty() {
+            writer.flush()?;
+        }
+    }
+    let (sealed, inner) = writer.finish()?;
+    let file = inner
+        .into_inner()
+        .map_err(|e| RecorderError::Io(e.error().to_string()))?;
+    file.sync_all()
+        .map_err(|e| RecorderError::Io(e.to_string()))?;
+    seal_rights(path).map_err(|e| RecorderError::Io(e.to_string()))?;
+    Ok(sealed)
 }
 
 /// What the reading loop ended on.
@@ -287,14 +348,15 @@ struct Received {
     output_bytes: u64,
 }
 
-/// Reads the stream into `writer` until its end or the first failure.
+/// Reads the stream into the queue of the file writer until its end or
+/// the first failure.
 async fn read_stream(
     store: &Transcripts,
     recorder: &Recorder,
     agent: Uuid,
     session: Uuid,
     channel: &mut Channel,
-    writer: &mut CastWriter<BufWriter<File>>,
+    writer: &mpsc::Sender<Frame>,
 ) -> Received {
     let mut decoder = Decoder::new(store.limits);
     let mut buf = vec![0u8; READ_CHUNK];
@@ -341,16 +403,12 @@ async fn read_stream(
                         ostena_recorder::Event::End { reason, .. } => out.reason = Some(*reason),
                         _ => {}
                     }
-                    if let Err(e) = writer.push(&frame) {
-                        out.failure = Some(e);
+                    // Stopped on an error: it is told at the end.
+                    if writer.send(frame).await.is_err() {
                         break 'stream;
                     }
                 }
                 out.output_bytes = decoder.output_bytes();
-                if let Err(e) = writer.flush() {
-                    out.failure = Some(e);
-                    break;
-                }
             }
             Ok(None) => {
                 out.failure = decoder.finish().err();
@@ -364,6 +422,35 @@ async fn read_stream(
     }
     out.output_bytes = decoder.output_bytes();
     out
+}
+
+/// Reads the stream of `session` into `file`, written by a blocking task;
+/// returns what was read and what the writer sealed. A writer error is the
+/// failure of the stream if it had none.
+async fn record(
+    store: &Transcripts,
+    recorder: &Recorder,
+    agent: Uuid,
+    session: Uuid,
+    channel: &mut Channel,
+    file: File,
+) -> (Received, Result<Sealed, RecorderError>) {
+    let (frames, queued) = mpsc::channel(WRITE_QUEUE);
+    let written = {
+        let path = store.path(session);
+        tokio::task::spawn_blocking(move || write_file(file, &path, session, queued))
+    };
+    let mut read = read_stream(store, recorder, agent, session, channel, &frames).await;
+    drop(frames);
+    let written = written
+        .await
+        .unwrap_or_else(|e| Err(RecorderError::Io(e.to_string())));
+    if read.failure.is_none()
+        && let Err(e) = &written
+    {
+        read.failure = Some(e.clone());
+    }
+    (read, written)
 }
 
 /// Receives the transcript stream of `session` from `agent`, writes it and
@@ -400,7 +487,13 @@ pub async fn receive(
         Err(e) => return refuse(&mut channel, REFUSED, &e.to_string()),
     }
     let path = store.path(session);
-    let file = match create(&path) {
+    let created = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || create(&path))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+    };
+    let file = match created {
         Ok(file) => file,
         Err(e) => {
             refuse(
@@ -426,11 +519,7 @@ pub async fn receive(
             return;
         }
     };
-    let mut writer = CastWriter::new(
-        BufWriter::with_capacity(WRITE_BUFFER, file),
-        session.to_bytes(),
-    );
-    let read = read_stream(store, recorder, agent, session, &mut channel, &mut writer).await;
+    let (read, written) = record(store, recorder, agent, session, &mut channel, file).await;
     let code = read.failure.as_ref().map(RecorderError::code);
     if let Some(failure) = &read.failure {
         if matches!(failure, RecorderError::Incomplete(_)) {
@@ -440,7 +529,7 @@ pub async fn receive(
             refuse(&mut channel, failure.code(), &failure.to_string());
         }
     }
-    let (sealed, code) = finish(writer, &path, session, code);
+    let (sealed, code) = finish(written, &path, session, code).await;
     let ending = Ending {
         sealed,
         output_bytes: read.output_bytes,
@@ -464,28 +553,29 @@ pub async fn receive(
     }
 }
 
-/// Flushes, syncs and makes read-only the file of a transcript; returns
-/// its seal and the code of the transcript. If the file cannot be finished,
-/// what is on disk is what gets sealed, incomplete.
-fn finish(
-    writer: CastWriter<BufWriter<File>>,
+/// The seal and the code of a transcript, from what the file writer
+/// returned. If the file could not be finished, what is on disk is what
+/// gets sealed, incomplete.
+async fn finish(
+    written: Result<Sealed, RecorderError>,
     path: &Path,
     session: Uuid,
     code: Option<&'static str>,
 ) -> (Sealed, Option<&'static str>) {
-    let finished = writer.finish().and_then(|(sealed, inner)| {
-        let file = inner
-            .into_inner()
-            .map_err(|e| RecorderError::Io(e.error().to_string()))?;
-        file.sync_all()
-            .map_err(|e| RecorderError::Io(e.to_string()))?;
-        Ok(sealed)
-    });
-    let out = match finished {
+    match written {
         Ok(sealed) => (sealed, code),
         Err(e) => {
             tracing::warn!(event = "transcript.write_failed", session = %session, code = e.code(), "{e}");
-            let (size, sha256) = measure(path).unwrap_or((0, ostena_crypto::sha256::digest(b"")));
+            let path = path.to_path_buf();
+            let measured = tokio::task::spawn_blocking(move || {
+                let measured = measure(&path);
+                let _ = seal_rights(&path);
+                measured
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+            let (size, sha256) = measured.unwrap_or((0, ostena_crypto::sha256::digest(b"")));
             (
                 Sealed {
                     sha256,
@@ -496,11 +586,7 @@ fn finish(
                 Some(code.unwrap_or(WRITE_FAILED)),
             )
         }
-    };
-    if let Err(e) = seal_rights(path) {
-        tracing::warn!(event = "transcript.write_failed", session = %session, code = WRITE_FAILED, "{e}");
     }
-    out
 }
 
 /// Seals as incomplete (`REC-E005`) the transcripts left unsealed by a stop
@@ -556,4 +642,82 @@ pub async fn recover(
         );
     }
     Ok(rows.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ostena-core-transcripts-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn frames() -> Vec<Frame> {
+        vec![
+            Frame {
+                at_us: 0,
+                event: ostena_recorder::Event::Start {
+                    cols: 0,
+                    rows: 0,
+                    started_ms: 1_700_000_000_000,
+                    term: String::new(),
+                    command: Some(b"id".to_vec()),
+                },
+            },
+            Frame {
+                at_us: 10,
+                event: ostena_recorder::Event::Output(b"uid=0(root)\n".to_vec()),
+            },
+            Frame {
+                at_us: 20,
+                event: ostena_recorder::Event::End {
+                    reason: EndReason::Closed,
+                    output_bytes: 12,
+                },
+            },
+        ]
+    }
+
+    /// The file writer runs off the async workers, fed by a bounded queue:
+    /// what it seals is what is on disk, read-only.
+    #[test]
+    fn the_file_writer_seals_what_it_wrote() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let dir = dir("writer");
+        let session = Uuid::random().unwrap();
+        let path = dir.join(format!("{session}.cast"));
+        let file = create(&path).unwrap();
+        assert!(create(&path).is_err(), "never over another file");
+        let sealed = rt.block_on(async {
+            let (tx, rx) = mpsc::channel(1);
+            let written = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || write_file(file, &path, session, rx))
+            };
+            for frame in frames() {
+                tx.send(frame).await.unwrap();
+            }
+            drop(tx);
+            written.await.unwrap().unwrap()
+        });
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(sealed.size, bytes.len() as u64);
+        assert_eq!(sealed.sha256, ostena_crypto::sha256::digest(&bytes));
+        assert_eq!(measure(&path).unwrap(), (sealed.size, sealed.sha256));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o400);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
