@@ -735,6 +735,7 @@ pub async fn agent(
     let identity = ostena_ssh::server::SshIdentity::new(
         host_key,
         &certificate,
+        &[host_ca.verifying_key()],
         vec![user_ca.verifying_key()],
         ostena_grant::unix_now(),
     )

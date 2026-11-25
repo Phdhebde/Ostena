@@ -222,6 +222,10 @@ pub enum CoreMessage {
         /// Authorities of the user certificates (1 to 4: rotation),
         /// uncompressed SEC1 points, base64url.
         user_ca_p256_public: Vec<String>,
+        /// Authorities of the host certificates (1 to 4: rotation),
+        /// uncompressed SEC1 points, base64url: the SSH server checks the
+        /// signature of its own host certificate against them.
+        host_ca_p256_public: Vec<String>,
         /// Host certificate of the agent (OpenSSH blob, base64url), once the
         /// core has certified its host key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -244,6 +248,8 @@ pub enum CoreMessage {
 
 /// Most user certificate authorities pushed at once (rotation).
 pub const MAX_USER_CAS: usize = 4;
+/// Most host certificate authorities pushed at once (rotation).
+pub const MAX_HOST_CAS: usize = 4;
 /// Largest host certificate, in bytes (as `ostena_ssh::cert`).
 pub const MAX_HOST_CERTIFICATE: usize = 4096;
 /// Longest SSH account, in bytes (as `ostena_ssh::login`).
@@ -536,11 +542,7 @@ impl CoreMessage {
                 Ok(())
             }
             Self::Shutdown { reason } => text("reason", reason, 128),
-            Self::SshTrust {
-                version,
-                user_ca_p256_public,
-                host_certificate: certificate,
-            } => ssh_trust(*version, user_ca_p256_public, certificate.as_deref()),
+            Self::SshTrust { .. } => self.check_ssh_trust(),
             Self::SshGrant { grant, .. } => SignedGrant::from_text(grant)
                 .map(|_| ())
                 .map_err(|e| invalid(format!("grant : {e}"))),
@@ -579,26 +581,56 @@ fn ssh_session_fields(
     }
 }
 
-/// 1 to [`MAX_USER_CAS`] distinct authorities, a structurally valid host
-/// certificate if any, a version above 0.
+impl CoreMessage {
+    /// For [`CoreMessage::SshTrust`]: 1 to 4 distinct authorities of each
+    /// kind, a structurally valid host certificate if any, a version above
+    /// 0. Any other message passes.
+    fn check_ssh_trust(&self) -> Result<(), TunnelError> {
+        let Self::SshTrust {
+            version,
+            user_ca_p256_public,
+            host_ca_p256_public,
+            host_certificate,
+        } = self
+        else {
+            return Ok(());
+        };
+        ssh_trust(
+            *version,
+            user_ca_p256_public,
+            host_ca_p256_public,
+            host_certificate.as_deref(),
+        )
+    }
+}
+
 fn ssh_trust(
     version: u64,
     user_cas: &[String],
+    host_cas: &[String],
     certificate: Option<&str>,
 ) -> Result<(), TunnelError> {
-    if version == 0 || user_cas.is_empty() || user_cas.len() > MAX_USER_CAS {
-        return Err(invalid(
-            "confiance SSH de version 0, ou sans 1 à 4 autorités d'utilisateurs",
-        ));
+    if version == 0 {
+        return Err(invalid("confiance SSH de version 0"));
     }
-    let mut seen = std::collections::HashSet::new();
-    for ca in user_cas {
-        if !seen.insert(p256_point("user_ca_p256_public", ca)?) {
-            return Err(invalid("autorité d'utilisateurs en double"));
-        }
-    }
+    authorities("user_ca_p256_public", user_cas, MAX_USER_CAS)?;
+    authorities("host_ca_p256_public", host_cas, MAX_HOST_CAS)?;
     if let Some(certificate) = certificate {
         host_certificate(certificate)?;
+    }
+    Ok(())
+}
+
+/// 1 to `max` distinct P-256 points.
+fn authorities(field: &str, cas: &[String], max: usize) -> Result<(), TunnelError> {
+    if cas.is_empty() || cas.len() > max {
+        return Err(invalid(format!("{field} : 1 à {max} autorités attendues")));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for ca in cas {
+        if !seen.insert(p256_point(field, ca)?) {
+            return Err(invalid(format!("{field} : autorité en double")));
+        }
     }
     Ok(())
 }

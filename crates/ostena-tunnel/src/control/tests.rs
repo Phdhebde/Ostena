@@ -401,11 +401,13 @@ fn ssh_messages_round_trip() {
         CoreMessage::SshTrust {
             version: 1,
             user_ca_p256_public: vec![point(), point()],
+            host_ca_p256_public: vec![point()],
             host_certificate: Some(host_certificate_blob()),
         },
         CoreMessage::SshTrust {
             version: 2,
             user_ca_p256_public: vec![point()],
+            host_ca_p256_public: vec![point(), point(), point(), point()],
             host_certificate: None,
         },
         CoreMessage::SshGrant {
@@ -486,8 +488,30 @@ fn ssh_trust_and_host_key_are_checked() {
     let trust = |cas: Vec<String>, certificate: Option<String>| CoreMessage::SshTrust {
         version: 1,
         user_ca_p256_public: cas,
+        host_ca_p256_public: vec![point()],
         host_certificate: certificate,
     };
+    let host = |cas: Vec<String>| CoreMessage::SshTrust {
+        version: 1,
+        user_ca_p256_public: vec![point()],
+        host_ca_p256_public: cas,
+        host_certificate: None,
+    };
+    let h = point();
+    assert!(host(vec![h.clone()]).validate().is_ok());
+    assert!(refused_core(&host(vec![])));
+    assert!(refused_core(&host(vec![point(); 5])));
+    assert!(refused_core(&host(vec![h.clone(), h])));
+    assert!(refused_core(&host(vec![URL_SAFE_NO_PAD.encode([4u8; 65])])));
+    // The field is required.
+    let json = format!(
+        r#"{{"type":"ssh_trust","version":1,"user_ca_p256_public":["{}"]}}"#,
+        point()
+    );
+    assert!(matches!(
+        decode::<CoreMessage>(json.as_bytes()),
+        Err(TunnelError::Protocol(_))
+    ));
     let p = point();
     assert!(refused_core(&trust(vec![], None)));
     assert!(refused_core(&trust(vec![point(); 5], None)));
@@ -504,6 +528,7 @@ fn ssh_trust_and_host_key_are_checked() {
     assert!(refused_core(&CoreMessage::SshTrust {
         version: 0,
         user_ca_p256_public: vec![point()],
+        host_ca_p256_public: vec![point()],
         host_certificate: None,
     }));
     assert!(refused_core(&CoreMessage::LoginRevoked {
@@ -586,6 +611,8 @@ fn ssh_field_names_are_not_redacted() {
         "resource",
         "client_address",
         "user_ca_p256_public",
+        "host_ca_p256_public",
+        "host_authorities",
         "host_certificate",
         "target_p256_public",
         "authorities",

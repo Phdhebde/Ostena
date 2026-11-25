@@ -211,9 +211,10 @@ impl GatewayState {
         self.ssh_trust.subscribe()
     }
 
-    /// Applies the SSH trust pushed by the core: the user certificate
-    /// authorities and the host certificate of the agent. The host
-    /// certificate is checked by the SSH server before use (`SSH-E018`).
+    /// Applies the SSH trust pushed by the core: the user and host
+    /// certificate authorities and the host certificate of the agent. The
+    /// host certificate, its signature by a host authority included, is
+    /// checked by the SSH server before use (`SSH-E018`).
     ///
     /// # Errors
     ///
@@ -226,9 +227,10 @@ impl GatewayState {
         &self,
         version: u64,
         user_cas: &[String],
+        host_cas: &[String],
         host_certificate: Option<&str>,
     ) -> Result<Applied, TunnelError> {
-        let trust = SshTrust::decode(version, user_cas, host_certificate)?;
+        let trust = SshTrust::decode(version, user_cas, host_cas, host_certificate)?;
         let mut outcome = Ok(Applied::Applied);
         self.ssh_trust
             .send_if_modified(|current| match current.as_ref().map(|c| c.version) {
@@ -816,16 +818,19 @@ async fn dispatch(
             CoreMessage::SshTrust {
                 version,
                 user_ca_p256_public,
+                host_ca_p256_public,
                 host_certificate,
             } => match state.apply_ssh_trust(
                 version,
                 &user_ca_p256_public,
+                &host_ca_p256_public,
                 host_certificate.as_deref(),
             ) {
                 Ok(Applied::Applied) => tracing::info!(
                     event = "agent.ssh_trust_applied",
                     version,
                     authorities = user_ca_p256_public.len(),
+                    host_authorities = host_ca_p256_public.len(),
                     host_certificate = host_certificate.is_some(),
                 ),
                 Ok(Applied::Unchanged) => {}

@@ -293,8 +293,14 @@ async fn bench() {
         &host_ca,
     )
     .unwrap();
-    let identity =
-        SshIdentity::new(host, &host_certificate, vec![user_ca.verifying_key()], now).unwrap();
+    let identity = SshIdentity::new(
+        host,
+        &host_certificate,
+        &[host_ca.verifying_key()],
+        vec![user_ca.verifying_key()],
+        now,
+    )
+    .unwrap();
     let (_identity, identity_rx) = tokio::sync::watch::channel(Some(Arc::new(identity)));
     let server = SshServer::new(
         ServerSettings::default(),

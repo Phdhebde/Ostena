@@ -167,6 +167,7 @@ struct Grants {
     resources: Mutex<HashMap<[u8; 16], Target>>,
     ssh_resources: Mutex<HashMap<String, SshResource>>,
     ssh_user_ca: p256::SigningKey,
+    ssh_host_ca: p256::SigningKey,
     ssh_host_keys: Mutex<Vec<p256::VerifyingKey>>,
     ssh_requests: Mutex<Vec<AgentMessage>>,
     ssh_issued: Mutex<Vec<String>>,
@@ -308,6 +309,7 @@ impl State {
                 resources: Mutex::default(),
                 ssh_resources: Mutex::default(),
                 ssh_user_ca: generate()?,
+                ssh_host_ca: generate()?,
                 ssh_host_keys: Mutex::default(),
                 ssh_requests: Mutex::default(),
                 ssh_issued: Mutex::default(),
@@ -726,6 +728,13 @@ impl TestCore {
         &self.state.grants.ssh_user_ca
     }
 
+    /// The authority of the host certificates, pushed in
+    /// [`TestCore::push_ssh_trust`]: tests sign the agent host certificate
+    /// with it.
+    pub fn ssh_host_ca(&self) -> &p256::SigningKey {
+        &self.state.grants.ssh_host_ca
+    }
+
     /// Adds an SSH resource to the test inventory, reached as
     /// `account@name`.
     pub fn add_ssh_resource(&self, name: &str, resource: SshResource) {
@@ -734,13 +743,16 @@ impl TestCore {
         }
     }
 
-    /// Pushes the SSH trust (the test user authority and `host_certificate`)
-    /// with `version` to every connected agent; returns how many.
+    /// Pushes the SSH trust (the test user and host authorities and
+    /// `host_certificate`) with `version` to every connected agent; returns
+    /// how many.
     pub async fn push_ssh_trust(&self, version: u64, host_certificate: Option<&[u8]>) -> usize {
         let ca = self.state.grants.ssh_user_ca.verifying_key();
+        let host_ca = self.state.grants.ssh_host_ca.verifying_key();
         self.push(&CoreMessage::SshTrust {
             version,
             user_ca_p256_public: vec![URL_SAFE_NO_PAD.encode(ca.to_bytes())],
+            host_ca_p256_public: vec![URL_SAFE_NO_PAD.encode(host_ca.to_bytes())],
             host_certificate: host_certificate.map(|c| URL_SAFE_NO_PAD.encode(c)),
         })
         .await

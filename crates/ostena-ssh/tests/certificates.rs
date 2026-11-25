@@ -150,3 +150,73 @@ fn our_certificates_are_read_by_ssh_keygen() {
     assert!(!listing.contains("permit-port-forwarding"));
     assert!(listing.contains("Critical Options: (none)"));
 }
+
+/// The agent checks the signature of its own host certificate against the
+/// host authorities pushed by the core (`SSH-E018`).
+#[test]
+fn host_certificate_must_be_signed_by_a_pushed_host_authority() {
+    use ostena_crypto::p256::VerifyingKey;
+    use ostena_ssh::server::SshIdentity;
+
+    let host_ca = SigningKey::generate().unwrap().0;
+    let rogue = SigningKey::generate().unwrap().0;
+    let user_ca = SigningKey::generate().unwrap().0;
+    let generated = ostena_ssh::keys::generate("host").unwrap();
+    let now = ostena_grant::unix_now();
+    let public = VerifyingKey::from_bytes(
+        &ostena_ssh::driver::sec1_point(
+            ostena_ssh::keys::load(&generated.private)
+                .unwrap()
+                .public_key(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap(),
+    )
+    .unwrap();
+    let issue = |ca: &SigningKey| {
+        cert::issue(
+            &Template {
+                kind: Kind::Host,
+                public,
+                serial: 1,
+                key_id: "gw".into(),
+                principals: vec!["gw.example.test".into()],
+                valid_after: now - 60,
+                valid_before: now + 3600,
+                critical_options: vec![],
+                extensions: vec![],
+            },
+            ca,
+        )
+        .unwrap()
+    };
+    let identity = |certificate: &[u8], host_cas: &[VerifyingKey]| {
+        SshIdentity::new(
+            ostena_ssh::keys::load(&generated.private).unwrap(),
+            certificate,
+            host_cas,
+            vec![user_ca.verifying_key()],
+            now,
+        )
+    };
+    let good = issue(&host_ca);
+    assert!(identity(&good, &[host_ca.verifying_key()]).is_ok());
+    // Signed by another authority, or no host authority pushed.
+    let refused = identity(&issue(&rogue), &[host_ca.verifying_key()]).unwrap_err();
+    assert_eq!(refused.code(), "SSH-E018");
+    assert!(refused.to_string().contains("autorité"), "{refused}");
+    assert_eq!(identity(&good, &[]).unwrap_err().code(), "SSH-E018");
+    // Rotation: either authority of the list.
+    assert!(identity(&good, &[rogue.verifying_key(), host_ca.verifying_key()]).is_ok());
+    // A tampered signature.
+    let mut tampered = good.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 1;
+    assert_eq!(
+        identity(&tampered, &[host_ca.verifying_key()])
+            .unwrap_err()
+            .code(),
+        "SSH-E018"
+    );
+}

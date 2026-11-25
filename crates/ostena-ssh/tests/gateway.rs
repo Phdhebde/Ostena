@@ -384,6 +384,7 @@ fn nothing_passes_before_the_ssh_trust_and_a_lower_trust_is_refused() {
         assert!(until(&gateway, |g| g.state().versions().ssh_trust == Some(2)).await);
         let trust = gateway.state().ssh_trust().unwrap();
         assert_eq!(trust.user_cas, [core.ssh_user_ca().verifying_key()]);
+        assert_eq!(trust.host_cas, [core.ssh_host_ca().verifying_key()]);
         // A lower version is refused, the trust stays.
         core.push_ssh_trust(1, None).await;
         // The same version again is ignored; with another content, refused.
