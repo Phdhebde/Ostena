@@ -6,6 +6,7 @@
 // A developer tool: reporting progress on the console is its job.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+mod bench;
 mod pe;
 mod secrets;
 
@@ -29,6 +30,9 @@ Tasks:
                  Measure the idle memory of the agent, with and without SSH (release
                  build, for TRIPLE if given, such as x86_64-unknown-linux-musl); fail
                  on a blocking regression (ADR-0009)
+  bench-ssh      Run the SSH latency benches (agent relay, tunnel), write
+                 target/bench/ssh-latency.jsonl and .md, and append the summary
+                 to $GITHUB_STEP_SUMMARY if set; displayed only, not a gate
   fuzz [SECS] [TARGET...]
                  Run fuzz targets, each for SECS (default 60, all targets)
   check-release [BINARY]
@@ -51,6 +55,7 @@ fn main() -> ExitCode {
         Some("vendor") => vendor(),
         Some("sbom") => sbom(),
         Some("footprint") => footprint(&std::env::args().skip(2).collect::<Vec<_>>()),
+        Some("bench-ssh") => bench_ssh(),
         Some("fuzz") => fuzz(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("check-release") => check_release(std::env::args().nth(2).as_deref()),
         None | Some("help" | "-h" | "--help") => {
@@ -189,6 +194,53 @@ fn sbom() -> Result<()> {
         return Err("cargo cyclonedx produced no SBOM".into());
     }
     eprintln!("{count} SBOM(s) written to {}", out_dir.display());
+    Ok(())
+}
+
+/// The SSH latency benches, gathered into one summary (ADR-0005: not a
+/// gate).
+fn bench_ssh() -> Result<()> {
+    let out_dir = workspace_root()?.join("target").join("bench");
+    fs::create_dir_all(&out_dir)?;
+    let lines = out_dir.join("ssh-latency.jsonl");
+    if lines.exists() {
+        fs::remove_file(&lines)?;
+    }
+    for args in [
+        ["bench", "--locked", "-p", "ostena-ssh", "--bench", "relay"],
+        [
+            "bench",
+            "--locked",
+            "-p",
+            "ostena-tunnel",
+            "--bench",
+            "latency",
+        ],
+    ] {
+        let mut cmd = cargo();
+        cmd.args(args).env("OSTENA_BENCH_OUT", &lines);
+        run(cmd)?;
+    }
+    let text = fs::read_to_string(&lines)?;
+    let results = text
+        .lines()
+        .map(|l| bench::parse_line(l).ok_or_else(|| format!("unreadable bench line: {l}")))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if results.len() != 3 {
+        return Err(format!("expected 3 bench results, got {}", results.len()).into());
+    }
+    let commit = std::env::var("GITHUB_SHA").ok();
+    let summary = bench::markdown(&results, commit.as_deref());
+    fs::write(out_dir.join("ssh-latency.md"), &summary)?;
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
+        use std::io::Write as _;
+        fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)?
+            .write_all(summary.as_bytes())?;
+    }
+    print!("{summary}");
     Ok(())
 }
 
@@ -836,7 +888,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Fuzz target run by `cargo xtask fuzz`.
-const FUZZ_TARGETS: [&str; 12] = [
+const FUZZ_TARGETS: [&str; 13] = [
     "grant_decode",
     "scope_target",
     "scope_policy",
@@ -849,6 +901,7 @@ const FUZZ_TARGETS: [&str; 12] = [
     "audit_decode",
     "audit_verify",
     "login_messages",
+    "release_manifest",
 ];
 
 /// Runs each fuzz target (all by default) for `SECS` seconds with the nightly

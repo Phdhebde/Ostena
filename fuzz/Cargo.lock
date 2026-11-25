@@ -649,6 +649,7 @@ dependencies = [
  "libfuzzer-sys",
  "ostena-audit",
  "ostena-common",
+ "ostena-crypto",
  "ostena-frame",
  "ostena-grant",
  "ostena-scope",

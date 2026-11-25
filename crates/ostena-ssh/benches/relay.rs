@@ -6,7 +6,8 @@
 //! shell) against a direct session. Prints p50 and p99; target: at most
 //! 3 ms added at p99 (CLAUDE.md). Not a gate (ADR-0005).
 //!
-//! `cargo bench -p ostena-ssh --bench relay`
+//! `cargo bench -p ostena-ssh --bench relay`; with `OSTENA_BENCH_OUT`, the
+//! results are also appended there as JSON Lines (`cargo xtask bench-ssh`).
 
 #![allow(
     clippy::expect_used,
@@ -232,7 +233,30 @@ async fn setups(addr: std::net::SocketAddr, user: &str, login: &Login) -> Vec<Du
     samples
 }
 
-fn report(name: &str, through: &mut [Duration], direct: &mut [Duration]) {
+/// Appends one result to `$OSTENA_BENCH_OUT` (JSON Lines), read by
+/// `cargo xtask bench-ssh`; durations in microseconds.
+fn record(case: &str, samples: usize, direct: [Duration; 2], through: [Duration; 2]) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("OSTENA_BENCH_OUT") else {
+        return;
+    };
+    let line = format!(
+        "{{\"bench\":\"ssh-relay\",\"case\":\"{case}\",\"samples\":{samples},\
+         \"direct_p50_us\":{},\"direct_p99_us\":{},\"through_p50_us\":{},\"through_p99_us\":{}}}\n",
+        direct[0].as_micros(),
+        direct[1].as_micros(),
+        through[0].as_micros(),
+        through[1].as_micros(),
+    );
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .expect("OSTENA_BENCH_OUT");
+}
+
+fn report(name: &str, case: &str, through: &mut [Duration], direct: &mut [Duration]) {
     through.sort_unstable();
     direct.sort_unstable();
     let (t50, t99) = (percentile(through, 500), percentile(through, 990));
@@ -246,6 +270,7 @@ fn report(name: &str, through: &mut [Duration], direct: &mut [Duration]) {
         micros(t50.saturating_sub(d50)),
         micros(t99.saturating_sub(d99)),
     );
+    record(case, through.len(), [d50, d99], [t50, t99]);
 }
 
 async fn bench() {
@@ -339,10 +364,20 @@ async fn bench() {
 
     let mut via = round_trips(shell(agent_addr, "ostena@bench", &certificate).await).await;
     let mut straight = round_trips(shell(target_addr, "ostena", &direct).await).await;
-    report("aller-retour 64 octets", &mut via, &mut straight);
+    report(
+        "aller-retour 64 octets",
+        "round_trip_64",
+        &mut via,
+        &mut straight,
+    );
     let mut via = setups(agent_addr, "ostena@bench", &certificate).await;
     let mut straight = setups(target_addr, "ostena", &direct).await;
-    report("établissement de session", &mut via, &mut straight);
+    report(
+        "établissement de session",
+        "session_setup",
+        &mut via,
+        &mut straight,
+    );
 }
 
 fn main() {

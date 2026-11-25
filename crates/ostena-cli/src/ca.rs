@@ -56,7 +56,7 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Creates `path` with `bytes`, refusing to overwrite; `secret` files get
 /// mode 0600 on Unix.
-fn create(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
+pub(crate) fn create(path: &Path, bytes: &[u8], secret: bool) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

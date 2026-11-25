@@ -12,7 +12,8 @@
 //! - [`sealed`] — sealing of the offline root key;
 //! - [`rand`] — operating system randomness;
 //! - [`hkdf`] — HKDF-SHA-256;
-//! - [`sha256`] — digests.
+//! - [`sha256`] — digests;
+//! - [`release`] — signed release manifests (ADR-0017).
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +23,7 @@ pub mod p256;
 pub mod password;
 pub mod pki;
 pub mod rand;
+pub mod release;
 pub mod sealed;
 pub mod sha256;
 pub mod tls;

@@ -4,17 +4,21 @@ name: CI
 # runs everything, Windows included. Hence:
 # - pushes to dev and main run the same jobs and save the caches that pull
 #   requests restore (pull requests only read them, so the cache stays small);
+# - the merge queue (merge_group) runs them again on the merged result;
 # - a weekly run on main also catches new RustSec advisories and runs the
 #   benches;
-# - documentation-only changes run nothing;
+# - documentation-only changes run the light checks only (job `changes`),
+#   so that the required check `ci-ok` still reports on them;
 # - GitHub-hosted runners only: a self-hosted runner would execute the code of
 #   pull requests from forks.
+#
+# Branch protection of dev and main requires the single check `ci-ok`, which
+# succeeds only when every job succeeded or was skipped as documentation-only.
 on:
   pull_request:
-    paths-ignore: ["docs/**", "**/*.md", "LICENSE"]
   push:
     branches: [main, dev]
-    paths-ignore: ["docs/**", "**/*.md", "LICENSE"]
+  merge_group:
   schedule:
     - cron: "0 3 * * 1"
   workflow_dispatch:
@@ -35,6 +39,49 @@ env:
 
 # Third-party actions are pinned by commit SHA; the tag is in the comment.
 jobs:
+  # Whether the change touches more than documentation: docs/**, *.md and
+  # LICENSE only skip the build jobs. Scheduled and manual runs, and pushes
+  # without a known previous commit, run everything.
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          case "$EVENT" in
+            pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
+            merge_group) base="$MQ_BASE"; head="$MQ_HEAD" ;;
+            push) base="$PUSH_BEFORE"; head="$PUSH_AFTER" ;;
+            *) base=""; head="" ;;
+          esac
+          code=true
+          if [ -n "$base" ] && [ -n "$head" ] && ! [[ "$base" =~ ^0+$ ]] \
+             && files="$(git diff --name-only "$base" "$head")"; then
+            code=false
+            while IFS= read -r f; do
+              case "$f" in
+                docs/*|*.md|LICENSE) ;;
+                *) code=true ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Code changed: $code"
+
   # Light checks gathered in one job: one checkout and one toolchain for all.
   checks:
     runs-on: ubuntu-24.04
@@ -78,6 +125,8 @@ jobs:
           exit $status
 
   linux:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -93,12 +142,11 @@ jobs:
       # ostena-frame is also the protocol core of the browser client.
       - run: cargo build --locked --release -p ostena-frame --target wasm32-unknown-unknown
       # Displayed only: no regression gate yet (ADR-0005). On dev and main.
-      - if: github.event_name != 'pull_request'
+      # The SSH latency benches run in their own job (bench-ssh).
+      - if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
         run: |
           cargo bench --locked -p ostena-scope
           cargo bench --locked -p ostena-frame
-          cargo bench --locked -p ostena-tunnel
-          cargo bench --locked -p ostena-ssh --bench relay
 
   # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
   # our server behind the pre-check (sessions, refusals, audit) and, with a
@@ -109,6 +157,8 @@ jobs:
   # through the real agent binary (test agent_ssh of ostena-cli).
   # Needs Docker.
   ssh-interop:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -132,6 +182,8 @@ jobs:
   # query cache (crates/ostena-core/.sqlx) is checked against the migrations.
   # Uses the PostgreSQL preinstalled on the runner (sudo).
   core-db:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -169,6 +221,8 @@ jobs:
   # restarts, uninstall), the unit on systemd 252 (Debian 12), and the idle
   # footprint. Needs a full VM with systemd.
   release-linux:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -203,6 +257,8 @@ jobs:
   # All targets in one job, 30 s each: the fuzz build is shared. Longer runs:
   # fuzz-nightly.yml.
   fuzz-smoke:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -238,6 +294,8 @@ jobs:
   # clean stop, uninstall) in one job, so the release build is shared.
   # Windows 2022 runs the service part only.
   windows:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -277,3 +335,118 @@ jobs:
           path: C:\ProgramData\Ostena\state\agent.log
           if-no-files-found: ignore
           retention-days: 14
+
+  # SSH latency (CLAUDE.md: at most 3 ms added at p99 by SSH, session set up
+  # in less than 5 s): the agent relay and the tunnel, on every run. The
+  # summary of the job shows the table; the raw results are an artifact.
+  # Displayed only, never a gate (ADR-0005).
+  bench-ssh:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: cargo xtask bench-ssh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-ssh-latency
+          path: target/bench/
+          retention-days: 90
+
+  # Signed deliverables (ADR-0017), with a TEST key drawn for this run only
+  # and never kept: the Linux and Windows release binaries and the SBOMs in
+  # one manifest, signed and verified by the binary itself, then a modified
+  # copy must be refused. The artifact holds the files, the manifest, its
+  # signature and the public test key.
+  release-sign:
+    needs: [changes, checks, release-linux, windows]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-unknown-linux-musl
+          path: signed
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-pc-windows-msvc
+          path: signed
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-cyclonedx
+          path: signed
+      - name: Sign with a test key, verify, refuse a modified copy
+        run: |
+          chmod +x signed/ostena
+          tool="$RUNNER_TEMP/ostena"
+          cp signed/ostena "$tool"
+          key="$RUNNER_TEMP/release-test.key"
+          "$tool" ca key new --key-out "$key" --public-out "$RUNNER_TEMP/release-test.pub"
+          "$tool" release sign --key "$key" --out "$RUNNER_TEMP/ostena-release.manifest" signed/*
+          rm -f "$key"
+          mv "$RUNNER_TEMP/ostena-release.manifest" "$RUNNER_TEMP/ostena-release.manifest.sig" \
+             "$RUNNER_TEMP/release-test.pub" signed/
+          "$tool" release verify signed/ostena-release.manifest --key signed/release-test.pub
+          cp -r signed "$RUNNER_TEMP/tampered"
+          printf 'x' >> "$RUNNER_TEMP/tampered/ostena.exe"
+          status=0
+          "$tool" release verify "$RUNNER_TEMP/tampered/ostena-release.manifest" \
+            --key signed/release-test.pub || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a modified file must be refused with exit code 1, got $status"
+            exit 1
+          fi
+          {
+            echo "## Livrables signés (clé de test)"
+            echo
+            echo "Clé de test tirée pour cette exécution et détruite : elle ne prouve que"
+            echo "l'intégrité de l'artefact \`ostena-test-signed\`, pas son origine (ADR-0017)."
+            echo
+            echo '```text'
+            "$tool" release verify signed/ostena-release.manifest --key signed/release-test.pub
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ostena-test-signed
+          path: signed/
+          retention-days: 7
+
+  # The single required check of the branch protection: every job must have
+  # succeeded, or been skipped by `changes` for a documentation-only change.
+  ci-ok:
+    if: always()
+    needs:
+      - changes
+      - checks
+      - linux
+      - ssh-interop
+      - core-db
+      - release-linux
+      - fuzz-smoke
+      - windows
+      - bench-ssh
+      - release-sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          echo "results: $RESULTS (code changed: $CODE)"
+          for r in $RESULTS; do
+            case "$r" in
+              success) ;;
+              skipped) [ "$CODE" = "false" ] || { echo "::error::a job was skipped"; exit 1; } ;;
+              *) echo "::error::a job ended with $r"; exit 1 ;;
+            esac
+          done
