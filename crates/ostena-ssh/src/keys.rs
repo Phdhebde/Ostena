@@ -113,6 +113,22 @@ pub fn public_line(key: &VerifyingKey, comment: &str) -> String {
     }
 }
 
+/// The key of an OpenSSH public key line `ecdsa-sha2-nistp256 AAAA…
+/// [comment]` (an `ssh_host_ecdsa_key.pub` file), if it is one: of the
+/// frozen type, its blob canonical, its point on the curve.
+pub fn parse_public_line(line: &str) -> Option<VerifyingKey> {
+    let mut fields = line.split_ascii_whitespace();
+    if fields.next()? != KEY_TYPE {
+        return None;
+    }
+    let blob = STANDARD.decode(fields.next()?).ok()?;
+    let point: [u8; 65] = blob.get(blob.len().checked_sub(65)?..)?.try_into().ok()?;
+    if public_blob(&point) != blob {
+        return None;
+    }
+    VerifyingKey::from_bytes(&point).ok()
+}
+
 /// Writes `key` in the OpenSSH private key format, unencrypted, with its
 /// scalar as a minimal `mpint`.
 ///
