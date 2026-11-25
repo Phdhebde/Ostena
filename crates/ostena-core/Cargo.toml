@@ -37,6 +37,11 @@ tracing.workspace = true
 
 [dev-dependencies]
 ostena-core = { path = ".", features = ["testing"] }
+# The end-to-end test: a test PKI, and the agent side (link and gateway)
+# with its private files.
+ostena-crypto = { workspace = true, features = ["testing"] }
+ostena-platform.workspace = true
+toml.workspace = true
 
 [lints]
 workspace = true

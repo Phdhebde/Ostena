@@ -1547,6 +1547,7 @@ dependencies = [
  "ostena-core",
  "ostena-crypto",
  "ostena-grant",
+ "ostena-platform",
  "ostena-scope",
  "ostena-ssh",
  "ostena-tunnel",
@@ -1554,6 +1555,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 

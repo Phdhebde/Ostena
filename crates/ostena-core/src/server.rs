@@ -3,7 +3,13 @@
 //!
 //! The copy of the registry is reloaded every [`RELOAD_INTERVAL`], and every
 //! [`RETRY_INTERVAL`] while it cannot be read. Notifications from the
-//! administration commands (token issued, agent revoked) apply at once.
+//! administration commands (token issued, agent revoked, login session
+//! revoked, group changed) apply at once.
+//!
+//! Native SSH access (ADR-0014): when an agent connects, the core pushes
+//! the grant key set, the scope policy of its group, its SSH trust and the
+//! revoked login sessions it received grants for; then it answers its host
+//! key, grant and session requests.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -17,16 +23,21 @@ use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::{IssuingAuthority, Validity};
 use ostena_crypto::tls::{self, ClientAuth, Identity, TrustAnchor};
+use ostena_grant::Issuer;
 use ostena_tunnel::control::{AgentMessage, CoreMessage, PROTOCOL_VERSION};
 use ostena_tunnel::enroll::{AgentRegistry, EnrollmentService};
 use ostena_tunnel::{ALPN, CoreListener, CoreTunnel, Limits, TunnelError, Uuid, renewal};
 use sqlx::postgres::PgListener;
 use tokio::task::JoinHandle;
 
+use crate::access::{self, Refusal, SshRequest};
 use crate::audit::{self, Cadence, HeadSigner, Recorder, SystemClock};
 use crate::cache::AgentCache;
 use crate::error::CoreError;
+use crate::grant_keys::GrantAuthority;
+use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
+use crate::{login, pushes};
 
 /// Full reload of the registry copy.
 pub const RELOAD_INTERVAL: Duration = Duration::from_secs(60);
@@ -37,6 +48,8 @@ const SKEW: u64 = 300;
 const DAY: u64 = 86_400;
 /// Time allowed for the enrolment handshake and exchange.
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Interval between two looks for host certificates due for renewal.
+pub const HOST_RENEWAL_INTERVAL: Duration = Duration::from_hours(1);
 
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -62,6 +75,10 @@ pub struct Keys {
     pub issuing: Arc<IssuingAuthority>,
     /// The key that signs the heads of the audit chain (ADR-0012).
     pub audit: Arc<SigningKey>,
+    /// The key that signs the session grants (ADR-0004).
+    pub grant: Arc<Issuer>,
+    /// The SSH certificate authorities, if `[core.ssh]` is set (ADR-0014).
+    pub ssh: Option<Arc<SshAuthorities>>,
 }
 
 impl std::fmt::Debug for Keys {
@@ -136,11 +153,42 @@ impl Keys {
             credentials,
         )?)
         .map_err(|e| keys("core.audit.signing_key", &e))?;
+        let signing = |field: &str, source: &KeySource| -> Result<SigningKey, CoreError> {
+            ostena_crypto::pki::signing_key_from_pem(&read_key(field, source, credentials)?)
+                .map_err(|e| keys(field, &e))
+        };
+        let grant = signing("core.grant_signing_key", &config.grant_signing_key)?;
+        let ssh = match &config.ssh {
+            Some(ssh) => Some(SshAuthorities::new(
+                signing("core.ssh.user_ca_key", &ssh.user_ca_key)?,
+                signing("core.ssh.host_ca_key", &ssh.host_ca_key)?,
+                ssh.host_certificate_days,
+            )?),
+            None => None,
+        };
+        // One key, one use, whatever the files (CFG-V016 compares sources).
+        let mut publics = vec![
+            ("core.audit.signing_key", audit.verifying_key()),
+            ("core.grant_signing_key", grant.verifying_key()),
+        ];
+        if let Some(ssh) = &ssh {
+            publics.push(("core.ssh.user_ca_key", ssh.user_ca_public()));
+            publics.push(("core.ssh.host_ca_key", ssh.host_ca_public()));
+        }
+        for (i, (field, key)) in publics.iter().enumerate() {
+            if let Some((other, _)) = publics[..i].iter().find(|(_, k)| k == key) {
+                return Err(CoreError::Keys(format!(
+                    "{field} : même clé que {other} ; chaque clé du core a un seul usage"
+                )));
+            }
+        }
         Ok(Self {
             root,
             server,
             issuing: Arc::new(issuing),
             audit: Arc::new(audit),
+            grant: Arc::new(Issuer::new(grant)),
+            ssh: ssh.map(Arc::new),
         })
     }
 }
@@ -190,6 +238,22 @@ impl Tunnels {
         self.close(&doomed, &TunnelError::Revoked)
     }
 
+    /// The open tunnels, with their certificate fingerprint.
+    fn live(&self) -> Vec<([u8; 32], Arc<CoreTunnel>)> {
+        self.0.lock().map_or_else(
+            |_| Vec::new(),
+            |map| {
+                map.iter()
+                    .flat_map(|(fp, list)| {
+                        list.iter()
+                            .filter(|t| !t.is_closed())
+                            .map(|t| (*fp, t.clone()))
+                    })
+                    .collect()
+            },
+        )
+    }
+
     fn open(&self) -> usize {
         self.0.lock().map_or(0, |map| {
             map.values().flatten().filter(|t| !t.is_closed()).count()
@@ -217,6 +281,8 @@ struct Shared {
     certificate_lifetime: u64,
     limits: Limits,
     recorder: Arc<Recorder>,
+    grants: GrantAuthority,
+    ssh: Option<Arc<SshAuthorities>>,
 }
 
 /// What the start of the core writes to the audit chain besides
@@ -330,6 +396,11 @@ impl RunningCore {
         // A broken segment refuses the start (CORE-E011).
         signer.sign_now().await?;
         write_granting(&store, start_events(&signer, info)).await?;
+        // The grant key: activated (granting record) if new.
+        let (grants, activated) = GrantAuthority::load(store.pool(), keys.grant.clone()).await?;
+        if let Some(appended) = activated {
+            recorder.critical(&[appended]);
+        }
         let startup = |e: TunnelError| CoreError::Startup(e.to_string());
         let tls = tls::server_config(
             &keys.server,
@@ -364,6 +435,8 @@ impl RunningCore {
             certificate_lifetime,
             limits,
             recorder: recorder.clone(),
+            grants,
+            ssh: keys.ssh.clone(),
         });
         write_granting(
             &shared.store,
@@ -384,6 +457,7 @@ impl RunningCore {
             tokio::spawn(follow_notices(notices, shared.clone())),
             tokio::spawn(reload_periodically(shared.clone())),
             tokio::spawn(signer.clone().run()),
+            tokio::spawn(renew_host_certificates(shared.clone())),
         ];
         tracing::info!(
             event = "core.started",
@@ -391,6 +465,8 @@ impl RunningCore {
             enrollment = %shared.enrollment.addr(),
             chain = %chain,
             kid = %signer.kid(),
+            grant_kid = %shared.grants.kid(),
+            ssh = shared.ssh.is_some(),
             "core démarré"
         );
         Ok(Self {
@@ -545,13 +621,312 @@ async fn accept(listener: Arc<CoreListener>, shared: Arc<Shared>) {
                 truncate(&accepted.hello.agent_version),
             ),
         );
-        tokio::spawn(control(tunnel, fingerprint, entry.agent, shared.clone()));
+        tokio::spawn(control(
+            tunnel,
+            fingerprint,
+            entry.agent,
+            entry.group,
+            shared.clone(),
+        ));
     }
 }
 
-/// Control messages of one agent: certificate renewal; session requests are
-/// refused until the inventory exists.
-async fn control(tunnel: Arc<CoreTunnel>, fingerprint: [u8; 32], agent: Uuid, shared: Arc<Shared>) {
+/// Sends `message` on `tunnel`; a failure is logged (the tunnel is closing).
+async fn send(tunnel: &CoreTunnel, agent: Uuid, message: &CoreMessage) -> bool {
+    match tunnel.send(message).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(event = "core.push_failed", agent = %agent, code = e.code(), "{e}");
+            false
+        }
+    }
+}
+
+/// What the core pushes to an agent that connects: the grant key set, the
+/// policy of its group, its SSH trust, and the revoked login sessions it
+/// received grants for (it may have missed their revocation while
+/// disconnected; it applies them again without harm).
+async fn push_on_connect(tunnel: &CoreTunnel, agent: Uuid, group: Uuid, shared: &Shared) {
+    let pool = shared.store.pool();
+    if !send(tunnel, agent, &shared.grants.key_set_message()).await {
+        return;
+    }
+    match pushes::policy_message(pool, group).await {
+        Ok(Some(policy)) => {
+            send(tunnel, agent, &policy).await;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(event = "core.push_failed", agent = %agent, code = e.code(), "{e}");
+        }
+    }
+    push_ssh_trust(tunnel, agent, shared).await;
+    match login::revoked_for_agent(pool, agent).await {
+        Ok(sessions) => {
+            for login_session in sessions {
+                let message = CoreMessage::LoginRevoked {
+                    login_session: login_session.to_string(),
+                };
+                send(tunnel, agent, &message).await;
+            }
+        }
+        Err(e) => {
+            tracing::warn!(event = "core.push_failed", agent = %agent, code = e.code(), "{e}");
+        }
+    }
+}
+
+async fn push_ssh_trust(tunnel: &CoreTunnel, agent: Uuid, shared: &Shared) {
+    let Some(ssh) = &shared.ssh else {
+        return;
+    };
+    match pushes::ssh_trust_message(shared.store.pool(), ssh, agent, unix_now()).await {
+        Ok(trust) => {
+            send(tunnel, agent, &trust).await;
+        }
+        Err(e) => {
+            tracing::warn!(event = "core.push_failed", agent = %agent, code = e.code(), "{e}");
+        }
+    }
+}
+
+/// Certifies the host key of `agent` (unless current and not `force`),
+/// then pushes its SSH trust if the certificate changed.
+async fn certify_host(
+    tunnel: &CoreTunnel,
+    agent: Uuid,
+    group: Uuid,
+    key: &ostena_crypto::p256::VerifyingKey,
+    force: bool,
+    shared: &Shared,
+) {
+    let Some(ssh) = &shared.ssh else {
+        let refusal = Refusal {
+            code: access::SSH_DISABLED,
+            reason: "clé d'hôte SSH reçue, mais [core.ssh] n'est pas configuré".into(),
+        };
+        shared
+            .recorder
+            .emit(pushes::host_key_refused_event(agent, &refusal));
+        return;
+    };
+    match pushes::certify_host(
+        shared.store.pool(),
+        ssh,
+        agent,
+        group,
+        key,
+        force,
+        unix_now(),
+    )
+    .await
+    {
+        Ok(Some(appended)) => {
+            shared.recorder.critical(&[appended]);
+            push_ssh_trust(tunnel, agent, shared).await;
+        }
+        Ok(None) => {}
+        Err(refusal) => {
+            tracing::warn!(
+                event = "ssh.host_key_refused",
+                agent = %agent,
+                code = refusal.code,
+                "{}",
+                refusal.reason
+            );
+            shared
+                .recorder
+                .emit(pushes::host_key_refused_event(agent, &refusal));
+        }
+    }
+}
+
+fn parse_hex32(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in bytes.chunks(2).enumerate() {
+        let digit = |c: u8| char::from(c).to_digit(16);
+        let value = digit(pair[0])? * 16 + digit(pair[1])?;
+        out[i] = u8::try_from(value).ok()?;
+    }
+    Some(out)
+}
+
+/// An `ssh_grant_request` (already validated by the tunnel).
+fn ssh_request(message: &AgentMessage) -> Option<(u64, SshRequest)> {
+    let AgentMessage::SshGrantRequest {
+        request_id,
+        subject,
+        login_session,
+        certificate_sha256,
+        account,
+        resource,
+        client_address,
+    } = message
+    else {
+        return None;
+    };
+    Some((
+        *request_id,
+        SshRequest {
+            subject: Uuid::parse(subject)?,
+            login_session: Uuid::parse(login_session)?,
+            certificate_sha256: parse_hex32(certificate_sha256)?,
+            account: account.clone(),
+            resource: resource.clone(),
+            client_address: client_address.clone(),
+        },
+    ))
+}
+
+async fn answer_ssh_grant(
+    tunnel: &CoreTunnel,
+    agent: Uuid,
+    group: Uuid,
+    message: &AgentMessage,
+    shared: &Shared,
+) {
+    let Some((request_id, request)) = ssh_request(message) else {
+        return;
+    };
+    let decided = if shared.ssh.is_none() {
+        Err(Refusal {
+            code: access::SSH_DISABLED,
+            reason: "[core.ssh] n'est pas configuré".into(),
+        })
+    } else {
+        access::ssh_grant(
+            shared.store.pool(),
+            &shared.grants,
+            agent,
+            group,
+            &request,
+            unix_now(),
+        )
+        .await
+    };
+    let reply = match decided {
+        Ok(issued) => {
+            shared.recorder.critical(&[issued.appended]);
+            tracing::info!(
+                event = "access.ssh_granted",
+                agent = %agent,
+                jti = %issued.content.jti,
+                user = %request.subject,
+            );
+            CoreMessage::SshGrant {
+                request_id,
+                grant: issued.grant,
+            }
+        }
+        Err(refusal) => {
+            tracing::warn!(
+                event = "access.ssh_refused",
+                agent = %agent,
+                code = refusal.code,
+                "{}",
+                refusal.reason
+            );
+            shared
+                .recorder
+                .emit(access::ssh_refused_event(agent, &request, &refusal));
+            refusal.to_message(request_id)
+        }
+    };
+    send(tunnel, agent, &reply).await;
+}
+
+async fn answer_session(
+    tunnel: &CoreTunnel,
+    agent: Uuid,
+    group: Uuid,
+    request_id: u64,
+    grant: &str,
+    shared: &Shared,
+) {
+    let opened = access::open_session(
+        shared.store.pool(),
+        &shared.grants,
+        agent,
+        group,
+        request_id,
+        grant,
+        unix_now(),
+    )
+    .await;
+    let reply = match opened {
+        Ok(opened) => {
+            shared.recorder.critical(&[opened.appended]);
+            tracing::info!(event = "access.session_opened", agent = %agent, session = %opened.session);
+            opened.params
+        }
+        Err(refusal) => {
+            tracing::warn!(
+                event = "access.session_refused",
+                agent = %agent,
+                code = refusal.code,
+                "{}",
+                refusal.reason
+            );
+            shared.recorder.emit(access::session_refused_event(
+                agent,
+                access::jti_of(grant),
+                &refusal,
+            ));
+            refusal.to_message(request_id)
+        }
+    };
+    send(tunnel, agent, &reply).await;
+}
+
+async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
+    let AgentMessage::SessionClosed {
+        session_id,
+        reason,
+        bytes_to_target,
+        bytes_from_target,
+    } = message
+    else {
+        return;
+    };
+    let Some(session) = Uuid::parse(&session_id) else {
+        return;
+    };
+    match access::close_session(
+        shared.store.pool(),
+        agent,
+        session,
+        &reason,
+        bytes_to_target,
+        bytes_from_target,
+        unix_now(),
+    )
+    .await
+    {
+        Ok(Some(event)) => shared.recorder.emit(event),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            event = "access.session_close_failed",
+            agent = %agent,
+            code = e.code(),
+            "{e}"
+        ),
+    }
+}
+
+/// Control messages of one agent: the pushes when it connects, then
+/// certificate renewal, SSH host key, grant and session requests.
+async fn control(
+    tunnel: Arc<CoreTunnel>,
+    fingerprint: [u8; 32],
+    agent: Uuid,
+    group: Uuid,
+    shared: Arc<Shared>,
+) {
+    push_on_connect(&tunnel, agent, group, &shared).await;
     while let Some(message) = tunnel.recv().await {
         match message {
             AgentMessage::Renew { request } => match renew(&shared, &fingerprint, &request).await {
@@ -573,13 +948,30 @@ async fn control(tunnel: Arc<CoreTunnel>, fingerprint: [u8; 32], agent: Uuid, sh
                     break;
                 }
             },
-            AgentMessage::SessionRequest { request_id, .. } => {
-                let reply = CoreMessage::SessionRefused {
-                    request_id,
-                    code: "INV-E001".into(),
-                    message: "ressource inconnue de l'inventaire".into(),
-                };
-                let _ = tunnel.send(&reply).await;
+            AgentMessage::SshHostKey { p256_public, proof } => {
+                match ostena_tunnel::ssh::verify_host_key(&p256_public, &proof, &fingerprint) {
+                    Ok(key) => certify_host(&tunnel, agent, group, &key, false, &shared).await,
+                    Err(e) => {
+                        let refusal = Refusal {
+                            code: e.code(),
+                            reason: e.to_string(),
+                        };
+                        shared
+                            .recorder
+                            .emit(pushes::host_key_refused_event(agent, &refusal));
+                        tunnel.close(e);
+                        break;
+                    }
+                }
+            }
+            message @ AgentMessage::SshGrantRequest { .. } => {
+                answer_ssh_grant(&tunnel, agent, group, &message, &shared).await;
+            }
+            AgentMessage::SessionRequest { request_id, grant } => {
+                answer_session(&tunnel, agent, group, request_id, &grant, &shared).await;
+            }
+            message @ AgentMessage::SessionClosed { .. } => {
+                close_session(agent, message, &shared).await;
             }
             _ => {}
         }
@@ -654,14 +1046,13 @@ async fn follow_notices(mut notices: PgListener, shared: Arc<Shared>) {
                                 .u64(field::CLOSED_TUNNELS, closed as u64),
                         );
                     }
-                    // Applied to the agents once the core serves SSH access.
-                    Some(
-                        Notice::Registered
-                        | Notice::Audit
-                        | Notice::LoginRevoked(_)
-                        | Notice::Group(_),
-                    )
-                    | None => {}
+                    Some(Notice::LoginRevoked(session)) => {
+                        tokio::spawn(apply_login_revocation(shared.clone(), session));
+                    }
+                    Some(Notice::Group(group)) => {
+                        tokio::spawn(apply_group_change(shared.clone(), group));
+                    }
+                    Some(Notice::Registered | Notice::Audit) | None => {}
                 }
             }
             Err(e) => {
@@ -707,5 +1098,107 @@ async fn reload_periodically(shared: Arc<Shared>) {
         } else {
             RETRY_INTERVAL
         };
+    }
+}
+
+/// The connected agents, by tunnel, with their group.
+fn connected(shared: &Shared) -> Vec<(Uuid, Uuid, Arc<CoreTunnel>)> {
+    shared
+        .tunnels
+        .live()
+        .into_iter()
+        .filter_map(|(fp, tunnel)| {
+            let entry = shared.cache.active(&fp)?;
+            Some((entry.agent, entry.group, tunnel))
+        })
+        .collect()
+}
+
+/// Tells the connected agents that received a grant for `session` that it
+/// is revoked; those not connected are told when they connect.
+async fn apply_login_revocation(shared: Arc<Shared>, session: Uuid) {
+    let agents = match login::agents_to_notify(shared.store.pool(), session).await {
+        Ok(agents) => agents,
+        Err(e) => {
+            tracing::warn!(
+                event = "login_session.revocation_failed",
+                code = e.code(),
+                "{e}"
+            );
+            return;
+        }
+    };
+    let message = CoreMessage::LoginRevoked {
+        login_session: session.to_string(),
+    };
+    let mut notified = std::collections::HashSet::new();
+    for (agent, _, tunnel) in connected(&shared) {
+        if agents.contains(&agent) && send(&tunnel, agent, &message).await {
+            notified.insert(agent);
+        }
+    }
+    tracing::warn!(
+        event = "login_session.revocation_applied",
+        login_session = %session,
+        notified_agents = notified.len(),
+    );
+    shared.recorder.emit(
+        Event::new(
+            EventKind::LoginSessionRevocationApplied,
+            Outcome::Success,
+            ActorKind::Core,
+            audit::CORE_ACTOR,
+        )
+        .uuid(field::LOGIN_SESSION, session.to_bytes())
+        .u64(field::NOTIFIED_AGENTS, notified.len() as u64),
+    );
+}
+
+/// Pushes the policy of `group` again to its connected agents and
+/// certifies their host keys again (the SSH host names may have changed).
+async fn apply_group_change(shared: Arc<Shared>, group: Uuid) {
+    let pool = shared.store.pool();
+    let policy = match pushes::policy_message(pool, group).await {
+        Ok(policy) => policy,
+        Err(e) => {
+            tracing::warn!(event = "core.push_failed", group = %group, code = e.code(), "{e}");
+            None
+        }
+    };
+    for (agent, agent_group, tunnel) in connected(&shared) {
+        if agent_group != group {
+            continue;
+        }
+        if let Some(policy) = &policy {
+            send(&tunnel, agent, policy).await;
+        }
+        if shared.ssh.is_some()
+            && let Ok(Some(key)) = pushes::stored_host_key(pool, agent).await
+        {
+            certify_host(&tunnel, agent, group, &key, true, &shared).await;
+        }
+    }
+}
+
+/// Renews the host certificates due (two thirds of their life) of the
+/// connected agents, every [`HOST_RENEWAL_INTERVAL`].
+async fn renew_host_certificates(shared: Arc<Shared>) {
+    if shared.ssh.is_none() {
+        return;
+    }
+    loop {
+        tokio::time::sleep(HOST_RENEWAL_INTERVAL).await;
+        let due = match pushes::renewals_due(shared.store.pool(), unix_now()).await {
+            Ok(due) => due,
+            Err(e) => {
+                tracing::warn!(event = "ssh.host_renewal_failed", code = e.code(), "{e}");
+                continue;
+            }
+        };
+        for (agent, group, tunnel) in connected(&shared) {
+            if let Some((_, key)) = due.iter().find(|(a, _)| *a == agent) {
+                certify_host(&tunnel, agent, group, key, false, &shared).await;
+            }
+        }
     }
 }
