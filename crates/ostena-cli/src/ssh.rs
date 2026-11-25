@@ -258,7 +258,8 @@ pub(crate) fn ensure_key(path: &Path, role: &str) -> Result<SecretBytes, String>
 }
 
 /// Writes the host certificate next to the keys, for the operators
-/// (`ssh-keygen -L -f`): a public file, replaced atomically.
+/// (`ssh-keygen -L -f`), replaced atomically. Not secret, but written like
+/// the keys: never through a link planted at the temporary name.
 fn write_host_certificate(path: &Path, certificate: &[u8]) -> std::io::Result<()> {
     let line = format!(
         "{} {} ostena-agent\n",
@@ -268,10 +269,7 @@ fn write_host_certificate(path: &Path, certificate: &[u8]) -> std::io::Result<()
     if std::fs::read_to_string(path).is_ok_and(|current| current == line) {
         return Ok(());
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".new");
-    std::fs::write(&tmp, line)?;
-    std::fs::rename(&tmp, path)
+    write_atomically(path, line.as_bytes())
 }
 
 /// Builds the identity of the server from the pushed trust.
@@ -939,6 +937,17 @@ mod tests {
             let meta = std::fs::symlink_metadata(&path).unwrap();
             assert!(meta.file_type().is_file());
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            // The host certificate likewise.
+            let certificate = d.0.join("ssh_host_certificate");
+            std::os::unix::fs::symlink(&victim, d.0.join("ssh_host_certificate.new")).unwrap();
+            write_host_certificate(&certificate, b"blob").unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+            assert!(
+                std::fs::symlink_metadata(&certificate)
+                    .unwrap()
+                    .file_type()
+                    .is_file()
+            );
         }
     }
 
