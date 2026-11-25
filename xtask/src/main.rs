@@ -221,11 +221,19 @@ const FOOTPRINT_TARGET_MIB: f64 = 20.0;
 /// The gateway group of the measured agent.
 const FOOTPRINT_GROUP: &str = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
 
-/// A footprint regression blocks when it exceeds both (CLAUDE.md,
-/// ADR-0009): a relative bound, in percent...
-const REGRESSION_PERCENT: u64 = 10;
-/// ... and an absolute one, in bytes.
-const REGRESSION_BYTES: u64 = 1024 * 1024;
+/// Accepted cost of the native SSH server in the idle agent: in any state,
+/// the agent with SSH may take at most this much more than the agent built
+/// without it; over it, the footprint fails. A ceiling accepted by the
+/// project lead on 2026-11-25 (ADR-0009, "Décision du 2026-11-25") in
+/// place of the general rule (+10 % and +1 MiB, CLAUDE.md), which the SSH
+/// cost exceeds; that rule stays for every other regression. Linux: the
+/// highest measure, +1.91 MiB (static musl binary), plus about 0.3 MiB of
+/// noise.
+#[cfg(not(windows))]
+const SSH_ACCEPTED_BYTES: u64 = 9 * 1024 * 1024 / 4;
+/// Windows: see the Linux ceiling; the highest CI measure plus noise.
+#[cfg(windows)]
+const SSH_ACCEPTED_BYTES: u64 = 1280 * 1024;
 
 /// One idle measure of an agent.
 struct Measure {
@@ -301,8 +309,9 @@ fn footprint_binaries(target: Option<&str>) -> Result<(PathBuf, PathBuf, PathBuf
 /// memory.
 ///
 /// Fails (ADR-0009) when, in any state, the agent with SSH:
-/// - takes more than both +10 % and +1 MiB over the reference;
-/// - loads a library or DLL the reference does not load;
+/// - takes more than the accepted SSH cost over the reference
+///   ([`SSH_ACCEPTED_BYTES`]);
+/// - loads a library or DLL the reference loads in no state;
 /// - loads a GUI or COM DLL (`user32`, `gdi32`, `win32u`, `combase`,
 ///   `ole32`, `oleaut32`).
 fn footprint(args: &[String]) -> Result<()> {
@@ -353,8 +362,16 @@ fn footprint(args: &[String]) -> Result<()> {
     let _ = fs::remove_dir_all(&dir);
     let _ = fs::remove_file(&reference);
 
+    let measures = measures?;
+    // A library the reference loads in some state is not one the SSH server
+    // adds: listening on a socket loads the Winsock provider (mswsock.dll)
+    // before the reference opens its first socket.
+    let reference_modules: Vec<String> = measures
+        .iter()
+        .flat_map(|(_, without, _)| without.modules.iter().cloned())
+        .collect();
     let mut failures = Vec::new();
-    for (state, without, with) in measures? {
+    for (state, without, with) in measures {
         for (name, m) in [("without SSH", &without), ("with SSH", &with)] {
             let mib = mib(m.bytes);
             let verdict = if mib <= FOOTPRINT_TARGET_MIB {
@@ -377,12 +394,13 @@ fn footprint(args: &[String]) -> Result<()> {
             without.modules.len(),
             with.modules.len()
         );
-        failures.extend(compare(state, &without, &with));
+        failures.extend(compare(state, &without, &with, &reference_modules));
     }
     if failures.is_empty() {
         println!(
-            "footprint: no blocking regression (+{REGRESSION_PERCENT} % and +1 MiB), no \
-             module loaded in addition, no GUI or COM DLL"
+            "footprint: SSH cost within the accepted {:.2} MiB (ADR-0009), no module \
+             loaded in addition, no GUI or COM DLL",
+            mib(SSH_ACCEPTED_BYTES)
         );
         Ok(())
     } else {
@@ -396,19 +414,24 @@ fn mib(bytes: u64) -> f64 {
 }
 
 /// The blocking differences between the reference and the agent with SSH.
-fn compare(state: &str, without: &Measure, with: &Measure) -> Vec<String> {
+fn compare(
+    state: &str,
+    without: &Measure,
+    with: &Measure,
+    reference_modules: &[String],
+) -> Vec<String> {
     let mut failures = Vec::new();
     let delta = with.bytes.saturating_sub(without.bytes);
-    if delta > REGRESSION_BYTES && delta * 100 > without.bytes * REGRESSION_PERCENT {
+    if delta > SSH_ACCEPTED_BYTES {
         failures.push(format!(
-            "{state}: the agent with SSH takes {delta} bytes more than without (over both \
-             +{REGRESSION_PERCENT} % and +1 MiB)",
+            "{state}: the agent with SSH takes {delta} bytes more than without, over the \
+             accepted {SSH_ACCEPTED_BYTES} (ADR-0009)",
         ));
     }
     let extra: Vec<&str> = with
         .modules
         .iter()
-        .filter(|m| !without.modules.contains(m))
+        .filter(|m| !without.modules.contains(m) && !reference_modules.contains(m))
         .map(String::as_str)
         .collect();
     if !extra.is_empty() {
@@ -896,29 +919,29 @@ mod tests {
     }
 
     #[test]
-    fn footprint_regression_blocks_over_both_bounds_only() {
+    fn footprint_ssh_cost_blocks_over_the_accepted_ceiling_only() {
         const MIB: u64 = 1024 * 1024;
         let base = measure_of(7 * MIB, &["kernel32.dll"]);
         let none: Vec<String> = Vec::new();
-        // +0.84 MiB (+12 %): under 1 MiB, not blocking.
-        let small = measure_of(7 * MIB + 880_000, &["kernel32.dll"]);
-        assert_eq!(compare("s", &base, &small), none);
-        // +1.5 MiB on 30 MiB (+5 %): not blocking.
-        let big = measure_of(30 * MIB, &[]);
-        assert_eq!(
-            compare("s", &big, &measure_of(31 * MIB + MIB / 2, &[])),
-            none
-        );
-        // +1.5 MiB on 7 MiB: blocking.
+        // Up to the ceiling: accepted.
+        let at = measure_of(7 * MIB + SSH_ACCEPTED_BYTES, &["kernel32.dll"]);
+        assert_eq!(compare("s", &base, &at, &[]), none);
+        // One page over it: blocking, whatever the base.
+        let over = measure_of(7 * MIB + SSH_ACCEPTED_BYTES + 4096, &["kernel32.dll"]);
+        let failures = compare("s", &base, &over, &[]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("ADR-0009"));
+        let big = measure_of(300 * MIB, &[]);
         let failures = compare(
             "s",
-            &base,
-            &measure_of(8 * MIB + MIB / 2, &["kernel32.dll"]),
+            &big,
+            &measure_of(300 * MIB + SSH_ACCEPTED_BYTES + 4096, &[]),
+            &[],
         );
         assert_eq!(failures.len(), 1, "{failures:?}");
         // Smaller with SSH: fine.
         let smaller = measure_of(6 * MIB, &["kernel32.dll"]);
-        assert_eq!(compare("s", &base, &smaller), none);
+        assert_eq!(compare("s", &base, &smaller, &[]), none);
     }
 
     #[test]
@@ -928,10 +951,31 @@ mod tests {
             100,
             &["combase.dll", "kernel32.dll", "oleaut32.dll", "ws2_32.dll"],
         );
-        let failures = compare("connected", &base, &with);
+        let failures = compare("connected", &base, &with, &[]);
         assert_eq!(failures.len(), 2, "{failures:?}");
         assert!(failures[0].contains("combase.dll, oleaut32.dll"));
         assert!(failures[1].contains("GUI or COM"));
+    }
+
+    #[test]
+    fn footprint_accepts_a_module_the_reference_loads_in_another_state() {
+        // Without a link, only the agent with SSH has a socket: Winsock loads
+        // its provider, which the reference loads once it connects.
+        let base = measure_of(100, &["kernel32.dll"]);
+        let with = measure_of(100, &["kernel32.dll", "mswsock.dll"]);
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            compare("without link", &base, &with, &["mswsock.dll".to_owned()]),
+            none
+        );
+        // A library the reference never loads still blocks.
+        let failures = compare("without link", &base, &with, &["kernel32.dll".to_owned()]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        // A forbidden DLL blocks even if the reference loads it somewhere.
+        let com = measure_of(100, &["kernel32.dll", "ole32.dll"]);
+        let failures = compare("connected", &base, &com, &["ole32.dll".to_owned()]);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("GUI or COM"));
     }
 
     #[test]
