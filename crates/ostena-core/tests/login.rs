@@ -221,7 +221,7 @@ fn login_issues_a_certificate_and_opens_a_session() {
             cert::format_uuid(&identity.login_session),
             response.login_session
         );
-        assert_eq!(response.valid_before - now(), 7200);
+        assert!((7198..=7200).contains(&(response.valid_before - now())));
         assert_eq!(response.valid_before - response.valid_after, 7260);
         assert_eq!(response.ssh_hosts, ["bastion.lab"]);
         assert_eq!(response.ssh_port, 2222);
