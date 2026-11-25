@@ -7,6 +7,7 @@
 - **Révision** : 2026-11-25, engagements de la PR 6 : chargement différé d'`oleaut32`, contrôles des imports et des modules chargés, remesure de l'empreinte ; écart d'empreinte accepté par le responsable du projet
 - **Révision** : 2026-11-25, profil de release compilé en taille, chemin chaud gardé à `opt-level = 3` (PR 6bis)
 - **Révision** : 2026-11-25, identités locales : mots de passe, TOTP et écart HMAC-SHA-1 (amendement accepté, décision du responsable du projet, 2026-11-25)
+- **Révision** : 2026-11-25, HMAC-SHA-256 pour les empreintes à clé de l'audit (ADR-0016)
 
 ## Contexte
 
@@ -53,7 +54,8 @@ L'encadré « Attention » du § 2.2.3 rappelle qu'ECDSA n'est pas fortement ré
 
 **Aléa et dérivation** :
 - aléa du système d'exploitation via `aws-lc-rs` ;
-- HKDF-SHA-256 (déjà dans `ostena-crypto`).
+- HKDF-SHA-256 (déjà dans `ostena-crypto`) ;
+- HMAC-SHA-256 sous une clé de 256 bits tirée par l'outil, pour les empreintes à clé des valeurs auditées qui ne doivent pas se retrouver par dictionnaire, comme la commande d'une session (ADR-0016). HMAC avec SHA-2 est un mécanisme d'intégrité symétrique conforme du [PG-083] ; la référence exacte du paragraphe reste à relever avec la prochaine revue du guide.
 
 **Scellement de la clé racine hors ligne** (`ostena-crypto::sealed`, cérémonie de l'ADR-0008) :
 - **AES-256-GCM** (conforme, § 2.1.2.1), sous une clé dérivée par PBKDF2-HMAC-SHA256 avec 600 000 itérations et un sel aléatoire de 128 bits ;
