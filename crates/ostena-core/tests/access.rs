@@ -425,6 +425,47 @@ fn a_session_uses_any_valid_right_on_the_account() {
 }
 
 #[test]
+fn the_session_length_is_computed_again_when_it_opens() {
+    block_on(async {
+        let Some(f) = fixture("the_session_length_is_computed_again_when_it_opens").await else {
+            return;
+        };
+        let max = |opened: &access::Opened| match &opened.params {
+            CoreMessage::SessionParams {
+                max_session_secs, ..
+            } => *max_session_secs,
+            _ => panic!("pas des paramètres de session"),
+        };
+        // The right ends soon after the grant: the session with it.
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        assert_eq!(issued.content.claims.max_session_secs, 3600);
+        sqlx::query(
+            "UPDATE access_right SET valid_until = $1
+             WHERE account_id = (SELECT a.id FROM target_account a
+                                 JOIN resource r ON r.id = a.resource_id
+                                 WHERE r.name = 'srv-lab01' AND a.name = 'root')",
+        )
+        .bind(i64::try_from(now() + 120).unwrap())
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        let secs = max(&f.open(&issued.grant).await.unwrap());
+        assert!((110..=120).contains(&secs), "{secs}");
+        // The login session ends sooner still.
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        sqlx::query("UPDATE login_session SET expires_at = $1 WHERE id = $2::uuid")
+            .bind(i64::try_from(now() + 60).unwrap())
+            .bind(f.login.to_string())
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let secs = max(&f.open(&issued.grant).await.unwrap());
+        assert!((50..=60).contains(&secs), "{secs}");
+        f.db.drop_database().await;
+    });
+}
+
+#[test]
 fn concurrent_session_requests_consume_a_jti_once() {
     block_on(async {
         let Some(f) = fixture("concurrent_session_requests_consume_a_jti_once").await else {

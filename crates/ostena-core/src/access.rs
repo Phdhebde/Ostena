@@ -458,10 +458,10 @@ pub async fn ssh_grant(
     )
     .await?;
     // Nor later than the login session.
-    let max_session_secs = allowed
-        .max_session_secs
-        .min(u32::try_from(login_expires.saturating_sub(now)).unwrap_or(u32::MAX))
-        .max(1);
+    let max_session_secs = session_secs(
+        &[u64::from(allowed.max_session_secs)],
+        login_expires.saturating_sub(now),
+    );
     let claims = Claims {
         subject: SubjectId::from_bytes(request.subject.to_bytes()),
         resource: ResourceId::from_bytes(allowed.resource.to_bytes()),
@@ -571,6 +571,13 @@ fn verify(
         .map_err(|e| Refusal::new(e.code(), e.to_string()))
 }
 
+/// The longest session allowed: the smallest of `limits` and of
+/// `login_left`, at least one second.
+fn session_secs(limits: &[u64], login_left: u64) -> u32 {
+    let max = limits.iter().copied().fold(login_left, u64::min).max(1);
+    u32::try_from(max).unwrap_or(u32::MAX)
+}
+
 /// Consumes the jti for `agent` and records a new session; returns it.
 async fn consume(tx: &mut Tx<'_>, jti: [u8; 16], agent: Uuid, now: u64) -> Result<Uuid, Refusal> {
     let session = Uuid::random().map_err(|e| Refusal::new("CORE-E006", e.to_string()))?;
@@ -650,7 +657,7 @@ pub async fn open_session(
     let login = uuid(&row.login)?;
     // Lock order (ADR-0014): the grant, the user, then the login session.
     let user = UserLock::take(&mut tx, subject).await?;
-    login_session(&mut tx, login, subject, None, now).await?;
+    let login_expires = login_session(&mut tx, login, subject, None, now).await?;
     user.active()?;
     let resource_name = sqlx::query_scalar!(
         "SELECT name FROM resource WHERE id = $1::text::uuid",
@@ -671,9 +678,17 @@ pub async fn open_session(
     // grant may have been replaced by another since (a longer one, for
     // example); without any, `allowed` refuses (`ACC-E006`).
     let session = consume(&mut tx, jti, agent, now).await?;
-    let max_session_secs = u32::try_from(row.max_session_secs)
-        .unwrap_or(1)
-        .min(checked.claims.max_session_secs);
+    // Computed again now: no longer than the grant (its row and its
+    // claims), than the right used (its maximum and its end), nor than the
+    // login session.
+    let max_session_secs = session_secs(
+        &[
+            u64::try_from(row.max_session_secs).unwrap_or(0),
+            u64::from(checked.claims.max_session_secs),
+            u64::from(allowed.max_session_secs),
+        ],
+        login_expires.saturating_sub(now),
+    );
     let event = Event::new(
         EventKind::AccessSessionOpened,
         Outcome::Success,
@@ -797,6 +812,14 @@ mod tests {
         };
         assert_eq!((request_id, code.as_str()), (7, NO_RIGHT));
         assert!(!message.contains("root@srv"));
+    }
+
+    #[test]
+    fn the_session_length_is_the_smallest_limit() {
+        assert_eq!(session_secs(&[3600, 1800, 900], 7200), 900);
+        assert_eq!(session_secs(&[3600], 120), 120);
+        assert_eq!(session_secs(&[3600, 0], 120), 1);
+        assert_eq!(session_secs(&[u64::MAX], u64::MAX), u32::MAX);
     }
 
     #[test]
