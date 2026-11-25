@@ -5,6 +5,7 @@
 - **Révision** : 2026-11-15, certificats, serveur, driver, codes `SSH-E010` à `SSH-E019`, événements (jalon M1, PR 4)
 - **Révision** : 2026-11-25, compte et session de connexion signés par le grant (format v2), autorités d'hôtes poussées et signature du certificat d'hôte vérifiée (jalon M1, PR 5a)
 - **Révision** : 2026-11-25, liaison dans l'agent, clés créées par l'agent, `ostena agent ssh-key`, code `SSH-E020`, événements `agent.ssh_*` (jalon M1, PR 6)
+- **Révision** : 2026-11-25, relecture de sécurité de la PR 6 : confiance fermée par défaut (identité retirée sur un push inapplicable), identité réévaluée aux dates du certificat d'hôte, arrêt dans un seul délai de grâce avec les bilans envoyés avant la fermeture du lien, clés et certificat d'hôte écrits de façon atomique, dossier des clés vérifié avant leur création
 
 ## Contexte
 
