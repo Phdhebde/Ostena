@@ -3,7 +3,8 @@
 //! on a plain TCP loopback. Prints p50 and p99; indicative target: < 1 ms
 //! added at p99. Not a gate (ADR-0005).
 //!
-//! `cargo bench -p ostena-tunnel`
+//! `cargo bench -p ostena-tunnel`; with `OSTENA_BENCH_OUT`, the results are
+//! also appended there as JSON Lines (`cargo xtask bench-ssh`).
 
 #![allow(
     clippy::expect_used,
@@ -83,6 +84,29 @@ async fn tcp_round_trips() -> Vec<Duration> {
     samples
 }
 
+/// Appends one result to `$OSTENA_BENCH_OUT` (JSON Lines), read by
+/// `cargo xtask bench-ssh`; durations in microseconds.
+fn record(case: &str, samples: usize, direct: [Duration; 2], through: [Duration; 2]) {
+    use std::io::Write as _;
+    let Some(path) = std::env::var_os("OSTENA_BENCH_OUT") else {
+        return;
+    };
+    let line = format!(
+        "{{\"bench\":\"tunnel\",\"case\":\"{case}\",\"samples\":{samples},\
+         \"direct_p50_us\":{},\"direct_p99_us\":{},\"through_p50_us\":{},\"through_p99_us\":{}}}\n",
+        direct[0].as_micros(),
+        direct[1].as_micros(),
+        through[0].as_micros(),
+        through[1].as_micros(),
+    );
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| f.write_all(line.as_bytes()))
+        .expect("OSTENA_BENCH_OUT");
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -107,5 +131,11 @@ fn main() {
     println!(
         "added latency p99: {:.3} ms (indicative target < 1 ms)",
         added_p99.as_secs_f64() * 1e3
+    );
+    record(
+        "round_trip_64",
+        tunnel.len(),
+        [percentile(&tcp, 500), percentile(&tcp, 990)],
+        [percentile(&tunnel, 500), percentile(&tunnel, 990)],
     );
 }
