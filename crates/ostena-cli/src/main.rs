@@ -15,6 +15,8 @@ mod core_link;
 mod enroll;
 mod keyset_state;
 mod sessions;
+#[cfg(feature = "ssh")]
+mod ssh;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -368,6 +370,25 @@ enum AgentCommand {
         #[arg(long, default_value_t = 15)]
         timeout: u64,
     },
+    /// Show the agent SSH key on the targets and the `authorized_keys` line
+    /// to deposit (`restrict,from=…`). The agent creates its keys at its
+    /// first start.
+    SshKey {
+        /// Configuration file.
+        #[arg(long, default_value_os_t = agent::default_config())]
+        config: PathBuf,
+        /// Addresses of the agents of the group, as the targets see them
+        /// (IP addresses or CIDR networks, comma separated).
+        #[arg(long, value_delimiter = ',')]
+        from: Vec<String>,
+        /// Allow a terminal on the target (`restrict,pty`): only if
+        /// interactive sessions are allowed there.
+        #[arg(long)]
+        pty: bool,
+        /// Print the `authorized_keys` line only.
+        #[arg(long)]
+        line: bool,
+    },
     /// Anti-replay journal of the gateway.
     ReplayStore {
         #[command(subcommand)]
@@ -413,6 +434,42 @@ enum ReplayStoreCommand {
     },
 }
 
+fn run_agent(command: AgentCommand) -> ExitCode {
+    match command {
+        AgentCommand::Install {
+            config,
+            executable,
+            no_start,
+            quiet,
+        } => agent::install(&config, executable, !no_start, quiet),
+        AgentCommand::Uninstall { quiet } => agent::uninstall(quiet),
+        AgentCommand::Run { config, service } => agent::run(&config, service),
+        AgentCommand::Status { config, pid } => agent::status(&config, pid),
+        AgentCommand::Enroll {
+            config,
+            token_file,
+            timeout,
+        } => enroll::enroll_agent(&config, &token_file, timeout),
+        AgentCommand::SshKey {
+            config,
+            from,
+            pty,
+            line,
+        } => agent::ssh_key(&config, &from, pty, line),
+        AgentCommand::ReplayStore {
+            command:
+                ReplayStoreCommand::Repair {
+                    path,
+                    max_ttl_secs,
+                    clock_skew_secs,
+                },
+        } => repair_replay_store(&path, max_ttl_secs, clock_skew_secs),
+        AgentCommand::KeysetState {
+            command: KeysetStateCommand::Repair { config, yes },
+        } => keyset_state::repair(&config, yes),
+    }
+}
+
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -433,49 +490,7 @@ fn main() -> ExitCode {
             let _ = Cli::command().print_help();
             ExitCode::SUCCESS
         }
-        Some(Command::Agent {
-            command:
-                AgentCommand::Install {
-                    config,
-                    executable,
-                    no_start,
-                    quiet,
-                },
-        }) => agent::install(&config, executable, !no_start, quiet),
-        Some(Command::Agent {
-            command: AgentCommand::Uninstall { quiet },
-        }) => agent::uninstall(quiet),
-        Some(Command::Agent {
-            command: AgentCommand::Run { config, service },
-        }) => agent::run(&config, service),
-        Some(Command::Agent {
-            command: AgentCommand::Status { config, pid },
-        }) => agent::status(&config, pid),
-        Some(Command::Agent {
-            command:
-                AgentCommand::Enroll {
-                    config,
-                    token_file,
-                    timeout,
-                },
-        }) => enroll::enroll_agent(&config, &token_file, timeout),
-        Some(Command::Agent {
-            command:
-                AgentCommand::ReplayStore {
-                    command:
-                        ReplayStoreCommand::Repair {
-                            path,
-                            max_ttl_secs,
-                            clock_skew_secs,
-                        },
-                },
-        }) => repair_replay_store(&path, max_ttl_secs, clock_skew_secs),
-        Some(Command::Agent {
-            command:
-                AgentCommand::KeysetState {
-                    command: KeysetStateCommand::Repair { config, yes },
-                },
-        }) => keyset_state::repair(&config, yes),
+        Some(Command::Agent { command }) => run_agent(command),
         Some(Command::Audit { command }) => run_audit(command),
         #[cfg(target_os = "linux")]
         Some(Command::Core { command }) => run_core(command),

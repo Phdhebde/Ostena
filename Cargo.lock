@@ -1503,6 +1503,7 @@ dependencies = [
 name = "ostena-cli"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "ostena-audit",
  "ostena-common",
@@ -1511,6 +1512,7 @@ dependencies = [
  "ostena-grant",
  "ostena-platform",
  "ostena-scope",
+ "ostena-ssh",
  "ostena-tunnel",
  "serde",
  "serde_json",
