@@ -386,6 +386,14 @@ fn login_bounds(out: &mut Vec<Violation>, field: &str, value: u32, min: u32, max
 
 /// Rules of `[core.login]` (`CFG-V017`).
 fn login_rules(core: &CoreConfig, login: &CoreLoginConfig, out: &mut Vec<Violation>) {
+    if core.ssh.is_none() {
+        login_violation(
+            out,
+            "[core.login] exige [core.ssh] : l'autorité des certificats utilisateur signe le \
+             certificat de la session."
+                .into(),
+        );
+    }
     if login.listen == core.tunnel_listen || login.listen == core.enrollment_listen() {
         login_violation(
             out,

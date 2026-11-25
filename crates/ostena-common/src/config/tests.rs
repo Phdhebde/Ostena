@@ -1380,6 +1380,10 @@ fn p011_key_files_through_the_injected_checker() {
 // ---------------------------------------------------------------- core.login
 
 const LOGIN: &str = r#"
+[core.ssh]
+user_ca_key = { credential = "ssh-user.key" }
+host_ca_key = { credential = "ssh-host.key" }
+
 [core.login]
 listen = "0.0.0.0:8445"
 totp_key = { credential = "totp.key" }
@@ -1466,6 +1470,10 @@ fn v017_core_login_rules() {
         let c = core_with(&LOGIN.replace("0.0.0.0:8445", listen));
         assert_eq!(core_codes(&c), vec![Code::CoreLogin], "{listen}");
     }
+    // The session certificate needs the SSH user authority.
+    let without_ssh = &LOGIN[LOGIN.find("[core.login]").unwrap()..];
+    let c = core_with(without_ssh);
+    assert_eq!(core_codes(&c), vec![Code::CoreLogin]);
 }
 
 #[test]
