@@ -152,7 +152,7 @@ Le parcours est celui de l'ADR-0010 ; le tunnel porte cinq messages de plus. Auc
 
 Événements : `agent.ssh_trust_applied`, `agent.ssh_trust_refused` (code), `agent.login_revoked`.
 
-Le core de test (`ostena_tunnel::testing`) répond à `ssh_grant_request` depuis un inventaire de ressources nommées (avec des réglages pour mal se comporter : autre sujet, autre protocole, autre compte, liaison à un autre compte, clé hôte absente), enregistre les clés d'hôte reçues et pousse la confiance de ses propres autorités d'utilisateurs et d'hôtes. Le core réel les traitera à la PR 5 du jalon M1 ; d'ici là, il ignore les messages qu'il ne traite pas.
+Le core de test (`ostena_tunnel::testing`) répond à `ssh_grant_request` depuis un inventaire de ressources nommées (avec des réglages pour mal se comporter : autre sujet, autre protocole, autre compte, liaison à un autre compte, clé hôte absente), enregistre les clés d'hôte reçues et pousse la confiance de ses propres autorités d'utilisateurs et d'hôtes. Le core réel les traite depuis la PR 5b du jalon M1 (ADR-0014) : décision depuis son inventaire, certificat d'hôte, poussées de la confiance SSH et diffusion de `login_revoked`, y compris à la reconnexion d'un agent pour les sessions de connexion révoquées et pas encore expirées pour lesquelles il a reçu un grant.
 
 ### Enrôlement, renouvellement, révocation
 

@@ -17,3 +17,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0011](0011-socle-du-core-et-postgresql.md) | Socle du core et base PostgreSQL | Accepté |
 | [0012](0012-chaine-d-audit-du-core.md) | Chaîne d'audit du core | Accepté |
 | [0013](0013-applications-web-et-navigateur-isole.md) | Applications web par navigateur isolé | Proposé |
+| [0014](0014-inventaire-minimal-et-decision-d-acces-ssh.md) | Inventaire minimal et décision d'accès SSH du core | Accepté |

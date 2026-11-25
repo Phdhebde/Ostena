@@ -48,7 +48,7 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
 
 ### Clés du core
 
-- **Trois clés** : celle du certificat serveur (`tls_private_key`), celle de la CA émettrice (`issuing_private_key`) et celle qui signe les têtes de la chaîne d'audit (`[core.audit] signing_key`, ADR-0012). Les règles ci-dessous valent pour les trois.
+- **Trois clés** : celle du certificat serveur (`tls_private_key`), celle de la CA émettrice (`issuing_private_key`) et celle qui signe les têtes de la chaîne d'audit (`[core.audit] signing_key`, ADR-0012). S'y ajoutent la clé des grants (`grant_signing_key`) et les deux autorités SSH (`[core.ssh] user_ca_key`, `host_ca_key`) de l'ADR-0014. Les règles ci-dessous valent pour toutes, et deux clés du core ne partagent jamais la même source (`CFG-V016`).
 - **Lecture** depuis un credential systemd (`LoadCredentialEncrypted=`, lu dans `$CREDENTIALS_DIRECTORY`) ou depuis un fichier PKCS#8.
 - **Fichier en clair** (`CFG-P012`) : **dérogation datée**, accepté en production et journalisé à chaque démarrage (`config.waiver`) **jusqu'au 2027-04-30 inclus**, refusé ensuite.
 - **Droits** : une clé en fichier lisible au-delà du compte du service est refusée (`CFG-P011`).
@@ -70,6 +70,9 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
 | `CORE-E009` | agent inconnu |
 | `CORE-E010` | écriture d'audit impossible (chaîne ou export) : l'opération auditée est refusée, sauf si elle ne fait que retirer des droits (ADR-0012) |
 | `CORE-E011` | chaîne d'audit incohérente : le core cesse de signer et refuse de démarrer (ADR-0012) |
+| `CORE-E012` | requête d'administration invalide (ADR-0014) |
+
+Les refus d'accès (`ACC-E001` à `ACC-E008`) et d'inventaire (`INV-E001` à `INV-E005`) sont décrits dans l'ADR-0014.
 
 Côté tunnel, `TUN-E029` signale un registre illisible (ADR-0008).
 
@@ -80,7 +83,8 @@ Les événements qui engagent une décision du core sont écrits dans la chaîne
 - **registre** : `core.registry_unavailable`, `core.registry_restored`, `core.registry_error`, `core.notices_interrupted` ;
 - **agents** : `tunnel.agent_connected`, `tunnel.refused`, `agent.certificate_renewed`, `agent.renewal_refused`, `agent.revoked`, `agent.revocation_applied` (tunnels fermés) ;
 - **enrôlement** (ADR-0008) : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted`, `enroll.refused`, `enroll.store_unavailable` ;
-- **chaîne d'audit** (ADR-0012) : `audit.chain_started`, `audit.head_signed` (tête sous forme texte), `audit.chain_broken`, `audit.break_accepted`, `audit.break_acknowledged`, `audit.append_failed`, `audit.event_dropped`, `audit.events_lost`, `audit.head_failed`.
+- **chaîne d'audit** (ADR-0012) : `audit.chain_started`, `audit.head_signed` (tête sous forme texte), `audit.chain_broken`, `audit.break_accepted`, `audit.break_acknowledged`, `audit.append_failed`, `audit.event_dropped`, `audit.events_lost`, `audit.head_failed` ;
+- **accès SSH et inventaire** (ADR-0014) : `grant.key_activated`, `access.ssh_granted`, `access.ssh_refused`, `access.session_opened`, `access.session_refused`, `access.session_closed`, `ssh.host_certified`, `ssh.host_key_refused`, `login_session.revoked`, `login_session.revocation_applied`, et les changements d'inventaire.
 
 ### Écarts
 
