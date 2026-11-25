@@ -418,7 +418,7 @@ pub fn load_for_enrollment(path: &Path) -> Result<Config, ConfigError> {
 }
 
 /// Rules that need the file system: `CFG-P006`, for an agent `CFG-P008` and
-/// `CFG-P009`, for the core `CFG-P011`.
+/// `CFG-P009`, for the core `CFG-P011` and `CFG-P016`.
 fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> Vec<Violation> {
     let mut out = Vec::new();
     if let Err(reason) = checker.not_writable_by_others(path) {
@@ -480,6 +480,23 @@ fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> 
                 out.push(Violation::new(
                     Code::CoreKeyExposed,
                     format!("{field} {} : {reason}", key.display()),
+                ));
+            }
+        }
+        // The transcripts (ADR-0016): the directory is private (0700, owner
+        // root or service); before the core creates it, its parent must
+        // not be writable by others.
+        if let Some(ssh) = &core.ssh {
+            let dir = &ssh.transcripts_dir;
+            let verdict = if dir.exists() {
+                checker.private(dir)
+            } else {
+                checker.not_writable_by_others(dir.parent().unwrap_or(dir))
+            };
+            if let Err(reason) = verdict {
+                out.push(Violation::new(
+                    Code::TranscriptsExposed,
+                    format!("core.ssh.transcripts_dir {} : {reason}", dir.display()),
                 ));
             }
         }

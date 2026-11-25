@@ -125,7 +125,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
-        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015",
+        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1359,6 +1359,46 @@ fn p012_key_files_are_waived_until_2027_04_30_then_refused() {
             .collect::<Vec<_>>(),
         vec![Code::CoreKeyInFile, Code::CoreKeyInFile]
     );
+}
+
+/// The transcript directory is private once it exists; before, its parent
+/// must not be writable by others (ADR-0016).
+#[test]
+fn p016_transcript_directory_through_the_injected_checker() {
+    let dir = TempDir::new("core-transcripts");
+    let transcripts = dir.0.join("transcripts");
+    let text = |path: &Path| {
+        format!(
+            "{CORE}[core.ssh]\nuser_ca_key = {{ credential = \"ssh-user.key\" }}\n\
+             host_ca_key = {{ credential = \"ssh-host.key\" }}\n\
+             transcripts_dir = \"{}\"\ncommand_mac_key = {{ credential = \"mac.key\" }}\n",
+            path.display()
+        )
+    };
+    let path = dir.write(&text(&transcripts));
+    let ok = FakeChecker {
+        writable: vec![],
+        exposed: vec![],
+    };
+    assert!(load_with(&path, &ok).is_ok());
+    // Not created yet: its parent is checked.
+    let parent_open = FakeChecker {
+        writable: vec![dir.0.clone()],
+        exposed: vec![],
+    };
+    assert_eq!(
+        load_with(&path, &parent_open).unwrap_err().codes(),
+        vec![Code::TranscriptsExposed]
+    );
+    // Created: it must be private.
+    std::fs::create_dir(&transcripts).unwrap();
+    let exposed = FakeChecker {
+        writable: vec![],
+        exposed: vec![transcripts.clone()],
+    };
+    let err = load_with(&path, &exposed).unwrap_err();
+    assert_eq!(err.codes(), vec![Code::TranscriptsExposed]);
+    assert!(err.to_string().contains("core.ssh.transcripts_dir"));
 }
 
 #[test]

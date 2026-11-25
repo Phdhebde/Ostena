@@ -199,12 +199,25 @@ fn write_service_keys(dir: &Path) {
     }
 }
 
+/// Creates `dir`, the directory of the agent, and the transcript directory
+/// private (CFG-P016), as an installation does: absent, the directories
+/// above it would be checked, and the system temporary directory is
+/// writable by all.
+fn create_dirs(dir: &Path) {
+    std::fs::create_dir_all(dir.join("agent")).unwrap();
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir.join("transcripts")).unwrap();
+}
+
 /// The PKI after a ceremony, the core configuration on `db`, and an agent
 /// configuration pointing at it.
 fn lab(db: &TestDb) -> Lab {
     let dir = std::env::temp_dir().join(format!("ostena-core-demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(dir.join("agent")).unwrap();
+    create_dirs(&dir);
     let pki = TestPki::new("Ostena demo").unwrap();
     let (server_key, server_pkcs8) = SigningKey::generate().unwrap();
     let server = pki

@@ -148,9 +148,14 @@ pub(crate) fn evaluate_private(
         (mode & GROUP_OR_OTHER_ANY != 0).then(|| {
             format!(
                 "{what} {} est accessible au groupe ou à tous (mode {:o}) ; \
-                 réservez-le au compte du service (chmod 600).",
+                 réservez-le au compte du service (chmod {}).",
                 path.display(),
-                mode & 0o7777
+                mode & 0o7777,
+                if mode & 0o170_000 == 0o040_000 {
+                    "700"
+                } else {
+                    "600"
+                }
             )
         })
     })
