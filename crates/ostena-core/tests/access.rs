@@ -406,6 +406,70 @@ fn concurrent_session_requests_consume_a_jti_once() {
     });
 }
 
+/// Waits until `count` transactions of the test database wait for a lock.
+async fn lock_waiters(pool: &PgPool, count: i64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{count} attentes de verrou attendues, {waiting} vues"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[test]
+fn disabling_a_user_during_a_grant_request_does_not_deadlock() {
+    block_on(async {
+        let Some(f) = fixture("disabling_a_user_during_a_grant_request_does_not_deadlock").await
+        else {
+            return;
+        };
+        let f = Arc::new(f);
+        // The user row held, so that both transactions queue on it: the
+        // disabling first, then the grant request. Taking the login session
+        // before the user, the request would hold what the disabling needs
+        // next, and PostgreSQL would abort one of them (40P01).
+        let mut blocker = f.pool.begin().await.unwrap();
+        sqlx::query("SELECT 1 FROM app_user WHERE id = $1::uuid FOR UPDATE")
+            .bind(f.user.to_string())
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let disable = {
+            let pool = f.pool.clone();
+            tokio::spawn(async move { inventory::disable_user(&pool, "alice").await })
+        };
+        lock_waiters(&f.pool, 1).await;
+        let grant = {
+            let f = f.clone();
+            tokio::spawn(async move { f.grant(&f.request("srv-lab01", "root")).await })
+        };
+        lock_waiters(&f.pool, 2).await;
+        blocker.rollback().await.unwrap();
+        assert_eq!(disable.await.unwrap().unwrap(), 1);
+        let refused = grant.await.unwrap().unwrap_err();
+        assert!(
+            [access::LOGIN_REVOKED, access::USER_INACTIVE].contains(&refused.code),
+            "{refused:?}"
+        );
+        let Ok(f) = Arc::try_unwrap(f) else {
+            panic!("fixture encore partagée");
+        };
+        f.db.drop_database().await;
+    });
+}
+
 #[test]
 fn revocations_are_repeated_to_the_agents_that_received_grants() {
     block_on(async {

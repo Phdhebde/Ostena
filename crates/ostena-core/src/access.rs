@@ -2,7 +2,7 @@
 //! (ADR-0014).
 //!
 //! 1. `ssh_grant_request`: the agent relays what the user certificate
-//!    says. In one transaction, the login session, the user, the resource,
+//!    says. In one transaction, the user, the login session, the resource,
 //!    the account and a right are read and locked (`FOR SHARE`: a
 //!    revocation waits for the grant to be recorded, then finds it); a grant
 //!    is signed and recorded by jti with its granting audit record.
@@ -13,6 +13,11 @@
 //!
 //! A refusal carries a precise code for the agent and its full reason for
 //! the audit chain; nothing goes back to the SSH client.
+//!
+//! Lock order, everywhere (ADR-0014): `access_grant`, `app_user`,
+//! `login_session`, `resource`, `target_account`, `access_right`. A
+//! transaction that locks two of them takes them in this order, or two
+//! transactions could wait for each other.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -161,28 +166,44 @@ fn secs_until(end: i64, now: u64) -> u64 {
     u64::try_from(end).unwrap_or(0).saturating_sub(now)
 }
 
-/// The user must exist and be active (read with `FOR SHARE`).
-async fn active_user(tx: &mut Tx<'_>, user: Uuid) -> Result<(), Refusal> {
-    let active = sqlx::query_scalar!(
-        "SELECT state = 'active' FROM app_user WHERE id = $1::text::uuid FOR SHARE",
-        user.to_string(),
-    )
-    .fetch_optional(&mut **tx)
-    .await?
-    .flatten();
-    if active == Some(true) {
-        Ok(())
-    } else {
-        Err(Refusal::new(
-            USER_INACTIVE,
-            format!("utilisateur {user} inconnu ou désactivé"),
-        ))
+/// The user, read with `FOR SHARE` before the login session (the lock
+/// order of ADR-0014); checked by [`UserLock::active`].
+struct UserLock {
+    user: Uuid,
+    active: bool,
+}
+
+impl UserLock {
+    async fn take(tx: &mut Tx<'_>, user: Uuid) -> Result<Self, Refusal> {
+        let active = sqlx::query_scalar!(
+            "SELECT state = 'active' FROM app_user WHERE id = $1::text::uuid FOR SHARE",
+            user.to_string(),
+        )
+        .fetch_optional(&mut **tx)
+        .await?
+        .flatten();
+        Ok(Self {
+            user,
+            active: active == Some(true),
+        })
+    }
+
+    /// The user must exist and be active.
+    fn active(&self) -> Result<(), Refusal> {
+        if self.active {
+            Ok(())
+        } else {
+            Err(Refusal::new(
+                USER_INACTIVE,
+                format!("utilisateur {} inconnu ou désactivé", self.user),
+            ))
+        }
     }
 }
 
-/// The user, the resource, the account and a valid right, read with
-/// `FOR SHARE` in `tx`. `group` is the group of the asking agent (`None`:
-/// any, for the dry run).
+/// The resource, the account and a valid right of `user` (already locked
+/// and checked), read with `FOR SHARE` in `tx`. `group` is the group of the
+/// asking agent (`None`: any, for the dry run).
 async fn allowed(
     tx: &mut Tx<'_>,
     user: Uuid,
@@ -191,7 +212,6 @@ async fn allowed(
     group: Option<Uuid>,
     now: u64,
 ) -> Result<Allowed, Refusal> {
-    active_user(tx, user).await?;
     let Some(r) = sqlx::query!(
         r#"SELECT id::text AS "id!", gateway_group::text AS "group!", host, port,
                   ssh_host_p256_public
@@ -357,7 +377,11 @@ pub async fn check(
             format!("utilisateur « {} » inconnu", truncate(user)),
         )
     })?;
-    let found = allowed(&mut tx, uuid(&user)?, resource, account, None, now).await;
+    let user = uuid(&user)?;
+    let found = match UserLock::take(&mut tx, user).await?.active() {
+        Ok(()) => allowed(&mut tx, user, resource, account, None, now).await,
+        Err(refusal) => Err(refusal),
+    };
     tx.rollback().await?;
     found
 }
@@ -413,6 +437,8 @@ pub async fn ssh_grant(
     now: u64,
 ) -> Result<Issued, Refusal> {
     let mut tx = pool.begin().await?;
+    // Lock order (ADR-0014): the user, then the login session.
+    let user = UserLock::take(&mut tx, request.subject).await?;
     let login_expires = login_session(
         &mut tx,
         request.login_session,
@@ -421,6 +447,7 @@ pub async fn ssh_grant(
         now,
     )
     .await?;
+    user.active()?;
     let allowed = allowed(
         &mut tx,
         request.subject,
@@ -619,7 +646,10 @@ pub async fn open_session(
     }
     let subject = Uuid::from_bytes(checked.claims.subject.to_bytes());
     let login = uuid(&row.login)?;
+    // Lock order (ADR-0014): the grant, the user, then the login session.
+    let user = UserLock::take(&mut tx, subject).await?;
     login_session(&mut tx, login, subject, None, now).await?;
+    user.active()?;
     let resource_name = sqlx::query_scalar!(
         "SELECT name FROM resource WHERE id = $1::text::uuid",
         row.resource

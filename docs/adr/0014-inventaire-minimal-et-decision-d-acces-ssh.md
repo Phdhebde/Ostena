@@ -63,13 +63,15 @@ Comme pour les agents (ADR-0011), une commande agit sur la base pendant que le c
 
 À `ssh_grant_request`, dans **une seule transaction** :
 1. `[core.ssh]` absent : `ACC-E007` ;
-2. la session de connexion est lue et verrouillée (`FOR SHARE`) : inconnue, expirée, révoquée, ou d'un autre sujet ou d'un autre certificat (`ACC-E001` à `ACC-E004`) ;
+2. la session de connexion est lue et verrouillée (`FOR SHARE`, après l'utilisateur, voir l'ordre des verrous) : inconnue, expirée, révoquée, ou d'un autre sujet ou d'un autre certificat (`ACC-E001` à `ACC-E004`) ;
 3. l'utilisateur doit être actif (`ACC-E005`) ;
 4. la ressource doit exister, appartenir au groupe de l'agent et avoir une clé d'hôte épinglée (`INV-E001`, `INV-E002`, `INV-E004`) ; le compte doit exister (`INV-E003`) ;
 5. un droit SSH valide, non révoqué, est cherché pour l'utilisateur et le compte (`ACC-E006`) ;
 6. le grant v2 est signé : sujet, ressource, audience (le groupe), protocole SSH, durée, **liaison à la session de connexion et au compte** (ADR-0004), TTL de 60 s. Il est enregistré par son jti avec son enregistrement d'audit accordant `access.ssh_granted`, puis renvoyé dans `ssh_grant`.
 
-Le verrou `FOR SHARE` porte sur la session de connexion, l'utilisateur, la ressource, le compte et le droit. Une révocation concurrente attend donc que le grant soit enregistré, puis le trouve, et l'agent qui l'a reçu est prévenu.
+Le verrou `FOR SHARE` porte sur l'utilisateur, la session de connexion, la ressource, le compte et le droit. Une révocation concurrente attend donc que le grant soit enregistré, puis le trouve, et l'agent qui l'a reçu est prévenu.
+
+**Ordre des verrous** : toute transaction qui verrouille plusieurs de ces lignes les prend dans cet ordre canonique : `access_grant`, `app_user`, `login_session`, `resource`, `target_account`, `access_right`. La demande de grant verrouille donc l'utilisateur avant sa session de connexion (les codes de refus restent évalués dans l'ordre ci-dessus), l'ouverture de session le grant, puis l'utilisateur, puis la session de connexion, et `user disable` l'utilisateur avant ses sessions de connexion. Sans cet ordre, une désactivation et une demande de grant simultanées pouvaient s'attendre l'une l'autre, et PostgreSQL annulait l'une d'elles (`40P01`).
 
 **Durée maximale de la session** : le minimum de la durée du droit, du temps restant jusqu'à la fin du droit et du temps restant jusqu'à la fin de la session de connexion.
 
