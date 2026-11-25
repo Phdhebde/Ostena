@@ -560,6 +560,67 @@ fn an_unreadable_secret_is_a_counted_refusal() {
     });
 }
 
+/// The actors of the `login.refused` records, in order.
+async fn refusal_actors(pool: &PgPool) -> Vec<String> {
+    let bodies: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT body FROM audit_record WHERE event = 'login.refused' ORDER BY seq",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    bodies
+        .iter()
+        .map(|b| ostena_audit::Record::decode(b).unwrap().actor)
+        .collect()
+}
+
+/// For a known account, `login.refused` is written in the transaction that
+/// counts the failure or reads the account (protective): it is in the
+/// chain when the answer leaves. An unknown name stays best effort.
+#[test]
+fn refusals_of_a_known_account_are_protective() {
+    block_on(async {
+        let Some(f) = fixture("refusals_of_a_known_account_are_protective").await else {
+            return;
+        };
+        let key = SigningKey::generate().unwrap().0;
+        let alice = alice(&f.pool).await.to_string();
+        assert!(
+            f.login("alice", "wrong password!", f.next_code(), &key)
+                .await
+                .is_err()
+        );
+        // No flush: already in the chain, the user as actor.
+        assert_eq!(refusal_actors(&f.pool).await, vec![alice.clone()]);
+        // A known account refused without a count (here disabled) too.
+        inventory::disable_user(&f.pool, "alice").await.unwrap();
+        assert!(
+            f.login("alice", PASSWORD, f.next_code(), &key)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            refusal_actors(&f.pool).await,
+            vec![alice.clone(), alice.clone()]
+        );
+        // An unknown name: best effort, the address as actor.
+        assert!(
+            f.login("nobody", PASSWORD, f.next_code(), &key)
+                .await
+                .is_err()
+        );
+        flushed(&f.recorder).await;
+        assert_eq!(
+            refusal_actors(&f.pool).await,
+            vec![alice.clone(), alice, peer().ip().to_string()]
+        );
+
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
 async fn alice(pool: &PgPool) -> ostena_tunnel::Uuid {
     let id: String = sqlx::query_scalar("SELECT id::text FROM app_user WHERE name = 'alice'")
         .fetch_one(pool)

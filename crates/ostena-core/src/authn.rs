@@ -23,8 +23,10 @@
 //! certificate, opens the login session and writes `login.succeeded`
 //! (granting), all in the same transaction.
 //!
-//! The client always gets `AUTH-E001`; the cause goes to `login.refused`
-//! (best effort). A logout is a revocation by the user of their own
+//! The client always gets `AUTH-E001`; the cause goes to `login.refused`:
+//! protective, in the transaction that counts the failure or reads the
+//! account, for a known account; best effort for an unknown name, which
+//! has no row to lock. A logout is a revocation by the user of their own
 //! session, signed by the session key (`login_session.revoked`).
 
 use std::net::SocketAddr;
@@ -93,8 +95,37 @@ impl Cause {
 }
 
 enum Failure {
+    /// Refused; `login.refused` still to be written (best effort).
     Refused(Cause, Option<Uuid>),
+    /// Refused; `login.refused` written in the transaction (protective).
+    Recorded(Cause, Uuid),
     Broken(CoreError),
+}
+
+/// The attempt on a known account, for its refusal records.
+struct Attempt<'a> {
+    user: Uuid,
+    name: &'a str,
+    peer: SocketAddr,
+}
+
+/// `login.refused` with its cause, for the audit chain only.
+fn refusal_event(cause: Cause, user: Option<Uuid>, name: &str, peer: SocketAddr) -> Event {
+    let actor = user.map_or_else(|| peer.ip().to_string(), |u| u.to_string());
+    let kind = if user.is_some() {
+        ActorKind::User
+    } else {
+        ActorKind::Peer
+    };
+    let mut event = Event::new(EventKind::LoginRefused, Outcome::Failure, kind, actor)
+        .text(field::NAME, truncate(name))
+        .text(field::CODE, ApiCode::InvalidCredentials.as_str())
+        .text(field::REASON, cause.as_str())
+        .text(field::CLIENT_ADDR, peer.to_string());
+    if let Some(user) = user {
+        event = event.uuid(field::USER_ID, user.to_bytes());
+    }
+    event
 }
 
 impl From<CoreError> for Failure {
@@ -286,14 +317,19 @@ impl PgAuthenticator {
         let Some(user) = user else {
             return Err(Failure::Refused(Cause::UnknownUser, None));
         };
+        let attempt = Attempt {
+            user,
+            name: &username,
+            peer,
+        };
 
         // Phase 2, the locks in the canonical order, everything checked again.
         let mut tx = self.pool.begin().await?;
-        let Some((locked_user, active)) = lock_user(&mut tx, &username).await? else {
-            return Err(Failure::Refused(Cause::Changed, Some(user)));
-        };
+        let (locked_user, active) = lock_user(&mut tx, &username)
+            .await?
+            .unwrap_or((user, false));
         if locked_user != user {
-            return Err(Failure::Refused(Cause::Changed, Some(user)));
+            return Err(self.refuse(tx, Cause::Changed, &attempt).await);
         }
         let row = sqlx::query!(
             r#"SELECT password_hash, totp_secret, totp_algorithm, totp_pending,
@@ -306,7 +342,7 @@ impl PgAuthenticator {
         .await?;
         let now = unix_now();
         let Some(row) = row else {
-            return Err(Failure::Refused(Cause::NotEnrolled, Some(user)));
+            return Err(self.refuse(tx, Cause::NotEnrolled, &attempt).await);
         };
         let locked = row
             .locked_until
@@ -331,10 +367,8 @@ impl PgAuthenticator {
             None
         };
         let (Some((_, sealed, algorithm)), None) = (enrolled, early) else {
-            return Err(Failure::Refused(
-                early.unwrap_or(Cause::NotEnrolled),
-                Some(user),
-            ));
+            let cause = early.unwrap_or(Cause::NotEnrolled);
+            return Err(self.refuse(tx, cause, &attempt).await);
         };
         let last_step = u64::try_from(row.totp_last_step).unwrap_or(0);
         let checked = if password_ok {
@@ -346,9 +380,9 @@ impl PgAuthenticator {
             Ok(step) => step,
             Err(cause) => {
                 let failures = self.failures_after(row.failed_attempts, row.last_failure_at, now);
-                self.count_failure(tx, user, &username, failures, now)
+                self.count_failure(tx, &attempt, cause, failures, now)
                     .await?;
-                return Err(Failure::Refused(cause, Some(user)));
+                return Err(Failure::Recorded(cause, user));
             }
         };
         self.succeed(
@@ -409,15 +443,32 @@ impl PgAuthenticator {
         previous.saturating_add(1)
     }
 
-    /// Counts a failure; at the limit, locks the account.
+    /// Refuses a known account without counting a failure: `login.refused`
+    /// is written in `tx` (protective), then committed.
+    async fn refuse(&self, mut tx: Tx<'_>, cause: Cause, a: &Attempt<'_>) -> Failure {
+        let appended =
+            audit::append_protective(&mut tx, refusal_event(cause, Some(a.user), a.name, a.peer))
+                .await;
+        if let Err(e) = tx.commit().await {
+            return Failure::Broken(e.into());
+        }
+        if let Some(appended) = appended {
+            self.recorder.critical(&[appended]);
+        }
+        Failure::Recorded(cause, a.user)
+    }
+
+    /// Counts a failure, and writes `login.refused` in the same
+    /// transaction (protective); at the limit, locks the account.
     async fn count_failure(
         &self,
         mut tx: Tx<'_>,
-        user: Uuid,
-        name: &str,
+        a: &Attempt<'_>,
+        cause: Cause,
         failures: u32,
         now: u64,
     ) -> Result<(), Failure> {
+        let (user, name) = (a.user, a.name);
         if failures < self.settings.max_failures {
             sqlx::query!(
                 "UPDATE user_credential SET failed_attempts = $2, last_failure_at = $3
@@ -428,7 +479,13 @@ impl PgAuthenticator {
             )
             .execute(&mut *tx)
             .await?;
+            let appended =
+                audit::append_protective(&mut tx, refusal_event(cause, Some(user), name, a.peer))
+                    .await;
             tx.commit().await?;
+            if let Some(appended) = appended {
+                self.recorder.critical(&[appended]);
+            }
             return Ok(());
         }
         let until = now + self.settings.lockout_secs;
@@ -441,7 +498,10 @@ impl PgAuthenticator {
         )
         .execute(&mut *tx)
         .await?;
-        let appended = audit::append_protective(
+        // Protective, last statements before the commit.
+        let refused =
+            audit::append_protective(&mut tx, refusal_event(cause, Some(user), name, a.peer)).await;
+        let locked = audit::append_protective(
             &mut tx,
             user_event(EventKind::LoginLocked, Outcome::Failure, user)
                 .uuid(field::USER_ID, user.to_bytes())
@@ -451,8 +511,9 @@ impl PgAuthenticator {
         )
         .await;
         tx.commit().await?;
-        if let Some(appended) = appended {
-            self.recorder.critical(&[appended]);
+        let appended: Vec<_> = refused.into_iter().chain(locked).collect();
+        if !appended.is_empty() {
+            self.recorder.critical(&appended);
         }
         tracing::warn!(
             event = "login.locked",
@@ -623,22 +684,19 @@ impl PgAuthenticator {
         Ok(())
     }
 
-    fn refused(&self, cause: Cause, user: Option<Uuid>, name: &str, peer: SocketAddr) {
-        let actor = user.map_or_else(|| peer.ip().to_string(), |u| u.to_string());
-        let kind = if user.is_some() {
-            ActorKind::User
-        } else {
-            ActorKind::Peer
-        };
-        let mut event = Event::new(EventKind::LoginRefused, Outcome::Failure, kind, actor)
-            .text(field::NAME, truncate(name))
-            .text(field::CODE, ApiCode::InvalidCredentials.as_str())
-            .text(field::REASON, cause.as_str())
-            .text(field::CLIENT_ADDR, peer.to_string());
-        if let Some(user) = user {
-            event = event.uuid(field::USER_ID, user.to_bytes());
+    /// Logs a refusal; writes `login.refused` (best effort) unless the
+    /// transaction already did.
+    fn refused(
+        &self,
+        cause: Cause,
+        user: Option<Uuid>,
+        name: &str,
+        peer: SocketAddr,
+        recorded: bool,
+    ) {
+        if !recorded {
+            self.recorder.emit(refusal_event(cause, user, name, peer));
         }
-        self.recorder.emit(event);
         tracing::info!(
             event = "login.refused",
             name = %truncate(name).escape_debug(),
@@ -680,7 +738,11 @@ impl Authenticator for PgAuthenticator {
         match self.decide(request, public, peer).await {
             Ok(response) => Ok(response),
             Err(Failure::Refused(cause, user)) => {
-                self.refused(cause, user, &name, peer);
+                self.refused(cause, user, &name, peer, false);
+                Err(ApiError::invalid_credentials())
+            }
+            Err(Failure::Recorded(cause, user)) => {
+                self.refused(cause, Some(user), &name, peer, true);
                 Err(ApiError::invalid_credentials())
             }
             Err(Failure::Broken(e)) => Err(broken(&e)),
@@ -688,19 +750,19 @@ impl Authenticator for PgAuthenticator {
     }
 
     async fn logout(&self, request: LogoutRequest, peer: SocketAddr) -> Result<(), ApiError> {
-        match self.revoke(&request).await {
-            Ok(()) => Ok(()),
-            Err(Failure::Refused(cause, user)) => {
-                tracing::info!(
-                    event = "login.logout_refused",
-                    user = ?user.map(|u| u.to_string()),
-                    reason = cause.as_str(),
-                    client_addr = %peer,
-                    "déconnexion refusée"
-                );
-                Err(ApiError::invalid_credentials())
-            }
-            Err(Failure::Broken(e)) => Err(broken(&e)),
-        }
+        let (cause, user) = match self.revoke(&request).await {
+            Ok(()) => return Ok(()),
+            Err(Failure::Broken(e)) => return Err(broken(&e)),
+            Err(Failure::Refused(cause, user)) => (cause, user),
+            Err(Failure::Recorded(cause, user)) => (cause, Some(user)),
+        };
+        tracing::info!(
+            event = "login.logout_refused",
+            user = ?user.map(|u| u.to_string()),
+            reason = cause.as_str(),
+            client_addr = %peer,
+            "déconnexion refusée"
+        );
+        Err(ApiError::invalid_credentials())
     }
 }
