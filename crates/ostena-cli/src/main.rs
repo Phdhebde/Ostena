@@ -16,6 +16,7 @@ mod core_inventory;
 mod core_link;
 mod enroll;
 mod keyset_state;
+mod login;
 mod sessions;
 #[cfg(feature = "ssh")]
 mod ssh;
@@ -57,6 +58,55 @@ enum Command {
         #[command(subcommand)]
         command: CoreCommand,
     },
+    /// Open a session on the bastion: password, TOTP code, then an SSH
+    /// certificate for the session in ~/.ostena (administrator workstation).
+    Login(LoginArgs),
+    /// Close the session on the core, then delete its key and certificate.
+    Logout {
+        /// The directory of the session files, ~/.ostena by default.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
+/// `ostena login`.
+#[derive(Debug, clap::Args)]
+struct LoginArgs {
+    /// The core, host:port (port 8445 if left out). Remembered.
+    #[arg(long)]
+    core: Option<String>,
+    /// The root certificate to pin (root.pem given by the administrator).
+    #[arg(long)]
+    root: Option<PathBuf>,
+    /// The user name. Remembered.
+    #[arg(long)]
+    user: Option<String>,
+    /// Session length in hours, from 1 to 8 (the core may give less).
+    #[arg(long)]
+    hours: Option<u64>,
+    /// The directory of the session files, ~/.ostena by default.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Accept another root than the pinned one.
+    #[arg(long)]
+    replace_root: bool,
+    /// Add the Include line of the fragment at the top of ~/.ssh/config.
+    #[arg(long)]
+    install_include: bool,
+}
+
+impl From<LoginArgs> for login::Options {
+    fn from(a: LoginArgs) -> Self {
+        Self {
+            core: a.core,
+            root: a.root,
+            user: a.user,
+            hours: a.hours,
+            dir: a.dir,
+            replace_root: a.replace_root,
+            install_include: a.install_include,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -735,43 +785,11 @@ fn main() -> ExitCode {
         }
         Some(Command::Agent { command }) => run_agent(command),
         Some(Command::Audit { command }) => run_audit(command),
+        Some(Command::Login(args)) => login::login(&args.into()),
+        Some(Command::Logout { dir }) => login::logout(dir.as_deref()),
         #[cfg(target_os = "linux")]
         Some(Command::Core { command }) => run_core(command),
-        Some(Command::Ca { command }) => match command {
-            CaCommand::Root {
-                command: RootCommand::Init { name, days, outs },
-            } => ca::root_init(&name, days, &outs),
-            CaCommand::Root {
-                command: RootCommand::Reseal { root, outs },
-            } => ca::root_reseal(&root, &outs),
-            CaCommand::Key {
-                command:
-                    KeyCommand::New {
-                        key_out,
-                        public_out,
-                    },
-            } => ca::key_new(&key_out, &public_out),
-            CaCommand::Issuing {
-                command:
-                    SignCommand::Sign {
-                        root,
-                        public_key,
-                        name,
-                        days,
-                        out,
-                    },
-            } => ca::issuing_sign(&root, &public_key, &name, days, &out),
-            CaCommand::Server {
-                command:
-                    ServerCommand::Sign {
-                        root,
-                        public_key,
-                        names,
-                        days,
-                        out,
-                    },
-            } => ca::server_sign(&root, &public_key, &names, days, &out),
-        },
+        Some(Command::Ca { command }) => run_ca(command),
     }
 }
 
@@ -786,6 +804,44 @@ fn usage_exit_code(error: &clap::Error, args: &[&str]) -> u8 {
         audit::USAGE_ERROR
     } else {
         code
+    }
+}
+
+fn run_ca(command: CaCommand) -> ExitCode {
+    match command {
+        CaCommand::Root {
+            command: RootCommand::Init { name, days, outs },
+        } => ca::root_init(&name, days, &outs),
+        CaCommand::Root {
+            command: RootCommand::Reseal { root, outs },
+        } => ca::root_reseal(&root, &outs),
+        CaCommand::Key {
+            command:
+                KeyCommand::New {
+                    key_out,
+                    public_out,
+                },
+        } => ca::key_new(&key_out, &public_out),
+        CaCommand::Issuing {
+            command:
+                SignCommand::Sign {
+                    root,
+                    public_key,
+                    name,
+                    days,
+                    out,
+                },
+        } => ca::issuing_sign(&root, &public_key, &name, days, &out),
+        CaCommand::Server {
+            command:
+                ServerCommand::Sign {
+                    root,
+                    public_key,
+                    names,
+                    days,
+                    out,
+                },
+        } => ca::server_sign(&root, &public_key, &names, days, &out),
     }
 }
 

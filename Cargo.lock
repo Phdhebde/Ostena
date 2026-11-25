@@ -1591,6 +1591,9 @@ version = "0.0.0"
 dependencies = [
  "base64 0.23.1",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "ostena-audit",
  "ostena-common",
  "ostena-core",
@@ -1602,9 +1605,12 @@ dependencies = [
  "ostena-tunnel",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
