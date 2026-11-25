@@ -37,6 +37,18 @@ fn public_line_format() {
 }
 
 #[test]
+fn public_line_of_a_verifying_key_matches_the_generated_line() {
+    let (signing, _) = SigningKey::generate().unwrap();
+    let generated = encode(&signing, "ca").unwrap();
+    let public = signing.verifying_key();
+    assert_eq!(public_line(&public, "ca"), generated.public);
+    assert_eq!(
+        public_line(&public, ""),
+        generated.public.trim_end_matches(" ca")
+    );
+}
+
+#[test]
 fn short_scalar_is_detected() {
     let key = short_scalar_key();
     // SECRET-EXPOSURE: test only.

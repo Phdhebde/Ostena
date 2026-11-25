@@ -16,7 +16,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use ostena_common::secret::SecretBytes;
-use ostena_crypto::p256::SigningKey;
+use ostena_crypto::p256::{SigningKey, VerifyingKey};
 
 const MAGIC: &[u8] = b"openssh-key-v1\0";
 const KEY_TYPE: &str = "ecdsa-sha2-nistp256";
@@ -100,6 +100,17 @@ fn public_blob(public: &[u8; 65]) -> Vec<u8> {
     put_string(&mut blob, CURVE.as_bytes());
     put_string(&mut blob, public);
     blob
+}
+
+/// The OpenSSH public key line of `key`: `ecdsa-sha2-nistp256 AAAA…`,
+/// followed by ` comment` when `comment` is not empty.
+pub fn public_line(key: &VerifyingKey, comment: &str) -> String {
+    let encoded = STANDARD.encode(public_blob(&key.to_bytes()));
+    if comment.is_empty() {
+        format!("{KEY_TYPE} {encoded}")
+    } else {
+        format!("{KEY_TYPE} {encoded} {comment}")
+    }
 }
 
 /// Writes `key` in the OpenSSH private key format, unencrypted, with its
