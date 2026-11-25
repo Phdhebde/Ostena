@@ -605,11 +605,24 @@ pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) 
     }
 }
 
-/// Weakenings tolerated in production until a date, and logged at every
-/// start: `CFG-P012` until 2027-04-30.
+/// Weakenings tolerated in production and logged at every start:
+/// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1, accepted
+/// deviation of ADR-0009) without end.
 pub(crate) fn tolerated(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
     if now < KEY_FILE_WAIVER_END {
         key_files(core, out);
+    }
+    if core
+        .login
+        .as_ref()
+        .is_some_and(|l| l.totp_algorithm == TotpAlgorithmSetting::Sha1)
+    {
+        out.push(Violation::new(
+            Code::TotpSha1,
+            "core.login.totp_algorithm = « sha1 » : les nouveaux enrôlements TOTP utilisent \
+             HMAC-SHA-1, écart accepté (ADR-0009) pour les applications d'authentification ; \
+             « sha256 » le supprime.",
+        ));
     }
 }
 

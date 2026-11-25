@@ -134,7 +134,7 @@ Un mot de passe est un secret de faible entropie, attaquable hors ligne si le co
 - Le code n'est pas une signature : il vaut 30 s, n'est utilisable qu'une fois (anti-rejeu), avec le mot de passe, et sous la limitation des tentatives et le verrouillage. Deviner un code de 6 chiffres reste la meilleure attaque, quelle que soit la fonction.
 - Le secret est tiré au hasard (160 bits), jamais dérivé d'un mot de passe.
 
-**Confinement.** HMAC-SHA-1 n'est exposé par `ostena-crypto` que dans le module `totp`, par la constante `HMAC_SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs. Aucun autre usage de SHA-1 n'est permis. Le choix de SHA-256 vaut pour les nouveaux enrôlements ; un administrateur peut l'imposer (`totp_algorithm = "sha256"`).
+**Confinement.** HMAC-SHA-1 n'est exposé par `ostena-crypto` que dans le module `totp`, par la constante `HMAC_SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs. Aucun autre usage de SHA-1 n'est permis. Le choix de SHA-256 vaut pour les nouveaux enrôlements ; un administrateur peut l'imposer (`totp_algorithm = "sha256"`). Tant que SHA-1 reste la valeur, chaque démarrage du core le signale comme affaiblissement accepté (`CFG-P015`, avertissement `config.waiver` et enregistrement d'audit), sans le refuser en production.
 
 **Conditions de sortie.** Passage à SHA-256 par défaut quand les applications d'authentification utilisées par les clients le prennent en charge, ou remplacement du TOTP par FIDO2/WebAuthn (après M1).
 

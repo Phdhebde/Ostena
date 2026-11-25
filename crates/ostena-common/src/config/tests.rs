@@ -125,7 +125,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
-        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017",
+        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1395,6 +1395,14 @@ fn core_login_defaults_are_safe() {
     let c = core_with(LOGIN);
     assert_eq!(core_codes(&c), Vec::new());
     assert_eq!(production_codes(&c), Vec::new());
+    // TOTP HMAC-SHA-1 by default: an accepted deviation, logged at every
+    // start, never refused (ADR-0009).
+    let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END + 365 * 86_400);
+    assert_eq!(
+        waived.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::TotpSha1]
+    );
+    assert!(waived[0].message.contains("ADR-0009"));
     let core = c.core.unwrap();
     let login = core.login.as_ref().unwrap();
     assert_eq!(login.totp_algorithm, TotpAlgorithmSetting::Sha1);
@@ -1431,6 +1439,7 @@ fn core_login_is_strict() {
         );
     }
     let c = core_with(&format!("{LOGIN}totp_algorithm = \"sha256\"\n"));
+    assert_eq!(c.tolerated(), Vec::new());
     assert_eq!(
         c.core.unwrap().login.unwrap().totp_algorithm,
         TotpAlgorithmSetting::Sha256
@@ -1493,7 +1502,7 @@ fn core_login_key_is_a_key_of_its_own() {
     let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END - 1);
     assert_eq!(
         waived.iter().map(|v| v.code).collect::<Vec<_>>(),
-        vec![Code::CoreKeyInFile]
+        vec![Code::CoreKeyInFile, Code::TotpSha1]
     );
     assert!(waived[0].message.contains("core.login.totp_key"));
 }

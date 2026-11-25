@@ -89,11 +89,14 @@ pub enum Code {
     CoreKeyReused,
     /// Core: invalid `[core.login]` (bound, address, host pattern).
     CoreLogin,
+    /// Core: TOTP with HMAC-SHA-1, the default; an accepted deviation
+    /// (ADR-0009), logged at every start and never refused.
+    TotpSha1,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -126,6 +129,7 @@ impl Code {
         Self::AgentSsh,
         Self::CoreKeyReused,
         Self::CoreLogin,
+        Self::TotpSha1,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -163,6 +167,7 @@ impl Code {
             Self::AgentSsh => "CFG-V015",
             Self::CoreKeyReused => "CFG-V016",
             Self::CoreLogin => "CFG-V017",
+            Self::TotpSha1 => "CFG-P015",
         }
     }
 
@@ -183,6 +188,7 @@ impl Code {
                 | Self::PrivateKeyExposed
                 | Self::ReplayJournalExposed
                 | Self::InfrastructureUnresolved
+                | Self::TotpSha1
         )
     }
 }

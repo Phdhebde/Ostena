@@ -64,6 +64,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P011` | production | clé de la CA émettrice ou du serveur lisible au-delà du compte du service (ADR-0008) |
 | `CFG-P012` | production, **dérogation datée** | clé du core lue en clair dans un fichier au lieu d'un credential systemd chiffré : accepté et journalisé (`config.waiver`) jusqu'au 2027-04-30 inclus, refusé ensuite (ADR-0011) |
 | `CFG-P014` | production | PostgreSQL joint en TCP au lieu du socket Unix local avec l'authentification `peer` (ADR-0011) |
+| `CFG-P015` | production, **écart accepté** | TOTP HMAC-SHA-1 (`core.login.totp_algorithm = "sha1"`, la valeur par défaut) : jamais refusé, journalisé (`config.waiver`) et écrit dans l'audit (`config.waiver`) à chaque démarrage, sans échéance (ADR-0009) ; `"sha256"` le supprime |
 
 `CFG-P013` (credential non lié au TPM 2.0, ADR-0008) est réservé : il n'est pas encore contrôlé, ce qui sera fait avec la lecture des credentials chiffrés après M1.
 
