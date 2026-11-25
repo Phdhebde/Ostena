@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT totp_secret, totp_algorithm, totp_pending FROM user_credential\n           WHERE user_id = $1::text::uuid FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "totp_secret",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "totp_secret"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "totp_algorithm",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "totp_algorithm"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "totp_pending",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "totp_pending"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "eace52a21f120ebe018b5cb9b47658a0a575c0262475f4a214b8fbb02d04ec15"
+}

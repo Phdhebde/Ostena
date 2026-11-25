@@ -9,6 +9,7 @@ pub mod access;
 pub mod api;
 pub mod audit;
 pub mod cache;
+pub mod credential;
 pub mod db;
 mod error;
 pub mod grant_keys;
