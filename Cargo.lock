@@ -1710,6 +1710,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostena-recorder"
+version = "0.0.0"
+dependencies = [
+ "ostena-crypto",
+ "proptest",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "ostena-scope"
 version = "0.0.0"
 dependencies = [

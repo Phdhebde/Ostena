@@ -7,6 +7,7 @@ members = [
     "crates/ostena-crypto",
     "crates/ostena-grant",
     "crates/ostena-audit",
+    "crates/ostena-recorder",
     "crates/ostena-scope",
     "crates/ostena-frame",
     "crates/ostena-platform",
@@ -35,6 +36,7 @@ ostena-frame = { path = "crates/ostena-frame" }
 ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 ostena-platform = { path = "crates/ostena-platform" }
+ostena-recorder = { path = "crates/ostena-recorder" }
 ostena-scope = { path = "crates/ostena-scope" }
 ostena-ssh = { path = "crates/ostena-ssh" }
 ostena-tunnel = { path = "crates/ostena-tunnel" }
