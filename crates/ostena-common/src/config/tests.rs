@@ -1133,7 +1133,8 @@ fn core_grant_key_is_required() {
 fn core_ssh_section_and_v016_reused_keys() {
     let c = core_with(
         "[core.ssh]\nuser_ca_key = { credential = \"ssh-user.key\" }\n\
-         host_ca_key = { file = \"/var/lib/ostena/ca/ssh-host.key\" }\n",
+         host_ca_key = { file = \"/var/lib/ostena/ca/ssh-host.key\" }\n\
+         transcripts_dir = \"/var/lib/ostena/transcripts\"\ncommand_mac_key = { credential = \"mac.key\" }\n",
     );
     assert_eq!(core_codes(&c), Vec::new());
     let core = c.core.clone().unwrap();
@@ -1141,6 +1142,11 @@ fn core_ssh_section_and_v016_reused_keys() {
     assert_eq!(ssh.host_certificate_days, 30);
     let names: Vec<_> = core.keys().iter().map(|(n, _)| *n).collect();
     assert!(names.contains(&"core.ssh.user_ca_key") && names.contains(&"core.ssh.host_ca_key"));
+    assert!(names.contains(&"core.ssh.command_mac_key"));
+    assert_eq!(
+        ssh.transcripts_dir,
+        std::path::Path::new("/var/lib/ostena/transcripts")
+    );
     // The SSH keys follow the key rules: a plain file is waived, then refused.
     let waived = c.tolerated_at(core::KEY_FILE_WAIVER_END - 1);
     assert!(
@@ -1150,16 +1156,23 @@ fn core_ssh_section_and_v016_reused_keys() {
     // The same source for two keys.
     let c = core_with(
         "[core.ssh]\nuser_ca_key = { credential = \"grant.key\" }\n\
-         host_ca_key = { credential = \"grant.key\" }\n",
+         host_ca_key = { credential = \"grant.key\" }\n\
+         transcripts_dir = \"/var/lib/ostena/transcripts\"\ncommand_mac_key = { credential = \"mac.key\" }\n",
     );
     assert_eq!(
         core_codes(&c),
         vec![Code::CoreKeyReused, Code::CoreKeyReused]
     );
+    // A relative transcript directory.
+    let c = core_with(
+        "[core.ssh]\nuser_ca_key = { credential = \"u\" }\nhost_ca_key = { credential = \"h\" }\n\
+         transcripts_dir = \"transcripts\"\ncommand_mac_key = { credential = \"m\" }\n",
+    );
+    assert_eq!(core_codes(&c), vec![Code::RelativePath]);
     // Bounds and strictness.
     let c = core_with(
         "[core.ssh]\nuser_ca_key = { credential = \"u\" }\nhost_ca_key = { credential = \"h\" }\n\
-         host_certificate_days = 91\n",
+         host_certificate_days = 91\ntranscripts_dir = \"/var/lib/ostena/transcripts\"\ncommand_mac_key = { credential = \"mac.key\" }\n",
     );
     assert_eq!(core_codes(&c), vec![Code::CoreBounds]);
     for extra in [
@@ -1383,6 +1396,8 @@ const LOGIN: &str = r#"
 [core.ssh]
 user_ca_key = { credential = "ssh-user.key" }
 host_ca_key = { credential = "ssh-host.key" }
+transcripts_dir = "/var/lib/ostena/transcripts"
+command_mac_key = { credential = "mac.key" }
 
 [core.login]
 listen = "0.0.0.0:8445"
@@ -1495,7 +1510,7 @@ fn v017_core_login_rules() {
 
 #[test]
 fn core_login_key_is_a_key_of_its_own() {
-    for other in ["server.key", "issuing.key", "audit.key"] {
+    for other in ["server.key", "issuing.key", "audit.key", "mac.key"] {
         let c = core_with(&LOGIN.replace("totp.key", other));
         // One key, one use (CFG-V016).
         assert_eq!(core_codes(&c), vec![Code::CoreKeyReused], "{other}");

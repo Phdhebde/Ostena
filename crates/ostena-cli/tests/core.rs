@@ -176,8 +176,11 @@ impl Drop for Lab {
 /// The keys of the core besides TLS, as credentials in `dir/credentials`:
 /// the head signing key of the audit chain (its public key in
 /// `dir/audit.pub`, for the auditor), the grant signing key and the two SSH
-/// authorities (what `ostena ca key new` writes).
+/// authorities (what `ostena ca key new` writes), and the command key (what
+/// `ostena ca key new-mac` writes).
 fn write_service_keys(dir: &Path) {
+    let mac = ostena_crypto::rand::array::<32>().unwrap();
+    write_private(&dir.join("credentials").join("mac.key"), &mac);
     for name in ["audit.key", "grant.key", "user_ca.key", "host_ca.key"] {
         let (key, pkcs8) = SigningKey::generate().unwrap();
         if name == "audit.key" {
@@ -265,7 +268,9 @@ fn lab(db: &TestDb) -> Lab {
              issuing_certificate = \"{}\"\nissuing_private_key = {{ credential = \"issuing.key\" }}\n\
              grant_signing_key = {{ credential = \"grant.key\" }}\n\n\
              [core.ssh]\nuser_ca_key = {{ credential = \"user_ca.key\" }}\n\
-             host_ca_key = {{ credential = \"host_ca.key\" }}\n\n\
+             host_ca_key = {{ credential = \"host_ca.key\" }}\n\
+             command_mac_key = {{ credential = \"mac.key\" }}\n\
+             transcripts_dir = \"{}\"\n\n\
              [core.login]\nlisten = \"127.0.0.1:{login_port}\"\n\
              totp_key = {{ credential = \"totp.key\" }}\nssh_hosts = [\"bastion.lab\"]\n\n\
              [core.audit]\nsigning_key = {{ credential = \"audit.key\" }}\nhead_interval_secs = 1\n\
@@ -274,6 +279,7 @@ fn lab(db: &TestDb) -> Lab {
             p("root.pem"),
             p("server.pem"),
             p("issuing.pem"),
+            p("transcripts"),
             database.port,
             database.name,
             database.user,
