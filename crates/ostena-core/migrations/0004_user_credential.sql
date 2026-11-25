@@ -21,7 +21,10 @@ CREATE TABLE user_credential (
     -- Last accepted time step: a code of this step or an earlier one is
     -- refused (anti-replay).
     totp_last_step      bigint      NOT NULL DEFAULT 0 CHECK (totp_last_step >= 0),
+    -- Consecutive failures; they count only within `lockout_minutes` of
+    -- the last one (`last_failure_at`), beyond which they start again.
     failed_attempts     integer     NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+    last_failure_at     bigint      CHECK (last_failure_at > 0),
     locked_until        bigint      CHECK (locked_until > 0),
     last_success_at     timestamptz,
     CHECK ((password_hash IS NULL) = (password_changed_at IS NULL)),

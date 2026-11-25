@@ -87,7 +87,7 @@ Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-
 **Décision du core** (`ostena_core::authn`), dans une transaction qui verrouille d'abord la ligne `app_user` de l'utilisateur (`FOR SHARE`, ordre canonique des verrous de l'ADR-0014 : `app_user` avant `login_session`), puis sa ligne d'identifiants (`FOR UPDATE`). Une désactivation concurrente attend donc l'ouverture de la session et la révoque, ou bien elle est vue et la connexion est refusée :
 1. nom inconnu, compte verrouillé, désactivé ou non enrôlé (mot de passe absent, TOTP absent ou en attente) : refus, après une vérification factice du même coût ;
 2. mot de passe (PBKDF2, hors des fils du runtime, quatre à la fois), puis code TOTP (un pas de tolérance, un pas jamais accepté deux fois) ;
-3. un échec compte ; à `max_failures` échecs consécutifs, le compte est verrouillé `lockout_minutes` ;
+3. un échec compte ; à `max_failures` échecs consécutifs, le compte est verrouillé `lockout_minutes`. Les échecs décroissent : un échec ne s'ajoute aux précédents que s'il survient moins de `lockout_minutes` après le dernier (`last_failure_at`), sinon le compte repart à un ;
 4. succès : compteurs remis à zéro, pas retenu, empreinte recalculée si ses paramètres ne sont plus ceux du binaire, certificat émis et session ouverte dans la même transaction que `login.succeeded`.
 
 Le certificat commence 60 s avant l'heure du core (horloges) et finit avec la session : sa validité dépasse donc la session d'une minute, dans la limite de 8 h 5 min de `check_user`.

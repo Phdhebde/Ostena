@@ -11,8 +11,10 @@
 //!    after a dummy password check of the same cost;
 //! 2. password (PBKDF2, off the runtime threads, a few at a time), then
 //!    TOTP code (one step of tolerance, a step never accepted twice);
-//! 3. a failure counts; at `max_failures` the account is locked for
-//!    `lockout_minutes` (`login.locked`, protective);
+//! 3. a failure counts; at `max_failures` failures, each within
+//!    `lockout_minutes` of the previous one, the account is locked for
+//!    `lockout_minutes` (`login.locked`, protective); an older count starts
+//!    again;
 //! 4. success: the counters are cleared, the step is kept, the user
 //!    certificate is issued, the login session opened and `login.succeeded`
 //!    written (granting), all in the same transaction.
@@ -229,7 +231,7 @@ impl PgAuthenticator {
         };
         let row = sqlx::query!(
             r#"SELECT password_hash, totp_secret, totp_algorithm, totp_pending,
-                      totp_last_step, failed_attempts, locked_until
+                      totp_last_step, failed_attempts, last_failure_at, locked_until
                FROM user_credential WHERE user_id = $1::text::uuid
                FOR UPDATE"#,
             user.to_string(),
@@ -288,9 +290,7 @@ impl PgAuthenticator {
         let step = match checked {
             Ok(step) => step,
             Err(cause) => {
-                let failures = u32::try_from(row.failed_attempts)
-                    .unwrap_or(0)
-                    .saturating_add(1);
+                let failures = self.failures_after(row.failed_attempts, row.last_failure_at, now);
                 self.count_failure(tx, user, &username, failures, now)
                     .await?;
                 return Err(Failure::Refused(cause, Some(user)));
@@ -311,6 +311,20 @@ impl PgAuthenticator {
         .await
     }
 
+    /// The count of consecutive failures with one more at `now`: the
+    /// previous ones count only within the lockout of the last one.
+    fn failures_after(&self, previous: i32, last: Option<i64>, now: u64) -> u32 {
+        let recent = last
+            .and_then(|t| u64::try_from(t).ok())
+            .is_some_and(|t| now < t.saturating_add(self.settings.lockout_secs));
+        let previous = if recent {
+            u32::try_from(previous).unwrap_or(0)
+        } else {
+            0
+        };
+        previous.saturating_add(1)
+    }
+
     /// Counts a failure; at the limit, locks the account.
     async fn count_failure(
         &self,
@@ -322,9 +336,11 @@ impl PgAuthenticator {
     ) -> Result<(), Failure> {
         if failures < self.settings.max_failures {
             sqlx::query!(
-                "UPDATE user_credential SET failed_attempts = $2 WHERE user_id = $1::text::uuid",
+                "UPDATE user_credential SET failed_attempts = $2, last_failure_at = $3
+                 WHERE user_id = $1::text::uuid",
                 user.to_string(),
                 i32::try_from(failures).unwrap_or(i32::MAX),
+                i64_of(now),
             )
             .execute(&mut *tx)
             .await?;
@@ -333,7 +349,8 @@ impl PgAuthenticator {
         }
         let until = now + self.settings.lockout_secs;
         sqlx::query!(
-            "UPDATE user_credential SET failed_attempts = 0, locked_until = $2
+            "UPDATE user_credential
+             SET failed_attempts = 0, last_failure_at = NULL, locked_until = $2
              WHERE user_id = $1::text::uuid",
             user.to_string(),
             i64_of(until),
@@ -381,7 +398,8 @@ impl PgAuthenticator {
         )?;
         sqlx::query!(
             "UPDATE user_credential
-             SET failed_attempts = 0, locked_until = NULL, totp_last_step = $2,
+             SET failed_attempts = 0, last_failure_at = NULL, locked_until = NULL,
+                 totp_last_step = $2,
                  last_success_at = now(),
                  password_hash = coalesce($3, password_hash),
                  password_changed_at = CASE WHEN $3::text IS NULL THEN password_changed_at

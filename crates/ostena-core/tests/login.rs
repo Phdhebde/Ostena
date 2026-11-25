@@ -396,6 +396,73 @@ fn a_disabled_user_cannot_open_a_login_session() {
     });
 }
 
+/// Failures count only within the lockout of the last one: an old count
+/// starts again instead of locking at the next mistake.
+#[test]
+fn failures_decay_after_the_lockout_window() {
+    block_on(async {
+        let Some(f) = fixture("failures_decay_after_the_lockout_window").await else {
+            return;
+        };
+        let key = SigningKey::generate().unwrap().0;
+        for n in 1..=2 {
+            assert!(
+                f.login("alice", "wrong password!", f.next_code(), &key)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(f.failures().await, (n, None));
+        }
+        let last: Option<i64> = sqlx::query_scalar(
+            "SELECT last_failure_at FROM user_credential c
+             JOIN app_user u ON u.id = c.user_id WHERE u.name = 'alice'",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert!(last.unwrap().abs_diff(i64::try_from(now()).unwrap()) <= 1);
+        // The last failure is just over 15 minutes old: the third one does
+        // not lock, it starts a new count.
+        let old = i64::try_from(now() - 15 * 60 - 1).unwrap();
+        sqlx::query("UPDATE user_credential SET last_failure_at = $1")
+            .bind(old)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        assert!(
+            f.login("alice", "wrong password!", f.next_code(), &key)
+                .await
+                .is_err()
+        );
+        assert_eq!(f.failures().await, (1, None));
+        // Within the window, they add up again and lock at three.
+        for _ in 0..2 {
+            assert!(
+                f.login("alice", "wrong password!", f.next_code(), &key)
+                    .await
+                    .is_err()
+            );
+        }
+        let (count, locked) = f.failures().await;
+        assert_eq!(count, 0);
+        assert!(locked.is_some());
+        // A success clears the time of the last failure.
+        credential::unlock(&f.pool, "alice").await.unwrap();
+        f.login("alice", PASSWORD, f.next_code(), &key)
+            .await
+            .unwrap();
+        let last: Option<i64> = sqlx::query_scalar("SELECT last_failure_at FROM user_credential")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(last, None);
+
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
 async fn alice(pool: &PgPool) -> ostena_tunnel::Uuid {
     let id: String = sqlx::query_scalar("SELECT id::text FROM app_user WHERE name = 'alice'")
         .fetch_one(pool)

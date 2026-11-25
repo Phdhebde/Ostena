@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_credential\n             SET failed_attempts = 0, last_failure_at = NULL, locked_until = $2\n             WHERE user_id = $1::text::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "441613b7a2d1cdc8888927a533d9ca04a025b2df2972733079acc9bd8e8e217e"
+}

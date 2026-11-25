@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_credential\n             SET failed_attempts = 0, last_failure_at = NULL, locked_until = NULL,\n                 totp_last_step = $2,\n                 last_success_at = now(),\n                 password_hash = coalesce($3, password_hash),\n                 password_changed_at = CASE WHEN $3::text IS NULL THEN password_changed_at\n                                            ELSE now() END\n             WHERE user_id = $1::text::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "17397552135ef1e88adde71d6407c7a33a285b8f836ee84ea62299db712abb54"
+}

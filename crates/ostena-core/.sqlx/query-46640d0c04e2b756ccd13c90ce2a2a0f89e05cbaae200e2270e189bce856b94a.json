@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT password_hash, totp_secret, totp_algorithm, totp_pending,\n                      totp_last_step, failed_attempts, locked_until\n               FROM user_credential WHERE user_id = $1::text::uuid\n               FOR UPDATE",
+  "query": "SELECT password_hash, totp_secret, totp_algorithm, totp_pending,\n                      totp_last_step, failed_attempts, last_failure_at, locked_until\n               FROM user_credential WHERE user_id = $1::text::uuid\n               FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -71,6 +71,17 @@
       },
       {
         "ordinal": 6,
+        "name": "last_failure_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "user_credential",
+            "name": "last_failure_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
         "name": "locked_until",
         "type_info": "Int8",
         "origin": {
@@ -93,8 +104,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "ad7d7b58599f06fcbf292a9f9af3f9d377bf7e5790c4cae45eb9700db049dec0"
+  "hash": "46640d0c04e2b756ccd13c90ce2a2a0f89e05cbaae200e2270e189bce856b94a"
 }

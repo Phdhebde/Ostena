@@ -192,7 +192,7 @@ pub async fn set_password(
          VALUES ($1::text::uuid, $2, now())
          ON CONFLICT (user_id) DO UPDATE
          SET password_hash = EXCLUDED.password_hash, password_changed_at = now(),
-             failed_attempts = 0, locked_until = NULL",
+             failed_attempts = 0, last_failure_at = NULL, locked_until = NULL",
         id.to_string(),
         digest,
     )
@@ -340,7 +340,7 @@ pub async fn unlock(pool: &PgPool, name: &str) -> Result<(), CoreError> {
     let actor = audit::admin_actor(&mut tx).await?;
     let id = user_id(&mut tx, name).await?;
     sqlx::query!(
-        "UPDATE user_credential SET failed_attempts = 0, locked_until = NULL
+        "UPDATE user_credential SET failed_attempts = 0, last_failure_at = NULL, locked_until = NULL
          WHERE user_id = $1::text::uuid",
         id.to_string(),
     )
