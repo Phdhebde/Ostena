@@ -46,6 +46,9 @@ tls_private_key = 'C:\ProgramData\Ostena\state\agent.key'
 tls_core_ca = 'C:\ProgramData\Ostena\core-ca.pem'
 replay_journal = 'C:\ProgramData\Ostena\state\replay.journal'
 shutdown_grace_secs = 5
+
+[agent.ssh]
+listen = ["127.0.0.1:2222"]
 '@ | Set-Content -Encoding utf8NoBOM $Config
 # The identity lives in the state directory, where the service may write
 # (renewal).
@@ -77,10 +80,39 @@ if ($keyAcl -notmatch 'NT SERVICE\\OstenaAgent:\(R,D\)') { Fail "service rights 
 if ($keyAcl -match '\(I\)') { Fail "inherited entries on the key: $keyAcl" }
 icacls (Join-Path $Data 'state')
 
+Write-Host '=== native SSH server (ADR-0010): keys created by the service, listening'
+foreach ($name in 'ssh_host_key', 'ssh_target_key') {
+    $path = Join-Path $Data "state\$name"
+    if (-not (Test-Path $path)) { Fail "$name not created" }
+    $acl = icacls $path | Out-String
+    Write-Host $acl
+    if ($acl -notmatch 'NT SERVICE\\OstenaAgent:\(R,D\)') { Fail "service rights on ${name}: $acl" }
+    if ($acl -match '\(I\)') { Fail "inherited entries on ${name}: $acl" }
+    if ($acl -match 'Users|Everyone|Authenticated') { Fail "$name readable by others: $acl" }
+}
+$client = New-Object System.Net.Sockets.TcpClient
+$client.Connect('127.0.0.1', 2222)
+$stream = $client.GetStream()
+$stream.ReadTimeout = 5000
+$buffer = New-Object byte[] 14
+$read = 0
+while ($read -lt 14) {
+    $n = $stream.Read($buffer, $read, 14 - $read)
+    if ($n -le 0) { break }
+    $read += $n
+}
+$client.Close()
+$banner = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+if ($banner -ne 'SSH-2.0-Ostena') { Fail "SSH identification: '$banner'" }
+$line = & $Exe agent ssh-key --config $Config --line --from 10.20.0.11 | Out-String
+Write-Host $line
+if ($LASTEXITCODE -ne 0 -or $line -notmatch '^restrict,from="10\.20\.0\.11" ecdsa-sha2-nistp256 ') { Fail "authorized_keys line: $line" }
+
 Write-Host '=== status (administrator)'
 $status = & $Exe agent status --config $Config | Out-String
 Write-Host $status
 if ($LASTEXITCODE -ne 0 -or $status -notmatch 'Groupe : 2f6c9a4e') { Fail 'status did not reach the control plane' }
+if ($status -notmatch 'SSH : .* 127\.0\.0\.1:2222') { Fail 'status does not show the SSH server' }
 
 Write-Host '=== control pipe refuses a non-administrator'
 & (Join-Path $PSScriptRoot 'windows-pipe-nonadmin.ps1')
@@ -94,7 +126,7 @@ Write-Host '=== clean stop'
 Stop-Service $Service
 if (-not (Wait-State 'Stopped' 60)) { Fail 'the service did not stop' }
 $logText = Get-Content $Log -Raw
-foreach ($event in '"agent.stopped"', '"agent.sessions_closed"') {
+foreach ($event in '"agent.stopped"', '"agent.sessions_closed"', '"agent.ssh_stopped"') {
     if ($logText -notmatch [regex]::Escape($event)) { Fail "no $event event" }
 }
 

@@ -37,6 +37,9 @@ tls_private_key = "/var/lib/ostena/agent.key"
 tls_core_ca = "/etc/ostena/core-ca.pem"
 replay_journal = "/var/lib/ostena/replay.journal"
 shutdown_grace_secs = 5
+
+[agent.ssh]
+listen = ["127.0.0.1:2222"]
 TOML
 # The identity lives in the state directory, where the service may write
 # (renewal).
@@ -51,9 +54,24 @@ sudo stat -c '%U:%G %a %n' "$CONFIG" /var/lib/ostena/agent.key /var/lib/ostena /
 [ "$(sudo stat -c '%U %a' /run/ostena)" = "ostena 700" ] || fail "runtime directory permissions"
 [ "$(sudo stat -c '%U %a' /run/ostena/agent.sock)" = "ostena 600" ] || fail "socket permissions"
 
+echo "=== native SSH server (ADR-0010): keys created by the service, listening"
+for key in ssh_host_key ssh_target_key; do
+    [ "$(sudo stat -c '%U %a' /var/lib/ostena/$key)" = "ostena 600" ] || fail "$key permissions"
+done
+ss -ltn | grep -q '127.0.0.1:2222 ' || fail "the SSH server does not listen on 127.0.0.1:2222"
+banner=$(timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/2222; head -c 14 <&3') || true
+[ "$banner" = "SSH-2.0-Ostena" ] || fail "SSH identification: '$banner'"
+line=$(sudo ostena agent ssh-key --config "$CONFIG" --line --from 10.20.0.11)
+echo "$line"
+case "$line" in
+    'restrict,from="10.20.0.11" ecdsa-sha2-nistp256 '*) ;;
+    *) fail "authorized_keys line: $line" ;;
+esac
+
 echo "=== status (root)"
 sudo ostena agent status --config "$CONFIG" | tee status.txt
 grep -q "Groupe : 2f6c9a4e" status.txt || fail "status did not reach the control plane"
+grep -q "SSH : à l'écoute sur 127.0.0.1:2222" status.txt || fail "status does not show the SSH server"
 
 echo "=== status (unprivileged user): refused"
 if ostena agent status --config "$CONFIG" --pid 1; then fail "an unprivileged user reached the control plane"; fi
@@ -66,6 +84,7 @@ echo "=== clean stop"
 sudo systemctl stop "$UNIT"
 sudo journalctl -u "$UNIT" --no-pager | grep -q '"agent.stopped"' || fail "no agent.stopped event"
 sudo journalctl -u "$UNIT" --no-pager | grep -q '"agent.sessions_closed"' || fail "no agent.sessions_closed event"
+sudo journalctl -u "$UNIT" --no-pager | grep -q '"agent.ssh_stopped"' || fail "no agent.ssh_stopped event"
 
 echo "=== bounded restarts: at most 3 in 10 minutes"
 sudo systemctl reset-failed "$UNIT" || true
