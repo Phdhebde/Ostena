@@ -49,6 +49,13 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 # X.509 issuance (core CA, agent certificates); no parser (no x509-parser).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 time = { version = "0.3.55", default-features = false }
+# HTTPS login API of the core and its client `ostena login` (ADR-0015):
+# HTTP/1.1 only, no axum yet. tokio-rustls carries the TLS configurations of
+# ostena-crypto::tls; it never builds one.
+hyper = { version = "1.13.0", default-features = false, features = ["http1"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
+http-body-util = "0.1.5"
+tokio-rustls = { version = "0.26.6", default-features = false }
 # QUIC transport of the agent-core tunnel (ADR-0008); TLS comes from ostena-crypto::tls.
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 # SSH server (agent) and client (driver to the targets), ADR-0010. Exact version:

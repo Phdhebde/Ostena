@@ -16,6 +16,10 @@ testing = []
 [dependencies]
 # Keys in the tunnel messages (base64url, ADR-0008).
 base64.workspace = true
+http-body-util.workspace = true
+# HTTPS login API (ADR-0015): HTTP/1.1 server only.
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = ["server", "http1", "service"] }
 idna_adapter.workspace = true
 ostena-audit.workspace = true
 ostena-common.workspace = true
@@ -33,7 +37,9 @@ serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 ostena-core = { path = ".", features = ["testing"] }
@@ -42,6 +48,8 @@ ostena-core = { path = ".", features = ["testing"] }
 ostena-crypto = { workspace = true, features = ["testing"] }
 ostena-platform.workspace = true
 toml.workspace = true
+# The login API tests: foreign TLS clients, an HTTP client.
+hyper = { workspace = true, features = ["client"] }
 
 [lints]
 workspace = true
