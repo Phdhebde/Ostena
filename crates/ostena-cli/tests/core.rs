@@ -600,7 +600,7 @@ fn login_and_logout(lab: &Lab, core: &mut Process) {
         ostena_common::secret::SecretBytes::from(base32_decode(base32)),
     )
     .unwrap();
-    let code = |step: u64| {
+    let otp = |step: u64| {
         // SECRET-EXPOSURE: test only, the code an authenticator shows.
         #[expect(clippy::disallowed_methods)]
         let shown = secret.code(step).expose_secret().to_owned();
@@ -610,7 +610,7 @@ fn login_and_logout(lab: &Lab, core: &mut Process) {
     let (ok, _, err) = run_with_input(
         &["core", "user", "totp-enroll", "bob", "--confirm", "--stdin"],
         Some(config),
-        &format!("{}\n", code(step)),
+        &format!("{}\n", otp(step)),
     );
     assert!(ok, "{err}");
     let users = command(&["core", "user", "list"], config);
@@ -623,7 +623,7 @@ fn login_and_logout(lab: &Lab, core: &mut Process) {
     let dir = lab.dir.join("bob");
     let core_address = format!("127.0.0.1:{}", lab.login_port);
     let root = lab.dir.join("root.pem");
-    let login = |code: String| {
+    let login = |otp: String| {
         run_with_input(
             &[
                 "login",
@@ -638,13 +638,13 @@ fn login_and_logout(lab: &Lab, core: &mut Process) {
                 "--stdin",
             ],
             None,
-            &format!("{password}\n{code}\n"),
+            &format!("{password}\n{otp}\n"),
         )
     };
     // The confirmed code is spent.
-    let (ok, _, err) = login(code(step));
+    let (ok, _, err) = login(otp(step));
     assert!(!ok && err.contains("AUTH-E001"), "{err}");
-    let (ok, out, err) = login(code(step + 1));
+    let (ok, out, err) = login(otp(step + 1));
     assert!(ok, "{err}");
     assert!(out.contains("Connecté : session"), "{out}");
     for name in [
