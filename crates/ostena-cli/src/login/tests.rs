@@ -434,6 +434,90 @@ mod against_the_listener {
         });
     }
 
+    /// An OpenSSH tool on the path; with `OSTENA_REQUIRE_OPENSSH=1` (CI) its
+    /// absence fails the test.
+    fn openssh(tool: &str) -> Option<std::process::Command> {
+        let found = std::process::Command::new(tool).arg("-V").output().is_ok();
+        if !found {
+            assert!(
+                std::env::var("OSTENA_REQUIRE_OPENSSH").as_deref() != Ok("1"),
+                "{tool} introuvable alors que OSTENA_REQUIRE_OPENSSH=1"
+            );
+            eprintln!("{tool} introuvable : test sauté");
+        }
+        found.then(|| std::process::Command::new(tool))
+    }
+
+    fn stdout(command: &mut std::process::Command) -> String {
+        let out = command.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// OpenSSH reads the key, the certificate and the fragment as written.
+    #[test]
+    fn openssh_reads_the_files() {
+        let (Some(mut keygen), Some(mut ssh)) = (openssh("ssh-keygen"), openssh("ssh")) else {
+            return;
+        };
+        runtime().block_on(async {
+            let f = Fixture::start("openssh").await;
+            login_with(&f.options(), secret("good"), secret("123456"))
+                .await
+                .unwrap();
+            let dir = f.dir();
+
+            let shown = stdout(keygen.arg("-L").arg("-f").arg(dir.join(CERTIFICATE)));
+            assert!(shown.contains("user certificate"), "{shown}");
+            assert!(shown.contains(&format!("Key ID: \"{SESSION}\"")), "{shown}");
+            assert!(shown.contains(USER), "{shown}");
+            assert!(shown.contains("permit-pty"), "{shown}");
+            assert!(!shown.contains("permit-agent-forwarding"), "{shown}");
+
+            let public = stdout(
+                std::process::Command::new("ssh-keygen")
+                    .arg("-y")
+                    .arg("-f")
+                    .arg(dir.join(KEY)),
+            );
+            let written = fs::read_to_string(dir.join(PUBLIC)).unwrap();
+            assert_eq!(
+                public.split(' ').take(2).collect::<Vec<_>>(),
+                written.split(' ').take(2).collect::<Vec<_>>()
+            );
+
+            let config = stdout(
+                ssh.arg("-G")
+                    .arg("-F")
+                    .arg(dir.join(SSH_CONFIG))
+                    .arg("compte@srv@bastion.test"),
+            );
+            for line in [
+                "port 2222",
+                "identitiesonly yes",
+                "stricthostkeychecking true",
+                "forwardagent no",
+                "clearallforwardings yes",
+                "ciphers aes256-gcm@openssh.com",
+                "kexalgorithms ecdh-sha2-nistp256",
+            ] {
+                assert!(config.lines().any(|l| l == line), "{line}\n{config}");
+            }
+            let certificate = dir.join(CERTIFICATE);
+            assert!(
+                config
+                    .lines()
+                    .any(|l| l == format!("certificatefile {}", certificate.display())),
+                "{config}"
+            );
+            f.listener.close();
+        });
+    }
+
     #[test]
     fn refusal_writes_nothing() {
         runtime().block_on(async {
