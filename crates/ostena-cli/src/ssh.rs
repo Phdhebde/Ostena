@@ -180,8 +180,14 @@ fn identity_of(
         keys::load(host_key)
             .map_err(|e| e.to_string())
             .and_then(|key| {
-                SshIdentity::new(key, certificate, trust.user_cas.clone(), now)
-                    .map_err(|e| e.to_string())
+                SshIdentity::new(
+                    key,
+                    certificate,
+                    &trust.host_cas,
+                    trust.user_cas.clone(),
+                    now,
+                )
+                .map_err(|e| e.to_string())
             }),
     )
 }
@@ -229,6 +235,7 @@ fn follow_trust(
                             event = "agent.ssh_identity_ready",
                             trust_version = trust.version,
                             authorities = trust.user_cas.len(),
+                            host_authorities = trust.host_cas.len(),
                             valid_before = end,
                         );
                         if let Err(e) = write_host_certificate(&certificate_path, certificate) {

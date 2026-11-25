@@ -4,7 +4,9 @@
 //!
 //! - Always (an OpenSSH client is enough): keys created private at the
 //!   first start, host key sent to the core with its proof, identity built
-//!   from the pushed trust, `ostena agent ssh-key`, status; refusals: expired
+//!   from the pushed trust (a host certificate signed by another authority
+//!   than the pushed host authority is refused), `ostena agent ssh-key`,
+//!   status; refusals: expired
 //!   certificate, no right (resource unknown to the core), target refused by
 //!   the scope control (loopback); clean stop.
 //! - With a target, the full path to it: `OSTENA_E2E_TARGET` (ip:port, not
@@ -367,7 +369,7 @@ fn ready_agent(
     core: &TestCore,
     name: &str,
     target: Option<&Target>,
-) -> (Agent, u16, SigningKey) {
+) -> (Agent, u16) {
     let port = free_port();
     let agent = Agent::start(core, name, port, target);
     agent.wait_event("agent.ssh_started");
@@ -377,23 +379,8 @@ fn ready_agent(
         "clé d'hôte non reçue"
     );
     let host_key = core.ssh_host_keys()[0];
-    let host_ca = SigningKey::generate().unwrap().0;
-    let now = ostena_grant::unix_now();
-    let host_certificate = cert::issue(
-        &Template {
-            kind: Kind::Host,
-            public: host_key,
-            serial: 1,
-            key_id: "agent".into(),
-            principals: vec!["127.0.0.1".into()],
-            valid_after: now - 60,
-            valid_before: now + 86_400,
-            critical_options: vec![],
-            extensions: vec![],
-        },
-        &host_ca,
-    )
-    .unwrap();
+    let host_ca = core.ssh_host_ca();
+    let host_certificate = host_certificate_by(host_key, host_ca);
     let networks = target.map_or_else(
         || vec!["10.0.0.0/8".to_owned(), "127.0.0.0/8".to_owned()],
         |t| vec![format!("{}/32", t.address.ip()), "127.0.0.0/8".to_owned()],
@@ -417,8 +404,17 @@ fn ready_agent(
             },
         })
         .await;
-        core.push_ssh_trust(1, Some(&host_certificate)).await;
+        // Signed by another authority than the pushed one: refused, and
+        // the server stays without identity.
+        let stranger = SigningKey::generate().unwrap().0;
+        core.push_ssh_trust(1, Some(&host_certificate_by(host_key, &stranger)))
+            .await;
     });
+    assert!(
+        agent.wait_event("agent.ssh_identity_refused")[0].contains("SSH-E018"),
+        "refus sans SSH-E018"
+    );
+    runtime.block_on(core.push_ssh_trust(2, Some(&host_certificate)));
     agent.wait_event("agent.ssh_identity_ready");
     std::fs::write(
         agent.dir.join("known_hosts"),
@@ -428,7 +424,27 @@ fn ready_agent(
         ),
     )
     .unwrap();
-    (agent, port, host_ca)
+    (agent, port)
+}
+
+/// A host certificate of `host_key` for 127.0.0.1, signed by `ca`.
+fn host_certificate_by(host_key: VerifyingKey, ca: &SigningKey) -> Vec<u8> {
+    let now = ostena_grant::unix_now();
+    cert::issue(
+        &Template {
+            kind: Kind::Host,
+            public: host_key,
+            serial: 1,
+            key_id: "agent".into(),
+            principals: vec!["127.0.0.1".into()],
+            valid_after: now - 60,
+            valid_before: now + 86_400,
+            critical_options: vec![],
+            extensions: vec![],
+        },
+        ca,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -439,7 +455,7 @@ fn native_ssh_through_the_real_agent() {
         .block_on(async { TestCore::start(Limits::default(), Behaviour::default()) })
         .unwrap();
     let target = target();
-    let (agent, port, _) = ready_agent(&runtime, &core, "agent-ssh", target.as_ref());
+    let (agent, port) = ready_agent(&runtime, &core, "agent-ssh", target.as_ref());
 
     // Keys created by the agent, private, and the host key sent is its own.
     let state = agent.dir.join("state");
