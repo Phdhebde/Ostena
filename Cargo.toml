@@ -23,6 +23,9 @@ edition = "2024"
 rust-version = "1.99.1"
 publish = false
 repository = "https://github.com/Phdhebde/Ostena"
+# The whole workspace, binary included (see LICENSE). Dependencies keep the
+# permissive allow list of deny.toml.
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 ostena-audit = { path = "crates/ostena-audit" }

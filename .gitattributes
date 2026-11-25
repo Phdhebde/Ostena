@@ -2,3 +2,14 @@
 *.ps1 text eol=crlf
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Fuzz corpus and test vectors are raw bytes: never convert line endings.
+fuzz/corpus/** -text
+*.bin binary
+*.png binary
+*.der binary
+
+# Generated files: collapsed in diffs and left out of the language statistics.
+Cargo.lock linguist-generated
+fuzz/Cargo.lock linguist-generated
+crates/ostena-core/.sqlx/** linguist-generated

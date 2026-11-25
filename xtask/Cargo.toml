@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+license.workspace = true
 
 # Deliberately dependency-free: it must build in an air-gapped environment
 # before anything is vendored.

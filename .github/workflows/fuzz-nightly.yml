@@ -1,17 +1,16 @@
 name: Fuzz (nightly)
 
-# Each fuzz target in parallel; crashes are published as artifacts. Keep the
-# list in sync with FUZZ_TARGETS in xtask (checked by its tests).
-#
-# Six hours of GitHub-hosted runners a night is three times the monthly
-# budget. Without a self-hosted runner (`vars.LINUX_RUNNER` unset): once a
-# week, 10 minutes per target. With one: every night, `vars.FUZZ_SECONDS`
-# per target (3600 suggested).
+# Each fuzz target in parallel, one hour each, every night; crashes are
+# published as artifacts. Keep the list in sync with FUZZ_TARGETS in xtask
+# (checked by its tests). A manual run can choose the duration.
 on:
   schedule:
-    - cron: "17 1 * * 1-6"
-    - cron: "17 1 * * 0"
+    - cron: "17 1 * * *"
   workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds per target
+        default: "3600"
 
 permissions:
   contents: read
@@ -26,12 +25,13 @@ env:
 
 jobs:
   fuzz:
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '17 1 * * 0' || vars.LINUX_RUNNER != ''
+    # Not in forks: a nightly hour per target is this repository's job.
+    if: github.repository == 'Phdhebde/Ostena'
     strategy:
       fail-fast: false
       matrix:
         target: [grant_decode, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, ssh_precheck, ssh_certificate, ssh_login, audit_decode, audit_verify]
-    runs-on: ${{ vars.LINUX_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 80
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,7 +51,9 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> target
-      - run: cargo xtask fuzz ${{ vars.LINUX_RUNNER != '' && vars.FUZZ_SECONDS || '600' }} ${{ matrix.target }}
+      - run: cargo xtask fuzz "$SECONDS_PER_TARGET" ${{ matrix.target }}
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '3600' }}
       # Crash inputs (crash-*, leak-*, timeout-*, oom-*), to reproduce with
       # `cargo fuzz run <target> <file>` and add to the corpus once fixed.
       - if: failure()

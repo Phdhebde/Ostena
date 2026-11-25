@@ -2,8 +2,11 @@
 
 ## Signaler une vulnérabilité
 
-**N'ouvrez pas de ticket public.** Écrivez à : `<CONTACT SÉCURITÉ À COMPLÉTER>`
-(clé OpenPGP : `<EMPREINTE À COMPLÉTER>`).
+**N'ouvrez pas de ticket public.** Utilisez le signalement privé de GitHub :
+onglet **Security**, bouton **Report a vulnerability**, ou directement
+<https://github.com/Phdhebde/Ostena/security/advisories/new>.
+Seuls les mainteneurs voient le signalement, et l'échange se poursuit dans un
+avis de sécurité privé jusqu'à la publication du correctif.
 
 Indiquez si possible :
 
@@ -23,4 +26,4 @@ Nous ne poursuivrons pas les chercheurs qui agissent de bonne foi, dans le respe
 
 ## Versions prises en charge
 
-Aucune version publiée pour l'instant.
+Aucune version publiée pour l'instant. Les correctifs portent sur la branche `dev`.

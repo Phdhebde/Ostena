@@ -1,0 +1,15 @@
+# Keeps the actions pinned by commit SHA up to date (tag in the comment).
+# Rust dependencies are not included: each one is pinned and justified by
+# hand (CONTRIBUTING.md), and cargo-deny reports the advisories.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: dev
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
