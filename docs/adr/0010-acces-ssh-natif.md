@@ -1,14 +1,15 @@
 # ADR-0010 : Accès SSH natif
 
-- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). L'autorisation par le core (session de connexion, droit, émission du grant et des certificats) vient à la PR 5, la liaison dans l'agent à la PR 6, les transcripts ensuite.
+- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). Le grant signe le compte et la session de connexion, et l'agent vérifie la signature de son certificat d'hôte (jalon M1, PR 5a). L'autorisation par le core (session de connexion, droit, émission du grant et des certificats) vient à la PR 5, la liaison dans l'agent à la PR 6, les transcripts ensuite.
 - **Date** : 2026-11-13
 - **Révision** : 2026-11-15, certificats, serveur, driver, codes `SSH-E010` à `SSH-E019`, événements (jalon M1, PR 4)
+- **Révision** : 2026-11-25, compte et session de connexion signés par le grant (format v2), autorités d'hôtes poussées et signature du certificat d'hôte vérifiée (jalon M1, PR 5a)
 
 ## Contexte
 
 L'administrateur doit joindre une cible avec son client SSH habituel, sans plugin : `ssh root@srv-lab01@bastion`. Le bastion doit l'authentifier fortement, vérifier son droit et tracer la session, sans que l'agent passerelle détienne de base de données ni de secret partagé.
 
-Le format des grants (ADR-0004) prévoit qu'un grant puisse transiter dans un champ de mot de passe d'un client natif ; c'est indispensable pour RDP. Pour SSH, coller 224 caractères à chaque connexion est inutilisable, et les contournements (`SSH_ASKPASS`) sont fragiles.
+Le format des grants (ADR-0004) prévoit qu'un grant puisse transiter dans un champ de mot de passe d'un client natif ; c'est indispensable pour RDP. Pour SSH, coller 246 caractères à chaque connexion est inutilisable, et les contournements (`SSH_ASKPASS`) sont fragiles.
 
 ## Décision
 
@@ -119,7 +120,7 @@ Les deux extrémités s'annoncent `SSH-2.0-Ostena`, sans version : la valeur par
 
 Il en sort l'identité : sujet, session de connexion, terminal permis, SHA-256 du certificat.
 
-**Certificat d'hôte de l'agent** (`check_host`) : type hôte, pour la clé d'hôte de l'agent, au moins un nom, aucune option ni extension, valide maintenant.
+**Certificat d'hôte de l'agent** (`check_host`) : type hôte, pour la clé d'hôte de l'agent, au moins un nom, aucune option ni extension, valide maintenant. Avant cela, `SshIdentity::new` vérifie sa signature contre les autorités d'hôtes poussées par le core (`host_ca_p256_public` de `ssh_trust`, ADR-0008) : un certificat d'une autre autorité, ou une confiance sans autorité d'hôtes, donne `SSH-E018`.
 
 ### Serveur SSH de l'agent (`ostena_ssh::server`)
 
@@ -201,13 +202,13 @@ Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et le
 
 ### Limites et écarts connus (jalon M1, PR 4)
 
-- **Le grant ne signe ni le compte ni la session de connexion.** Son format (ADR-0004) porte le sujet, la ressource, le protocole et la durée. Le compte est lié par `session_params`, reçu du core sur le tunnel mTLS, et l'agent exige qu'il soit celui demandé (`TUN-E010`). La PR 5 du jalon M1 ajoute le compte et la session de connexion aux revendications signées.
+- ~~**Le grant ne signe ni le compte ni la session de connexion.**~~ **Levée à la PR 5a** : le grant v2 (ADR-0004) porte une liaison de 128 bits à la session de connexion et au compte, que l'agent recalcule et exige après avoir consommé le jti (`TUN-E010`, grant brûlé). Le contrôle du compte dans `session_params` reste.
 - **`ssh.exec` journalise un SHA-256 simple** de la commande : pour une commande courte, il se retrouve par dictionnaire. La PR 8 le remplace par un hachage à clé (HMAC avec une clé d'audit, par `ostena-crypto`).
 - **Requêtes relayées une à une** : la bibliothèque ne garde qu'un indicateur « réponse attendue » par canal, si bien que chaque requête (terminal, shell, commande, environnement) est transmise à la cible et sa réponse attendue dans le rappel, jusqu'à 10 s, en bloquant la boucle de la connexion. Une seule file de réponses par canal.
 - **Adresses de la cible essayées l'une après l'autre** par le driver, dans le délai global de 5 s : une première adresse muette peut consommer tout le délai.
 - **Flux couplés** : la bibliothèque traite une connexion dans une seule boucle ; un flux montant et un flux descendant tous deux massifs et couplés (une cible qui ne lit plus tant qu'elle ne peut écrire) peuvent se bloquer mutuellement au-delà des tampons. Le terminal et les commandes usuelles ne sont pas concernés ; à revoir avec les transferts de fichiers.
 - **Aucune tolérance d'horloge sur le début de validité** : la bibliothèque refuse un certificat dont le début est encore à venir avant nos contrôles ; la marge de 60 s de `check_user` n'est qu'une défense en profondeur.
-- **Clé de la CA d'hôte** : la confiance poussée ne porte pas la clé de la CA d'hôte, si bien que l'agent ne vérifie pas la signature de son propre certificat d'hôte (seulement son type, sa clé, ses dates et l'absence d'options). La PR 5 ajoute la clé de la CA d'hôte à `ssh_trust`.
+- ~~**Clé de la CA d'hôte**~~ : **levée à la PR 5a**. `ssh_trust` porte les autorités d'hôtes (`host_ca_p256_public`, 1 à 4) et l'agent vérifie la signature de son certificat d'hôte (`SSH-E018`).
 - **Chemins par défaut des clés SSH** : `ssh_host_key`, `ssh_target_key` et `ssh_host_certificate` dans le dossier du journal anti-rejeu, pris comme dossier d'état ; à confirmer à la PR 6.
 - **`CFG-P008` sur les clés SSH dès qu'elles existent** : l'agent les créera lui-même avec des droits privés au premier démarrage (PR 6) ; avant leur création, rien n'est vérifié.
 - **Révocations perdues par le consommateur** : `Gateway::subscribe_login_revocations` est un canal de diffusion borné (64). Le consommateur (la liaison dans l'agent, PR 6) **doit couper toutes les sessions SSH en cours**, avec un événement d'audit, s'il reçoit `RecvError::Lagged` : une révocation a pu être perdue.

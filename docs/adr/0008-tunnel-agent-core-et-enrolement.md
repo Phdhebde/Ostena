@@ -3,6 +3,7 @@
 - **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (lot L2, PR 3b). La reconnexion et le repli TCP viendront dans les PR suivantes. Les messages de l'accès SSH natif sont implémentés côté agent et dans le core de test (jalon M1, PR 4) ; leur traitement par le core viendra à la PR 5 du jalon M1.
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-15, messages de l'accès SSH natif et `TUN-E030` (jalon M1, PR 4)
+- **Révision** : 2026-11-25, autorités d'hôtes dans `ssh_trust`, liaison du grant exigée par l'agent (jalon M1, PR 5a)
 
 ## Contexte
 
@@ -130,7 +131,7 @@ Le parcours est celui de l'ADR-0010 ; le tunnel porte cinq messages de plus. Auc
 |---|---|---|---|
 | `ssh_host_key` | agent → core | `p256_public` (point SEC1 non compressé, base64url), `proof` | point sur la courbe ; `proof` signature de 64 octets |
 | `ssh_grant_request` | agent → core | `request_id`, `subject`, `login_session`, `certificate_sha256`, `account`, `resource`, `client_address` | UUID canoniques, 64 hexadécimaux minuscules, compte de 1 à 256 octets sans caractère de contrôle ni espace aux bords, ressource `[a-z0-9][a-z0-9.-]{0,62}`, `ip:port` |
-| `ssh_trust` | core → agent | `version`, `user_ca_p256_public` (1 à 4), `host_certificate` facultatif | version non nulle, autorités sur la courbe et distinctes, certificat d'hôte du type figé d'au plus 4096 octets |
+| `ssh_trust` | core → agent | `version`, `user_ca_p256_public` (1 à 4), `host_ca_p256_public` (1 à 4, requis), `host_certificate` facultatif | version non nulle, autorités de chaque sorte sur la courbe et distinctes, certificat d'hôte du type figé d'au plus 4096 octets |
 | `ssh_grant` | core → agent | `request_id`, `grant` | forme texte du grant |
 | `login_revoked` | core → agent | `login_session` | UUID canonique |
 
@@ -138,12 +139,12 @@ Le parcours est celui de l'ADR-0010 ; le tunnel porte cinq messages de plus. Auc
 
 **Preuve de possession de la clé d'hôte.** Sur le modèle de `renew` : signature par la clé d'hôte SSH de l'agent de `"ostena-ssh-host-key-v1\0"` ‖ SHA-256 du certificat du tunnel courant ‖ la clé (`ostena_tunnel::ssh`). Le core la vérifie (`TUN-E022`) avant de certifier la clé et de renvoyer le certificat d'hôte dans `ssh_trust`.
 
-**Confiance SSH** (`GatewayState::apply_ssh_trust`) : la version ne recule pas (`TUN-E030`, la confiance précédente reste) ; la même poussée répétée est ignorée, mais la même version avec un autre contenu est refusée (`TUN-E030`). Elle est publiée au serveur SSH de l'agent, qui vérifie le certificat d'hôte avant de s'en servir (`SSH-E018`, ADR-0010).
+**Confiance SSH** (`GatewayState::apply_ssh_trust`) : la version ne recule pas (`TUN-E030`, la confiance précédente reste) ; la même poussée répétée est ignorée, mais la même version avec un autre contenu est refusée (`TUN-E030`). Elle est publiée au serveur SSH de l'agent, qui vérifie le certificat d'hôte avant de s'en servir, **y compris sa signature par l'une des autorités d'hôtes poussées** (`SSH-E018`, ADR-0010). Les autorités sont des listes pour permettre une rotation.
 
 **Ouverture d'une session SSH** (`Gateway::open_ssh_session`) :
 1. pas de politique, de clés ou de confiance SSH poussées : refus (`TUN-E026`) ;
 2. l'agent envoie `ssh_grant_request` ; sans réponse sous 5 s : `TUN-E027` ; un refus du core revient en `session_refused` avec son code ;
-3. l'agent vérifie le grant et consomme son jti dans son journal, puis exige le sujet du certificat et le protocole SSH (`TUN-E010`) : un grant qui ne correspond pas est donc brûlé ;
+3. l'agent vérifie le grant et consomme son jti dans son journal, puis exige le sujet du certificat, le protocole SSH et la **liaison** à la session de connexion et au compte demandés (format v2, ADR-0004) (`TUN-E010`) : un grant qui ne correspond pas est donc brûlé ;
 4. le chemin commun suit : `session_request`, jti consommé par le core, `session_params` ;
 5. la réponse doit porter le compte demandé et la clé hôte de la cible (`TUN-E010`), puis la cible est épinglée par le contrôle de périmètre.
 
@@ -151,7 +152,7 @@ Le parcours est celui de l'ADR-0010 ; le tunnel porte cinq messages de plus. Auc
 
 Événements : `agent.ssh_trust_applied`, `agent.ssh_trust_refused` (code), `agent.login_revoked`.
 
-Le core de test (`ostena_tunnel::testing`) répond à `ssh_grant_request` depuis un inventaire de ressources nommées (avec des réglages pour mal se comporter : autre sujet, autre protocole, autre compte, clé hôte absente), enregistre les clés d'hôte reçues et pousse la confiance de sa propre autorité d'utilisateurs. Le core réel les traitera à la PR 5 du jalon M1 ; d'ici là, il ignore les messages qu'il ne traite pas.
+Le core de test (`ostena_tunnel::testing`) répond à `ssh_grant_request` depuis un inventaire de ressources nommées (avec des réglages pour mal se comporter : autre sujet, autre protocole, autre compte, liaison à un autre compte, clé hôte absente), enregistre les clés d'hôte reçues et pousse la confiance de ses propres autorités d'utilisateurs et d'hôtes. Le core réel les traitera à la PR 5 du jalon M1 ; d'ici là, il ignore les messages qu'il ne traite pas.
 
 ### Enrôlement, renouvellement, révocation
 
