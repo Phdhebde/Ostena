@@ -162,6 +162,29 @@ impl Drop for Lab {
     }
 }
 
+/// The keys of the core besides TLS, as credentials in `dir/credentials`:
+/// the head signing key of the audit chain (its public key in
+/// `dir/audit.pub`, for the auditor), the grant signing key and the two SSH
+/// authorities (what `ostena ca key new` writes).
+fn write_service_keys(dir: &Path) {
+    for name in ["audit.key", "grant.key", "user_ca.key", "host_ca.key"] {
+        let (key, pkcs8) = SigningKey::generate().unwrap();
+        if name == "audit.key" {
+            std::fs::write(
+                dir.join("audit.pub"),
+                encode_public_key(&key.verifying_key()),
+            )
+            .unwrap();
+        }
+        // SECRET-EXPOSURE: test only, the key files `ostena ca key new` writes.
+        #[expect(clippy::disallowed_methods)]
+        write_private(
+            &dir.join("credentials").join(name),
+            pem_private_key(&pkcs8).expose_secret(),
+        );
+    }
+}
+
 /// The PKI after a ceremony, the core configuration on `db`, and an agent
 /// configuration pointing at it.
 fn lab(db: &TestDb) -> Lab {
@@ -198,30 +221,7 @@ fn lab(db: &TestDb) -> Lab {
         &dir.join("credentials/issuing.key"),
         pem_private_key(&pki.issuing_key).expose_secret(),
     );
-    // The head signing key of the audit chain, and its public key for the
-    // auditor (what `ostena ca key new` writes).
-    let (audit_key, audit_pkcs8) = SigningKey::generate().unwrap();
-    // SECRET-EXPOSURE: test only, the key files `ostena ca key new` writes.
-    #[expect(clippy::disallowed_methods)]
-    write_private(
-        &dir.join("credentials/audit.key"),
-        pem_private_key(&audit_pkcs8).expose_secret(),
-    );
-    // The grant signing key and the two SSH authorities of the core.
-    for name in ["grant.key", "user_ca.key", "host_ca.key"] {
-        let (_, pkcs8) = SigningKey::generate().unwrap();
-        // SECRET-EXPOSURE: test only, the key files `ostena ca key new` writes.
-        #[expect(clippy::disallowed_methods)]
-        write_private(
-            &dir.join("credentials").join(name),
-            pem_private_key(&pkcs8).expose_secret(),
-        );
-    }
-    std::fs::write(
-        dir.join("audit.pub"),
-        encode_public_key(&audit_key.verifying_key()),
-    )
-    .unwrap();
+    write_service_keys(&dir);
 
     let (tunnel, enrollment) = (free_port(), free_port());
     let p = |name: &str| dir.join(name).display().to_string();
@@ -337,6 +337,8 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     assert_eq!((fields[3], fields[4]), ("1", "-"), "{list}");
     let agent_id = fields[0].to_owned();
 
+    inventory_is_administered(&lab, &mut agent);
+
     // The core restarts: the agent comes back without enrolling again.
     core.stop();
     agent.wait_for("agent.core_disconnected");
@@ -366,6 +368,137 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     core.stop();
     drop(lab);
     block_on(db.drop_database());
+}
+
+/// The minimal inventory with the administration commands (ADR-0014): the
+/// policy of the group reaches the connected agent at once; the dry run
+/// says whether an access would be granted.
+#[expect(clippy::too_many_lines, reason = "one scenario of commands")]
+fn inventory_is_administered(lab: &Lab, agent: &mut Process) {
+    let config = &lab.core_config;
+    let group = command(
+        &[
+            "core",
+            "group",
+            "add",
+            "lab",
+            "--id",
+            GROUP,
+            "--host-name",
+            "bastion.lab",
+        ],
+        config,
+    );
+    assert_eq!(group.trim(), GROUP);
+    let policy = lab.dir.join("lab-policy.toml");
+    std::fs::write(
+        &policy,
+        "[[allow]]\nnetworks = [\"10.20.0.0/16\"]\nports = [\"22\"]\n",
+    )
+    .unwrap();
+    let version = command(
+        &["core", "group", "policy", "lab", policy.to_str().unwrap()],
+        config,
+    );
+    assert!(version.contains("version"), "{version}");
+    agent.wait_for("agent.policy_applied");
+    command(
+        &[
+            "core",
+            "user",
+            "add",
+            "alice",
+            "--display-name",
+            "Alice Martin",
+        ],
+        config,
+    );
+    let host_key = lab.dir.join("ssh_host_ecdsa_key.pub");
+    let (target, _) = SigningKey::generate().unwrap();
+    std::fs::write(
+        &host_key,
+        ostena_ssh::keys::public_line(&target.verifying_key(), "root@srv-lab01"),
+    )
+    .unwrap();
+    command(
+        &[
+            "core",
+            "resource",
+            "add",
+            "srv-lab01",
+            "--host",
+            "10.20.0.5",
+            "--group",
+            "lab",
+            "--host-key",
+            host_key.to_str().unwrap(),
+        ],
+        config,
+    );
+    command(
+        &["core", "account", "add", "--resource", "srv-lab01", "root"],
+        config,
+    );
+    let right = command(
+        &[
+            "core",
+            "right",
+            "grant",
+            "--user",
+            "alice",
+            "--resource",
+            "srv-lab01",
+            "--account",
+            "root",
+            "--days",
+            "30",
+            "--max-session-mins",
+            "30",
+        ],
+        config,
+    );
+    let check = command(
+        &[
+            "core",
+            "access",
+            "check",
+            "--user",
+            "alice",
+            "--resource",
+            "srv-lab01",
+            "--account",
+            "root",
+        ],
+        config,
+    );
+    assert!(check.starts_with("autorisé"), "{check}");
+    assert!(check.contains(right.trim()), "{check}");
+    assert!(check.contains("1800 s"), "{check}");
+    command(&["core", "right", "revoke", right.trim()], config);
+    let refused = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args([
+            "core",
+            "access",
+            "check",
+            "--user",
+            "alice",
+            "--resource",
+            "srv-lab01",
+        ])
+        .args(["--account", "root", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("ACC-E006"));
+    let resources = command(&["core", "resource", "list"], config);
+    assert!(
+        resources.contains("srv-lab01\t10.20.0.5:22\tlab\toui\troot"),
+        "{resources}"
+    );
+    command(&["core", "user", "disable", "alice"], config);
+    let users = command(&["core", "user", "list"], config);
+    assert!(users.contains("alice\tAlice Martin\tdisabled"), "{users}");
 }
 
 /// `ostena audit verify <export> --key audit.pub`: exit code and report.
