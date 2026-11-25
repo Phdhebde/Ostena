@@ -675,7 +675,7 @@ async fn push_on_connect(tunnel: &CoreTunnel, agent: Uuid, group: Uuid, shared: 
             tracing::warn!(event = "core.push_failed", agent = %agent, code = e.code(), "{e}");
         }
     }
-    push_ssh_trust(tunnel, agent, shared).await;
+    push_ssh_trust(tunnel, agent, group, shared).await;
     match login::revoked_for_agent(pool, agent).await {
         Ok(sessions) => {
             for login_session in sessions {
@@ -691,11 +691,11 @@ async fn push_on_connect(tunnel: &CoreTunnel, agent: Uuid, group: Uuid, shared: 
     }
 }
 
-async fn push_ssh_trust(tunnel: &CoreTunnel, agent: Uuid, shared: &Shared) {
+async fn push_ssh_trust(tunnel: &CoreTunnel, agent: Uuid, group: Uuid, shared: &Shared) {
     let Some(ssh) = &shared.ssh else {
         return;
     };
-    match pushes::ssh_trust_message(shared.store.pool(), ssh, agent, unix_now()).await {
+    match pushes::ssh_trust_message(shared.store.pool(), ssh, agent, group, unix_now()).await {
         Ok(trust) => {
             send(tunnel, agent, &trust).await;
         }
@@ -705,14 +705,14 @@ async fn push_ssh_trust(tunnel: &CoreTunnel, agent: Uuid, shared: &Shared) {
     }
 }
 
-/// Certifies the host key of `agent` (unless current and not `force`),
-/// then pushes its SSH trust if the certificate changed.
+/// Certifies the host key of `agent` (unless current: same key, current
+/// host names of the group, not due), then pushes its SSH trust if the
+/// certificate changed.
 async fn certify_host(
     tunnel: &CoreTunnel,
     agent: Uuid,
     group: Uuid,
     key: &ostena_crypto::p256::VerifyingKey,
-    force: bool,
     shared: &Shared,
 ) {
     let Some(ssh) = &shared.ssh else {
@@ -725,20 +725,10 @@ async fn certify_host(
             .emit(pushes::host_key_refused_event(agent, &refusal));
         return;
     };
-    match pushes::certify_host(
-        shared.store.pool(),
-        ssh,
-        agent,
-        group,
-        key,
-        force,
-        unix_now(),
-    )
-    .await
-    {
+    match pushes::certify_host(shared.store.pool(), ssh, agent, group, key, unix_now()).await {
         Ok(Some(appended)) => {
             shared.recorder.critical(&[appended]);
-            push_ssh_trust(tunnel, agent, shared).await;
+            push_ssh_trust(tunnel, agent, group, shared).await;
         }
         Ok(None) => {}
         Err(refusal) => {
@@ -965,7 +955,7 @@ async fn control(
             },
             AgentMessage::SshHostKey { p256_public, proof } => {
                 match ostena_tunnel::ssh::verify_host_key(&p256_public, &proof, &fingerprint) {
-                    Ok(key) => certify_host(&tunnel, agent, group, &key, false, &shared).await,
+                    Ok(key) => certify_host(&tunnel, agent, group, &key, &shared).await,
                     Err(e) => {
                         let refusal = Refusal {
                             code: e.code(),
@@ -1170,7 +1160,7 @@ async fn apply_login_revocation(shared: Arc<Shared>, session: Uuid) {
 }
 
 /// Pushes the policy of `group` again to its connected agents and
-/// certifies their host keys again (the SSH host names may have changed).
+/// certifies their host keys again if the SSH host names changed.
 async fn apply_group_change(shared: Arc<Shared>, group: Uuid) {
     let pool = shared.store.pool();
     let policy = match pushes::policy_message(pool, group).await {
@@ -1190,7 +1180,7 @@ async fn apply_group_change(shared: Arc<Shared>, group: Uuid) {
         if shared.ssh.is_some()
             && let Ok(Some(key)) = pushes::stored_host_key(pool, agent).await
         {
-            certify_host(&tunnel, agent, group, &key, true, &shared).await;
+            certify_host(&tunnel, agent, group, &key, &shared).await;
         }
     }
 }
@@ -1212,7 +1202,7 @@ async fn renew_host_certificates(shared: Arc<Shared>) {
         };
         for (agent, group, tunnel) in connected(&shared) {
             if let Some((_, key)) = due.iter().find(|(a, _)| *a == agent) {
-                certify_host(&tunnel, agent, group, key, false, &shared).await;
+                certify_host(&tunnel, agent, group, key, &shared).await;
             }
         }
     }

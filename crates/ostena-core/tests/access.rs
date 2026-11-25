@@ -778,30 +778,30 @@ fn pushed_versions_never_go_back() {
             _ => panic!("pas une confiance SSH"),
         };
         let (t1, cert) = trust(
-            pushes::ssh_trust_message(&f.pool, &ssh, AGENT, now())
+            pushes::ssh_trust_message(&f.pool, &ssh, AGENT, GROUP, now())
                 .await
                 .unwrap(),
         );
         assert!(cert.is_none() && t1 > p2);
         let (t2, _) = trust(
-            pushes::ssh_trust_message(&f.pool, &ssh, AGENT, now())
+            pushes::ssh_trust_message(&f.pool, &ssh, AGENT, GROUP, now())
                 .await
                 .unwrap(),
         );
         assert_eq!(t1, t2);
         let host = SigningKey::generate().unwrap().0.verifying_key();
-        let certified = pushes::certify_host(&f.pool, &ssh, AGENT, GROUP, &host, false, now())
+        let certified = pushes::certify_host(&f.pool, &ssh, AGENT, GROUP, &host, now())
             .await
             .unwrap();
         assert!(certified.is_some());
-        // Current: not again, unless forced.
+        // Current: not again.
         assert!(
-            pushes::certify_host(&f.pool, &ssh, AGENT, GROUP, &host, false, now())
+            pushes::certify_host(&f.pool, &ssh, AGENT, GROUP, &host, now())
                 .await
                 .unwrap()
                 .is_none()
         );
-        let message = pushes::ssh_trust_message(&f.pool, &ssh, AGENT, now())
+        let message = pushes::ssh_trust_message(&f.pool, &ssh, AGENT, GROUP, now())
             .await
             .unwrap();
         message.validate().unwrap();
@@ -812,11 +812,48 @@ fn pushed_versions_never_go_back() {
         parsed.verify(&[ssh.host_ca_public()]).unwrap();
         assert_eq!(parsed.principals, ["bastion.lab"]);
         assert_eq!(audit_count(&f.pool, "ssh.host_certified").await, 1);
-        // A group without SSH host names: the key is kept, not certified.
-        let refused =
-            pushes::certify_host(&f.pool, &ssh, OTHER_AGENT, OTHER_GROUP, &host, false, now())
+        // The host names of the group change: the certificate for the old
+        // names is no longer pushed, and is replaced.
+        inventory::set_group_host_names(&f.pool, "lab", &["bastion.lab".into(), "jump.lab".into()])
+            .await
+            .unwrap();
+        let (t4, cert) = trust(
+            pushes::ssh_trust_message(&f.pool, &ssh, AGENT, GROUP, now())
                 .await
-                .unwrap_err();
+                .unwrap(),
+        );
+        assert!(cert.is_none() && t4 > t3);
+        assert!(
+            pushes::certify_host(&f.pool, &ssh, AGENT, GROUP, &host, now())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let (t5, cert) = trust(
+            pushes::ssh_trust_message(&f.pool, &ssh, AGENT, GROUP, now())
+                .await
+                .unwrap(),
+        );
+        assert!(t5 > t4);
+        let blob = ostena_tunnel::control::host_certificate(&cert.unwrap()).unwrap();
+        let mut principals = ostena_ssh::cert::parse(&blob).unwrap().principals;
+        principals.sort_unstable();
+        assert_eq!(principals, ["bastion.lab", "jump.lab"]);
+        // The same names in another order: current.
+        inventory::set_group_host_names(&f.pool, "lab", &["jump.lab".into(), "bastion.lab".into()])
+            .await
+            .unwrap();
+        assert!(
+            pushes::certify_host(&f.pool, &ssh, AGENT, GROUP, &host, now())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(audit_count(&f.pool, "ssh.host_certified").await, 2);
+        // A group without SSH host names: the key is kept, not certified.
+        let refused = pushes::certify_host(&f.pool, &ssh, OTHER_AGENT, OTHER_GROUP, &host, now())
+            .await
+            .unwrap_err();
         assert_eq!(refused.code, access::NO_HOST_NAME);
         assert_eq!(
             pushes::stored_host_key(&f.pool, OTHER_AGENT).await.unwrap(),

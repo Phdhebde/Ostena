@@ -125,6 +125,8 @@ Dans l'ordre :
 
 **Changement de groupe** (`group policy`, `group host-names`) : la politique est poussée de nouveau aux agents connectés du groupe, et leurs certificats d'hôte sont renouvelés avec les nouveaux noms.
 
+Un certificat d'hôte n'est **utilisable** que s'il est valide, pour la clé enregistrée, signé par l'autorité d'hôtes actuelle, et si ses principaux sont exactement les noms d'hôte SSH actuels du groupe, dans n'importe quel ordre. Sinon il n'est pas poussé dans la confiance SSH, et il est remplacé à la prochaine certification. Un groupe sans nom d'hôte n'a donc pas de certificat poussé.
+
 **Révocation d'une session de connexion** (`login revoke`, `user disable`) : le core envoie `login_revoked` tout de suite aux agents connectés qui ont reçu un grant pour elle ou ouvert une session avec l'un de ses grants (`login_session.revocation_applied`, au mieux).
 
 ### Événements d'audit

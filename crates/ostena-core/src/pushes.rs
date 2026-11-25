@@ -47,11 +47,14 @@ pub async fn policy_message(pool: &PgPool, group: Uuid) -> Result<Option<CoreMes
 }
 
 /// A stored host certificate still usable: valid at `now`, for the stored
-/// key, signed by the current host authority.
+/// key, signed by the current host authority, and for the current SSH host
+/// names of the group (`names`, in any order): a certificate for names the
+/// group no longer has is not pushed, and is replaced.
 fn usable_certificate(
     ssh: &SshAuthorities,
     key: Option<&[u8]>,
     blob: Option<&[u8]>,
+    names: &[String],
     now: u64,
 ) -> Option<Vec<u8>> {
     let key = VerifyingKey::from_bytes(key?.try_into().ok()?).ok()?;
@@ -59,11 +62,30 @@ fn usable_certificate(
     let parsed = ostena_ssh::cert::parse(blob).ok()?;
     parsed.verify(&[ssh.host_ca_public()]).ok()?;
     ostena_ssh::cert::check_host(&parsed, &key, now).ok()?;
+    let mut principals = parsed.principals.clone();
+    principals.sort_unstable();
+    let mut current: Vec<&str> = names.iter().map(String::as_str).collect();
+    current.sort_unstable();
+    if current.is_empty() || principals != current {
+        return None;
+    }
     Some(blob.to_vec())
 }
 
-/// The SSH trust of `agent`: the two authorities and its host certificate
-/// if one is usable; its version changes only with its content.
+/// The SSH host names of `group` (none for an unknown group).
+async fn host_names(tx: &mut Tx<'_>, group: Uuid) -> Result<Vec<String>, sqlx::Error> {
+    Ok(sqlx::query_scalar!(
+        "SELECT ssh_host_names FROM gateway_group WHERE id = $1::text::uuid",
+        group.to_string(),
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or_default())
+}
+
+/// The SSH trust of `agent` of `group`: the two authorities and its host
+/// certificate if one is usable; its version changes only with its
+/// content.
 ///
 /// # Errors
 ///
@@ -72,6 +94,7 @@ pub async fn ssh_trust_message(
     pool: &PgPool,
     ssh: &SshAuthorities,
     agent: Uuid,
+    group: Uuid,
     now: u64,
 ) -> Result<CoreMessage, CoreError> {
     let mut tx = pool.begin().await?;
@@ -82,6 +105,7 @@ pub async fn ssh_trust_message(
     )
     .fetch_optional(&mut *tx)
     .await?;
+    let names = host_names(&mut tx, group).await?;
     let user_ca = ssh.user_ca_public().to_bytes();
     let host_ca = ssh.host_ca_public().to_bytes();
     let certificate = row.as_ref().and_then(|r| {
@@ -89,6 +113,7 @@ pub async fn ssh_trust_message(
             ssh,
             r.host_p256_public.as_deref(),
             r.host_certificate.as_deref(),
+            &names,
             now,
         )
     });
@@ -215,7 +240,8 @@ async fn keep_host_key(tx: &mut Tx<'_>, agent: Uuid, public: &[u8; 65]) -> Resul
 
 /// Certifies the SSH host key `key` of `agent` of `group` with the SSH
 /// host names of the group, unless its certificate is current (same key,
-/// signed by the current authority, not due) and `force` is not set.
+/// signed by the current authority, for the current host names of the
+/// group, not due).
 /// Returns the granting `ssh.host_certified` record of a new certificate,
 /// `None` if nothing changed. The key is stored even when it cannot be
 /// certified yet (a group without host names), for a later change of the
@@ -231,7 +257,6 @@ pub async fn certify_host(
     agent: Uuid,
     group: Uuid,
     key: &VerifyingKey,
-    force: bool,
     now: u64,
 ) -> Result<Option<Appended>, Refusal> {
     let public = key.to_bytes();
@@ -244,16 +269,17 @@ pub async fn certify_host(
     )
     .fetch_optional(&mut *tx)
     .await?;
+    let names = host_names(&mut tx, group).await?;
     let same_key = row
         .as_ref()
         .is_some_and(|r| r.host_p256_public.as_deref() == Some(&public[..]));
-    if !force
-        && same_key
+    if same_key
         && let Some(r) = &row
         && usable_certificate(
             ssh,
             r.host_p256_public.as_deref(),
             r.host_certificate.as_deref(),
+            &names,
             now,
         )
         .is_some()
@@ -265,13 +291,6 @@ pub async fn certify_host(
     {
         return Ok(None);
     }
-    let names = sqlx::query_scalar!(
-        "SELECT ssh_host_names FROM gateway_group WHERE id = $1::text::uuid",
-        group.to_string(),
-    )
-    .fetch_optional(&mut *tx)
-    .await?
-    .unwrap_or_default();
     if names.is_empty() {
         keep_host_key(&mut tx, agent, &public).await?;
         tx.commit().await?;
