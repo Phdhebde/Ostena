@@ -1,9 +1,10 @@
 # ADR-0010 : Accès SSH natif
 
-- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). Le grant signe le compte et la session de connexion, et l'agent vérifie la signature de son certificat d'hôte (jalon M1, PR 5a). L'autorisation par le core (session de connexion, droit, émission du grant et des certificats) vient à la PR 5, la liaison dans l'agent à la PR 6, les transcripts ensuite.
+- **Statut** : Accepté en partie. Le parcours, les clés de l'agent sur les cibles, la liste d'algorithmes et le pré-contrôle sont décidés. Ce dernier est implémenté avec la configuration de la bibliothèque (jalon M1, PR 1). Les certificats, le serveur SSH de l'agent et le driver vers les cibles sont implémentés comme bibliothèque, avec leurs messages de tunnel (jalon M1, PR 4). Le grant signe le compte et la session de connexion, et l'agent vérifie la signature de son certificat d'hôte (jalon M1, PR 5a). L'autorisation par le core (session de connexion, droit, émission du grant et des certificats) vient à la PR 5. Le serveur est lié dans l'agent, avec ses clés créées au premier démarrage et `ostena agent ssh-key` (jalon M1, PR 6). Les transcripts viennent ensuite.
 - **Date** : 2026-11-13
 - **Révision** : 2026-11-15, certificats, serveur, driver, codes `SSH-E010` à `SSH-E019`, événements (jalon M1, PR 4)
 - **Révision** : 2026-11-25, compte et session de connexion signés par le grant (format v2), autorités d'hôtes poussées et signature du certificat d'hôte vérifiée (jalon M1, PR 5a)
+- **Révision** : 2026-11-25, liaison dans l'agent, clés créées par l'agent, `ostena agent ssh-key`, code `SSH-E020`, événements `agent.ssh_*` (jalon M1, PR 6)
 
 ## Contexte
 
@@ -43,7 +44,7 @@ restrict,from="10.20.0.11,10.20.0.12" ecdsa-sha2-nistp256 AAAA… ostena-agent-g
 - Si une session interactive est autorisée sur la cible, ajouter `pty` après `restrict` (`restrict,pty,from=…`). Seulement dans ce cas.
 
 **Dépôt** :
-1. afficher la clé publique de l'agent sur l'agent (`ostena agent ssh-key`, à venir) ;
+1. afficher la clé publique de l'agent sur l'agent : `ostena agent ssh-key --from 10.20.0.11,10.20.0.12` donne la ligne complète à déposer (`--pty` ajoute `pty`, `--line` n'imprime que la ligne ; sans `--from`, la ligne porte un repère `ADRESSES_DES_AGENTS` à remplacer) ;
 2. la déposer dans `authorized_keys` du compte cible avec les options ci-dessus, par l'outil de gestion de configuration du client ;
 3. vérifier depuis le bastion qu'une session aboutit, et que la même clé est refusée depuis une autre adresse.
 
@@ -159,7 +160,7 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 - Tout dans le délai `target_connect_timeout` (5 s) ; cible injoignable ou négociation impossible : `SSH-E016`, `ssh.target_unreachable`.
 - La bibliothèque accepte par défaut les canaux qu'un serveur ouvre vers son client : une cible ne doit jamais en ouvrir vers l'agent. Redirections, agent, X11, sessions, `direct-tcpip` et `streamlocal` ouverts par la cible sont refusés (`SSH-E017`, `ssh.target_channel_refused`).
 
-### Configuration (`[agent.ssh]`, lue et validée dès maintenant, utilisée à la PR 6)
+### Configuration (`[agent.ssh]`)
 
 | Clé | Défaut | Bornes |
 |---|---|---|
@@ -171,7 +172,19 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 | `login_grace_secs` | 30 | 5 à 120 |
 | `target_connect_timeout_secs` | 5 | 1 à 30 |
 
-Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et les cibles donnent `CFG-V015`. Une clé SSH lisible par un autre compte donne `CFG-P008`, dès que l'agent l'a créée.
+Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et les cibles donnent `CFG-V015`. Une clé SSH lisible par un autre compte donne `CFG-P008`.
+
+### Liaison dans l'agent (jalon M1, PR 6)
+
+Quand `[agent.ssh]` est présent, `ostena agent run` démarre le serveur SSH à côté de la liaison au core :
+
+- **Clés** : au premier démarrage, l'agent crée `host_key` et `target_key` par `ostena_ssh::keys` (scalaire de 32 octets tiré par `ostena-crypto`), avec des droits privés (0600 au compte du service, ACL protégée sous Windows), et journalise `agent.ssh_key_created`. Une clé existante est relue et validée ; une clé illisible ou incohérente (`SSH-E008`), ou touchée par le défaut amont (`SSH-E007`), arrête le démarrage. `CFG-P008` les vérifie ensuite comme les autres fichiers secrets.
+- **Clé d'hôte** : à chaque connexion au core, l'agent envoie sa clé publique d'hôte, liée à l'empreinte de son certificat mTLS (`AgentLink::subscribe_connected`, `agent.ssh_host_key_sent`). Le certificat d'hôte reçu dans `ssh_trust` est écrit dans `host_certificate` (remplacement atomique), et l'identité SSH n'est prête qu'avec lui (`agent.ssh_identity_ready`, ou `agent.ssh_identity_refused` avec `SSH-E018`). Tant qu'elle n'est pas prête, le serveur refuse les connexions.
+- **Autorisation** : chaque accès passe par la passerelle du tunnel (grant, journal anti-rejeu partagé avec les autres sessions, `session_params`, contrôle de périmètre, driver avec `target_key` et la clé hôte épinglée). Sans liaison établie, l'accès est refusé (`TUN-E026`). La fin de session est rapportée au core (`SessionClosed`).
+- **Révocations** : chaque `login_revoked` coupe les sessions de la session de connexion (`agent.login_revocation_applied`) ; le traitement est idempotent, une révocation reçue deux fois ne coupe rien de plus. Si le canal a débordé (`Lagged`), **toutes** les sessions SSH sont coupées (`ssh.revocations_lost`, `SSH-E020`, niveau avertissement).
+- **Arrêt** : le serveur SSH s'arrête avant les autres sessions, avec le même délai de grâce (`agent.ssh_stopped`). Une adresse d'écoute inutilisable arrête le démarrage (`AGT-E010`).
+- **État** : `ostena agent status` affiche les adresses d'écoute, le nombre de sessions SSH, l'état de l'identité et la fin de validité du certificat d'hôte.
+- **Fonctionnalité `ssh`** d'`ostena-cli`, active par défaut. Un binaire construit sans elle refuse de démarrer avec `[agent.ssh]` ; il sert de référence à la mesure d'empreinte, et `cargo xtask check-release` refuse un binaire de release qui ne l'a pas.
 
 ### Codes et événements de la session
 
@@ -187,8 +200,9 @@ Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et le
 | `SSH-E017` | canal ou requête refusé |
 | `SSH-E018` | certificat d'hôte ou identité SSH de l'agent invalide |
 | `SSH-E019` | limite du serveur atteinte |
+| `SSH-E020` | révocations perdues (canal débordé) : toutes les sessions SSH coupées |
 
-Événements (journal structuré, messages en français, textes du pair bornés et assainis : caractères de contrôle et de format Unicode, dont les contrôles bidirectionnels, remplacés ; aucun nom de champ masqué par la règle des journaux) : `ssh.connection_limited`, `ssh.connection_refused`, `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`, `ssh.exec`, `ssh.session_expired`, `ssh.session_revoked`, `ssh.session_closed` (raison, octets dans chaque sens, durée), `ssh.channel_refused` ; côté driver `ssh.target_host_key_mismatch`, `ssh.target_auth_failed`, `ssh.target_unreachable`, `ssh.target_channel_refused` ; côté tunnel `agent.ssh_trust_applied`, `agent.ssh_trust_refused`, `agent.login_revoked` (ADR-0008). Les événements du serveur portent l'adresse du client (`peer`) et celle d'écoute (`listener`).
+Événements (journal structuré, messages en français, textes du pair bornés et assainis : caractères de contrôle et de format Unicode, dont les contrôles bidirectionnels, remplacés ; aucun nom de champ masqué par la règle des journaux) : `ssh.connection_limited`, `ssh.connection_refused`, `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`, `ssh.exec`, `ssh.session_expired`, `ssh.session_revoked`, `ssh.session_closed` (raison, octets dans chaque sens, durée), `ssh.channel_refused` ; côté driver `ssh.target_host_key_mismatch`, `ssh.target_auth_failed`, `ssh.target_unreachable`, `ssh.target_channel_refused` ; côté tunnel `agent.ssh_trust_applied`, `agent.ssh_trust_refused`, `agent.login_revoked` (ADR-0008) ; côté agent `agent.ssh_started`, `agent.ssh_stopped`, `agent.ssh_unavailable`, `agent.ssh_key_created`, `agent.ssh_host_key_sent`, `agent.ssh_host_key_unsent`, `agent.ssh_identity_ready`, `agent.ssh_identity_refused`, `agent.login_revocation_applied`, `agent.session_report_lost`, `ssh.revocations_lost`. Les événements du serveur portent l'adresse du client (`peer`) et celle d'écoute (`listener`).
 
 ### Défaut amont : clés P-256 à scalaire court
 
@@ -209,9 +223,14 @@ Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et le
 - **Flux couplés** : la bibliothèque traite une connexion dans une seule boucle ; un flux montant et un flux descendant tous deux massifs et couplés (une cible qui ne lit plus tant qu'elle ne peut écrire) peuvent se bloquer mutuellement au-delà des tampons. Le terminal et les commandes usuelles ne sont pas concernés ; à revoir avec les transferts de fichiers.
 - **Aucune tolérance d'horloge sur le début de validité** : la bibliothèque refuse un certificat dont le début est encore à venir avant nos contrôles ; la marge de 60 s de `check_user` n'est qu'une défense en profondeur.
 - ~~**Clé de la CA d'hôte**~~ : **levée à la PR 5a**. `ssh_trust` porte les autorités d'hôtes (`host_ca_p256_public`, 1 à 4) et l'agent vérifie la signature de son certificat d'hôte (`SSH-E018`).
-- **Chemins par défaut des clés SSH** : `ssh_host_key`, `ssh_target_key` et `ssh_host_certificate` dans le dossier du journal anti-rejeu, pris comme dossier d'état ; à confirmer à la PR 6.
-- **`CFG-P008` sur les clés SSH dès qu'elles existent** : l'agent les créera lui-même avec des droits privés au premier démarrage (PR 6) ; avant leur création, rien n'est vérifié.
-- **Révocations perdues par le consommateur** : `Gateway::subscribe_login_revocations` est un canal de diffusion borné (64). Le consommateur (la liaison dans l'agent, PR 6) **doit couper toutes les sessions SSH en cours**, avec un événement d'audit, s'il reçoit `RecvError::Lagged` : une révocation a pu être perdue.
+- **Chemins par défaut des clés SSH** : confirmés à la PR 6, dans le dossier d'état (celui du journal anti-rejeu).
+- **Révocations perdues par le consommateur** : levée à la PR 6 (`SSH-E020`, toutes les sessions coupées).
+
+### Limites et écarts connus (jalon M1, PR 6)
+
+- **Révocations perdues pendant une coupure du tunnel** : un `login_revoked` émis par le core pendant que la liaison est coupée n'arrive pas à l'agent, et les sessions SSH en cours continuent jusqu'à leur fin ou à la durée maximale du grant. Pas de coupure automatique au jalon M1 (décision du responsable du projet) : la PR 5b fera repousser par le core les révocations récentes à chaque reconnexion, ce que l'agent traite déjà de façon idempotente.
+- **Adresses locales relevées au démarrage** : le contrôle de périmètre de l'agent prend un instantané de ses propres adresses au démarrage, sans le rafraîchir. Une adresse ajoutée ensuite n'est pas reconnue comme locale avant un redémarrage.
+- **Test de bout en bout hors de l'hôte** : le plancher du périmètre refuse la boucle locale et les adresses de l'agent, et une politique poussée ne peut pas le lever. Le parcours complet du test `agent_ssh` (session, révocation, clé hôte de la cible inattendue) demande donc une cible sur une autre machine : un conteneur Debian 12 en CI (`tests/ssh/native-e2e.sh`), ou une cible donnée par les variables `OSTENA_E2E_*`. Sans elles, le test vérifie la mise en place et les refus (certificat expiré, ressource inconnue, cible en boucle locale).
 
 ## Conséquences
 
@@ -220,7 +239,7 @@ Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et le
   - client de l'agent vers un sshd OpenSSH 9.2 de Debian 12 (`tests/ssh/debian12-target.sh`), avec une clé déposée en `restrict,from=` : la session aboutit, et une clé hôte inattendue est refusée ;
   - client OpenSSH (9.5 sous Windows, 9.2 sous Debian 12) avec un certificat, `@cert-authority` et `StrictHostKeyChecking=yes`, à travers le serveur de l'agent jusqu'à une cible (`tests/interop.rs`) : la session aboutit ; sont refusés une autorité d'hôte non reconnue, une clé nue, une autre autorité d'utilisateurs, un certificat expiré, `permit-port-forwarding`, un nom sans ressource, un refus de l'autorisation, `-W` (`direct-tcpip`, comme `-L`), `-R` et `-s sftp` ; la durée maximale et la révocation coupent la session ;
   - le parcours complet par le tunnel et le core de test (`tests/gateway.rs`) : jti consommé des deux côtés, rejeu refusé, sujet ou compte différents (`TUN-E010`), clé hôte absente, cibles de métadonnées ou de boucle locale refusées par le périmètre, rien sans confiance poussée (`TUN-E026`) ;
-  - de bout en bout (`tests/ssh/native-e2e.sh`) : client OpenSSH, serveur de l'agent, tunnel, core de test, driver, sshd Debian 12 avec la clé de l'agent en `restrict,from=`.
+  - de bout en bout (`tests/ssh/native-e2e.sh`, test `agent_ssh` d'`ostena-cli`) : client OpenSSH, binaire `ostena agent run` réel avec `[agent.ssh]`, tunnel, core de test, driver, sshd Debian 12 avec la clé de l'agent en `restrict,from=` ; la révocation coupe la session et une clé hôte de cible inattendue est refusée (`SSH-E014`).
 - **Latence ajoutée** mesurée par `cargo bench -p ostena-ssh --bench relay` (aller-retour de 64 octets dans un shell, à travers le serveur et le driver, comparé au même aller-retour direct vers la cible, en boucle locale) : **120 µs au p99 sous Windows 11** et **52 µs au p99 sous Linux** (conteneur Docker, WSL2), pour un objectif de 3 ms. Établissement d'une session complète (contrôles du certificat, autorisation, connexion à la cible, canal, shell) : 5,6 ms au p50 sous Windows, 5,1 ms sous Linux, pour un objectif de 5 s. Les sockets du serveur et du driver sont en `TCP_NODELAY` : sans cela, Nagle et les accusés de réception différés ajoutaient environ 100 ms à l'établissement sous Linux. Affiché en CI sans seuil bloquant (ADR-0005).
 - **Clients exclus** : un client trop ancien pour le strict KEX ou pour AES-GCM est refusé. C'est voulu.
 - **Le grant n'apparaît pas** dans le parcours SSH de l'utilisateur. Pour RDP, il reste remis à l'utilisateur (ADR-0004).

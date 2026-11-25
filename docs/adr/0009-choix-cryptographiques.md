@@ -4,6 +4,7 @@
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-11, algorithmes du coffre-fort décidés (P-256 + ML-KEM-768, ECDSA P-256 + ML-DSA-65)
 - **Révision** : 2026-11-13, écart SSH : cryptographie de russh dans `ostena-ssh`
+- **Révision** : 2026-11-25, engagements de la PR 6 : chargement différé d'`oleaut32`, contrôles des imports et des modules chargés, remesure de l'empreinte (seuil dépassé sous Linux, décision attendue)
 
 ## Contexte
 
@@ -156,6 +157,24 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 2. le contrôle de `cargo xtask ci` ci-dessus est actif et passe (imports statiques **et** DLL chargées au repos) ;
 3. si l'un des deux échoue, **la PR 6 ne fusionne pas** sans décision explicite du responsable du projet.
 - **Seuil d'empreinte double** : une régression d'empreinte n'est bloquante que si elle dépasse **+10 % et plus de 1 Mio** en valeur absolue, pour ne pas déclencher sur une base de quelques Mio (ADR-0007).
+
+**Mise en œuvre à la PR 6 (2026-11-25)** :
+- **Chargement différé** : `crates/ostena-cli/build.rs` passe `/DELAYLOAD:oleaut32.dll` et `delayimp.lib` à l'éditeur de liens pour le binaire `ostena`, sous Windows avec MSVC et seulement avec la fonctionnalité `ssh`.
+- **Imports statiques** : `cargo xtask check-release` lit le répertoire d'imports et celui des imports différés du binaire PE (analyseur borné, sans dépendance, `xtask/src/pe.rs`) et échoue si l'une des six DLL interdites est importée statiquement. Une DLL interdite en import différé est admise : elle n'est chargée qu'à l'appel. Le même contrôle refuse un binaire de release construit sans la fonctionnalité `ssh`.
+- **Modules chargés au repos** : `cargo xtask footprint` relève, pour chaque état, les bibliothèques chargées par l'agent sans SSH et avec SSH (`/proc/<pid>/maps` sous Linux, modules du processus sous Windows). Il échoue si l'agent avec SSH charge un module que la référence ne charge pas, ou l'une des six DLL interdites.
+- **Seuil d'empreinte** : le même outil échoue si l'agent avec SSH dépasse la référence de +10 % et de 1 Mio à la fois (ADR-0007).
+
+**Remesure sous Linux** (conteneur de développement, binaire de release glibc, `cargo xtask footprint`, mémoire résidente au repos ; la référence est l'agent construit sans la fonctionnalité `ssh`, l'autre mesure l'agent avec `[agent.ssh]` à l'écoute) :
+
+| État | Sans SSH | Avec SSH | Écart | Modules |
+|---|---|---|---|---|
+| sans liaison | 7,27 Mio | 9,12 Mio | +1,85 Mio (+25,4 %) | 4 et 4 |
+| non connecté | 9,86 Mio | 11,66 Mio | +1,80 Mio (+18,3 %) | 4 et 4 |
+| connecté | 10,73 Mio | 12,30 Mio | +1,58 Mio (+14,7 %) | 4 et 4 |
+
+Avant la PR 6, sur `dev` et dans le même environnement, l'agent mesurait 7,8, 10,0 et 10,6 Mio : la référence sans SSH n'a pas bougé. Aucun module en plus. L'écart est presque entièrement fait de **pages d'image** (adossées au binaire, partagées et récupérables) : le tas privé ne prend que +50 à +200 Kio. Une mesure de diagnostic, avec le binaire lié avec SSH mais sans `[agent.ssh]`, donne déjà l'essentiel de l'écart : il tient à la taille du binaire (12,1 Mo), pas au serveur en marche. Les mesures varient d'environ 0,3 Mio d'une exécution à l'autre.
+
+**Le seuil est dépassé dans les trois états** (+10 % et +1 Mio à la fois) : `cargo xtask footprint` échoue, donc le job `release-linux` de la CI aussi. Conformément à l'engagement 3, la PR 6 ne fusionne pas sans **décision explicite du responsable du projet**. Pistes à arbitrer : accepter l'écart en le motivant par sa nature (pages d'image partagées) ; mesurer le seuil sur la mémoire privée ; réduire les pages touchées (initialisation paresseuse, disposition du code). Mesures sous Windows (working set et DLL chargées) : à relever par le job Windows de la CI.
 
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 
