@@ -1601,12 +1601,15 @@ dependencies = [
 name = "ostena-platform"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "ostena-common",
+ "proptest",
  "thiserror",
  "tokio",
  "tracing",
  "windows-service",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

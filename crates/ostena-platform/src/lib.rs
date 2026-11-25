@@ -2,9 +2,9 @@
 //! next lots services and local IPC.
 //!
 //! This is the only crate allowed to contain `unsafe` code, confined to the
-//! Windows FFI modules. Every `unsafe` block carries a `// SAFETY:` comment
-//! (enforced by `clippy::undocumented_unsafe_blocks`) and is exercised by a
-//! test.
+//! Windows FFI modules and the terminal modes ([`tty`]). Every `unsafe`
+//! block carries a `// SAFETY:` comment (enforced by
+//! `clippy::undocumented_unsafe_blocks`) and is exercised by a test.
 
 #![warn(clippy::undocumented_unsafe_blocks)]
 
@@ -14,6 +14,7 @@ mod error;
 pub mod memory;
 pub mod private_file;
 pub mod service;
+pub mod tty;
 
 pub use error::{Code, PlatformError};
 
