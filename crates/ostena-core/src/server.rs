@@ -167,7 +167,15 @@ impl Keys {
             None => None,
         };
         // One key, one use, whatever the files (CFG-V016 compares sources).
+        let issuing_public = SigningKey::from_pkcs8(&issuing_key)
+            .map_err(|e| keys("core.issuing_private_key", &e))?
+            .verifying_key();
+        let tls_public = ostena_crypto::pki::signing_key_from_pem(&server_key)
+            .map_err(|e| keys("core.tls_private_key", &e))?
+            .verifying_key();
         let mut publics = vec![
+            ("core.tls_private_key", tls_public),
+            ("core.issuing_private_key", issuing_public),
             ("core.audit.signing_key", audit.verifying_key()),
             ("core.grant_signing_key", grant.verifying_key()),
         ];
@@ -175,13 +183,7 @@ impl Keys {
             publics.push(("core.ssh.user_ca_key", ssh.user_ca_public()));
             publics.push(("core.ssh.host_ca_key", ssh.host_ca_public()));
         }
-        for (i, (field, key)) in publics.iter().enumerate() {
-            if let Some((other, _)) = publics[..i].iter().find(|(_, k)| k == key) {
-                return Err(CoreError::Keys(format!(
-                    "{field} : même clé que {other} ; chaque clé du core a un seul usage"
-                )));
-            }
-        }
+        distinct_keys(&publics)?;
         Ok(Self {
             root,
             server,
@@ -191,6 +193,19 @@ impl Keys {
             ssh: ssh.map(Arc::new),
         })
     }
+}
+
+/// Each key of the core has one use: two fields with the same public key
+/// are refused, whatever their sources.
+fn distinct_keys(publics: &[(&str, ostena_crypto::p256::VerifyingKey)]) -> Result<(), CoreError> {
+    for (i, (field, key)) in publics.iter().enumerate() {
+        if let Some((other, _)) = publics[..i].iter().find(|(_, k)| k == key) {
+            return Err(CoreError::Keys(format!(
+                "{field} : même clé que {other} ; chaque clé du core a un seul usage"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `$CREDENTIALS_DIRECTORY`, set by systemd for the credentials of the unit.

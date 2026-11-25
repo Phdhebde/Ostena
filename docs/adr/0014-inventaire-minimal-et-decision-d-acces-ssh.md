@@ -107,7 +107,7 @@ Le verrou `FOR SHARE` porte sur la session de connexion, l'utilisateur, la resso
 - `[core.ssh] user_ca_key` : l'autorité des certificats utilisateur. Le core en expose l'émission (`SshAuthorities::issue_user`) : principal l'utilisateur, identifiant de clé la session de connexion, 8 h au plus. Aucune commande ne l'émet : c'est le rôle du service de connexion (PR 7).
 - `[core.ssh] host_ca_key` : l'autorité des certificats d'hôte des agents.
 - `[core.ssh] host_certificate_days` : validité d'un certificat d'hôte, de 1 à 90 jours (30 par défaut).
-- **Toutes les clés du core diffèrent** : même source refusée à la validation (`CFG-V016`), mêmes clés publiques refusées au chargement.
+- **Toutes les clés du core diffèrent** (TLS du serveur, AC émettrice, audit, grants, autorités SSH) : même source refusée à la validation (`CFG-V016`), même clé publique refusée au chargement, quel que soit le fichier.
 
 ### Poussées à la connexion d'un agent
 
