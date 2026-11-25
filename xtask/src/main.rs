@@ -227,10 +227,11 @@ const FOOTPRINT_GROUP: &str = "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6";
 /// project lead on 2026-11-25 (ADR-0009, "Décision du 2026-11-25") in
 /// place of the general rule (+10 % and +1 MiB, CLAUDE.md), which the SSH
 /// cost exceeds; that rule stays for every other regression. Linux: the
-/// highest measure, +1.91 MiB (static musl binary), plus about 0.3 MiB of
-/// noise.
+/// highest measure, +2.31 MiB (static musl binary, after the core grew in
+/// the same binary), plus about 0.4 MiB of noise; raised from 2.25 MiB by
+/// the project lead on 2026-11-25.
 #[cfg(not(windows))]
-const SSH_ACCEPTED_BYTES: u64 = 9 * 1024 * 1024 / 4;
+const SSH_ACCEPTED_BYTES: u64 = 11 * 1024 * 1024 / 4;
 /// Windows: see the Linux ceiling; the highest CI measure plus noise.
 #[cfg(windows)]
 const SSH_ACCEPTED_BYTES: u64 = 1280 * 1024;

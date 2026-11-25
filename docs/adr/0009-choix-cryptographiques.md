@@ -194,6 +194,8 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 - Le seuil double (+10 % et +1 Mio) reste la règle pour toute autre régression d'empreinte (CLAUDE.md, ADR-0007) ; il n'est pas automatisé par rapport à `dev`.
 - Une PR séparée mesure la compilation de l'agent en taille (`opt-level = "s"`), qui ramènerait l'agent avec SSH sous l'agent actuel sans SSH ; elle n'est retenue que si le banc de latence SSH ne régresse pas de plus de 10 % au p99 et reste sous l'objectif de 3 ms.
 
+**Révision du 2026-11-25 (responsable du projet), plafond Linux relevé à 2,75 Mio.** Avec l'autorisation SSH du core (PR 5b, ADR-0014), la CI mesure +2,31 Mio sans liaison, +2,04 Mio non connecté et +2,17 Mio connecté, contre +1,95, +1,62 et +1,49 Mio auparavant. Le code de l'agent n'a pas changé. La mémoire anonyme ne prend que +20 Kio. La hausse est faite de pages adossées au binaire : le binaire étant unique, le core y grossit (environ 4 000 lignes, dont l'autorité SSH qui appelle `ostena-ssh`), ce qui change la disposition du code et les pages lues autour de chaque défaut de page. Ces pages sont partagées et récupérables par le noyau. Le plafond devient 2,75 Mio sous Linux (mesure maximale +2,31 Mio, plus environ 0,4 Mio de bruit) ; il reste 1,25 Mio sous Windows. La PR qui mesure la compilation en taille reste ouverte pour réduire ce coût.
+
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 
 #### PostgreSQL : la cryptographie de `sqlx-postgres` dans `ostena-core` (décidé le 2026-11-14)
