@@ -149,3 +149,6 @@ Nouvelle crate `ostena-recorder`, prévue dans l'organisation du dépôt : évé
 - `AUD-W007` repose sur la durée maximale de la session plus une marge de 5 min, comparée à l'instant de l'export : une horloge du core décalée de plus de 5 min peut faire passer une session finie pour ouverte, ou l'inverse.
 - Un transcript repris au démarrage (`REC-E005`) est scellé sur le contenu du fichier, avec des compteurs d'événements et de séquences UTF-8 invalides à 0 : ils ne sont pas recalculés.
 - Une fin de commande est enregistrée telle que la cible l'annonce : une cible compromise peut mentir sur son code de sortie.
+- La durée d'une session repose sur l'horloge de l'agent : le core n'impose pas de délai propre à un flux muet, qui reste ouvert tant que la liaison vit.
+- Le core est mono-instance au jalon M1 : au démarrage, il scelle incomplets tous les transcripts restés ouverts. Plusieurs instances partageant la base demanderont de ne reprendre que ceux de l'instance.
+- Chaque sortie de la cible est copiée trois fois sur l'agent avant l'envoi, et le tampon de ligne du core garde sa capacité maximale (environ 200 Kio par flux). À réduire si les bancs ou l'empreinte le demandent.
