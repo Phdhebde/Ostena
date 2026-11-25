@@ -62,7 +62,7 @@ Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-
 
 | Code | HTTP | Signification |
 |---|---|---|
-| `AUTH-E001` | 401 | identifiants invalides ou compte indisponible : nom inconnu, mot de passe ou code faux, code rejoué, compte verrouillé, désactivé ou non enrôlé. Un seul message, quelle que soit la cause |
+| `AUTH-E001` | 401 | identifiants invalides ou compte indisponible : nom inconnu, mot de passe ou code faux, code rejoué, compte verrouillé, désactivé ou non enrôlé. Un seul message, quelle que soit la cause, et un seul délai : la réponse ne part pas avant 1 s après l'arrivée de la requête (plancher fixe, au-dessus du coût de PBKDF2, de la transaction et de l'écriture d'audit), ce qui égalise les temps mieux qu'un COMMIT factice ; vaut aussi pour un logout refusé |
 | `AUTH-E002` | 429 | trop de tentatives depuis cette adresse |
 | `AUTH-E003` | 400, 404, 405, 413, 415 | requête mal formée (route, méthode, type, taille, JSON, champ) |
 | `AUTH-E004` | 400 | clé publique refusée |

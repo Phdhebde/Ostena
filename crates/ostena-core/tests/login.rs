@@ -621,6 +621,50 @@ fn refusals_of_a_known_account_are_protective() {
     });
 }
 
+/// Every refusal leaves after the same floor, whatever the cause: an
+/// unknown name (no transaction) is not faster than a wrong password
+/// (transaction, protective audit) or a locked account.
+#[test]
+fn refusals_take_the_same_time() {
+    block_on(async {
+        let Some(mut f) = fixture("refusals_take_the_same_time").await else {
+            return;
+        };
+        let floor = Duration::from_millis(1500);
+        f.authenticator = f.authenticator.with_refusal_floor(floor);
+        let key = SigningKey::generate().unwrap().0;
+        let mut spent = Vec::new();
+        for (user, password) in [
+            ("nobody", PASSWORD),
+            ("alice", "wrong password!"),
+            ("alice", "wrong password!"),
+            ("alice", "wrong password!"),
+            // Locked now.
+            ("alice", PASSWORD),
+        ] {
+            let start = std::time::Instant::now();
+            let code = f.login(user, password, f.next_code(), &key).await;
+            assert_eq!(code.unwrap_err(), ApiCode::InvalidCredentials);
+            spent.push(start.elapsed());
+        }
+        assert!(f.failures().await.1.is_some(), "locked");
+        for elapsed in &spent {
+            assert!(*elapsed >= floor, "{spent:?}");
+        }
+        // A success is not delayed by the floor.
+        credential::unlock(&f.pool, "alice").await.unwrap();
+        let start = std::time::Instant::now();
+        f.login("alice", PASSWORD, f.next_code(), &key)
+            .await
+            .unwrap();
+        assert!(start.elapsed() < floor, "{:?}", start.elapsed());
+
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
 async fn alice(pool: &PgPool) -> ostena_tunnel::Uuid {
     let id: String = sqlx::query_scalar("SELECT id::text FROM app_user WHERE name = 'alice'")
         .fetch_one(pool)

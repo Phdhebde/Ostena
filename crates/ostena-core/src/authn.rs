@@ -23,6 +23,11 @@
 //! certificate, opens the login session and writes `login.succeeded`
 //! (granting), all in the same transaction.
 //!
+//! Every refusal leaves no earlier than [`REFUSAL_FLOOR`] after the request
+//! came in: an unknown name, a locked account, a wrong password or code
+//! take the same time seen from the client, whatever the work done (a
+//! dummy COMMIT would not cover the audit writes and the lock waits).
+//!
 //! The client always gets `AUTH-E001`; the cause goes to `login.refused`:
 //! protective, in the transaction that counts the failure or reads the
 //! account, for a known account; best effort for an unknown name, which
@@ -31,6 +36,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -57,6 +63,9 @@ use crate::store::{Notice, i64_of, notify_notice, truncate, unix_now, uuid};
 /// PBKDF2 derivations run at the same time; the others wait. A slot is
 /// held only while deriving, never with a transaction open.
 pub const HASHING_SLOTS: usize = 4;
+/// Least time before any `AUTH-E001` answer, from the arrival of the
+/// request: above the cost of PBKDF2, a transaction and an audit write.
+pub const REFUSAL_FLOOR: Duration = Duration::from_secs(1);
 /// Clock tolerance at the start of a user certificate, seconds.
 const CERTIFICATE_SKEW: u64 = 60;
 /// Tolerance on the time of a logout request, seconds.
@@ -158,6 +167,7 @@ pub struct PgAuthenticator {
     totp: Arc<TotpKey>,
     settings: Settings,
     hashing: Semaphore,
+    refusal_floor: Duration,
 }
 
 impl std::fmt::Debug for PgAuthenticator {
@@ -251,7 +261,21 @@ impl PgAuthenticator {
                 ssh_port: config.ssh_port,
             },
             hashing: Semaphore::new(HASHING_SLOTS),
+            refusal_floor: REFUSAL_FLOOR,
         }
+    }
+
+    /// Another floor for the refusals than [`REFUSAL_FLOOR`] (tests).
+    #[must_use]
+    pub fn with_refusal_floor(mut self, floor: Duration) -> Self {
+        self.refusal_floor = floor;
+        self
+    }
+
+    /// `AUTH-E001`, once `refusal_floor` has passed since `start`.
+    async fn invalid_credentials(&self, start: tokio::time::Instant) -> ApiError {
+        tokio::time::sleep_until(start + self.refusal_floor).await;
+        ApiError::invalid_credentials()
     }
 
     /// Phase 1: PBKDF2 against the digest read without a lock, outside any
@@ -728,6 +752,7 @@ impl Authenticator for PgAuthenticator {
         request: LoginRequest,
         peer: SocketAddr,
     ) -> Result<LoginResponse, ApiError> {
+        let start = tokio::time::Instant::now();
         let Some(public) = decode_public(&request.p256_public) else {
             return Err(ApiError::new(
                 ApiCode::PublicKey,
@@ -739,17 +764,18 @@ impl Authenticator for PgAuthenticator {
             Ok(response) => Ok(response),
             Err(Failure::Refused(cause, user)) => {
                 self.refused(cause, user, &name, peer, false);
-                Err(ApiError::invalid_credentials())
+                Err(self.invalid_credentials(start).await)
             }
             Err(Failure::Recorded(cause, user)) => {
                 self.refused(cause, Some(user), &name, peer, true);
-                Err(ApiError::invalid_credentials())
+                Err(self.invalid_credentials(start).await)
             }
             Err(Failure::Broken(e)) => Err(broken(&e)),
         }
     }
 
     async fn logout(&self, request: LogoutRequest, peer: SocketAddr) -> Result<(), ApiError> {
+        let start = tokio::time::Instant::now();
         let (cause, user) = match self.revoke(&request).await {
             Ok(()) => return Ok(()),
             Err(Failure::Broken(e)) => return Err(broken(&e)),
@@ -763,6 +789,6 @@ impl Authenticator for PgAuthenticator {
             client_addr = %peer,
             "déconnexion refusée"
         );
-        Err(ApiError::invalid_credentials())
+        Err(self.invalid_credentials(start).await)
     }
 }
