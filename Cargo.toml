@@ -118,3 +118,67 @@ print_stderr = "warn"
 lto = "fat"
 codegen-units = 1
 strip = true
+# Size first: `opt-level = "s"` shrinks the resident code of the single
+# `ostena` binary (agent and core). The crates on the data path and the
+# session setup stay at `opt-level = 3`, so that the SSH relay and the tunnel
+# keep their latency and throughput (measures and criteria: ADR-0009).
+opt-level = "s"
+
+# Runtime and SSH relay path.
+package.tokio.opt-level = 3
+package.mio.opt-level = 3
+package.bytes.opt-level = 3
+package.futures-util.opt-level = 3
+package.russh.opt-level = 3
+package.russh-cryptovec.opt-level = 3
+package.ssh-cipher.opt-level = 3
+package.ssh-encoding.opt-level = 3
+package.ostena-ssh.opt-level = 3
+package.ostena-tunnel.opt-level = 3
+package.ostena-crypto.opt-level = 3
+
+# Symmetric ciphers, MACs and hashes of the SSH transport.
+package.aes.opt-level = 3
+package.aes-gcm.opt-level = 3
+package.ctr.opt-level = 3
+package.ghash.opt-level = 3
+package.polyval.opt-level = 3
+package.universal-hash.opt-level = 3
+package.cipher.opt-level = 3
+package.chacha20.opt-level = 3
+package.poly1305.opt-level = 3
+package.sha1.opt-level = 3
+package.sha2.opt-level = 3
+package.hmac.opt-level = 3
+package.digest.opt-level = 3
+package.block-buffer.opt-level = 3
+
+# Key exchange and signatures (session setup).
+package.p256.opt-level = 3
+package.p384.opt-level = 3
+package.p521.opt-level = 3
+package.primeorder.opt-level = 3
+package.primefield.opt-level = 3
+package.elliptic-curve.opt-level = 3
+package.crypto-bigint.opt-level = 3
+package.ecdsa.opt-level = 3
+package.ff.opt-level = 3
+package.group.opt-level = 3
+package.wnaf.opt-level = 3
+package.curve25519-dalek.opt-level = 3
+package.ed25519-dalek.opt-level = 3
+package.ml-kem.opt-level = 3
+package.module-lattice.opt-level = 3
+package.sha3.opt-level = 3
+package.keccak.opt-level = 3
+package.ctutils.opt-level = 3
+package.subtle.opt-level = 3
+package.cmov.opt-level = 3
+
+# TLS and QUIC of the tunnel (aws-lc-sys: its C code too).
+package.aws-lc-rs.opt-level = 3
+package.aws-lc-sys.opt-level = 3
+package.rustls.opt-level = 3
+package.quinn.opt-level = 3
+package.quinn-proto.opt-level = 3
+package.quinn-udp.opt-level = 3

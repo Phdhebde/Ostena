@@ -5,6 +5,7 @@
 - **Révision** : 2026-11-11, algorithmes du coffre-fort décidés (P-256 + ML-KEM-768, ECDSA P-256 + ML-DSA-65)
 - **Révision** : 2026-11-13, écart SSH : cryptographie de russh dans `ostena-ssh`
 - **Révision** : 2026-11-25, engagements de la PR 6 : chargement différé d'`oleaut32`, contrôles des imports et des modules chargés, remesure de l'empreinte ; écart d'empreinte accepté par le responsable du projet
+- **Révision** : 2026-11-25, profil de release compilé en taille, chemin chaud gardé à `opt-level = 3` (PR 6bis)
 
 ## Contexte
 
@@ -195,6 +196,31 @@ Elles viennent de l'import statique d'`oleaut32` pour deux fonctions (`SysString
 - Une PR séparée mesure la compilation de l'agent en taille (`opt-level = "s"`), qui ramènerait l'agent avec SSH sous l'agent actuel sans SSH ; elle n'est retenue que si le banc de latence SSH ne régresse pas de plus de 10 % au p99 et reste sous l'objectif de 3 ms.
 
 **Révision du 2026-11-25 (responsable du projet), plafond Linux relevé à 2,75 Mio.** Avec l'autorisation SSH du core (PR 5b, ADR-0014), la CI mesure +2,31 Mio sans liaison, +2,04 Mio non connecté et +2,17 Mio connecté, contre +1,95, +1,62 et +1,49 Mio auparavant. Le code de l'agent n'a pas changé. La mémoire anonyme ne prend que +20 Kio. La hausse est faite de pages adossées au binaire : le binaire étant unique, le core y grossit (environ 4 000 lignes, dont l'autorité SSH qui appelle `ostena-ssh`), ce qui change la disposition du code et les pages lues autour de chaque défaut de page. Ces pages sont partagées et récupérables par le noyau. Le plafond devient 2,75 Mio sous Linux (mesure maximale +2,31 Mio, plus environ 0,4 Mio de bruit) ; il reste 1,25 Mio sous Windows. La PR qui mesure la compilation en taille reste ouverte pour réduire ce coût.
+
+**Profil optimisé pour la taille (mesuré le 2026-11-25, PR 6bis).** Le binaire `ostena` est unique : un `opt-level` global touche aussi le core. Trois variantes ont été comparées au profil actuel (`opt-level = 3`, LTO complète, une unité de compilation). Critères de refus fixés d'avance : p99 de latence qui régresse de plus de 10 % ou dépasse 3 ms, ou débit du relais qui régresse de plus de 10 %.
+
+Méthode : conteneur de développement partagé (4 CPU, bruit d'autres compilations). `cargo bench -p ostena-ssh --bench relay` donne l'aller-retour de 64 octets et l'établissement de session à travers l'agent. Le débit est mesuré par une sonde locale ajoutée au même banc, non versionnée (32 Mio renvoyés par la cible en écho, 128 Kio en vol, 3 mesures par exécution). Les variantes sont exécutées en alternance, 6 fois chacune ; on donne la médiane et l'étendue. Empreinte : `cargo xtask footprint --target x86_64-unknown-linux-musl`.
+
+| Mesure (via l'agent, `dev` 7b7d7d2) | `opt-level = 3` (actuel) | `"s"` + chemin chaud à 3 (retenu) | Écart |
+|---|---|---|---|
+| Aller-retour 64 octets, p50 | 70 µs [31–100] | 32 µs [27–98] | dans le bruit |
+| Aller-retour 64 octets, p99 | 168 µs [125–215] | 128 µs [78–215] | −24 % (bruit) |
+| Établissement de session, p50 | 3,84 ms [3,48–4,45] | 3,97 ms [3,57–4,07] | +3,6 % |
+| Établissement de session, p99 | 5,19 ms [4,14–8,75] | 5,03 ms [4,16–7,11] | −3 % |
+| Débit du relais (18 mesures) | 260 Mio/s [148–316] | 249 Mio/s [216–297] | −4 % |
+| Latence ajoutée du tunnel, p99 (3 exécutions) | 0,12 ms [0–0,29] | 0,15 ms [0,12–0,20] | dans le bruit |
+| Agent avec SSH, sans liaison | 6,78 Mio | 6,26 Mio | −0,52 Mio |
+| Agent avec SSH, non connecté | 9,29 Mio | 8,55 Mio | −0,74 Mio |
+| Agent avec SSH, connecté | 10,07 Mio | 8,70 à 8,76 Mio | −1,31 à −1,37 Mio |
+| Coût du SSH (avec − sans) | +2,02 / +1,61 / +1,86 Mio | +1,88 / +1,68 / +1,24 à +1,30 Mio | inchangé, sous le plafond |
+| Binaire musl | 13 246 608 octets | 11 223 184 octets | −15 % |
+
+Variantes refusées :
+- **`opt-level = "s"` global** (mesuré sur `dev` a1b0e62, 3 exécutions) : l'agent avec SSH tombe à 5,50 / 6,40 / 6,67 Mio et le binaire à 8,0 Mo, mais le débit du relais perd 18 % (224 contre 273 Mio/s), l'établissement de session prend +49 % au p50 (2,75 contre 1,85 ms ajoutées) et l'aller-retour p99 +28 % (204 contre 160 µs). Le chiffrement, les échanges de clés et les signatures compilés en taille coûtent trop. Refusé.
+- **`"s"` + chemin chaud étendu** (22 crates de plus à 3 : `ssh-key`, `der`, `ostena-scope`, `tracing`, etc.) : l'établissement de session revient au niveau actuel, mais l'aller-retour p99 médian dépasse le critère (190 µs, +13 %) et le gain d'empreinte diminue (9,07 Mio connecté). Refusé.
+- **`opt-level = "z"`** : non essayé. Le « s » global échoue déjà sur le débit ; « z » ne réduirait que le code froid, déjà en « s » dans la variante retenue.
+
+**Décision** : le profil de release compile en taille (`opt-level = "s"`), sauf les crates du chemin de données et de l'établissement de session, gardées à `opt-level = 3` par des surcharges par paquet dans `Cargo.toml` : runtime (`tokio`, `mio`, `bytes`, `futures-util`), relais SSH (`russh`, `russh-cryptovec`, `ssh-cipher`, `ssh-encoding`, `ostena-ssh`, `ostena-tunnel`, `ostena-crypto`), chiffrement symétrique, MAC et hachage, échange de clés et signatures (courbes NIST, X25519, Ed25519, ML-KEM, SHA-3), TLS et QUIC du tunnel (`aws-lc-rs`, `aws-lc-sys` dont le code C, `rustls`, `quinn*`). Le profil `bench` en hérite : les bancs mesurent le binaire livré. Aucun critère n'est franchi ; l'agent avec SSH gagne 0,5 à 1,4 Mio de mémoire résidente au repos et le binaire 2 Mo. Le coût propre du SSH (avec − sans) ne baisse pas : les deux binaires rétrécissent ensemble. Les plafonds d'`xtask` restent inchangés. Une crate ajoutée au chemin chaud (pilote RDP, nouveau chiffrement) rejoint cette liste, avec une mesure des bancs.
 
 **Réexamen** de l'écart et des épinglages au premier des trois événements : sortie de `ssh-key` 0.7 stable, avis RustSec sur russh ou ses dépendances, **fin du jalon M1 au plus tard** (fin février 2027).
 
