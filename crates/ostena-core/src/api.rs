@@ -284,11 +284,75 @@ impl LogBudget {
     }
 }
 
-/// Attempts per source, in fixed one-minute windows.
+/// Length of the sliding window of [`Attempts`], in seconds.
+const WINDOW_SECONDS: u64 = 60;
+/// One bucket per second of the window.
+const BUCKETS: usize = 60;
+
+/// Attempts per source, over a sliding window of one minute.
+///
+/// A source never gets more than `per_minute` attempts admitted in any
+/// 60 consecutive seconds (at the one-second resolution of the clock). A
+/// window fixed to the minute of the clock would admit twice as many
+/// across a minute boundary, two seconds apart.
 #[derive(Debug)]
 pub struct Attempts {
-    per_minute: u32,
-    map: Mutex<HashMap<IpAddr, (u64, u32)>>,
+    per_minute: u16,
+    map: Mutex<HashMap<IpAddr, Window>>,
+}
+
+/// The attempts of one source admitted in the last [`WINDOW_SECONDS`]:
+/// one counter per second, indexed by the second modulo [`BUCKETS`].
+#[derive(Debug)]
+struct Window {
+    /// Latest second seen; the buckets after it are stale.
+    last: u64,
+    counts: [u16; BUCKETS],
+    /// A refusal was returned since the last admitted attempt.
+    refusing: bool,
+}
+
+impl Window {
+    fn new(now: u64) -> Self {
+        Self {
+            last: now,
+            counts: [0; BUCKETS],
+            refusing: false,
+        }
+    }
+
+    /// Moves the window to `now`, emptying the seconds that left it. A clock
+    /// that goes back keeps the window where it is: counts are never
+    /// forgotten early.
+    fn advance(&mut self, now: u64) {
+        if now <= self.last {
+            return;
+        }
+        if now - self.last >= WINDOW_SECONDS {
+            self.counts = [0; BUCKETS];
+        } else {
+            for second in self.last + 1..=now {
+                self.counts[bucket(second)] = 0;
+            }
+        }
+        self.last = now;
+    }
+
+    fn admitted(&self) -> u32 {
+        self.counts.iter().map(|&c| u32::from(c)).sum()
+    }
+
+    /// Nothing admitted is left in the window at `now`.
+    fn is_empty_at(&self, now: u64) -> bool {
+        now.saturating_sub(self.last) >= WINDOW_SECONDS || self.admitted() == 0
+    }
+}
+
+fn bucket(second: u64) -> usize {
+    // The remainder is below BUCKETS (60): the cast is exact.
+    #[expect(clippy::cast_possible_truncation)]
+    let index = (second % BUCKETS as u64) as usize;
+    index
 }
 
 /// The decision of the limiter.
@@ -296,52 +360,54 @@ pub struct Attempts {
 pub enum Admission {
     /// Go on.
     Allowed,
-    /// Refused; `first` is set for the first refusal of the window, which
-    /// is the only one logged.
+    /// Refused; `first` is set for the first refusal since the last
+    /// admitted attempt, which is the only one logged.
     Refused {
-        /// First refusal of this address in this window.
+        /// First refusal of this source since its last admitted attempt.
         first: bool,
     },
 }
 
 impl Attempts {
-    /// A limiter of `per_minute` attempts.
+    /// A limiter of `per_minute` attempts (configured from 1 to 600, held to
+    /// `u16::MAX`).
     pub fn new(per_minute: u32) -> Self {
         Self {
-            per_minute,
+            per_minute: u16::try_from(per_minute).unwrap_or(u16::MAX),
             map: Mutex::new(HashMap::new()),
         }
     }
 
     /// Counts an attempt of `ip` at `now` (Unix seconds), for its source
-    /// ([`source_of`]).
+    /// ([`source_of`]). Only admitted attempts fill the window: a source
+    /// that keeps trying while refused is admitted again once its oldest
+    /// admitted attempt is a minute old.
     ///
-    /// When [`MAX_TRACKED_ADDRESSES`] sources are followed in the current
-    /// window, a new one is refused: the limiter fails closed rather than
-    /// forget the counts.
+    /// When [`MAX_TRACKED_ADDRESSES`] sources are followed with attempts
+    /// still in their window, a new one is refused: the limiter fails closed
+    /// rather than forget the counts.
     pub fn admit(&self, ip: IpAddr, now: u64) -> Admission {
         let ip = source_of(ip);
-        let window = now / 60;
         let Ok(mut map) = self.map.lock() else {
             return Admission::Refused { first: false };
         };
         if !map.contains_key(&ip) && map.len() >= MAX_TRACKED_ADDRESSES {
-            map.retain(|_, (w, _)| *w == window);
+            map.retain(|_, w| !w.is_empty_at(now));
             if map.len() >= MAX_TRACKED_ADDRESSES {
                 return Admission::Refused { first: false };
             }
         }
-        let entry = map.entry(ip).or_insert((window, 0));
-        if entry.0 != window {
-            *entry = (window, 0);
-        }
-        entry.1 = entry.1.saturating_add(1);
-        if entry.1 <= self.per_minute {
+        let window = map.entry(ip).or_insert_with(|| Window::new(now));
+        window.advance(now);
+        if window.admitted() < u32::from(self.per_minute) {
+            let slot = &mut window.counts[bucket(window.last)];
+            *slot = slot.saturating_add(1);
+            window.refusing = false;
             Admission::Allowed
         } else {
-            Admission::Refused {
-                first: entry.1 == self.per_minute + 1,
-            }
+            let first = !window.refusing;
+            window.refusing = true;
+            Admission::Refused { first }
         }
     }
 }
@@ -615,7 +681,7 @@ async fn handle<A: Authenticator>(
                 event = "login.rate_limited",
                 peer = %peer,
                 limit = shared.limits.attempts_per_minute,
-                "tentatives refusées pour cette adresse jusqu'à la minute suivante"
+                "tentatives refusées pour cette adresse : limite atteinte sur la dernière minute"
             );
         }
         return Err(ApiError::new(
@@ -698,8 +764,67 @@ mod tests {
         assert_eq!(a.admit(ip, 610), Admission::Refused { first: true });
         assert_eq!(a.admit(ip, 619), Admission::Refused { first: false });
         assert_eq!(a.admit(other, 619), Admission::Allowed);
-        // The next minute starts afresh.
+        // A minute after the admitted attempts, the source starts afresh.
+        assert_eq!(a.admit(ip, 659), Admission::Refused { first: false });
         assert_eq!(a.admit(ip, 660), Admission::Allowed);
+        assert_eq!(a.admit(ip, 660), Admission::Allowed);
+        assert_eq!(a.admit(ip, 661), Admission::Allowed);
+        assert_eq!(a.admit(ip, 662), Admission::Refused { first: true });
+    }
+
+    #[test]
+    fn attempts_slide_across_minute_boundaries() {
+        // Two attempts at the end of a clock minute leave none for the
+        // start of the next one: the window slides, it is not reset.
+        let a = Attempts::new(2);
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(a.admit(ip, 119), Admission::Allowed);
+        assert_eq!(a.admit(ip, 119), Admission::Allowed);
+        for now in 120..179 {
+            assert_eq!(
+                a.admit(ip, now),
+                Admission::Refused { first: now == 120 },
+                "{now}"
+            );
+        }
+        assert_eq!(a.admit(ip, 179), Admission::Allowed);
+        assert_eq!(a.admit(ip, 179), Admission::Allowed);
+        assert_eq!(a.admit(ip, 180), Admission::Refused { first: true });
+        // Spread attempts leave the window one by one.
+        let b = Attempts::new(2);
+        assert_eq!(b.admit(ip, 100), Admission::Allowed);
+        assert_eq!(b.admit(ip, 130), Admission::Allowed);
+        assert_eq!(b.admit(ip, 159), Admission::Refused { first: true });
+        assert_eq!(b.admit(ip, 160), Admission::Allowed);
+        assert_eq!(b.admit(ip, 189), Admission::Refused { first: true });
+        assert_eq!(b.admit(ip, 190), Admission::Allowed);
+        // A clock that goes back keeps the counts.
+        assert_eq!(b.admit(ip, 150), Admission::Refused { first: true });
+        // After a long silence the window is empty.
+        assert_eq!(b.admit(ip, 10_000), Admission::Allowed);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn no_minute_admits_more_than_the_limit(
+            limit in 1u32..6,
+            steps in proptest::collection::vec(0u64..30, 1..200),
+        ) {
+            let a = Attempts::new(limit);
+            let ip: IpAddr = "192.0.2.1".parse().unwrap();
+            let mut now = 1_000;
+            let mut admitted = Vec::new();
+            for step in steps {
+                now += step;
+                if a.admit(ip, now) == Admission::Allowed {
+                    admitted.push(now);
+                }
+            }
+            for (i, &t) in admitted.iter().enumerate() {
+                let in_minute = admitted[i..].iter().take_while(|&&u| u < t + 60).count();
+                proptest::prop_assert!(in_minute <= limit as usize, "{admitted:?}");
+            }
+        }
     }
 
     #[test]

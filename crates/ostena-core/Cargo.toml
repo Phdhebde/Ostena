@@ -52,6 +52,8 @@ ostena-platform.workspace = true
 toml.workspace = true
 # The login API tests: foreign TLS clients, an HTTP client.
 hyper = { workspace = true, features = ["client"] }
+# The property test of the login rate limiter.
+proptest.workspace = true
 
 [lints]
 workspace = true
