@@ -54,7 +54,7 @@ Le transport est décrit par l'ADR-0015, les mots de passe et le TOTP par l'ADR-
 
 `ostena login` affiche la ligne `Include` à placer une fois en tête de `~/.ssh/config` ; `--install-include` l'y ajoute, une seule fois. OpenSSH lit les fichiers tels qu'écrits (test `openssh_reads_the_files` : `ssh-keygen -L`, `ssh-keygen -y`, `ssh -G`).
 
-**Déconnexion.** `ostena logout` envoie `POST /v1/logout` avec la session, le certificat, l'heure et une signature ECDSA de la clé de la session sur `"ostena-logout-v1\0" ‖ session ‖ heure`. Le core révoque la session, puis le client supprime la clé et le certificat. La réponse est `204`.
+**Déconnexion.** `ostena logout` envoie `POST /v1/logout` avec la session, le certificat, l'heure et une signature ECDSA de la clé de la session sur `"ostena-logout-v1\0" ‖ session ‖ heure`. L'heure est acceptée à ±60 s de celle du core (`LOGOUT_SKEW_SECS`). Le core révoque la session, puis le client supprime la clé et le certificat. La réponse est `204`.
 
 **Saisie.** Le mot de passe est lu sans écho sur le terminal (`ostena_platform::tty`) ; le terminal est restauré même sur erreur ou Ctrl-C (Ctrl-C annule la saisie).
 

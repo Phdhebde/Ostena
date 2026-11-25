@@ -68,8 +68,6 @@ pub const HASHING_SLOTS: usize = 4;
 pub const REFUSAL_FLOOR: Duration = Duration::from_secs(1);
 /// Clock tolerance at the start of a user certificate, seconds.
 const CERTIFICATE_SKEW: u64 = 60;
-/// Tolerance on the time of a logout request, seconds.
-const LOGOUT_SKEW: u64 = 300;
 
 /// Why a login is refused: told to the audit chain only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,7 +652,7 @@ impl PgAuthenticator {
                 &Signature::from_bytes(&signature),
             )
             .map_err(|_| Failure::Refused(Cause::Code, Some(subject)))?;
-        if request.issued_at.abs_diff(unix_now()) > LOGOUT_SKEW {
+        if request.issued_at.abs_diff(unix_now()) > login::LOGOUT_SKEW_SECS {
             return Err(Failure::Refused(Cause::Replayed, Some(subject)));
         }
         let sha256 = ostena_crypto::sha256::digest(&blob);

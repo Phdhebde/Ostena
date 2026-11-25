@@ -775,12 +775,12 @@ fn logout_is_signed_by_the_session_key() {
             .login("alice", PASSWORD, f.next_code(), &key)
             .await
             .unwrap();
-        // Signed by another key, or too old: refused.
+        // Signed by another key, or out of the ±60 s window: refused.
         let other = SigningKey::generate().unwrap().0;
-        for request in [
-            logout_request(&response, &other, now()),
-            logout_request(&response, &key, now() - 3600),
-        ] {
+        // Each request is dated when sent: a refusal takes a second.
+        for (signer, offset) in [(&other, 0), (&key, -3600), (&key, -62), (&key, 62)] {
+            let issued = now().checked_add_signed(offset).unwrap();
+            let request = logout_request(&response, signer, issued);
             assert_eq!(
                 f.authenticator
                     .logout(request, peer())

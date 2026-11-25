@@ -291,7 +291,8 @@ pub struct LogoutRequest {
     /// The certificate of that session (OpenSSH line): the core checks its
     /// SHA-256 against the session and verifies the signature with its key.
     pub certificate: String,
-    /// When the request was signed, Unix seconds (accepted within ±60 s).
+    /// When the request was signed, Unix seconds (accepted within
+    /// ±[`LOGOUT_SKEW_SECS`]).
     pub issued_at: u64,
     /// ECDSA P-256 / SHA-256 signature `r ‖ s` (64 bytes, base64url) of
     /// [`logout_message`].
@@ -300,6 +301,9 @@ pub struct LogoutRequest {
 
 /// Domain separation of the logout signature.
 const LOGOUT_DOMAIN: &[u8] = b"ostena-logout-v1\0";
+
+/// Tolerance on [`LogoutRequest::issued_at`], seconds, either way.
+pub const LOGOUT_SKEW_SECS: u64 = 60;
 
 /// The bytes signed by a logout request.
 pub fn logout_message(login_session: &str, issued_at: u64) -> Vec<u8> {
