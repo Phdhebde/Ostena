@@ -56,7 +56,9 @@ exceptions = [
 ]
 
 [licenses.private]
-# Workspace crates are not published and carry no license yet.
+# Workspace crates are AGPL-3.0-or-later (LICENSE) and not published. They are
+# left out of the check so that AGPL stays off the allow list above: no
+# dependency may bring a strong copyleft license (GPL, AGPL).
 ignore = true
 
 [bans]
