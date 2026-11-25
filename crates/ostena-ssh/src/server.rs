@@ -23,16 +23,21 @@
 //! and `LANG`/`LC_*` are relayed. Subsystems (sftp), port forwarding in
 //! both directions, agent and X11 forwarding are refused
 //! (`ssh.channel_refused`, `SSH-E017`). A command is logged by its length
-//! and SHA-256 only: secrets can appear in a command line; its text belongs
-//! to the transcripts.
+//! only: secrets can appear in a command line; its text goes to the
+//! transcript, and the core keeps a keyed hash of it (ADR-0016).
+//!
+//! **Transcript** (ADR-0016). Every authorised access comes with its
+//! [`Transcript`]: the start (terminal, command), the outputs of the target
+//! and the window changes are recorded, an output **before** it reaches the
+//! user. Fail closed: when the transcript can no longer reach the core, the
+//! session is cut (`ssh.transcript_lost`, `SSH-E021`).
 //!
 //! Events: `ssh.connection_limited`, `ssh.connection_refused`,
 //! `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`,
 //! `ssh.exec`, `ssh.session_expired`, `ssh.session_revoked`,
-//! `ssh.session_closed`, `ssh.channel_refused`.
+//! `ssh.session_closed`, `ssh.channel_refused`, `ssh.transcript_lost`.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,6 +59,8 @@ use crate::error::SshError;
 use crate::login::parse_login;
 use crate::precheck::Role;
 use crate::precheck::stream::Prechecked;
+use crate::transcript::{Terminal, Transcript};
+use ostena_recorder::EndReason;
 
 /// Longest command accepted.
 pub const MAX_COMMAND: usize = 32 * 1024;
@@ -69,6 +76,8 @@ const MAX_ENV_VALUE: usize = 256;
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a session may take to end once disconnected.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reason of a session cut because its transcript was lost.
+const TRANSCRIPT_LOST: &str = "transcript perdu";
 
 /// Bounds and delays of the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +202,8 @@ pub struct Authorized {
     pub account: String,
     /// Maximum length of the session.
     pub max_session: Duration,
+    /// Its transcript, towards the core: no access without one.
+    pub transcript: Transcript,
 }
 
 /// Why an access is refused: the underlying stable code and a message.
@@ -239,19 +250,6 @@ pub trait Authorizer: Send + Sync + 'static {
     fn closed(&self, summary: SessionSummary);
 }
 
-/// Sees what is relayed; the hook of the future transcripts. Does nothing
-/// by default.
-pub trait SessionObserver: Send + Sync + 'static {
-    /// Bytes from the user to the target.
-    fn user_data(&self, _session: &[u8; 16], _data: &[u8]) {}
-    /// Bytes from the target to the user.
-    fn target_data(&self, _session: &[u8; 16], _data: &[u8]) {}
-}
-
-struct NoObserver;
-
-impl SessionObserver for NoObserver {}
-
 /// A live authenticated session, for revocations.
 struct Live {
     login_session: [u8; 16],
@@ -266,7 +264,6 @@ struct Shared<A> {
     identity: watch::Receiver<Option<Arc<SshIdentity>>>,
     target_key: Arc<PrivateKey>,
     authorizer: Arc<A>,
-    observer: Arc<dyn SessionObserver>,
     unauthenticated: Arc<Semaphore>,
     sessions: Arc<Semaphore>,
     authorizations: Arc<Semaphore>,
@@ -341,13 +338,6 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
-
 fn limited(peer: SocketAddr, listener: SocketAddr, what: &'static str) {
     let error = SshError::Limit(what);
     tracing::warn!(
@@ -374,7 +364,6 @@ impl<A: Authorizer> SshServer<A> {
                 identity,
                 target_key,
                 authorizer,
-                observer: Arc::new(NoObserver),
                 unauthenticated: Arc::new(Semaphore::new(settings.max_unauthenticated)),
                 sessions: Arc::new(Semaphore::new(settings.max_sessions)),
                 authorizations: Arc::new(Semaphore::new(settings.max_authorizations)),
@@ -383,20 +372,6 @@ impl<A: Authorizer> SshServer<A> {
                 next: AtomicU64::new(1),
             }),
         }
-    }
-
-    /// The same server, with `observer` seeing what is relayed. Call it
-    /// before [`SshServer::serve`].
-    #[must_use]
-    pub fn with_observer(self, observer: Arc<dyn SessionObserver>) -> Self {
-        let shared = Arc::try_unwrap(self.shared).map_or_else(
-            |shared| shared,
-            |mut shared| {
-                shared.observer = observer;
-                Arc::new(shared)
-            },
-        );
-        Self { shared }
     }
 
     /// Serves the connections of `listener` until `stop` turns true; the
@@ -514,6 +489,8 @@ struct Handler<A> {
     relay: Option<Relay>,
     access: Option<(AccessRequest, Authorized)>,
     session_id: [u8; 16],
+    /// The terminal relayed, for the start of the transcript.
+    terminal: Option<Terminal>,
 }
 
 impl<A: Authorizer> Handler<A> {
@@ -688,6 +665,32 @@ impl<A: Authorizer> Handler<A> {
         }
     }
 
+    fn transcript(&self) -> Option<Transcript> {
+        self.access.as_ref().map(|(_, a)| a.transcript.clone())
+    }
+
+    /// Records the start of the shell or of `command` before it is relayed;
+    /// `false` if it cannot be (lost, or already started).
+    async fn start_transcript(&self, command: Option<&[u8]>) -> bool {
+        let Some(transcript) = self.transcript() else {
+            return false;
+        };
+        match transcript.start(self.terminal.as_ref(), command).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    event = "ssh.channel_refused",
+                    code = e.code(),
+                    session = %format_uuid(&self.session_id),
+                    peer = %self.peer,
+                    listener = %self.listener,
+                    "{e}"
+                );
+                false
+            }
+        }
+    }
+
     fn relay(&self, channel: ChannelId) -> Option<Arc<ChannelWriteHalf<client::Msg>>> {
         self.relay
             .as_ref()
@@ -736,12 +739,13 @@ impl<A: Authorizer> Handler<A> {
             .access
             .as_ref()
             .is_some_and(|(r, _)| r.identity.allow_pty);
+        let Some(transcript) = self.transcript() else {
+            return Ok(());
+        };
         tokio::spawn(user_to_target(
             user_read,
             target_write.clone(),
             self.conn.to_target.clone(),
-            self.shared.observer.clone(),
-            self.session_id,
         ));
         tokio::spawn(target_to_user(
             target_read,
@@ -750,8 +754,7 @@ impl<A: Authorizer> Handler<A> {
             id,
             replies_tx,
             self.conn.from_target.clone(),
-            self.shared.observer.clone(),
-            self.session_id,
+            transcript,
         ));
         self.relay = Some(Relay {
             id,
@@ -777,19 +780,17 @@ impl<A: Authorizer> Handler<A> {
     }
 }
 
-/// From the user to the target: data, end of data, close.
+/// From the user to the target: data, end of data, close. Keystrokes are
+/// not recorded (ADR-0016).
 async fn user_to_target(
     mut user: russh::ChannelReadHalf,
     target: Arc<ChannelWriteHalf<client::Msg>>,
     count: Arc<AtomicU64>,
-    observer: Arc<dyn SessionObserver>,
-    session: [u8; 16],
 ) {
     while let Some(message) = user.wait().await {
         let sent = match message {
             ChannelMsg::Data { data } => {
                 count.fetch_add(data.len() as u64, Ordering::Relaxed);
-                observer.user_data(&session, &data);
                 target.data_bytes(data).await
             }
             ChannelMsg::Eof => target.eof().await,
@@ -807,7 +808,9 @@ async fn user_to_target(
 }
 
 /// From the target to the user: data, end of data, exit status, close;
-/// the answers to the relayed requests go to the handler.
+/// the answers to the relayed requests go to the handler. Each output is
+/// recorded before it is relayed; an output that cannot be recorded is not
+/// relayed, and the relay stops (the session is cut by its transcript).
 #[allow(clippy::too_many_arguments)]
 async fn target_to_user(
     mut target: russh::ChannelReadHalf,
@@ -816,19 +819,22 @@ async fn target_to_user(
     id: ChannelId,
     replies: mpsc::Sender<bool>,
     count: Arc<AtomicU64>,
-    observer: Arc<dyn SessionObserver>,
-    session: [u8; 16],
+    transcript: Transcript,
 ) {
     while let Some(message) = target.wait().await {
         let sent = match message {
             ChannelMsg::Data { data } => {
+                if transcript.output(&data).await.is_err() {
+                    break;
+                }
                 count.fetch_add(data.len() as u64, Ordering::Relaxed);
-                observer.target_data(&session, &data);
                 user.data_bytes(data).await
             }
             ChannelMsg::ExtendedData { data, ext } => {
+                if transcript.output(&data).await.is_err() {
+                    break;
+                }
                 count.fetch_add(data.len() as u64, Ordering::Relaxed);
-                observer.target_data(&session, &data);
                 user.extended_data_bytes(ext, data).await
             }
             ChannelMsg::Eof => user.eof().await,
@@ -999,6 +1005,11 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
         {
             return session.channel_failure(channel);
         }
+        self.terminal = Some(Terminal {
+            term: term.to_owned(),
+            cols: col_width,
+            rows: row_height,
+        });
         self.answer(channel, session).await
     }
 
@@ -1010,6 +1021,9 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
         let Some(target) = self.relay(channel) else {
             return session.channel_failure(channel);
         };
+        if !self.start_transcript(None).await {
+            return session.channel_failure(channel);
+        }
         if target.request_shell(true).await.is_err() {
             return session.channel_failure(channel);
         }
@@ -1029,14 +1043,16 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
             self.channel_refused("commande de plus de 32 Kio");
             return session.channel_failure(channel);
         }
+        if !self.start_transcript(Some(data)).await {
+            return session.channel_failure(channel);
+        }
         tracing::info!(
             event = "ssh.exec",
             session = %format_uuid(&self.session_id),
             peer = %self.peer,
             listener = %self.listener,
             length = data.len(),
-            sha256 = %hex(&ostena_crypto::sha256::digest(data)),
-            "commande transmise à la cible"
+            "commande transmise à la cible (texte dans le transcript)"
         );
         if target.exec(true, data).await.is_err() {
             return session.channel_failure(channel);
@@ -1084,6 +1100,10 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
             let _ = target
                 .window_change(col_width, row_height, pix_width, pix_height)
                 .await;
+            if let Some(transcript) = self.transcript() {
+                // A loss is handled by the connection: it cuts the session.
+                let _ = transcript.resize(col_width, row_height).await;
+            }
         }
         Ok(())
     }
@@ -1282,6 +1302,7 @@ async fn connection<A: Authorizer>(
         relay: None,
         access: None,
         session_id: [0; 16],
+        terminal: None,
     };
     let grace = tokio::time::Instant::now() + shared.settings.login_grace;
     let stream = Prechecked::new(
@@ -1352,6 +1373,7 @@ async fn connection<A: Authorizer>(
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + authorized.max_session;
     let session_text = format_uuid(&authorized.session_id);
+    let transcript = authorized.transcript.clone();
     let reason = if ended {
         "fermée"
     } else {
@@ -1390,6 +1412,19 @@ async fn connection<A: Authorizer>(
                 disconnect(&handle, "arrêt de l'agent").await;
                 "arrêt"
             }
+            () = transcript.closed() => {
+                let error = SshError::TranscriptLost("flux vers le core perdu".into());
+                tracing::warn!(
+                    event = "ssh.transcript_lost",
+                    code = error.code(),
+                    session = %session_text,
+                    peer = %peer,
+                    listener = %listener,
+                    "{error}"
+                );
+                disconnect(&handle, "enregistrement de la session impossible").await;
+                TRANSCRIPT_LOST
+            }
         }
     };
     if !ended {
@@ -1398,6 +1433,25 @@ async fn connection<A: Authorizer>(
     let target = conn.target.lock().ok().and_then(|mut t| t.take());
     if let Some(target) = target {
         target.close().await;
+    }
+    let end = match reason {
+        "révoquée" => EndReason::Revoked,
+        "expirée" => EndReason::Expired,
+        "arrêt" => EndReason::Shutdown,
+        TRANSCRIPT_LOST => EndReason::Error,
+        _ => EndReason::Closed,
+    };
+    if let Err(e) = transcript.end(end).await
+        && reason != TRANSCRIPT_LOST
+    {
+        tracing::warn!(
+            event = "ssh.transcript_lost",
+            code = e.code(),
+            session = %session_text,
+            peer = %peer,
+            listener = %listener,
+            "{e}"
+        );
     }
     drop(permit);
     let summary = SessionSummary {

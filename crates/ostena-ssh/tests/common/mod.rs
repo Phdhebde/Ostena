@@ -607,6 +607,25 @@ pub struct TestAuthorizer {
     pub delay: Mutex<Option<Duration>>,
     pub requests: Mutex<Vec<ostena_ssh::server::AccessRequest>>,
     pub closed: Mutex<Vec<ostena_ssh::server::SessionSummary>>,
+    /// Transcript streams received, by session.
+    pub transcripts: Arc<Mutex<std::collections::HashMap<[u8; 16], Vec<u8>>>>,
+    /// Drops the transcript queue this long after the authorisation, as a
+    /// lost tunnel does.
+    pub lose_transcript_after: Mutex<Option<Duration>>,
+}
+
+impl TestAuthorizer {
+    /// The transcript stream of `session`, decoded strictly.
+    pub fn transcript(&self, session: &[u8; 16]) -> Vec<ostena_recorder::Frame> {
+        let bytes = self.transcripts.lock().unwrap().get(session).cloned();
+        let mut decoder = ostena_recorder::Decoder::new(ostena_recorder::Limits::default());
+        decoder.feed(&bytes.unwrap_or_default());
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.next_frame().unwrap() {
+            frames.push(frame);
+        }
+        frames
+    }
 }
 
 impl ostena_ssh::server::Authorizer for TestAuthorizer {
@@ -634,12 +653,36 @@ impl ostena_ssh::server::Authorizer for TestAuthorizer {
             .lock()
             .unwrap()
             .unwrap_or(Duration::from_secs(3600));
+        let session_id = ostena_crypto::rand::array().unwrap();
+        let (transcript, mut rx) = ostena_ssh::transcript::Transcript::channel(8);
+        let store = self.transcripts.clone();
+        let lose = *self.lose_transcript_after.lock().unwrap();
+        tokio::spawn(async move {
+            let deadline = lose.map(|d| tokio::time::Instant::now() + d);
+            loop {
+                let frame = match deadline {
+                    Some(at) => match tokio::time::timeout_at(at, rx.recv()).await {
+                        Ok(frame) => frame,
+                        Err(_) => return,
+                    },
+                    None => rx.recv().await,
+                };
+                let Some(frame) = frame else { return };
+                store
+                    .lock()
+                    .unwrap()
+                    .entry(session_id)
+                    .or_default()
+                    .extend_from_slice(&frame);
+            }
+        });
         Ok(ostena_ssh::server::Authorized {
-            session_id: ostena_crypto::rand::array().unwrap(),
+            session_id,
             target,
             target_host_key: host_key,
             account: request.account,
             max_session,
+            transcript,
         })
     }
 

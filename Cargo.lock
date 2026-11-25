@@ -1741,6 +1741,7 @@ dependencies = [
  "ostena-common",
  "ostena-crypto",
  "ostena-grant",
+ "ostena-recorder",
  "ostena-scope",
  "ostena-tunnel",
  "proptest",

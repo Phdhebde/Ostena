@@ -23,10 +23,12 @@ use ostena_ssh::server::{
     AccessRequest, Authorized, Authorizer, Refusal, ServerSettings, SessionSummary, SshIdentity,
     SshServer,
 };
+use ostena_ssh::transcript::Transcript;
 use ostena_tunnel::Uuid;
 use ostena_tunnel::control::AgentMessage;
 use ostena_tunnel::gateway::{Gateway, SshAccess};
 use ostena_tunnel::link::AgentLink;
+use ostena_tunnel::recording;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -116,13 +118,33 @@ impl Authorizer for TunnelAuthorizer {
             .open_ssh_session(&access, ostena_grant::unix_now(), self.journal.as_ref())
             .await
         {
-            Ok(session) => Ok(Authorized {
-                session_id: session.session.session_id.to_bytes(),
-                target: session.session.target,
-                target_host_key: session.target_host_key,
-                account: session.account,
-                max_session: Duration::from_secs(session.session.max_session_secs.into()),
-            }),
+            Ok(session) => {
+                // The transcript stream (ADR-0016): its loss cuts the session.
+                let session_id = session.session.session_id;
+                let (transcript, frames) = Transcript::channel(recording::QUEUE);
+                // Counted like a report: a stop closes the link only once
+                // the transcript is acknowledged by the core.
+                let sending = self.reports.sending();
+                tokio::spawn(async move {
+                    let _sending = sending;
+                    if let Err(e) = recording::pump(frames, session.recording).await {
+                        tracing::warn!(
+                            event = "agent.transcript_lost",
+                            session_id = %session_id,
+                            code = e.code(),
+                            "{e}"
+                        );
+                    }
+                });
+                Ok(Authorized {
+                    session_id: session_id.to_bytes(),
+                    target: session.session.target,
+                    target_host_key: session.target_host_key,
+                    account: session.account,
+                    max_session: Duration::from_secs(session.session.max_session_secs.into()),
+                    transcript,
+                })
+            }
             Err(e) => Err(Refusal {
                 code: e.code(),
                 message: e.to_string(),

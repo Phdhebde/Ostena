@@ -241,6 +241,65 @@ fn ssh_session_consumes_the_jti_on_both_sides() {
     });
 }
 
+/// The transcript stream of an SSH session reaches the core, finished;
+/// once the connection is lost, the transcript of a live session sees it
+/// at once (fail closed, ADR-0016).
+#[test]
+fn the_transcript_reaches_the_core_and_its_loss_is_seen() {
+    use ostena_recorder::{Decoder, EndReason, Limits as RecLimits};
+    use ostena_ssh::transcript::Transcript;
+    use ostena_tunnel::recording::{QUEUE, pump};
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("transcript");
+        let gateway = agent(&core, &dir, allow(&["10.0.0.0/8"])).await;
+        push(&core, &gateway, allow(&["10.20.0.0/16"]), true).await;
+        core.add_ssh_resource("srv-lab01", SshResource::new("10.20.0.5", 22, target_key()));
+        let store = MemoryReplayStore::new();
+
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let id = session.session.session_id;
+        let (transcript, rx) = Transcript::channel(QUEUE);
+        let pumped = tokio::spawn(pump(rx, session.recording));
+        transcript.start(None, Some(b"uname -a")).await.unwrap();
+        transcript.output(b"Linux srv-lab01\n").await.unwrap();
+        transcript.end(EndReason::Closed).await.unwrap();
+        drop(transcript);
+        pumped.await.unwrap().unwrap();
+        let (bytes, finished) = core.recording(id).unwrap();
+        assert!(finished);
+        let mut decoder = Decoder::new(RecLimits::default());
+        decoder.feed(&bytes);
+        let mut frames = 0;
+        while decoder.next_frame().unwrap().is_some() {
+            frames += 1;
+        }
+        decoder.finish().unwrap();
+        assert_eq!(frames, 3);
+
+        // A live session, then the core goes away.
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let (transcript, rx) = Transcript::channel(QUEUE);
+        let pumped = tokio::spawn(pump(rx, session.recording));
+        transcript.start(None, None).await.unwrap();
+        core.stop();
+        tokio::time::timeout(Duration::from_secs(20), transcript.closed())
+            .await
+            .expect("loss of the tunnel seen by the transcript");
+        assert!(pumped.await.unwrap().is_err());
+        assert_eq!(
+            transcript.output(b"x").await.unwrap_err().code(),
+            "SSH-E021"
+        );
+    });
+}
+
 #[test]
 fn a_grant_or_an_answer_that_does_not_match_the_access_is_refused() {
     run(async {

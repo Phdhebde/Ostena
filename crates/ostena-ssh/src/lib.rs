@@ -22,6 +22,7 @@ pub mod login;
 pub mod precheck;
 #[cfg(feature = "russh")]
 pub mod server;
+pub mod transcript;
 
 pub use error::SshError;
 

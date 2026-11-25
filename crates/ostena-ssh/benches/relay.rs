@@ -125,12 +125,17 @@ struct Bench {
 
 impl Authorizer for Bench {
     async fn authorize(&self, request: AccessRequest) -> Result<Authorized, Refusal> {
+        // The transcript is encoded and queued as in the agent; the queue is
+        // drained here instead of the tunnel stream.
+        let (transcript, mut rx) = ostena_ssh::transcript::Transcript::channel(8);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
         Ok(Authorized {
             session_id: [7; 16],
             target: self.target.clone(),
             target_host_key: self.target_key,
             account: request.account,
             max_session: Duration::from_secs(3600),
+            transcript,
         })
     }
 
