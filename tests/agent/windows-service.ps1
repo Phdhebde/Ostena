@@ -80,7 +80,7 @@ if ($keyAcl -notmatch 'NT SERVICE\\OstenaAgent:\(R,D\)') { Fail "service rights 
 if ($keyAcl -match '\(I\)') { Fail "inherited entries on the key: $keyAcl" }
 icacls (Join-Path $Data 'state')
 
-Write-Host '=== native SSH server (ADR-0010): keys created by the service, listening'
+Write-Host '=== native SSH server (ADR-0010): keys created by the service, listening, no handshake without identity'
 foreach ($name in 'ssh_host_key', 'ssh_target_key') {
     $path = Join-Path $Data "state\$name"
     if (-not (Test-Path $path)) { Fail "$name not created" }
@@ -90,20 +90,28 @@ foreach ($name in 'ssh_host_key', 'ssh_target_key') {
     if ($acl -match '\(I\)') { Fail "inherited entries on ${name}: $acl" }
     if ($acl -match 'Users|Everyone|Authenticated') { Fail "$name readable by others: $acl" }
 }
+# Without a core, no host certificate is pushed: the server accepts the
+# connection and closes it before its identification, with an audit event.
 $client = New-Object System.Net.Sockets.TcpClient
 $client.Connect('127.0.0.1', 2222)
 $stream = $client.GetStream()
 $stream.ReadTimeout = 5000
 $buffer = New-Object byte[] 14
-$read = 0
-while ($read -lt 14) {
-    $n = $stream.Read($buffer, $read, 14 - $read)
-    if ($n -le 0) { break }
-    $read += $n
-}
+try { $read = $stream.Read($buffer, 0, 14) }
+catch { Fail "SSH server: connection left open or reset: $($_.Exception.Message)" }
 $client.Close()
-$banner = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
-if ($banner -ne 'SSH-2.0-Ostena') { Fail "SSH identification: '$banner'" }
+if ($read -ne 0) {
+    Fail "SSH identification sent without a host identity: '$([System.Text.Encoding]::ASCII.GetString($buffer, 0, $read))'"
+}
+$refused = $false
+foreach ($i in 1..20) {
+    if ((Test-Path $Log) -and (Select-String -Path $Log -Pattern '"code":"SSH-E018".*"event":"ssh.connection_refused"' -Quiet)) {
+        $refused = $true
+        break
+    }
+    Start-Sleep -Milliseconds 500
+}
+if (-not $refused) { Fail 'no ssh.connection_refused (SSH-E018) for a connection without identity' }
 $line = & $Exe agent ssh-key --config $Config --line --from 10.20.0.11 | Out-String
 Write-Host $line
 if ($LASTEXITCODE -ne 0 -or $line -notmatch '^restrict,from="10\.20\.0\.11" ecdsa-sha2-nistp256 ') { Fail "authorized_keys line: $line" }
@@ -113,6 +121,7 @@ $status = & $Exe agent status --config $Config | Out-String
 Write-Host $status
 if ($LASTEXITCODE -ne 0 -or $status -notmatch 'Groupe : 2f6c9a4e') { Fail 'status did not reach the control plane' }
 if ($status -notmatch 'SSH : .* 127\.0\.0\.1:2222') { Fail 'status does not show the SSH server' }
+if ($status -notmatch 'Identité SSH : pas encore reçue du core') { Fail 'status does not show the pending SSH identity' }
 
 Write-Host '=== control pipe refuses a non-administrator'
 & (Join-Path $PSScriptRoot 'windows-pipe-nonadmin.ps1')
