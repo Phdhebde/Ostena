@@ -1,23 +1,27 @@
 //! The PostgreSQL [`Authenticator`] of the login API (ADR-0010, step 1).
 //!
-//! A login is one transaction. It first locks the user row (`FOR SHARE`,
-//! in the canonical order of ADR-0014: `app_user` before `login_session`),
-//! so that a concurrent `disable_user` either waits for the session to be
-//! opened and revokes it, or is seen and refuses the login. It then locks
-//! the credential row (`FOR UPDATE`), so that concurrent attempts count
-//! failures and consume TOTP steps one after the other:
+//! A login runs in two phases, so that no row lock and no hashing slot is
+//! held while another attempt waits:
 //!
-//! 1. unknown name, locked, disabled or not enrolled account: refused,
-//!    after a dummy password check of the same cost;
-//! 2. password (PBKDF2, off the runtime threads, a few at a time), then
-//!    TOTP code (one step of tolerance, a step never accepted twice);
-//! 3. a failure counts; at `max_failures` failures, each within
-//!    `lockout_minutes` of the previous one, the account is locked for
-//!    `lockout_minutes` (`login.locked`, protective); an older count starts
-//!    again;
-//! 4. success: the counters are cleared, the step is kept, the user
-//!    certificate is issued, the login session opened and `login.succeeded`
-//!    written (granting), all in the same transaction.
+//! 1. the password digest is read without a lock, and PBKDF2 runs off the
+//!    runtime threads, outside any transaction, holding one of the
+//!    [`HASHING_SLOTS`] only while it derives; an unknown name or an
+//!    account without a digest gets a dummy derivation of the same cost;
+//! 2. one transaction then locks, in the canonical order of ADR-0014, the
+//!    user row (`FOR SHARE`: a concurrent `disable_user` either waits for
+//!    the session to be opened and revokes it, or is seen) and the
+//!    credential row (`FOR UPDATE`: concurrent attempts count failures and
+//!    consume TOTP steps one after the other). It checks again that the
+//!    account is active, not locked, fully enrolled and that its digest is
+//!    the one derived against (else refused, not counted), then the TOTP
+//!    code (one step of tolerance, a step never accepted twice).
+//!
+//! A failure counts; at `max_failures` failures, each within
+//! `lockout_minutes` of the previous one, the account is locked for
+//! `lockout_minutes` (`login.locked`, protective); an older count starts
+//! again. A success clears the counters, keeps the step, issues the user
+//! certificate, opens the login session and writes `login.succeeded`
+//! (granting), all in the same transaction.
 //!
 //! The client always gets `AUTH-E001`; the cause goes to `login.refused`
 //! (best effort). A logout is a revocation by the user of their own
@@ -31,6 +35,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
 use ostena_common::api::login::{self, LoginRequest, LoginResponse, LogoutRequest};
 use ostena_common::config::CoreLoginConfig;
+use ostena_common::secret::SecretString;
 use ostena_crypto::p256::{Signature, VerifyingKey};
 use ostena_crypto::password::{self, PasswordHash};
 use ostena_crypto::totp::{TotpAlgorithm, TotpError};
@@ -47,7 +52,8 @@ use crate::login as sessions;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{Notice, i64_of, notify_notice, truncate, unix_now, uuid};
 
-/// Password checks run at the same time; the others wait.
+/// PBKDF2 derivations run at the same time; the others wait. A slot is
+/// held only while deriving, never with a transaction open.
 pub const HASHING_SLOTS: usize = 4;
 /// Clock tolerance at the start of a user certificate, seconds.
 const CERTIFICATE_SKEW: u64 = 60;
@@ -64,6 +70,8 @@ enum Cause {
     Password,
     Code,
     Replayed,
+    /// The account changed between the derivation and the transaction.
+    Changed,
 }
 
 impl Cause {
@@ -76,6 +84,7 @@ impl Cause {
             Self::Password => "mot de passe faux",
             Self::Code => "code TOTP faux",
             Self::Replayed => "code TOTP déjà utilisé",
+            Self::Changed => "compte modifié pendant la vérification du mot de passe",
         }
     }
 }
@@ -129,7 +138,7 @@ fn user_event(kind: EventKind, outcome: Outcome, user: Uuid) -> Event {
     Event::new(kind, outcome, ActorKind::User, user.to_string())
 }
 
-/// Runs a password check off the runtime threads.
+/// Runs a derivation off the runtime threads.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Failure> {
@@ -211,6 +220,49 @@ impl PgAuthenticator {
         }
     }
 
+    /// Phase 1: PBKDF2 against the digest read without a lock, outside any
+    /// transaction, holding a hashing slot only while it derives. Returns
+    /// whether the password matches and, if its iterations are too few,
+    /// a new digest.
+    async fn derive(
+        &self,
+        password: SecretString,
+        stored: Option<PasswordHash>,
+    ) -> Result<(bool, Option<String>), Failure> {
+        let _slot = self.hashing.acquire().await.map_err(|e| {
+            Failure::Broken(CoreError::Keys(format!("vérification indisponible : {e}")))
+        })?;
+        blocking(move || {
+            let Some(stored) = stored else {
+                password::dummy_verify(&password);
+                return (false, None);
+            };
+            let ok = password::verify(&password, &stored).is_ok();
+            let rehash = (ok && stored.needs_rehash())
+                .then(|| password::hash(&password).ok())
+                .flatten()
+                .map(|p| p.encode());
+            (ok, rehash)
+        })
+        .await
+    }
+
+    /// Phase 1: the user and their password digest, read without a lock.
+    async fn read_digest(&self, name: &str) -> Result<(Option<Uuid>, Option<String>), Failure> {
+        let row = sqlx::query!(
+            r#"SELECT u.id::text AS "id!", c.password_hash AS "password_hash?"
+               FROM app_user u LEFT JOIN user_credential c ON c.user_id = u.id
+               WHERE u.name = $1"#,
+            name,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(row) => (Some(uuid(&row.id)?), row.password_hash),
+            None => (None, None),
+        })
+    }
+
     async fn decide(
         &self,
         request: LoginRequest,
@@ -224,11 +276,22 @@ impl PgAuthenticator {
             ttl_secs,
             ..
         } = request;
-        let mut tx = self.pool.begin().await?;
-        let Some((user, active)) = lock_user(&mut tx, &username).await? else {
-            blocking(move || password::dummy_verify(&password)).await?;
+        // Phase 1, no lock.
+        let (user, digest) = self.read_digest(&username).await?;
+        let stored = digest.as_deref().and_then(|d| PasswordHash::parse(d).ok());
+        let (password_ok, rehash) = self.derive(password, stored).await?;
+        let Some(user) = user else {
             return Err(Failure::Refused(Cause::UnknownUser, None));
         };
+
+        // Phase 2, the locks in the canonical order, everything checked again.
+        let mut tx = self.pool.begin().await?;
+        let Some((locked_user, active)) = lock_user(&mut tx, &username).await? else {
+            return Err(Failure::Refused(Cause::Changed, Some(user)));
+        };
+        if locked_user != user {
+            return Err(Failure::Refused(Cause::Changed, Some(user)));
+        }
         let row = sqlx::query!(
             r#"SELECT password_hash, totp_secret, totp_algorithm, totp_pending,
                       totp_last_step, failed_attempts, last_failure_at, locked_until
@@ -240,12 +303,12 @@ impl PgAuthenticator {
         .await?;
         let now = unix_now();
         let Some(row) = row else {
-            blocking(move || password::dummy_verify(&password)).await?;
             return Err(Failure::Refused(Cause::NotEnrolled, Some(user)));
         };
         let locked = row
             .locked_until
             .is_some_and(|t| u64::try_from(t).unwrap_or(0) > now);
+        let unchanged = row.password_hash == digest;
         let enrolled = enrolled(
             user,
             row.password_hash,
@@ -259,24 +322,17 @@ impl PgAuthenticator {
             Some(Cause::Disabled)
         } else if enrolled.is_none() {
             Some(Cause::NotEnrolled)
+        } else if !unchanged {
+            Some(Cause::Changed)
         } else {
             None
         };
-        let (Some((stored, sealed, algorithm)), None) = (enrolled, early) else {
-            blocking(move || password::dummy_verify(&password)).await?;
+        let (Some((_, sealed, algorithm)), None) = (enrolled, early) else {
             return Err(Failure::Refused(
                 early.unwrap_or(Cause::NotEnrolled),
                 Some(user),
             ));
         };
-        let (password_ok, password) = blocking(move || {
-            let ok = password::verify(&password, &stored).is_ok();
-            let rehash = (ok && stored.needs_rehash())
-                .then(|| password::hash(&password).ok())
-                .flatten();
-            (ok, rehash)
-        })
-        .await?;
         let last_step = u64::try_from(row.totp_last_step).unwrap_or(0);
         let checked = if password_ok {
             let secret = self.totp.open(user, algorithm, &sealed)?;
@@ -302,7 +358,7 @@ impl PgAuthenticator {
                 user,
                 public,
                 step,
-                rehash: password.map(|p| p.encode()),
+                rehash,
                 ttl_secs,
                 peer,
                 now,
@@ -593,9 +649,6 @@ impl Authenticator for PgAuthenticator {
             ));
         };
         let name = request.username.clone();
-        let Ok(_slot) = self.hashing.acquire().await else {
-            return Err(ApiError::unavailable());
-        };
         match self.decide(request, public, peer).await {
             Ok(response) => Ok(response),
             Err(Failure::Refused(cause, user)) => {

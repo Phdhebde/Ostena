@@ -463,6 +463,58 @@ fn failures_decay_after_the_lockout_window() {
     });
 }
 
+/// PBKDF2 runs against the digest read without a lock: a password changed
+/// while the row is held elsewhere is seen by the transaction, which
+/// refuses without counting a failure (the derivation was against the old
+/// digest).
+#[test]
+fn the_digest_is_checked_again_under_the_lock() {
+    block_on(async {
+        let Some(f) = fixture("the_digest_is_checked_again_under_the_lock").await else {
+            return;
+        };
+        let f = Arc::new(f);
+        // Another transaction holds the credential row and changes the
+        // password, not committed yet.
+        let mut change = f.pool.begin().await.unwrap();
+        let other = ostena_crypto::password::hash(&secret("an entirely new password"))
+            .unwrap()
+            .encode();
+        sqlx::query("UPDATE user_credential SET password_hash = $1")
+            .bind(other)
+            .execute(&mut *change)
+            .await
+            .unwrap();
+        let attempt = tokio::spawn({
+            let f = f.clone();
+            async move {
+                let key = SigningKey::generate().unwrap().0;
+                f.login("alice", PASSWORD, f.next_code(), &key).await
+            }
+        });
+        // The old password is derived without waiting for the row; the
+        // transaction then waits for it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        change.commit().await.unwrap();
+        assert_eq!(
+            attempt.await.unwrap().unwrap_err(),
+            ApiCode::InvalidCredentials
+        );
+        // Not a wrong password: nothing counted, no session.
+        assert_eq!(f.failures().await, (0, None));
+        let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM login_session")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+
+        let f = Arc::into_inner(f).unwrap();
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
 async fn alice(pool: &PgPool) -> ostena_tunnel::Uuid {
     let id: String = sqlx::query_scalar("SELECT id::text FROM app_user WHERE name = 'alice'")
         .fetch_one(pool)
