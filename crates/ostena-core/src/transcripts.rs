@@ -374,6 +374,10 @@ fn create(path: &Path) -> std::io::Result<File> {
 
 /// Syncs a directory (its entries). Not possible on Windows, where the
 /// metadata are journaled by NTFS.
+#[cfg_attr(
+    not(unix),
+    expect(clippy::unnecessary_wraps, reason = "fallible on Unix only")
+)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
