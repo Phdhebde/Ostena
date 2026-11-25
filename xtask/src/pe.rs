@@ -14,6 +14,33 @@ pub(crate) const FORBIDDEN: [&str; 6] = [
     "oleaut32.dll",
 ];
 
+/// API sets (contracts the loader redirects to a DLL) that resolve to one of
+/// the [`FORBIDDEN`] DLLs, by prefix: importing one statically loads the
+/// DLL behind it. Each prefix ends at a `-`, so that `api-ms-win-core-com-`
+/// does not catch `api-ms-win-core-comm-` (serial ports, kernelbase).
+pub(crate) const FORBIDDEN_API_SETS: [&str; 11] = [
+    // combase.dll
+    "api-ms-win-core-com-",
+    "api-ms-win-core-marshal-",
+    "api-ms-win-core-winrt-",
+    // ole32.dll, and the other COM contracts
+    "ext-ms-win-com-",
+    "ext-ms-win-ole32-",
+    // user32.dll
+    "ext-ms-win-ntuser-",
+    "ext-ms-win-rtcore-ntuser-",
+    "api-ms-win-rtcore-ntuser-",
+    // gdi32.dll
+    "ext-ms-win-gdi-",
+    "ext-ms-win-rtcore-gdi-",
+    "api-ms-win-gdi-",
+];
+
+/// A forbidden DLL, or an API set that resolves to one (`name` lower case).
+pub(crate) fn is_forbidden(name: &str) -> bool {
+    FORBIDDEN.contains(&name) || FORBIDDEN_API_SETS.iter().any(|p| name.starts_with(p))
+}
+
 /// The imports of an executable, lower case, in directory order.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Imports {
@@ -24,12 +51,13 @@ pub(crate) struct Imports {
 }
 
 impl Imports {
-    /// The forbidden DLLs among the static imports.
+    /// The forbidden DLLs, and API sets resolving to them, among the static
+    /// imports.
     pub(crate) fn forbidden(&self) -> Vec<&str> {
         self.static_dlls
             .iter()
             .map(String::as_str)
-            .filter(|d| FORBIDDEN.contains(d))
+            .filter(|d| is_forbidden(d))
             .collect()
     }
 }
@@ -293,6 +321,54 @@ mod tests {
             imports(&b).unwrap().forbidden(),
             ["oleaut32.dll", "user32.dll"]
         );
+    }
+
+    #[test]
+    fn finds_api_sets_of_forbidden_dlls() {
+        let b = synthetic(
+            &[
+                "kernel32.dll",
+                "api-ms-win-core-synch-l1-2-0.dll",
+                "api-ms-win-core-comm-l1-1-0.dll",
+                "API-MS-WIN-CORE-COM-L1-1-0.dll",
+                "ext-ms-win-ntuser-window-l1-1-0.dll",
+            ],
+            &["ext-ms-win-gdi-dc-l1-2-0.dll"],
+        );
+        // Delay-loaded: allowed, like the DLLs themselves.
+        assert_eq!(
+            imports(&b).unwrap().forbidden(),
+            [
+                "api-ms-win-core-com-l1-1-0.dll",
+                "ext-ms-win-ntuser-window-l1-1-0.dll"
+            ]
+        );
+        for name in [
+            "api-ms-win-core-com-midlproxystub-l1-1-0.dll",
+            "api-ms-win-core-marshal-l1-1-0.dll",
+            "api-ms-win-core-winrt-string-l1-1-0.dll",
+            "api-ms-win-core-winrt-error-l1-1-1.dll",
+            "ext-ms-win-com-ole32-l1-1-5.dll",
+            "ext-ms-win-ole32-bindctx-l1-1-0.dll",
+            "ext-ms-win-rtcore-ntuser-sysparams-l1-1-0.dll",
+            "api-ms-win-rtcore-ntuser-window-l1-1-0.dll",
+            "ext-ms-win-gdi-draw-l1-1-3.dll",
+            "ext-ms-win-rtcore-gdi-devcaps-l1-1-0.dll",
+            "user32.dll",
+        ] {
+            assert!(is_forbidden(name), "{name}");
+        }
+        for name in [
+            "api-ms-win-core-comm-l1-1-0.dll",
+            "api-ms-win-core-synch-l1-2-0.dll",
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            "ws2_32.dll",
+            "kernel32.dll",
+            "ntdll.dll",
+            "bcrypt.dll",
+        ] {
+            assert!(!is_forbidden(name), "{name}");
+        }
     }
 
     #[test]

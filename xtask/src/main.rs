@@ -444,7 +444,7 @@ fn compare(
         .modules
         .iter()
         .map(String::as_str)
-        .filter(|m| pe::FORBIDDEN.contains(m))
+        .filter(|m| pe::is_forbidden(m))
         .collect();
     if !forbidden.is_empty() {
         failures.push(format!(
@@ -779,8 +779,10 @@ fn check_windows_imports(path: &str, bytes: &[u8]) -> Result<()> {
         .into());
     }
     eprintln!(
-        "{path}: no GUI or COM DLL imported statically ({})",
-        pe::FORBIDDEN.join(", ")
+        "{path}: no GUI or COM DLL imported statically ({}), nor an API set resolving to \
+         one ({}*)",
+        pe::FORBIDDEN.join(", "),
+        pe::FORBIDDEN_API_SETS.join("*, ")
     );
     Ok(())
 }
