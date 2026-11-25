@@ -202,6 +202,29 @@ pub(crate) fn key_new(key_out: &Path, public_out: &Path) -> ExitCode {
     }
 }
 
+/// `ostena ca key new-mac`: the key of the keyed hash of the commands
+/// (ADR-0016), 32 random bytes in a new 0600 file, generated on the core.
+pub(crate) fn mac_key_new(out: &Path) -> ExitCode {
+    let result = (|| {
+        let key = ostena_crypto::hmac::HmacKey::generate().map_err(|e| e.to_string())?;
+        // SECRET-EXPOSURE: written once to a new 0600 file.
+        #[expect(clippy::disallowed_methods)]
+        create(out, key.expose_secret(), true)
+    })();
+    match result {
+        Ok(()) => {
+            let _ = writeln!(
+                io::stdout(),
+                "Clé d'empreinte des commandes : {} (ne quitte pas cette machine ; \
+                 core.ssh.command_mac_key)",
+                out.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
 fn open_root(dir: &Path) -> Result<RootAuthority, String> {
     let read =
         |f: &str| fs::read(dir.join(f)).map_err(|e| format!("{} : {e}", dir.join(f).display()));

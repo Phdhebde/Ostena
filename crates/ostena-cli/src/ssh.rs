@@ -130,7 +130,7 @@ impl Authorizer for TunnelAuthorizer {
                     if let Err(e) = recording::pump(frames, session.recording).await {
                         tracing::warn!(
                             event = "agent.transcript_lost",
-                            session_id = %session_id,
+                            session = %session_id,
                             code = e.code(),
                             "{e}"
                         );

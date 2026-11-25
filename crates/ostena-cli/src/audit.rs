@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ostena_audit::head::TEXT_PREFIX;
-use ostena_audit::{Head, Options, Report, Severity, TrustedKeys, verify_export};
+use ostena_audit::{Head, Options, Report, Severity, TrustedKeys, transcripts, verify_export};
 use ostena_crypto::pki;
 
 /// Exit code of a usage or input/output error.
@@ -22,6 +22,7 @@ pub(crate) struct VerifyArgs<'a> {
     pub(crate) export: &'a Path,
     pub(crate) keys: &'a [PathBuf],
     pub(crate) heads: &'a [String],
+    pub(crate) transcripts: Option<&'a Path>,
     pub(crate) json: bool,
     pub(crate) clock_tolerance_ms: u64,
     pub(crate) head_gap_tolerance_secs: u64,
@@ -70,8 +71,12 @@ fn run(args: &VerifyArgs<'_>) -> Result<Report, String> {
         clock_tolerance_ms: args.clock_tolerance_ms,
         head_gap_tolerance_secs: args.head_gap_tolerance_secs,
     };
-    verify_export(BufReader::new(file), keys, options)
-        .map_err(|e| format!("{} : {e}", args.export.display()))
+    let mut report = verify_export(BufReader::new(file), keys, options)
+        .map_err(|e| format!("{} : {e}", args.export.display()))?;
+    if let Some(dir) = args.transcripts {
+        transcripts::check(&mut report, dir).map_err(|e| e.to_string())?;
+    }
+    Ok(report)
 }
 
 /// A head given in its text form, or the file that holds it.
@@ -105,6 +110,9 @@ pub(crate) fn summary(export: &Path, report: &Report) -> String {
         report.heads,
         seq(report.covered_seq)
     );
+    if !report.transcripts.is_empty() {
+        let _ = writeln!(out, "Transcripts scellés : {}", report.transcripts.len());
+    }
     let _ = writeln!(
         out,
         "Constats : {} erreur(s), {} avertissement(s)",
@@ -148,6 +156,7 @@ pub(crate) fn json(export: &Path, report: &Report) -> String {
         "first_seq": report.first_seq,
         "last_seq": report.last_seq,
         "covered_seq": report.covered_seq,
+        "transcripts": report.transcripts.len(),
         "errors": report.errors,
         "warnings": report.warnings,
         "dropped": report.dropped(),

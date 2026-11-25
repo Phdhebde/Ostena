@@ -120,6 +120,72 @@ fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
 
+/// `--transcripts` (ADR-0016): the transcript sealed in the export is
+/// checked against the file; an altered file exits 1 with its code.
+#[test]
+fn transcripts_are_checked_against_their_seals() {
+    let dir = temp("transcripts");
+    let key = SigningKey::generate().unwrap().0;
+    let key_file = dir.join("audit.pub");
+    std::fs::write(&key_file, pki::encode_public_key(&key.verifying_key())).unwrap();
+    let content = b"{\"version\":2}\n";
+    let chain_id = ChainId::random().unwrap();
+    let mut tip = ChainTip::empty(chain_id);
+    let event = Event::new(
+        EventKind::TranscriptSealed,
+        Outcome::Success,
+        ActorKind::Agent,
+        "a",
+    )
+    .uuid(field::ACCESS_SESSION, [9; 16])
+    .bytes(field::SHA256, ostena_crypto::sha256::digest(content))
+    .u64(field::SIZE, content.len() as u64)
+    .bool(field::COMPLETE, true);
+    let appended = tip.append(event, T0 + 1000).unwrap();
+    let head = UnsignedHead::after(None, chain_id, tip.seq, tip.hash, T0 + 1001, 3600)
+        .sign(&key)
+        .unwrap();
+    let mut writer = ExportWriter::new(Vec::new(), chain_id, T0 + 2000, 1).unwrap();
+    writer.record(&appended.body).unwrap();
+    writer.head(&head).unwrap();
+    let export = dir.join("export.bin");
+    std::fs::write(&export, writer.finish().unwrap()).unwrap();
+    let transcripts = dir.join("transcripts");
+    std::fs::create_dir_all(&transcripts).unwrap();
+    let file = transcripts.join("09090909-0909-0909-0909-090909090909.cast");
+    std::fs::write(&file, content).unwrap();
+    let args = |t: &Path| {
+        ostena(&[
+            "audit",
+            "verify",
+            s(&export),
+            "--key",
+            s(&key_file),
+            "--transcripts",
+            s(t),
+        ])
+    };
+    let out = args(&transcripts);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("Transcripts scellés : 1"),
+        "{}",
+        stdout(&out)
+    );
+    std::fs::write(&file, b"{\"version\":3}\n").unwrap();
+    let out = args(&transcripts);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stdout(&out).contains("[AUD-E018]"), "{}", stdout(&out));
+    std::fs::remove_file(&file).unwrap();
+    let out = args(&transcripts);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stdout(&out).contains("[AUD-E017]"), "{}", stdout(&out));
+    // Without the option, the transcripts are not looked at.
+    let out = ostena(&["audit", "verify", s(&export), "--key", s(&key_file)]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn intact_export_exits_0() {
     let f = Fixture::new("intact", 4, &[2, 4]);
