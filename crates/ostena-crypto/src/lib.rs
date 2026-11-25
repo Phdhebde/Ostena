@@ -5,6 +5,9 @@
 //! fixed and never negotiated:
 //!
 //! - [`p256`] — ECDSA P-256 / SHA-256 signatures, with strict verification;
+//! - [`password`] — PBKDF2-HMAC-SHA256 password digests;
+//! - [`totp`] — one-time passwords (RFC 6238);
+//! - [`aead`] — AES-256-GCM encryption of small secrets at rest;
 //! - [`tls`] and [`pki`] — the tunnel TLS configurations and certificates;
 //! - [`sealed`] — sealing of the offline root key;
 //! - [`rand`] — operating system randomness;
@@ -13,13 +16,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aead;
 pub mod hkdf;
 pub mod p256;
+pub mod password;
 pub mod pki;
 pub mod rand;
 pub mod sealed;
 pub mod sha256;
 pub mod tls;
+pub mod totp;
 
 /// Errors raised by this crate. Deliberately coarse: callers must not be able
 /// to tell apart the reasons of a cryptographic failure.
@@ -40,6 +46,9 @@ pub enum CryptoError {
     /// The library failed to produce a signature.
     #[error("échec de la signature")]
     Signing,
+    /// A ciphertext does not open (wrong key, associated data or content).
+    #[error("déchiffrement impossible")]
+    Decrypt,
 }
 
 /// Compares two byte strings in constant time (for secrets: tokens, MACs).
