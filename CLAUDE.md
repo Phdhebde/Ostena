@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 > À placer à la racine du dépôt. Claude Code le lit automatiquement à chaque session.
-> Nom de travail : **Ostena** (pas encore validé, renommer avant toute ouverture publique coûte peu).
+> Nom : **Ostena**. Dépôt public : github.com/Phdhebde/Ostena, licence AGPL-3.0-or-later.
 
 ## Le projet
 
@@ -101,11 +101,11 @@ cargo xtask <tâche>        # build reproductible, SBOM, etc.
 - Langue : code, identifiants et messages de commit en anglais ; documentation, ADR et échanges en français.
 - Avant un changement non trivial : proposer un plan court, puis attendre validation.
 - Écrire les tests en même temps que le code, et les faire tourner avant de déclarer une tâche finie.
-- Petits commits, un sujet par commit. Ne jamais pousser sur `main` directement.
+- Petits commits, un sujet par commit, signés (`git commit -s`, DCO). PR vers `dev` ; ne jamais pousser sur `main` directement.
 - Signaler toute exigence ci-dessus qui semble impossible à tenir plutôt que de la contourner en silence.
 
 ## Confidentialité et propriété intellectuelle
 
-- Le dépôt est **privé** jusqu'à nouvel ordre. Ne rien publier, ne créer aucun dépôt public, paquet ou image publique.
+- Le dépôt est **public** (licence AGPL-3.0-or-later, fichier `LICENSE`). Tout ce qui est poussé, y compris les messages de commit, les branches et les descriptions de PR, est visible de tous. Ne publier aucun paquet, image ou version sans décision explicite du mainteneur.
 - Le code est écrit à partir des spécifications publiques (RFC, documentation Microsoft [MS-RDPBCGR], [MS-RDPEGFX], [MS-TSGU], etc.) et des bibliothèques open source citées. N'y introduire aucun code, document, test ou capture provenant d'un produit tiers ou d'un employeur, et ne pas les mentionner dans le code, les commentaires, les ADR ou les messages de commit.
-- Ne pas ajouter de fichier `LICENSE` tant que la licence n'est pas décidée (AGPLv3 envisagée).
+- Chaque crate déclare `license.workspace = true`. Les dépendances restent soumises à la liste de licences permissives de `deny.toml` : aucune dépendance sous copyleft fort (GPL, AGPL).
