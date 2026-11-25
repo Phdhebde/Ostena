@@ -85,6 +85,28 @@ fn an_exec_without_terminal_has_a_command_and_a_default_size() {
     );
 }
 
+/// The bidirectional format characters, which could make a command read
+/// as another, are escaped like the control characters.
+#[test]
+fn bidirectional_format_characters_are_escaped() {
+    let (_, text) = write(&[
+        start(
+            "",
+            Some("rm -rf /tmp/a\u{202e}gpj.\u{2066}x\u{200f}".as_bytes()),
+        ),
+        out(1, "a\u{061c}b\u{2069}".as_bytes()),
+        end(2),
+    ]);
+    assert!(text.contains("\"command\":\"rm -rf /tmp/a\\u202egpj.\\u2066x\\u200f\""));
+    assert!(text.contains("\"a\\u061cb\\u2069\""));
+    assert!(!text.chars().any(is_bidi_format));
+    let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        header["command"].as_str(),
+        Some("rm -rf /tmp/a\u{202e}gpj.\u{2066}x\u{200f}")
+    );
+}
+
 #[test]
 fn utf8_split_across_events_is_joined() {
     let euro = "€".as_bytes();
@@ -228,7 +250,7 @@ proptest! {
             count += 1;
         }
         prop_assert_eq!(count, sealed.events);
-        prop_assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        prop_assert!(!text.chars().any(|c| (c.is_control() && c != '\n') || is_bidi_format(c)));
         // The text shown is the lossy decoding of all the output joined.
         let all: Vec<u8> = frames
             .iter()

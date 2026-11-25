@@ -15,8 +15,14 @@
 //!   only holds the start of a sequence.
 //! - Strings are escaped so that the file holds no control character but
 //!   the line feeds between lines: C0, DEL and C1 are written `\uXXXX`
-//!   (escape sequences of the session included). The file can be shown
-//!   safely; a player renders the session.
+//!   (escape sequences of the session included), and so are the
+//!   bidirectional format characters (U+061C, U+200E, U+200F, U+202A to
+//!   U+202E, U+2066 to U+2069), which could make the command or the output
+//!   read differently from what they are. The file can be shown safely; a
+//!   player renders the session. A player that replays it in a real
+//!   terminal runs the escape sequences of the session in that terminal,
+//!   as the session did: replay untrusted transcripts in an isolated
+//!   player.
 
 use std::io::Write;
 
@@ -67,6 +73,23 @@ fn format_uuid(b: &[u8; 16]) -> String {
     s
 }
 
+/// A bidirectional format character: shown as is, it reorders the text
+/// around it.
+pub(crate) fn is_bidi_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn push_escaped(out: &mut String, c: char) {
+    let v = u32::from(c);
+    out.push_str("\\u");
+    for shift in [12, 8, 4, 0] {
+        out.push(char::from(b"0123456789abcdef"[(v >> shift) as usize & 0xf]));
+    }
+}
+
 /// Appends `text` as a JSON string.
 fn push_json_str(out: &mut String, text: &str) {
     out.push('"');
@@ -77,13 +100,9 @@ fn push_json_str(out: &mut String, text: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                // C0, DEL and C1: all below U+00A0, so four hex digits.
-                let v = u32::from(c);
-                out.push_str("\\u00");
-                out.push(char::from(b"0123456789abcdef"[(v >> 4) as usize & 0xf]));
-                out.push(char::from(b"0123456789abcdef"[v as usize & 0xf]));
-            }
+            // C0, DEL and C1, and the bidirectional format characters: all
+            // in the basic plane, so four hex digits.
+            c if c.is_control() || is_bidi_format(c) => push_escaped(out, c),
             c => out.push(c),
         }
     }

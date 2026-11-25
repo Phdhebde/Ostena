@@ -90,8 +90,10 @@ pub fn cast(data: &[u8]) {
     assert!(text.is_ok(), "the file is UTF-8");
     let text = text.unwrap_or_default();
     assert!(
-        !text.chars().any(|c| c.is_control() && c != '\n'),
-        "no control character in the file"
+        !text
+            .chars()
+            .any(|c| (c.is_control() && c != '\n') || crate::cast::is_bidi_format(c)),
+        "no control or bidirectional format character in the file"
     );
     assert!(file.is_empty() || file.ends_with(b"\n"));
     for (i, line) in text.lines().enumerate() {
