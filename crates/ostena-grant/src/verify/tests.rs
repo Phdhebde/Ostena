@@ -407,3 +407,15 @@ proptest! {
         let _ = f.verifier.check(&data, NOW);
     }
 }
+
+#[test]
+fn issue_grant_returns_what_it_signed() {
+    let f = fixture();
+    let (grant, signed) = f.issuer.issue_grant(&claims(), NOW).unwrap();
+    assert_eq!(f.verifier.check(signed.as_bytes(), NOW).unwrap(), grant);
+    assert_eq!(grant.kid, f.issuer.kid());
+    assert_eq!(
+        grant.expires_at - grant.issued_at,
+        u64::from(crate::DEFAULT_TTL_SECS)
+    );
+}
