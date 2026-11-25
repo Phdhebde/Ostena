@@ -757,25 +757,55 @@ impl Gateway {
             ));
         }
         let answer = self.request(&grant, verified).await?;
-        if answer.account.as_deref() != Some(access.account.as_str()) {
-            return Err(SessionError::Mismatch("compte"));
+        // The core opened the session: past here, a failure closes it there.
+        let opened = async {
+            if answer.account.as_deref() != Some(access.account.as_str()) {
+                return Err(SessionError::Mismatch("compte"));
+            }
+            let target_host_key = answer
+                .target_p256_public
+                .as_deref()
+                .and_then(|k| p256_point("target_p256_public", k).ok())
+                .ok_or(SessionError::Mismatch("clé d'hôte de la cible"))?;
+            let recording = self
+                .link
+                .open_channel(answer.session.session_id, crate::StreamClass::Recording)
+                .await
+                .map_err(SessionError::Tunnel)?;
+            Ok((target_host_key, recording))
         }
-        let target_host_key = answer
-            .target_p256_public
-            .as_deref()
-            .and_then(|k| p256_point("target_p256_public", k).ok())
-            .ok_or(SessionError::Mismatch("clé d'hôte de la cible"))?;
-        let recording = self
-            .link
-            .open_channel(answer.session.session_id, crate::StreamClass::Recording)
-            .await
-            .map_err(SessionError::Tunnel)?;
-        Ok(SshSession {
-            session: answer.session,
-            account: access.account.clone(),
-            target_host_key,
-            recording,
-        })
+        .await;
+        match opened {
+            Ok((target_host_key, recording)) => Ok(SshSession {
+                session: answer.session,
+                account: access.account.clone(),
+                target_host_key,
+                recording,
+            }),
+            Err(e) => {
+                self.abandon(answer.session.session_id, &e).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Reports to the core that session `session_id`, which it opened, ends
+    /// before it started (best effort: on a lost tunnel, the report is lost too).
+    async fn abandon(&self, session_id: Uuid, error: &SessionError) {
+        let message = AgentMessage::SessionClosed {
+            session_id: session_id.to_string(),
+            reason: format!("ouverture interrompue : {error}"),
+            bytes_to_target: 0,
+            bytes_from_target: 0,
+        };
+        if let Err(e) = self.link.send(&message).await {
+            tracing::warn!(
+                event = "agent.session_report_lost",
+                session = %session_id,
+                code = e.code(),
+                "bilan de session non transmis au core : {e}"
+            );
+        }
     }
 }
 

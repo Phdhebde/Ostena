@@ -298,6 +298,8 @@ struct State {
     /// Transcript streams received, by session, and whether each ended
     /// cleanly (finished by the agent).
     recordings: Mutex<HashMap<Uuid, (Vec<u8>, bool)>>,
+    /// Session reports received: session and reason.
+    closed: Mutex<Vec<(String, String)>>,
 }
 
 impl State {
@@ -311,6 +313,7 @@ impl State {
             errors: Mutex::default(),
             tunnels: Mutex::default(),
             recordings: Mutex::default(),
+            closed: Mutex::default(),
             grants: Grants {
                 issuer: Issuer::new(generate()?),
                 replay: MemoryReplayStore::new(),
@@ -801,6 +804,15 @@ impl TestCore {
             .unwrap_or_default()
     }
 
+    /// The session reports received (session, reason), oldest first.
+    pub fn sessions_closed(&self) -> Vec<(String, String)> {
+        self.state
+            .closed
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default()
+    }
+
     /// The SSH grants issued (text form), oldest first.
     pub fn ssh_grants(&self) -> Vec<String> {
         self.state
@@ -960,6 +972,14 @@ async fn control(
                 let group = registry.entry(&fingerprint).map(|e| e.group);
                 let reply = state.grants.ssh_grant(group, &request);
                 let _ = tunnel.send(&reply).await;
+                continue;
+            }
+            AgentMessage::SessionClosed {
+                session_id, reason, ..
+            } => {
+                if let Ok(mut closed) = state.closed.lock() {
+                    closed.push((session_id, reason));
+                }
                 continue;
             }
             AgentMessage::SshHostKey { p256_public, proof } => {

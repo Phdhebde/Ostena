@@ -386,6 +386,15 @@ fn a_grant_or_an_answer_that_does_not_match_the_access_is_refused() {
             .unwrap_err();
         assert_eq!(refused.code(), "TUN-E010");
         assert!(refused.to_string().contains("compte"), "{refused}");
+        // The core opened that session: the agent closes it there. The
+        // refusals before it opened nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while core.sessions_closed().is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let closed = core.sessions_closed();
+        assert_eq!(closed.len(), 1, "{closed:?}");
+        assert!(closed[0].1.contains("compte"), "{closed:?}");
 
         // A grant bound to another account (or login session): burned.
         let mut other_binding = SshResource::new("10.20.0.5", 22, target_key());
