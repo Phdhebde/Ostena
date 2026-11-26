@@ -1,8 +1,9 @@
 # ADR-0020 : Portail web et passerelle navigateur
 
-- **Statut** : Accepté pour les sections 2 (serveur web du core, hors WebSocket) et 3 (session navigateur), livrées par la PR 8a, et pour les trois arbitrages rendus par le responsable du projet le 2026-11-26 (amendement de l'ADR-0009). Proposé pour le reste (chaîne de build, passerelle, internationalisation, tests de bout en bout) : chaque partie passe à « Accepté » avec sa PR.
+- **Statut** : Accepté pour les sections 2 (serveur web du core ; la WebSocket `ostena-ws` avec la PR 8b) et 3 (session navigateur), livrées par les PR 8a et 8b, et pour les trois arbitrages rendus par le responsable du projet le 2026-11-26 (amendement de l'ADR-0009). Proposé pour le reste (chaîne de build, passerelle, internationalisation, tests de bout en bout) : chaque partie passe à « Accepté » avec sa PR.
 - **Date** : 2026-11-26
 - **Révision** : 2026-11-26, PR 8a : arbitrages consignés, détails de mise en œuvre (« Mise en œuvre de la PR 8a »)
+- **Révision** : 2026-11-26, PR 8b (1/2) : crate `ostena-ws` et module `ostena-crypto::websocket` (« Mise en œuvre de la PR 8b »)
 
 ## Contexte
 
@@ -313,7 +314,7 @@ Les codes sont réservés ici ; leur texte exact est fixé par la PR qui les int
 | `GTW-E002` | 400 | sous-protocole `ostena-frame.v1` absent, ou poignée de main WebSocket invalide |
 | `GTW-E003` | 503 | aucun agent du groupe joignable |
 | `GTW-E004` | — | navigateur trop lent (fermeture 4003) |
-| `GTW-E005` | — | message WebSocket invalide : texte, trop grand ou trame refusée (fermeture 1002 ou 1009) |
+| `GTW-E005` | — | message WebSocket invalide : texte (fermeture 1003), trop grand (1009), trame refusée (1002), raison de fermeture hors UTF-8 (1007) |
 
 **Événements** :
 - connexion : `login.succeeded`, `login.refused` et `login.locked`, avec le champ `channel` (`cli` ou `web`) ;
@@ -354,6 +355,20 @@ Les codes sont réservés ici ; leur texte exact est fixé par la PR qui les int
 **Tests.** Le test d'énumération et les tests de la CSRF tournent sur une mémoire de sessions en processus, qui implémente le même trait que PostgreSQL (`WebBackend`) : la décision sur la session est celle de l'écouteur, quelle que soit la mémoire. Des tests contre PostgreSQL couvrent le chemin réel (connexion, ré-authentification, inactivité, changement de source, révocation par un administrateur, désactivation du compte).
 
 **Coût mesuré** (`cargo bench -p ostena-core --bench web_request`, 2026-11-26, machine de développement, mémoire en processus) : un aller-retour `GET /api/v1/session` sur une connexion TLS persistante coûte 86 µs au p50 et 136 µs au p99, contre 77 µs et 127 µs pour la route publique `GET /api/v1/health`. L'authentification elle-même (cookie, recherche, décision, contrôles) ajoute donc environ 10 µs. La lecture dans PostgreSQL (une requête indexée par le SHA-256 du cookie) n'est pas comptée.
+
+### Mise en œuvre de la PR 8b
+
+La PR 8b est livrée en deux parties : le crate `ostena-ws` et le module `ostena-crypto::websocket` (1/2), puis la passerelle (2/2).
+
+**`ostena-ws`.** Un analyseur sans entrées-sorties (*sans-I/O*) : l'appelant remplit un tampon, `Parser::parse` rend le nombre d'octets lus et l'événement complété (message binaire, ping, pong, fermeture). Aucune dépendance, aucun runtime, `#![forbid(unsafe_code)]`.
+- **Poignée de main** (`handshake::check`) : `GET` en HTTP/1.1, `Upgrade: websocket`, jeton `upgrade` dans `Connection`, `Sec-WebSocket-Version: 13` présent une seule fois, `Sec-WebSocket-Key` présent une seule fois et égal à 16 octets en base64 canonique, sous-protocoles en jetons HTTP (4 au plus, 512 octets chacun). `Sec-WebSocket-Extensions` est ignoré : rien n'est jamais négocié. L'origine, la session et le grant restent à l'appelant.
+- **Trames** : masque exigé, bits réservés nuls, opcodes réservés refusés, longueur dans son encodage le plus court, trames de contrôle finales et de 125 octets au plus, suites seulement après un message commencé, aucun nouveau message avant la fin du précédent, rien après une fermeture. Le masque est retiré pendant la copie dans le tampon du message : une seule copie.
+- **Borne** : 32 Kio par message, vérifiée sur le champ de longueur **avant** la lecture de la charge : un client ne peut pas faire tamponner davantage au core.
+- **Codes de fermeture** : 1003 pour un message texte (la RFC le prévoit pour un type de données refusé, plutôt que 1002 annoncé plus haut), 1009 pour un message trop grand, 1007 pour une raison de fermeture hors UTF-8, 1002 pour le reste. Le tableau des codes est mis à jour.
+- **Côté client** : une fonctionnalité `client` (trames masquées, opcodes et bits quelconques pour forger ce que le serveur doit refuser) sert aux tests de la passerelle et à la cible de fuzz. Elle n'entre jamais dans le binaire.
+- **Tests** : vecteurs de la RFC 6455 (§ 5.7), chaque refus avec son code, tests de propriétés (messages fragmentés et pings mêlés, masque quelconque, lectures découpées au hasard : mêmes messages), cible de fuzz `ws_frame` (mêmes événements quel que soit le découpage des lectures, aucun message au-delà de la borne, poignée de main sur les mêmes octets), corpus rejoué par les tests stables.
+
+**`ostena-crypto::websocket`.** `accept_key` rend `base64(SHA-1(clé ‖ GUID))` par `SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs, et rien d'autre (ADR-0009, amendement du 2026-11-26). Le crate `sha1` reste refusé par `deny.toml`.
 
 ## Conséquences
 

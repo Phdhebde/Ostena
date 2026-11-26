@@ -11,6 +11,7 @@
 - **Révision** : 2026-11-26, écart RDP : cryptographie d'IronRDP et de `sspi` dans `ostena-rdp`, profil TLS 1.2 des cibles Windows, règle NTLM (amendement accepté, décision du responsable du projet, 2026-11-26)
 - **Révision** : 2026-11-26, portail web (ADR-0020) : groupes TLS de l'écouteur `core.web` et écart `X25519MLKEM768`, SHA-1 confiné à `Sec-WebSocket-Accept`, licence OFL-1.1 des polices embarquées (amendement accepté, décision du responsable du projet, 2026-11-26)
 - **Révision** : 2026-11-26, écart des annuaires LDAPS : profil TLS 1.3 à échange classique et certificats RSA, TLS 1.2 en option par source (amendement accepté, décision du responsable du projet, 2026-11-26, ADR-0021)
+- **Révision** : 2026-11-26, PR 8b : module `ostena-crypto::websocket` livré, seul usage de SHA-1 dans `ostena-crypto` hors TOTP
 
 ## Contexte
 
@@ -177,7 +178,7 @@ Un mot de passe est un secret de faible entropie, attaquable hors ligne si le co
 **Confinement.**
 - SHA-1 est exposé par `ostena-crypto` dans le seul module `websocket`, par la constante `SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs, sur le modèle du TOTP. Le module ne rend que la valeur de `Sec-WebSocket-Accept` ; il n'offre pas de hachage SHA-1 générique.
 - Le crate `sha1` reste refusé par `deny.toml`.
-- Le module arrive avec la passerelle navigateur (PR 8b) ; le RD Gateway (`ostena-tsgu`, transport WebSocket) le réutilisera.
+- Le module est livré par la PR 8b : `ostena_crypto::websocket::accept_key` rend la valeur pour la clé reçue, et rien d'autre ; son test vérifie l'exemple de la RFC 6455 (§ 1.3). Le crate `ostena-ws` ne fait que vérifier la forme de la clé (16 octets en base64) et ne dépend de rien. Le RD Gateway (`ostena-tsgu`, transport WebSocket) réutilisera ce module.
 
 #### SSH : la cryptographie de russh dans `ostena-ssh` (décidé le 2026-11-13)
 
