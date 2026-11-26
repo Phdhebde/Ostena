@@ -1,6 +1,6 @@
 # ADR-0019 : Driver RDP et passthrough vers le navigateur
 
-- **Statut** : Proposé. L'écart cryptographique propre à RDP et le profil TLS des cibles Windows sont décidés (amendement de l'ADR-0009 du 2026-11-26, PR 7). Restent à trancher : le stockage des mots de passe des comptes de ressource sur l'agent tant que le coffre-fort n'existe pas, et l'écart d'empreinte (voir « Points à trancher »).
+- **Statut** : Proposé. L'écart cryptographique propre à RDP et le profil TLS des cibles Windows sont décidés (amendement de l'ADR-0009 du 2026-11-26, PR 7). Restent à trancher : le stockage des mots de passe des comptes de ressource sur l'agent tant que le coffre-fort n'existe pas, et l'écart d'empreinte (voir « Points à trancher »). Mise en œuvre de la PR 7 : section 9.
 - **Date** : 2026-11-26
 
 ## Contexte
@@ -278,6 +278,44 @@ Comme russh pour SSH, IronRDP et `sspi` apportent leur propre cryptographie, et 
 - **Confinement** : ces crates ne sont dépendances que d'`ostena-rdp` (et, pour les PDU et les décodeurs d'image sans cryptographie, d'`ostena-web-client`). `deny.toml` les enveloppe comme celles de russh ; `des`, aujourd'hui interdite partout, n'est admise que par `picky` et `picky-krb`.
 - **Portée** : ces mécanismes ne protègent que le segment agent-cible, à l'intérieur de la TLS validée (section 3), et seulement parce que Windows les impose. Le secret des licences ne protège qu'une licence.
 - **TLS vers la cible** : le profil figé du tunnel (TLS 1.3, `SecP256r1MLKEM768` seul) est inapplicable aux cibles Windows, qui ne proposent pas ML-KEM et, pour 2016 et 2019, pas TLS 1.3 pour RDP. Profil proposé : TLS 1.3 quand la cible le propose, sinon TLS 1.2 avec *extended master secret* ; suites ECDHE avec AES-256-GCM seulement ; groupes P-256 et P-384 ; certificats RSA d'au moins 2048 bits ou ECDSA P-256. Cela demande la fonctionnalité `tls12` de rustls, dans `ostena-crypto` seulement, pour ce seul profil.
+
+### 9. Mise en œuvre (PR 7) : codes, événements et écarts
+
+**Codes et événements** (`ostena_rdp::RdpError`, stables) :
+
+| Code | Cas | Événement |
+|---|---|---|
+| `RDP-E001` | certificat refusé (empreinte, hors PKI), avant tout identifiant | `rdp.certificate_mismatch` |
+| `RDP-E002` | cible injoignable ou connexion fermée | `rdp.target_unreachable` |
+| `RDP-E003` | pas de NLA proposée | `rdp.target_refused` |
+| `RDP-E004` | négociation TLS impossible | `rdp.target_refused` |
+| `RDP-E005` | CredSSP refusé | `rdp.target_auth_failed` |
+| `RDP-E006` | Kerberos impossible (KDC absent, injoignable, refus) | `rdp.target_auth_failed` |
+| `RDP-E007` | CredSSP antérieur à la version 6 | `rdp.target_refused` |
+| `RDP-E008` | Restricted Admin exigé, non annoncé | `rdp.target_refused` |
+| `RDP-E009` | refus après CredSSP (*Early User Authorization*) | `rdp.target_auth_failed` |
+| `RDP-E010` | licence RDS refusée | `rdp.license_failed` |
+| `RDP-E011` | NTLM là où il n'est pas admis | `rdp.target_auth_failed` |
+| `RDP-E012` | séquence invalide | `rdp.target_refused` |
+| `RDP-E013` | redirection demandée | `rdp.target_refused` |
+| `RDP-E014` | fin de session avec un code d'erreur de la cible | `rdp.session_error` |
+| `RDP-E015` | délai d'établissement dépassé | `rdp.target_unreachable` |
+| `RDP-E016` | secret du compte illisible sur l'agent | `rdp.target_auth_failed` |
+| `RDP-E017` | `session_params` invalides | `rdp.params_refused` |
+| `RDP-E099` | panique d'une dépendance, session coupée | `rdp.internal_error` |
+
+Événements de succès : `rdp.connect_phases` (durée et allers-retours par phase : `tcp`, `x224`, `tls`, `credssp`, `mcs`, `licensing`, `activation`), `rdp.ntlm_used`, `rdp.profile_changed`.
+
+**Écarts et précisions par rapport aux sections 2 à 7**, constatés pendant la mise en œuvre :
+
+- **Mot de passe hors du connecteur** : le connecteur reçoit le nom du compte et un mot de passe vide ; seul CredSSP (piloté par l'agent) porte le secret. Le *Client Info PDU* ne contient donc jamais de mot de passe.
+- **Phase des licences** : la première PDU de licence peut arriver alors que le connecteur attend encore l'auto-détection de connexion ; la phase est donc déterminée par la PDU (`SEC_LICENSE_PKT`), pour la mesure comme pour la traduction d'erreur en `RDP-E010`.
+- **Mode `pki`** : le vérificateur exige l'usage `serverAuth`. Un certificat qui ne porterait que l'usage « Remote Desktop Authentication » (1.3.6.1.4.1.311.54.1.2) est refusé : les certificats émis par une autorité d'entreprise pour RDP portent en pratique les deux. À revoir si un client en présente un sans `serverAuth`.
+- **`certificate_validation = "none"`** n'est pas offert par le driver : le mode de développement utilise aussi une empreinte épinglée (lue sur la cible par le job Windows).
+- **Cache de TGT** : non réalisé, `sspi` 0.23.0 n'offrant pas d'API pour injecter ou récupérer un ticket (correctif amont proposé, `docs/notes/ironrdp-sspi-correctifs-amont.md`). Coût : deux allers-retours vers le KDC par session Kerberos.
+- **Une seule adresse tentée** : les paramètres d'authentification (et le secret) sont consommés par la tentative ; l'agent ne rejoue pas CredSSP sur une deuxième adresse de la même cible.
+- **Serveur de test** : CredSSP côté serveur en SPNEGO avec NTLM seulement. Kerberos de bout en bout reste à valider sur le laboratoire ; en CI, le refus de tout repli NTLM quand seul Kerberos est admis (REG-SEC-02) est vérifié contre ce serveur. Le chemin « nouvelle licence » n'est pas exercé (le serveur de test, comme une cible Windows sans rôle RDS, répond `STATUS_VALID_CLIENT`) ; la conservation et la présentation de la licence sont couvertes par des tests unitaires du cache.
+- **Désactivation-réactivation** : traitée par la boucle de session (séquence d'activation du connecteur rejouée), sans test de bout en bout à ce stade.
 
 ## Conséquences
 
