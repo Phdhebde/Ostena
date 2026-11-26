@@ -2232,6 +2232,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostena-ws"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "p256"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
