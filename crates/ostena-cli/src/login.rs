@@ -14,7 +14,8 @@
 //! - `id_ecdsa`, `id_ecdsa.pub`, `id_ecdsa-cert.pub`: the key and the
 //!   certificate of the session;
 //! - `known_hosts`: the `@cert-authority` line of the bastion hosts;
-//! - `ssh_config`: a fragment to include from `~/.ssh/config`.
+//! - `ssh_config`: a fragment to include from `~/.ssh/config`; it includes
+//!   `ssh_hosts`, the aliases written by `ostena config ssh` (`hosts`).
 //!
 //! `ostena logout` closes the session on the core with a request signed by
 //! the session key, then deletes the key and the certificate.
@@ -55,6 +56,10 @@ const PUBLIC: &str = "id_ecdsa.pub";
 const CERTIFICATE: &str = "id_ecdsa-cert.pub";
 const KNOWN_HOSTS: &str = "known_hosts";
 const SSH_CONFIG: &str = "ssh_config";
+const SSH_HOSTS: &str = "ssh_hosts";
+
+mod hosts;
+pub(crate) use hosts::config_ssh;
 
 /// Why `ostena login` or `ostena logout` fails. Codes are stable.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -244,6 +249,7 @@ async fn post(
     root: &TrustAnchor,
     path: &str,
     body: Bytes,
+    max_answer: usize,
 ) -> Result<(StatusCode, Vec<u8>), LoginError> {
     let (host, port) = split_address(core)?;
     let unreachable = |what: String| LoginError::Unreachable(format!("{core} : {what}"));
@@ -302,8 +308,11 @@ async fn post(
         while let Some(frame) = incoming.frame().await {
             let frame = frame.map_err(|e| unreachable(e.to_string()))?;
             if let Ok(data) = frame.into_data() {
-                if out.len() + data.len() > login::MAX_BODY {
-                    return Err(LoginError::Response("réponse de plus de 16 Kio".into()));
+                if out.len() + data.len() > max_answer {
+                    return Err(LoginError::Response(format!(
+                        "réponse de plus de {} Kio",
+                        max_answer / 1024
+                    )));
                 }
                 out.extend_from_slice(&data);
             }
@@ -486,12 +495,28 @@ pub(crate) fn quoted(path: &Path) -> Result<String, LoginError> {
 /// a separate identity, and its key, a plain `ecdsa-sha2-nistp256` key, is
 /// dropped by `PubkeyAcceptedAlgorithms` (certificates only): the client
 /// would then offer the certificate without its private key and fail.
+///
+/// It first includes `ssh_hosts`, the aliases of `ostena config ssh`, if
+/// any (OpenSSH ignores an `Include` that matches no file).
 pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> Result<String, LoginError> {
     Ok(format!(
         "# Écrit par ostena login, réécrit à chaque connexion.\n\
          # Session {session}, valable jusqu'au {until}.\n\
+         Include {aliases}\n\
          Host {hosts}\n\
-         \x20   Port {port}\n\
+         {options}",
+        session = response.login_session,
+        until = utc_text(response.valid_before),
+        aliases = quoted(&dir.join(SSH_HOSTS))?,
+        hosts = response.ssh_hosts.join(" "),
+        options = options(dir, response.ssh_port)?,
+    ))
+}
+
+/// The options of a bastion `Host` block, indented.
+fn options(dir: &Path, port: u16) -> Result<String, LoginError> {
+    Ok(format!(
+        "\x20   Port {port}\n\
          \x20   IdentityFile {key}\n\
          \x20   IdentitiesOnly yes\n\
          \x20   IdentityAgent none\n\
@@ -505,10 +530,6 @@ pub(crate) fn ssh_config(dir: &Path, response: &LoginResponse) -> Result<String,
          \x20   ForwardAgent no\n\
          \x20   ForwardX11 no\n\
          \x20   ClearAllForwardings yes\n",
-        session = response.login_session,
-        until = utc_text(response.valid_before),
-        hosts = response.ssh_hosts.join(" "),
-        port = response.ssh_port,
         key = quoted(&dir.join(KEY))?,
         known = quoted(&dir.join(KNOWN_HOSTS))?,
     ))
@@ -575,7 +596,14 @@ pub(crate) async fn login_with(
         zeroize::Zeroize::zeroize(&mut body);
         return Err(LoginError::Usage(e.to_string()));
     }
-    let (status, answer) = post(&settings.core, &root, LOGIN_PATH, wiped_body(body)).await?;
+    let (status, answer) = post(
+        &settings.core,
+        &root,
+        LOGIN_PATH,
+        wiped_body(body),
+        login::MAX_BODY,
+    )
+    .await?;
     if status != StatusCode::OK {
         return Err(refusal(status, &answer));
     }
@@ -751,11 +779,18 @@ pub(crate) async fn logout_in(dir: &Path) -> Result<String, LoginError> {
     };
     let body = serde_json::to_vec(&request).map_err(|e| LoginError::Usage(e.to_string()))?;
     // No secret in a logout: signed, bound to its session and its time.
-    let (status, answer) = post(&settings.core, &root, LOGOUT_PATH, Bytes::from(body)).await?;
+    let (status, answer) = post(
+        &settings.core,
+        &root,
+        LOGOUT_PATH,
+        Bytes::from(body),
+        login::MAX_BODY,
+    )
+    .await?;
     if status != StatusCode::NO_CONTENT {
         return Err(refusal(status, &answer));
     }
-    for name in [KEY, PUBLIC, CERTIFICATE] {
+    for name in [KEY, PUBLIC, CERTIFICATE, SSH_HOSTS] {
         let path = dir.join(name);
         if let Err(e) = fs::remove_file(&path)
             && e.kind() != io::ErrorKind::NotFound

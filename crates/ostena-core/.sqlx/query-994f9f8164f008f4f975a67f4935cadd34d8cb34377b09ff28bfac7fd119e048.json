@@ -1,0 +1,61 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.name AS \"resource!\", a.name AS \"account!\",\n                      g.ssh_host_names AS \"hosts!\", max(ar.valid_until) AS \"valid_until!\"\n               FROM access_right ar\n               JOIN target_account a ON a.id = ar.account_id\n               JOIN resource r ON r.id = a.resource_id\n               JOIN gateway_group g ON g.id = r.gateway_group\n               WHERE ar.user_id = $1::text::uuid AND ar.protocol = 'ssh'\n                 AND ar.revoked_at IS NULL AND ar.valid_from <= $2 AND ar.valid_until > $2\n                 AND a.disabled_at IS NULL AND r.disabled_at IS NULL\n               GROUP BY r.name, a.name, g.ssh_host_names\n               ORDER BY r.name COLLATE \"C\", a.name COLLATE \"C\"\n               LIMIT $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "resource!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "resource",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "account!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "target_account",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "hosts!",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "gateway_group",
+            "name": "ssh_host_names"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "valid_until!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "994f9f8164f008f4f975a67f4935cadd34d8cb34377b09ff28bfac7fd119e048"
+}

@@ -20,7 +20,9 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use common::{TestDb, block_on};
-use ostena_common::api::login::{LoginRequest, LoginResponse, LogoutRequest, logout_message};
+use ostena_common::api::login::{
+    LoginRequest, LoginResponse, LogoutRequest, SshHostsRequest, logout_message, ssh_hosts_message,
+};
 use ostena_common::config::CoreLoginConfig;
 use ostena_common::secret::{SecretBytes, SecretString};
 use ostena_core::api::{ApiCode, Authenticator};
@@ -902,6 +904,143 @@ fn logout_is_signed_by_the_session_key() {
         assert_eq!(by, format!("user:{}", response.user));
         assert_eq!(reason, "ostena logout");
         assert_eq!(audit_count(&f.pool, "login_session.revoked").await, 1);
+
+        drop(f.authenticator);
+        f.pool.close().await;
+        f.db.drop_database().await;
+    });
+}
+
+fn hosts_request(response: &LoginResponse, key: &SigningKey, issued_at: u64) -> SshHostsRequest {
+    SshHostsRequest {
+        protocol: 1,
+        login_session: response.login_session.clone(),
+        certificate: response.certificate.clone(),
+        issued_at,
+        signature: URL_SAFE_NO_PAD.encode(
+            key.sign(&ssh_hosts_message(&response.login_session, issued_at))
+                .unwrap()
+                .to_bytes(),
+        ),
+    }
+}
+
+/// `ostena config ssh`: the valid rights of the user, through a bastion
+/// host name the `known_hosts` of the login trusts; signed by the session
+/// key for a listing (a logout signature is refused); nothing once the
+/// session is closed.
+#[test]
+fn ssh_hosts_lists_the_valid_rights_of_the_session_user() {
+    block_on(async {
+        let Some(f) = fixture("ssh_hosts_lists_the_valid_rights").await else {
+            return;
+        };
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        // `bastion.lab` is the pattern of [core.login] (settings()).
+        inventory::create_group(&f.pool, None, "lab", &names(&["gw.other", "bastion.lab"]))
+            .await
+            .unwrap();
+        inventory::create_group(&f.pool, None, "far", &names(&["gw.far"]))
+            .await
+            .unwrap();
+        let target = SigningKey::generate().unwrap().0.verifying_key();
+        for (resource, group) in [("srv-b", "lab"), ("srv-a", "lab"), ("srv-far", "far")] {
+            inventory::add_resource(&f.pool, resource, "10.0.0.5", 22, group, &target)
+                .await
+                .unwrap();
+        }
+        for (resource, account) in [
+            ("srv-a", "root"),
+            ("srv-a", "admin"),
+            ("srv-b", "root"),
+            ("srv-far", "root"),
+        ] {
+            inventory::add_account(&f.pool, resource, account)
+                .await
+                .unwrap();
+        }
+        let until = now() + 86_400;
+        for (resource, account, days) in [
+            ("srv-a", "root", 1),
+            ("srv-a", "root", 2),
+            ("srv-a", "admin", 1),
+            ("srv-b", "root", 1),
+            ("srv-far", "root", 1),
+        ] {
+            inventory::grant_right(
+                &f.pool,
+                "alice",
+                resource,
+                account,
+                now() + 86_400 * days,
+                3600,
+            )
+            .await
+            .unwrap();
+        }
+        let revoked = inventory::grant_right(&f.pool, "alice", "srv-b", "root", until, 3600)
+            .await
+            .unwrap();
+        inventory::revoke_right(&f.pool, revoked).await.unwrap();
+
+        let key = SigningKey::generate().unwrap().0;
+        let response = f
+            .login("alice", PASSWORD, f.next_code(), &key)
+            .await
+            .unwrap();
+        let listed = f
+            .authenticator
+            .ssh_hosts(hosts_request(&response, &key, now()), peer())
+            .await
+            .unwrap();
+        let got: Vec<(&str, &str, &str)> = listed
+            .accesses
+            .iter()
+            .map(|a| (a.resource.as_str(), a.account.as_str(), a.host.as_str()))
+            .collect();
+        // Sorted, each pair once (the longest right), only through a
+        // trusted host name: the group `far` has none.
+        assert_eq!(
+            got,
+            [
+                ("srv-a", "admin", "bastion.lab"),
+                ("srv-a", "root", "bastion.lab"),
+                ("srv-b", "root", "bastion.lab"),
+            ]
+        );
+        assert!(listed.accesses[1].valid_until > listed.accesses[0].valid_until);
+        // Nothing listed is invalid for the client parser.
+        let body = serde_json::to_vec(&listed).unwrap();
+        assert_eq!(
+            ostena_common::api::login::SshHostsResponse::parse(&body).unwrap(),
+            listed
+        );
+
+        // A logout signature does not list, nor another key.
+        let mut as_logout = hosts_request(&response, &key, now());
+        as_logout.signature = logout_request(&response, &key, as_logout.issued_at).signature;
+        let other = SigningKey::generate().unwrap().0;
+        for request in [as_logout, hosts_request(&response, &other, now())] {
+            assert_eq!(
+                f.authenticator
+                    .ssh_hosts(request, peer())
+                    .await
+                    .unwrap_err()
+                    .code,
+                ApiCode::InvalidCredentials
+            );
+        }
+        // Closed session: refused.
+        f.authenticator
+            .logout(logout_request(&response, &key, now()), peer())
+            .await
+            .unwrap();
+        assert!(
+            f.authenticator
+                .ssh_hosts(hosts_request(&response, &key, now()), peer())
+                .await
+                .is_err()
+        );
 
         drop(f.authenticator);
         f.pool.close().await;

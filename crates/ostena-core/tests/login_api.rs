@@ -17,6 +17,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use ostena_common::api::login::{
     ErrorResponse, LOGIN_PATH, LOGOUT_PATH, LoginRequest, LoginResponse, LogoutRequest,
+    SshHostsRequest, SshHostsResponse,
 };
 use ostena_core::api::{ApiError, Authenticator, Limits, LoginListener};
 use ostena_crypto::pki::testing::TestPki;
@@ -75,6 +76,22 @@ impl Authenticator for Stub {
     async fn logout(&self, request: LogoutRequest, _peer: SocketAddr) -> Result<(), ApiError> {
         self.logouts.lock().unwrap().push(request.login_session);
         Ok(())
+    }
+
+    async fn ssh_hosts(
+        &self,
+        request: SshHostsRequest,
+        _peer: SocketAddr,
+    ) -> Result<SshHostsResponse, ApiError> {
+        self.logouts
+            .lock()
+            .unwrap()
+            .push(format!("hosts {}", request.login_session));
+        Ok(SshHostsResponse {
+            protocol: 1,
+            ssh_port: 2222,
+            accesses: Vec::new(),
+        })
     }
 }
 

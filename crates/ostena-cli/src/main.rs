@@ -75,6 +75,24 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Client configuration from the open session (administrator
+    /// workstation).
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+/// `ostena config`.
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Write `Host` aliases for the SSH accesses held now (`~/.ostena/ssh_hosts`,
+    /// included by the fragment of `ostena login`).
+    Ssh {
+        /// The directory of the session files, ~/.ostena by default.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 /// `ostena login`.
@@ -916,6 +934,9 @@ fn main() -> ExitCode {
         Some(Command::Audit { command }) => run_audit(command),
         Some(Command::Login(args)) => login::login(&args.into()),
         Some(Command::Logout { dir }) => login::logout(dir.as_deref()),
+        Some(Command::Config {
+            command: ConfigCommand::Ssh { dir },
+        }) => login::config_ssh(dir.as_deref()),
         Some(Command::Release { command }) => run_release(command),
         #[cfg(target_os = "linux")]
         Some(Command::Core { command }) => run_core(command),

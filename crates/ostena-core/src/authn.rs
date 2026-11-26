@@ -32,7 +32,9 @@
 //! protective, in the transaction that counts the failure or reads the
 //! account, for a known account; best effort for an unknown name, which
 //! has no row to lock. A logout is a revocation by the user of their own
-//! session, signed by the session key (`login_session.revoked`).
+//! session, signed by the session key (`login_session.revoked`). A listing
+//! of the SSH accesses (`ostena config ssh`) is signed the same way, under
+//! another domain, and reads only.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,7 +43,9 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
-use ostena_common::api::login::{self, LoginRequest, LoginResponse, LogoutRequest};
+use ostena_common::api::login::{
+    self, LoginRequest, LoginResponse, LogoutRequest, SshAccess, SshHostsRequest, SshHostsResponse,
+};
 use ostena_common::config::CoreLoginConfig;
 use ostena_common::secret::SecretString;
 use ostena_crypto::p256::{Signature, VerifyingKey};
@@ -619,7 +623,15 @@ impl PgAuthenticator {
         })
     }
 
-    async fn revoke(&self, request: &LogoutRequest) -> Result<(), Failure> {
+    /// Checks a request signed by a session key over `message`: the
+    /// certificate of the user authority, the session it names, the
+    /// signature, the time. Returns the session, its user and the SHA-256
+    /// of the certificate.
+    fn signed(
+        &self,
+        request: &LogoutRequest,
+        message: &[u8],
+    ) -> Result<(Uuid, Uuid, [u8; 32]), Failure> {
         let refused = || Failure::Refused(Cause::UnknownUser, None);
         let blob = request
             .certificate
@@ -647,15 +659,19 @@ impl PgAuthenticator {
             .ok_or_else(refused)?;
         parsed
             .public
-            .verify(
-                &login::logout_message(&request.login_session, request.issued_at),
-                &Signature::from_bytes(&signature),
-            )
+            .verify(message, &Signature::from_bytes(&signature))
             .map_err(|_| Failure::Refused(Cause::Code, Some(subject)))?;
         if request.issued_at.abs_diff(unix_now()) > login::LOGOUT_SKEW_SECS {
             return Err(Failure::Refused(Cause::Replayed, Some(subject)));
         }
-        let sha256 = ostena_crypto::sha256::digest(&blob);
+        Ok((session, subject, ostena_crypto::sha256::digest(&blob)))
+    }
+
+    async fn revoke(&self, request: &LogoutRequest) -> Result<(), Failure> {
+        let (session, subject, sha256) = self.signed(
+            request,
+            &login::logout_message(&request.login_session, request.issued_at),
+        )?;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query!(
             r#"UPDATE login_session
@@ -706,6 +722,82 @@ impl PgAuthenticator {
         Ok(())
     }
 
+    /// The SSH accesses of the user of a signed listing request: every
+    /// valid right of an active user, on an enabled account of an enabled
+    /// resource, while the session is valid. Reads only.
+    async fn list_hosts(&self, request: &SshHostsRequest) -> Result<SshHostsResponse, Failure> {
+        let (session, subject, sha256) = self.signed(
+            request,
+            &login::ssh_hosts_message(&request.login_session, request.issued_at),
+        )?;
+        let now = unix_now();
+        let mut tx = self.pool.begin().await?;
+        let valid = sqlx::query_scalar!(
+            r#"SELECT true AS "valid!" FROM login_session s JOIN app_user u ON u.id = s.user_id
+               WHERE s.id = $1::text::uuid AND s.certificate_sha256 = $2
+                 AND s.user_id = $3::text::uuid AND s.revoked_at IS NULL
+                 AND s.expires_at > $4 AND u.state = 'active'"#,
+            session.to_string(),
+            &sha256[..],
+            subject.to_string(),
+            i64_of(now),
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if valid.is_none() {
+            return Err(Failure::Refused(Cause::UnknownUser, Some(subject)));
+        }
+        let rows = sqlx::query!(
+            r#"SELECT r.name AS "resource!", a.name AS "account!",
+                      g.ssh_host_names AS "hosts!", max(ar.valid_until) AS "valid_until!"
+               FROM access_right ar
+               JOIN target_account a ON a.id = ar.account_id
+               JOIN resource r ON r.id = a.resource_id
+               JOIN gateway_group g ON g.id = r.gateway_group
+               WHERE ar.user_id = $1::text::uuid AND ar.protocol = 'ssh'
+                 AND ar.revoked_at IS NULL AND ar.valid_from <= $2 AND ar.valid_until > $2
+                 AND a.disabled_at IS NULL AND r.disabled_at IS NULL
+               GROUP BY r.name, a.name, g.ssh_host_names
+               ORDER BY r.name COLLATE "C", a.name COLLATE "C"
+               LIMIT $3"#,
+            subject.to_string(),
+            i64_of(now),
+            i64::try_from(login::MAX_SSH_ACCESSES).unwrap_or(i64::MAX) + 1,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let total = rows.len();
+        let accesses: Vec<SshAccess> = rows
+            .into_iter()
+            .take(login::MAX_SSH_ACCESSES)
+            .filter_map(|row| {
+                let host = bastion_host(&row.hosts, &self.settings.ssh_hosts)?;
+                (login::is_resource(&row.resource) && login::is_account(&row.account)).then(|| {
+                    SshAccess {
+                        resource: row.resource,
+                        account: row.account,
+                        host: host.to_owned(),
+                        valid_until: u64::try_from(row.valid_until).unwrap_or(0),
+                    }
+                })
+            })
+            .collect();
+        tracing::info!(
+            event = "login.ssh_hosts_listed",
+            login_session = %session,
+            user = %subject,
+            accesses = accesses.len(),
+            omitted = total - accesses.len(),
+            "accès SSH listés pour ostena config ssh"
+        );
+        Ok(SshHostsResponse {
+            protocol: login::PROTOCOL,
+            ssh_port: self.settings.ssh_port,
+            accesses,
+        })
+    }
+
     /// Logs a refusal; writes `login.refused` (best effort) unless the
     /// transaction already did.
     fn refused(
@@ -742,6 +834,33 @@ struct Success {
 fn broken(e: &CoreError) -> ApiError {
     tracing::error!(event = "login.unavailable", code = e.code(), "{e}");
     ApiError::unavailable()
+}
+
+/// Whether `name` matches the `ssh_config` `pattern` (`*` any run, `?` one
+/// character), as OpenSSH compares host names: ASCII, case-insensitive.
+fn host_matches(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some((b'*', rest)) => (0..=name.len()).any(|i| host_matches(rest, &name[i..])),
+        Some((p, rest)) => name.split_first().is_some_and(|(n, tail)| {
+            (*p == b'?' || p.eq_ignore_ascii_case(n)) && host_matches(rest, tail)
+        }),
+    }
+}
+
+/// The bastion host to reach a resource through: the first host name of
+/// its group, without wildcard, that the patterns of `[core.login]` cover
+/// (the `known_hosts` line written by `ostena login` trusts only those).
+fn bastion_host<'a>(group_names: &'a [String], patterns: &[String]) -> Option<&'a str> {
+    group_names
+        .iter()
+        .filter(|n| login::is_host_pattern(n) && !n.contains(['*', '?']))
+        .find(|n| {
+            patterns
+                .iter()
+                .any(|p| host_matches(p.as_bytes(), n.as_bytes()))
+        })
+        .map(String::as_str)
 }
 
 impl Authenticator for PgAuthenticator {
@@ -788,5 +907,65 @@ impl Authenticator for PgAuthenticator {
             "déconnexion refusée"
         );
         Err(self.invalid_credentials(start).await)
+    }
+
+    async fn ssh_hosts(
+        &self,
+        request: SshHostsRequest,
+        peer: SocketAddr,
+    ) -> Result<SshHostsResponse, ApiError> {
+        let start = tokio::time::Instant::now();
+        let (cause, user) = match self.list_hosts(&request).await {
+            Ok(response) => return Ok(response),
+            Err(Failure::Broken(e)) => return Err(broken(&e)),
+            Err(Failure::Refused(cause, user)) => (cause, user),
+            Err(Failure::Recorded(cause, user)) => (cause, Some(user)),
+        };
+        tracing::info!(
+            event = "login.ssh_hosts_refused",
+            user = ?user.map(|u| u.to_string()),
+            reason = cause.as_str(),
+            client_addr = %peer,
+            "liste des accès SSH refusée"
+        );
+        Err(self.invalid_credentials(start).await)
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::{bastion_host, host_matches};
+
+    #[test]
+    fn host_patterns_match_as_openssh() {
+        for (pattern, name, expected) in [
+            ("bastion.corp", "bastion.corp", true),
+            ("bastion.corp", "BASTION.corp", true),
+            ("*.corp", "bastion.corp", true),
+            ("*.corp", "corp", false),
+            ("bastion?.corp", "bastion1.corp", true),
+            ("bastion?.corp", "bastion.corp", false),
+            ("b*n*.corp", "bastion.corp", true),
+            ("bastion", "bastion.corp", false),
+        ] {
+            assert_eq!(
+                host_matches(pattern.as_bytes(), name.as_bytes()),
+                expected,
+                "{pattern} {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bastion_host_is_a_covered_name_of_the_group() {
+        let names = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let group = names(&["gw*.corp", "gw1.other", "gw1.corp"]);
+        assert_eq!(bastion_host(&group, &names(&["*.corp"])), Some("gw1.corp"));
+        assert_eq!(
+            bastion_host(&group, &names(&["gw1.other"])),
+            Some("gw1.other")
+        );
+        assert_eq!(bastion_host(&group, &names(&["*.example"])), None);
+        assert_eq!(bastion_host(&[], &names(&["*.corp"])), None);
     }
 }

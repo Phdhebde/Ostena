@@ -245,6 +245,7 @@ mod against_the_listener {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
+    use ostena_common::api::login::{SshAccess, SshHostsRequest, SshHostsResponse};
     use ostena_core::api::{ApiError, Authenticator, Limits, LoginListener};
     use ostena_crypto::p256::{Signature, SigningKey, VerifyingKey};
     use ostena_crypto::pki::{pem_certificate, testing::TestPki};
@@ -350,6 +351,41 @@ mod against_the_listener {
                 .map_err(|_| ApiError::invalid_credentials())?;
             self.logged_out.lock().unwrap().push(request.login_session);
             Ok(())
+        }
+
+        async fn ssh_hosts(
+            &self,
+            request: SshHostsRequest,
+            _peer: SocketAddr,
+        ) -> Result<SshHostsResponse, ApiError> {
+            let public = self.public.lock().unwrap().unwrap();
+            let signature: [u8; 64] = URL_SAFE_NO_PAD
+                .decode(&request.signature)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            // Signed for a listing, not for a logout.
+            public
+                .verify(
+                    &login::ssh_hosts_message(&request.login_session, request.issued_at),
+                    &Signature::from_bytes(&signature),
+                )
+                .map_err(|_| ApiError::invalid_credentials())?;
+            let access = |resource: &str, account: &str| SshAccess {
+                resource: resource.into(),
+                account: account.into(),
+                host: "bastion.test".into(),
+                valid_until: 1_900_000_000,
+            };
+            Ok(SshHostsResponse {
+                protocol: login::PROTOCOL,
+                ssh_port: 2222,
+                accesses: vec![
+                    access("db01", "DOM\\svc ops"),
+                    access("db01", "postgres"),
+                    access("srv-lab01", "root"),
+                ],
+            })
         }
     }
 
@@ -580,6 +616,62 @@ mod against_the_listener {
                     .any(|l| l == format!("identityfile {}", key.display())),
                 "{config}"
             );
+            f.listener.close();
+        });
+    }
+
+    /// `ostena config ssh` writes the aliases, OpenSSH resolves them to
+    /// the bastion with the account and the options of the session, and
+    /// `ostena logout` removes them.
+    #[test]
+    fn config_ssh_writes_aliases_that_openssh_resolves() {
+        runtime().block_on(async {
+            let f = Fixture::start("aliases").await;
+            login_with(&f.options(), secret("good"), secret("123456"))
+                .await
+                .unwrap();
+            let dir = f.dir();
+            let written = hosts::config_ssh_in(&dir).await.unwrap();
+            assert_eq!(written.written, 2);
+            assert_eq!(written.skipped, ["DOM\\svc ops@db01"]);
+            #[cfg(unix)]
+            assert_eq!(mode_of(&dir.join(SSH_HOSTS)), 0o600);
+            let text = fs::read_to_string(dir.join(SSH_HOSTS)).unwrap();
+            // The only account of a resource gets the resource as alias too;
+            // an account among several gets only `account.resource`.
+            assert!(text.contains("Host srv-lab01 root.srv-lab01\n"), "{text}");
+            assert!(text.contains("Host postgres.db01\n"), "{text}");
+            assert!(!text.contains("Host db01"), "{text}");
+            assert!(!text.contains("svc"), "{text}");
+            if let Some(mut ssh) = openssh("ssh") {
+                let config = stdout(
+                    ssh.arg("-G")
+                        .arg("-F")
+                        .arg(dir.join(SSH_CONFIG))
+                        .arg("srv-lab01"),
+                );
+                for line in [
+                    "hostname bastion.test",
+                    "user root@srv-lab01",
+                    "port 2222",
+                    "stricthostkeychecking true",
+                    "forwardagent no",
+                    "kexalgorithms ecdh-sha2-nistp256",
+                ] {
+                    assert!(config.lines().any(|l| l == line), "{line}\n{config}");
+                }
+                let known = dir.join(KNOWN_HOSTS);
+                assert!(
+                    config
+                        .lines()
+                        .any(|l| l == format!("userknownhostsfile {}", known.display())),
+                    "{config}"
+                );
+            }
+            logout_in(&dir).await.unwrap();
+            assert!(!dir.join(SSH_HOSTS).exists());
+            // No session, no listing.
+            assert!(hosts::config_ssh_in(&dir).await.is_err());
             f.listener.close();
         });
     }
