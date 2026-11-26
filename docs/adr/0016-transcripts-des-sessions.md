@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté, implémenté (jalon M1, PR 8) : format du flux, écrivain asciicast, primitives cryptographiques, capture par l'agent, réception, stockage et scellement par le core, vérification hors ligne.
 - **Date** : 2026-11-25
+- **Révision** : 2026-11-26, jalon M2 (PR 2c) : grâce de reconnexion. Accusés applicatifs du core, tampon borné sur l'agent, reprise du flux sur la nouvelle connexion, scellement différé ; l'échec fermé est gardé au-delà de la grâce ou du tampon.
 - **Révision** : 2026-11-25, relecture de sécurité : session coupée quand le core ne lit plus, écriture hors des workers async, limite des refus de flux, `AUD-E019`, `AUD-E020`, `AUD-W007`, `AUD-W008`, `CFG-P016`, empreinte de la commande dans le sceau avec l'identifiant de sa clé, fin de commande enregistrée, caractères bidirectionnels échappés, borne de ce qui peut être montré sans être enregistré
 
 ## Contexte
@@ -35,7 +36,7 @@ Alternative écartée : un format binaire exact dont l'asciicast serait dérivé
 
 ### Flux de l'agent vers le core
 
-L'agent capture les événements et les envoie au fil de la session, sur un flux du tunnel (classe `Recording`, ADR-0008), après l'en-tête de canal de 18 octets. Le flux est une suite de trames, entiers big-endian :
+L'agent capture les événements et les envoie au fil de la session, sur un flux du tunnel (classe `Recording`, ADR-0008), après l'en-tête de canal de 18 octets et un **préambule** de 4 octets : `type u8 ‖ 0 u8 ‖ grâce en secondes u16`. Le type vaut 1 pour un nouveau transcript, qui annonce la grâce de l'agent (300 s au plus, une valeur plus grande est ramenée à 300), et 2 pour la reprise d'un transcript déjà commencé (grâce à 0). Le flux est ensuite une suite de trames, entiers big-endian :
 
 | Taille | Champ |
 |---|---|
@@ -46,6 +47,8 @@ L'agent capture les événements et les envoie au fil de la session, sur un flux
 
 Charges : début `cols u16 ‖ lignes u16 ‖ début en ms Unix u64 ‖ longueur du type de terminal u8 ‖ type ‖ commande présente u8 (0 ou 1) ‖ commande` (jusqu'à la fin de la charge) ; sortie : les octets ; taille `cols u16 ‖ lignes u16` ; fin `raison u8 ‖ octets de sortie u64` ; fin de commande `1 ‖ code u32` (`exit-status`) ou `2 ‖ core u8 (0 ou 1) ‖ nom du signal` (`exit-signal`, 1 à 32 caractères ASCII imprimables, `KILL` et non `SIGKILL`).
 
+**Sens retour : accusés du core.** Le core répond sur le même flux par des entiers de 8 octets big-endian : le nombre cumulé d'octets de transcript (comptés après le préambule, d'un flux à l'autre) qu'il a écrits dans le fichier, c'est-à-dire remis au noyau ; le dernier accusé suit la synchronisation finale sur le disque. Sur un flux de reprise, le premier entier est l'offset de reprise : les octets que le core a reçus, trame partielle comprise (il garde l'état de son décodeur). Un accusé qui recule ou qui dépasse ce que l'agent a envoyé est une violation : la session est coupée.
+
 **Décodeur strict** (`ostena_recorder::wire::Decoder`), donc `encode(decode(b)) == b` :
 
 - le début vient en premier, au temps 0, une seule fois ; la fin en dernier, avec le nombre exact d'octets de sortie reçus ; rien après ;
@@ -55,30 +58,37 @@ Charges : début `cols u16 ‖ lignes u16 ‖ début en ms Unix u64 ‖ longueur
 - **limites du core** : taille (256 Mio de sortie par défaut) et durée (8 h 10 min) : `REC-E003` ;
 - le décodeur mémorise au plus une trame incomplète.
 
-### Échec fermé (décision du responsable du projet, 2026-11-25)
+### Échec fermé (décision du responsable du projet, 2026-11-25), avec une grâce bornée
 
-**Une session dont le transcript ne peut plus être transmis est coupée**, y compris à la coupure du tunnel et au redémarrage du core. Le flux appartient à la connexion QUIC : sa perte coupe aussitôt les sessions SSH de l'agent. Une sortie n'est jamais montrée à l'utilisateur sans avoir été remise à la file d'envoi de l'agent, ce qui ne veut pas dire reçue par le core (borne ci-dessous). Cela rend effective, pour SSH, la coupure à la perte du tunnel que l'ADR-0010 n'avait pas retenue au jalon M1.
+**Une session dont le transcript ne peut plus être transmis est coupée.** Une sortie n'est jamais montrée à l'utilisateur sans avoir été remise à l'agent pour l'envoi, et aucune donnée d'enregistrement n'est perdue en silence : ce que le core n'a pas accusé est soit envoyé plus tard, soit compté dans l'erreur qui coupe la session, et le core scelle alors le transcript incomplet.
 
-Alternative écartée pour M1 : un tampon borné sur l'agent et une reprise du flux après reconnexion. Elle pourra venir plus tard ; le code isole cette décision. Stocker le transcript sur le disque de l'agent est exclu.
+Au jalon M1, la perte du flux coupait aussitôt les sessions, y compris à la coupure du tunnel. Le jalon M2 ajoute une **grâce de reconnexion** : pendant une coupure plus courte que la grâce, la session continue et son transcript est gardé sur l'agent, en mémoire, jusqu'à sa reprise. Stocker le transcript sur le disque de l'agent reste exclu.
 
 Mise en œuvre :
 
-- **agent** (`ostena_ssh::transcript`) : à l'ouverture d'un shell ou d'un `exec`, la trame de début part dans une file bornée (2 trames, 64 Kio de sortie) ; chaque sortie de la cible y entre **avant** d'être relayée à l'utilisateur, et une file pleine fait attendre le relais (contre-pression, pas de perte). Une tâche (`ostena_tunnel::recording::pump`) vide la file sur le flux `Recording`, ouvert avec la session. Si le flux échoue, est arrêté par le core ou perd sa connexion, la file se ferme et la session est coupée : `SSH-E021`, événement `ssh.transcript_lost` (et `agent.transcript_lost` côté service). À la fin normale, l'agent termine le flux et attend 5 s au plus l'accusé de transport QUIC de toutes les données et de la fin : il dit que le core les a reçues, **pas qu'il les a scellées** ; le sceau se lit dans la chaîne d'audit (`transcript.sealed`) ;
-- **core qui ne lit plus** : une trame attend au plus 15 s de la place dans la file (`SEND_TIMEOUT`) puis sur le flux (`WRITE_TIMEOUT`) ; au-delà, l'agent réinitialise le flux, le transcript est perdu et la session coupée (`SSH-E021`). Le gestionnaire SSH n'attend jamais le core : un changement de taille est gardé et enregistré avant la sortie suivante, et la fin du transcript est attendue 40 s au plus ; le permis de session et le bilan sont toujours rendus ;
-- **ouverture interrompue** : si l'agent ne peut pas commencer une session que le core a ouverte (compte ou clé d'hôte de la cible différents, flux `Recording` impossible à ouvrir), il envoie aussitôt son bilan (`session_closed`, raison « ouverture interrompue ») ;
+- **agent** (`ostena_ssh::transcript`) : à l'ouverture d'un shell ou d'un `exec`, la trame de début part dans une file bornée (2 trames, 64 Kio de sortie). Chaque sortie de la cible y entre **avant** d'être relayée à l'utilisateur, et une file pleine fait attendre le relais (contre-pression, pas de perte). Une attente de plus de 15 s (`SEND_TIMEOUT`) coupe la session.
+- **tampon et accusés** (`ostena_tunnel::recording`) : la tâche d'envoi vide la file dans un **tampon de 1 Mio** (`BUFFER`) qu'elle écrit sur le flux `Recording`. Chaque octet y reste jusqu'à l'accusé du core. Connecté, un tampon plein fait attendre la file (contre-pression). Si le core, connecté, n'accuse rien pendant 15 s (`WRITE_TIMEOUT`), l'agent réinitialise le flux (code 2) et le traite comme une coupure.
+- **grâce** : `[agent.ssh] reconnect_grace_secs`, 60 s par défaut, de 0 à 300 ; 0 rend le comportement du jalon M1. Quand le flux est perdu avec sa connexion, la session continue et les sorties s'accumulent dans le tampon. L'agent attend que le lien revienne : il retente alors toutes les 2 s au plus (`URGENT_RETRY`), au lieu du délai exponentiel qui peut monter à 60 s. Il ouvre ensuite un flux de reprise et renvoie le tampon à partir de l'offset que le core a reçu. La grâce court depuis le moment où l'agent constate la perte (délai d'inactivité du tunnel, 15 s par défaut). Le renouvellement du certificat, qui rouvre la connexion, profite de la même reprise.
+- **coupure de la session** (`SSH-E021`, `ssh.transcript_lost`, `agent.transcript_lost`), dans chacun de ces cas :
+  - la grâce est dépassée ;
+  - le tampon est plein pendant la coupure ;
+  - le core refuse le flux ou la reprise (flux arrêté ou terminé par le core) ;
+  - un accusé est invalide.
+
+  L'erreur dit combien d'octets le core n'a jamais accusés.
+- **fin normale** : l'agent termine le flux et attend 5 s au plus que le core accuse tous les octets, synchronisés sur le disque. Cela ne dit **pas** que le core les a scellés : le sceau se lit dans la chaîne d'audit (`transcript.sealed`).
+- **gestionnaire SSH** : il n'attend jamais le core. Un changement de taille est gardé et enregistré avant la sortie suivante. La fin du transcript est attendue 40 s au plus ; le permis de session et le bilan sont toujours rendus. Le bilan (`session_closed`) attend lui aussi le retour du lien pendant la grâce.
+- **ouverture interrompue** : si l'agent ne peut pas commencer une session que le core a ouverte (compte ou clé d'hôte de la cible différents, flux `Recording` impossible à ouvrir), il envoie aussitôt son bilan (`session_closed`, raison « ouverture interrompue »).
 - **raison de fin** scellée : `closed`, `revoked`, `expired`, `shutdown` ou `error` (transcript perdu).
 
-**Borne réelle de ce qui peut être montré sans être enregistré.** « Remis à la file d'envoi » ne veut pas dire reçu par le core. Pendant une partition entre l'agent et le core, l'utilisateur peut donc voir, sans que le core le reçoive jamais :
-
-- en volume, au plus la file (2 trames de 32 Kio), la trame que la tâche d'envoi est en train d'écrire (32 Kio) et la fenêtre de réception QUIC du flux accordée par le core (`stream_window`, 256 Kio par défaut), soit **environ 352 Kio** de sortie, en-têtes de trame en plus ;
-- en durée, au plus le temps de détecter la partition : la session est coupée quand une trame attend plus de 15 s (`WRITE_TIMEOUT` de l'envoi, `SEND_TIMEOUT` de la file), ou à l'expiration du délai d'inactivité QUIC (15 s par défaut), au premier des deux.
-
-Une session peu bavarde peut ainsi montrer jusqu'à 15 s de sortie non enregistrée, une session très bavarde jusqu'à environ 352 Kio. La fenêtre QUIC ne peut pas être réduite pour le seul flux `Recording` : QUIC (quinn 0.11) n'a qu'une fenêtre de réception par flux pour toute la connexion, et la réduire à 64 Kio limiterait aussi le débit des flux SSH et RDP (64 Kio par aller-retour). Une borne plus serrée demande un crédit applicatif (le core accuse les octets reçus sur le sens retour du flux, l'agent n'en laisse que 64 Kio sans accusé) ; c'est un lot ultérieur.
+**Borne de ce qui peut être montré sans être écrit par le core** : le tampon de l'agent (1 Mio), plus la file (2 trames de 32 Kio). La fenêtre de réception du transport ne compte plus, puisque l'agent ne libère un octet que sur l'accusé applicatif. En durée, c'est la grâce, plus le temps de constater la coupure. Ces octets ne sont jamais perdus en silence : ils sont écrits après la reprise, ou la session est coupée, le nombre d'octets perdus journalisé et le transcript scellé incomplet. Cela remplace la borne du jalon M1 (environ 352 Kio ou 15 s, sans compte de ce qui était perdu).
 
 ### Réception et scellement par le core
 
 - Le core n'accepte un flux `Recording` que pour une session SSH **ouverte, de cet agent** (`access_session`) ; sinon, et pour toute autre classe de flux, il arrête le flux (`transcript.refused`, `REC-E002` ; `tunnel.channel_refused`) et l'agent coupe la session. `transcript.refused` est de classe protectrice (ADR-0012). Les refus sont limités par agent (8 d'affilée, puis un toutes les 15 s, `rate::Limiter`) : au-delà, le tunnel de l'agent est fermé et un seul journal agrégé `tunnel.streams_limited` remplace un événement par refus.
 - Le fichier `<session>.cast` est créé dans `[core.ssh] transcripts_dir` (création exclusive, mode 0600, répertoire 0700), puis le répertoire est synchronisé sur le disque. Une ligne `session_transcript` (migration 0005) passe de `recording` à `sealed` ou `incomplete`. Au démarrage, ce répertoire doit appartenir à root ou au compte du service, sans aucun droit pour le groupe ni les autres ; tant qu'il n'existe pas, son parent ne doit être modifiable par personne d'autre (`CFG-P016`, refusé en production).
+- **Accusés** : l'écrivain publie, après chaque vidage de son tampon dans le fichier, l'offset de la dernière trame complète écrite ; la lecture l'envoie à l'agent. Le dernier accusé part après la synchronisation finale et le passage en lecture seule, avant le scellement.
+- **Scellement différé pendant la grâce** : si le flux est perdu avec sa connexion, ou réinitialisé par l'agent faute d'accusé (code 2), le core ne scelle pas. Il garde le décodeur, le fichier ouvert et les compteurs, et attend un flux de reprise pendant la grâce annoncée par l'agent plus 30 s (`RESUME_MARGIN`). Cette marge couvre l'écart entre l'instant où le core et celui où l'agent constatent la coupure. Un flux de reprise n'est accepté que pour un transcript en cours d'enregistrement par ce core et venant du même agent ; sinon il est refusé (`REC-E002`, `transcript.refused`) et l'agent coupe la session. Un flux de reprise qui arrive alors que l'ancien semble encore vivant le remplace (l'ancien est arrêté, code 3). Passé le délai, le transcript est scellé incomplet (`REC-E005`), comme avant. Événements : `transcript.interrupted`, `transcript.resumed` (journal).
 - **Écriture hors des workers async** : la lecture du flux QUIC reste asynchrone ; les trames passent par une file bornée (16 trames) à un écrivain dédié (`spawn_blocking`), qui écrit le fichier, le synchronise et le scelle. Un disque lent ne bloque aucun worker du runtime.
 - À la trame de début d'un `exec`, le core consigne `access.ssh_exec` : longueur de la commande et HMAC (ci-dessous), jamais le texte.
 - Un flux mal formé, une limite dépassée ou une écriture impossible arrête le flux : le transcript est scellé incomplet avec son code (`REC-E001`, `REC-E003`, `REC-E004`) et la session est coupée par l'agent.
@@ -125,7 +135,7 @@ L'agent ne journalise plus que la longueur d'une commande. Le core, qui reçoit 
 | `AUD-W008` | sceau de transcript non couvert par une tête signée |
 | `CFG-P016` | répertoire des transcripts accessible au-delà du compte du service, ou parent modifiable par un autre compte |
 
-Événements : `access.ssh_exec`, `transcript.sealed`, `transcript.refused` (chaîne d'audit) ; `ssh.transcript_lost`, `agent.transcript_lost`, `transcript.recovered`, `transcript.write_failed`, `transcript.seal_failed`, `tunnel.channel_refused`, `tunnel.streams_limited` (journal).
+Événements : `access.ssh_exec`, `transcript.sealed`, `transcript.refused` (chaîne d'audit) ; `ssh.transcript_lost`, `agent.transcript_lost`, `agent.transcript_interrupted`, `agent.transcript_resumed`, `transcript.interrupted`, `transcript.resumed`, `transcript.recovered`, `transcript.write_failed`, `transcript.seal_failed`, `tunnel.channel_refused`, `tunnel.streams_limited` (journal).
 
 ### Crate
 
@@ -139,12 +149,15 @@ Nouvelle crate `ostena-recorder`, prévue dans l'organisation du dépôt : évé
 - Le répertoire des transcripts grossit sans limite au jalon M1 : sa rétention et son archivage (WORM) relèvent de l'exploitation, puis d'un lot ultérieur.
 - L'écriture du fichier se fait dans un écrivain dédié, par blocs ; un disque lent ralentit, par contre-pression, la seule session concernée, que l'agent coupe au bout de 15 s d'attente.
 - Les transcripts contiennent ce que la session a affiché, secrets compris, et la commande d'un `exec` en clair : ils sont aussi sensibles que la session elle-même.
-- Une panne du lien entre l'agent et le core coupe les sessions SSH en cours. C'est le prix de la traçabilité.
+- Une panne du lien entre l'agent et le core plus longue que la grâce (60 s par défaut), ou pendant laquelle une session affiche plus d'1 Mio, coupe les sessions SSH en cours. C'est le prix de la traçabilité.
+- **Pendant la grâce, le core ne peut plus rien imposer à la session** : une révocation (session de connexion, agent) ne lui parvient qu'à la reconnexion, où le core la répète. La durée maximale de la session reste appliquée par l'agent. La grâce allonge donc d'autant le délai d'effet d'une révocation ; elle est bornée à 300 s, et 0 rend la coupure immédiate.
+- L'agent garde jusqu'à 1 Mio par session SSH (64 sessions par défaut, soit 64 Mio au pire), seulement pendant une coupure ou quand le core accuse lentement.
 - Le décodage UTF-8 avec remplacement perd les octets invalides ; leur nombre est scellé.
 
 ### Limites connues
 
-- Pendant une partition, l'utilisateur peut voir jusqu'à environ 352 Kio ou 15 s de sortie que le core ne recevra jamais (voir « Borne réelle » ci-dessus) ; une borne plus serrée demande un crédit applicatif.
+- Pendant une coupure, l'utilisateur peut voir jusqu'à 1 Mio de sortie (le tampon), ou la durée de la grâce, que le core n'écrira jamais si le lien ne revient pas à temps. Ce n'est jamais silencieux : la session est alors coupée, le nombre d'octets perdus journalisé, le transcript scellé incomplet.
+- Un redémarrage du core pendant la grâce coupe les sessions : au démarrage, le core scelle incomplets les transcripts restés ouverts et refuse leur reprise. Une coupure avant que le premier octet du transcript ait atteint le core coupe aussi la session : la reprise d'un transcript inconnu est refusée.
 - Une session ouverte par le core mais que l'agent n'a pas pu commencer (ouverture interrompue) n'a pas de transcript : la vérification avec `--transcripts` la signale `AUD-E019`. Le bilan de l'agent la ferme, mais aucun sceau « sans transcript » n'est écrit au jalon M1.
 - `AUD-W007` repose sur la durée maximale de la session plus une marge de 5 min, comparée à l'instant de l'export : une horloge du core décalée de plus de 5 min peut faire passer une session finie pour ouverte, ou l'inverse.
 - Un transcript repris au démarrage (`REC-E005`) est scellé sur le contenu du fichier, avec des compteurs d'événements et de séquences UTF-8 invalides à 0 : ils ne sont pas recalculés.

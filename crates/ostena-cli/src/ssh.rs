@@ -53,6 +53,8 @@ struct TunnelAuthorizer {
     core: CoreSide,
     journal: Arc<FileReplayStore>,
     reports: Reports,
+    /// How long a session survives a lost link (ADR-0016).
+    grace: Duration,
 }
 
 /// Session reports (`SessionClosed`) being sent to the core by detached
@@ -94,6 +96,22 @@ async fn wait_idle(deadline: Instant, busy: impl Fn() -> bool) -> bool {
     }
 }
 
+impl TunnelAuthorizer {
+    fn new(
+        core: CoreSide,
+        journal: Arc<FileReplayStore>,
+        reports: Reports,
+        ssh: &ostena_common::config::AgentSshConfig,
+    ) -> Self {
+        Self {
+            core,
+            journal,
+            reports,
+            grace: Duration::from_secs(ssh.reconnect_grace_secs),
+        }
+    }
+}
+
 fn refusal(code: &str, message: &str) -> Refusal {
     Refusal {
         code: code.to_owned(),
@@ -125,9 +143,17 @@ impl Authorizer for TunnelAuthorizer {
                 // Counted like a report: a stop closes the link only once
                 // the transcript is acknowledged by the core.
                 let sending = self.reports.sending();
+                let options = recording::Options {
+                    resume: self.core.link.get().map(|link| recording::Resume {
+                        link: link.clone(),
+                        session: session_id,
+                        grace: self.grace,
+                    }),
+                    ..recording::Options::default()
+                };
                 tokio::spawn(async move {
                     let _sending = sending;
-                    if let Err(e) = recording::pump(frames, session.recording).await {
+                    if let Err(e) = recording::run(frames, session.recording, options).await {
                         tracing::warn!(
                             event = "agent.transcript_lost",
                             session = %session_id,
@@ -164,9 +190,12 @@ impl Authorizer for TunnelAuthorizer {
             bytes_from_target: summary.bytes_from_target,
         };
         let sending = self.reports.sending();
+        let grace = self.grace;
         tokio::spawn(async move {
             let _sending = sending;
-            if let Err(e) = link.send(&message).await {
+            // Within the grace, a report waits for the link to come back,
+            // as the transcript does.
+            if let Err(e) = link.send_within(&message, grace).await {
                 tracing::warn!(
                     event = "agent.session_report_lost",
                     session = %session_id,
@@ -656,15 +685,12 @@ pub(crate) async fn start(
 
     let (identity_tx, identity) = watch::channel(None);
     let reports = Reports::default();
+    let authorizer = TunnelAuthorizer::new(core.clone(), journal, reports.clone(), ssh);
     let server = SshServer::new(
         settings(ssh, agent.session_bounds()),
         identity.clone(),
         target,
-        Arc::new(TunnelAuthorizer {
-            core: core.clone(),
-            journal,
-            reports: reports.clone(),
-        }),
+        Arc::new(authorizer),
     );
     let (stop, stop_rx) = watch::channel(false);
     let mut listen = Vec::with_capacity(bound.len());
