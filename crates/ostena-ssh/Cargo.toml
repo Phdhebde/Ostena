@@ -20,6 +20,8 @@ ostena-grant.workspace = true
 ostena-recorder.workspace = true
 # PinnedTarget: the driver dials nothing else (anti-SSRF by type).
 ostena-scope = { workspace = true, optional = true }
+# The session manager (ADR-0018): quotas, lengths, cuts; the Driver trait.
+ostena-session = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
 ssh-key = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -33,7 +35,7 @@ tracing.workspace = true
 default = ["russh"]
 # tokio/macros (select!) is already enabled by russh-util, a dependency of
 # russh: declared here rather than relied upon.
-russh = ["dep:russh", "dep:ssh-key", "dep:ostena-scope", "tokio/macros"]
+russh = ["dep:russh", "dep:ssh-key", "dep:ostena-scope", "dep:ostena-session", "tokio/macros"]
 
 [dev-dependencies]
 # The gateway tests and the end-to-end example run against the in-process

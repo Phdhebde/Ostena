@@ -1755,6 +1755,7 @@ dependencies = [
  "ostena-grant",
  "ostena-recorder",
  "ostena-scope",
+ "ostena-session",
  "ostena-tunnel",
  "proptest",
  "russh",

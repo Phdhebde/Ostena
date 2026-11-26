@@ -13,10 +13,15 @@
 //! decides (`SSH-E013`, with the underlying code). The library is told to
 //! accept only once all of it succeeded.
 //!
-//! **Bounds.** Connections not yet authenticated, authenticated sessions
-//! and authorisations in flight are bounded (`SSH-E019`), a connection must
-//! authenticate within `login_grace`, a session ends at its maximum length,
-//! on a revocation of its login session or on stop.
+//! **Bounds.** Connections not yet authenticated and authorisations in
+//! flight are bounded (`SSH-E019`), a connection must authenticate within
+//! `login_grace`. The sessions are those of the agent's
+//! [`SessionManager`] (ADR-0018): a slot is reserved within the quotas of
+//! the agent, of the user and of the resource before the core is asked
+//! (`SSH-E019`, cause `SES-E001` to `SES-E003`), the identifier the core
+//! gives must be unique (`SSH-E013`, cause `SES-E004`); a session ends at
+//! its maximum length, at its idle delay (traffic from the user only), on a
+//! revocation of its login session or on stop.
 //!
 //! **Channel.** One session channel; terminal (if the certificate allows
 //! it, bounded), shell, command (32 KiB at most), window changes, signals
@@ -34,8 +39,8 @@
 //!
 //! Events: `ssh.connection_limited`, `ssh.connection_refused`,
 //! `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`,
-//! `ssh.exec`, `ssh.session_expired`, `ssh.session_revoked`,
-//! `ssh.session_closed`, `ssh.channel_refused`, `ssh.transcript_lost`.
+//! `ssh.exec`, `ssh.session_expired`, `ssh.session_idle`,
+//! `ssh.session_revoked`, `ssh.session_closed`, `ssh.channel_refused`, `ssh.transcript_lost`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -45,6 +50,10 @@ use std::time::{Duration, Instant};
 
 use ostena_crypto::p256::VerifyingKey;
 use ostena_scope::PinnedTarget;
+use ostena_session::{
+    Activity, Claim, Driver, EndReason as SessionEnd, Limits, Protocol, Session as ManagedSession,
+    SessionError, SessionManager,
+};
 use russh::keys::{Certificate, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session, VerifiedPublicKey};
 use russh::{Channel, ChannelId, ChannelMsg, ChannelWriteHalf, Disconnect, Pty, Sig, client};
@@ -54,7 +63,7 @@ use tokio::task::JoinHandle;
 
 use crate::cert::{self, UserIdentity, format_uuid};
 use crate::config;
-use crate::driver::{self, TargetSession, sec1_point};
+use crate::driver::{SshDriver, TargetParams, TargetSession, sec1_point};
 use crate::error::SshError;
 use crate::login::parse_login;
 use crate::precheck::Role;
@@ -78,6 +87,8 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reason of a session cut because its transcript was lost.
 const TRANSCRIPT_LOST: &str = "transcript perdu";
+/// Reason of a session cut at its idle delay.
+const IDLE: &str = "inactive";
 /// How long the end of a transcript may take: a start and an end frame,
 /// each waiting at most [`crate::transcript::SEND_TIMEOUT`], and the lock.
 const END_TIMEOUT: Duration = Duration::from_secs(40);
@@ -85,8 +96,16 @@ const END_TIMEOUT: Duration = Duration::from_secs(40);
 /// Bounds and delays of the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerSettings {
-    /// Authenticated sessions at once.
+    /// Authenticated sessions at once (the session manager built by
+    /// [`SshServer::new`]).
     pub max_sessions: usize,
+    /// Sessions of one user at once; `None`: only `max_sessions`.
+    pub max_sessions_per_user: Option<usize>,
+    /// Sessions towards one resource at once; `None`: only `max_sessions`.
+    pub max_sessions_per_target: Option<usize>,
+    /// A session without traffic from the user for this long is cut;
+    /// `None`: never.
+    pub idle_timeout: Option<Duration>,
     /// Connections not yet authenticated at once.
     pub max_unauthenticated: usize,
     /// Connections not yet authenticated at once from one source address.
@@ -107,6 +126,9 @@ impl Default for ServerSettings {
     fn default() -> Self {
         Self {
             max_sessions: 64,
+            max_sessions_per_user: None,
+            max_sessions_per_target: None,
+            idle_timeout: None,
             max_unauthenticated: 16,
             max_unauthenticated_per_source: 4,
             max_authorizations: 32,
@@ -114,6 +136,18 @@ impl Default for ServerSettings {
             target_connect_timeout: Duration::from_secs(5),
             max_auth_attempts: 3,
             precheck_timeout: crate::precheck::stream::DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+impl ServerSettings {
+    /// The bounds of the session manager.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            max_per_user: self.max_sessions_per_user,
+            max_per_target: self.max_sessions_per_target,
+            idle_timeout: self.idle_timeout,
+            ..Limits::new(self.max_sessions)
         }
     }
 }
@@ -253,26 +287,15 @@ pub trait Authorizer: Send + Sync + 'static {
     fn closed(&self, summary: SessionSummary);
 }
 
-/// A live authenticated session, for revocations.
-struct Live {
-    login_session: [u8; 16],
-    revoke: watch::Sender<bool>,
-    /// Authorised (until then, registered while the authoriser decides,
-    /// so that a revocation in between is not lost).
-    active: bool,
-}
-
 struct Shared<A> {
     settings: ServerSettings,
     identity: watch::Receiver<Option<Arc<SshIdentity>>>,
-    target_key: Arc<PrivateKey>,
+    driver: SshDriver,
     authorizer: Arc<A>,
     unauthenticated: Arc<Semaphore>,
-    sessions: Arc<Semaphore>,
+    sessions: SessionManager,
     authorizations: Arc<Semaphore>,
-    live: Mutex<HashMap<u64, Live>>,
     sources: Mutex<HashMap<std::net::IpAddr, usize>>,
-    next: AtomicU64,
 }
 
 /// The agent SSH server.
@@ -354,9 +377,24 @@ fn limited(peer: SocketAddr, listener: SocketAddr, what: &'static str) {
 
 impl<A: Authorizer> SshServer<A> {
     /// A server presenting the latest `identity`, joining the targets with
-    /// `target_key`, deciding through `authorizer`.
+    /// `target_key`, deciding through `authorizer`, with its own session
+    /// manager bounded by `settings`.
     pub fn new(
         settings: ServerSettings,
+        identity: watch::Receiver<Option<Arc<SshIdentity>>>,
+        target_key: Arc<PrivateKey>,
+        authorizer: Arc<A>,
+    ) -> Self {
+        let sessions = SessionManager::new(settings.limits(), Vec::new());
+        Self::with_sessions(settings, sessions, identity, target_key, authorizer)
+    }
+
+    /// As [`new`](Self::new), the sessions held in `sessions`, the manager
+    /// of the agent shared with the other protocols (its bounds apply, not
+    /// those of `settings`).
+    pub fn with_sessions(
+        settings: ServerSettings,
+        sessions: SessionManager,
         identity: watch::Receiver<Option<Arc<SshIdentity>>>,
         target_key: Arc<PrivateKey>,
         authorizer: Arc<A>,
@@ -365,14 +403,12 @@ impl<A: Authorizer> SshServer<A> {
             shared: Arc::new(Shared {
                 settings,
                 identity,
-                target_key,
+                driver: SshDriver::new(target_key),
                 authorizer,
                 unauthenticated: Arc::new(Semaphore::new(settings.max_unauthenticated)),
-                sessions: Arc::new(Semaphore::new(settings.max_sessions)),
+                sessions,
                 authorizations: Arc::new(Semaphore::new(settings.max_authorizations)),
-                live: Mutex::new(HashMap::new()),
                 sources: Mutex::new(HashMap::new()),
-                next: AtomicU64::new(1),
             }),
         }
     }
@@ -410,63 +446,44 @@ impl<A: Authorizer> SshServer<A> {
     /// Cuts every session of the login session `login_session` (revoked on
     /// the core); returns how many.
     pub fn revoke_login(&self, login_session: [u8; 16]) -> usize {
-        let live = self
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut count = 0;
-        for l in live.values().filter(|l| l.login_session == login_session) {
-            l.revoke.send_replace(true);
-            count += 1;
-        }
-        count
+        self.shared.sessions.cut_where(
+            |s| s.claim.protocol == Protocol::Ssh && s.claim.login_session == login_session,
+            SessionEnd::Revoked,
+        )
     }
 
-    /// Cuts every session, authorised or being authorised, as a revocation
-    /// does (a revocation may have been lost); returns how many.
+    /// Cuts every SSH session, authorised or being authorised, as a
+    /// revocation does (a revocation may have been lost); returns how many.
     pub fn revoke_all(&self) -> usize {
-        let live = self
-            .shared
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for l in live.values() {
-            l.revoke.send_replace(true);
-        }
-        live.len()
+        self.shared
+            .sessions
+            .cut_where(|s| s.claim.protocol == Protocol::Ssh, SessionEnd::Revoked)
     }
 
-    /// Authenticated sessions now.
+    /// Authenticated SSH sessions now.
     pub fn sessions(&self) -> usize {
         self.shared
-            .live
-            .lock()
-            .map(|l| l.values().filter(|s| s.active).count())
-            .unwrap_or_default()
+            .sessions
+            .count(|s| s.claim.protocol == Protocol::Ssh && s.session_id.is_some())
     }
 
-    /// Sessions authorised or being authorised, until their end is handed
-    /// to [`Authorizer::closed`]: what a stop waits for.
+    /// SSH sessions authorised or being authorised, until their end is
+    /// handed to [`Authorizer::closed`]: what a stop waits for.
     pub fn in_progress(&self) -> usize {
         self.shared
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+            .sessions
+            .count(|s| s.claim.protocol == Protocol::Ssh)
     }
 }
 
 /// What the handler tells the connection task.
 #[derive(Default)]
 struct Conn {
-    /// Set once authorised: the session permit and what was authorised.
-    authorized: Mutex<Option<(OwnedSemaphorePermit, AccessRequest, Authorized)>>,
+    /// Set once authorised: the session in the manager and what was
+    /// authorised.
+    authorized: Mutex<Option<(ManagedSession, AccessRequest, Authorized)>>,
     /// The target, once connected.
     target: Mutex<Option<Arc<TargetSession>>>,
-    /// The registration in `live` of the authorised session and its
-    /// revocation signal.
-    live: Mutex<Option<(u64, watch::Receiver<bool>)>>,
     /// A certificate reached our checks (the library refuses an expired
     /// one or a bad signature before them, without telling).
     certificate_checked: AtomicBool,
@@ -494,6 +511,8 @@ struct Handler<A> {
     session_id: [u8; 16],
     /// The terminal relayed, for the start of the transcript.
     terminal: Option<Terminal>,
+    /// Marks the traffic of the user, for the idle delay.
+    activity: Option<Activity>,
 }
 
 impl<A: Authorizer> Handler<A> {
@@ -520,36 +539,41 @@ impl<A: Authorizer> Handler<A> {
         );
     }
 
-    /// Asks the authoriser, the session registered in `live` meanwhile: a
-    /// revocation of the login session arriving before the decision is not
-    /// lost. Unregistered if refused.
-    async fn decide(
-        &self,
-        request: &AccessRequest,
-    ) -> (u64, watch::Receiver<bool>, Result<Authorized, Refusal>) {
-        let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
-        let (revoke, revoked) = watch::channel(false);
-        if let Ok(mut live) = self.shared.live.lock() {
-            live.insert(
-                id,
-                Live {
-                    login_session: request.identity.login_session,
-                    revoke,
-                    active: false,
-                },
-            );
-        }
-        let decision = self.shared.authorizer.authorize(request.clone()).await;
-        if let Ok(mut live) = self.shared.live.lock() {
-            if decision.is_ok() {
-                if let Some(entry) = live.get_mut(&id) {
-                    entry.active = true;
-                }
-            } else {
-                live.remove(&id);
-            }
-        }
-        (id, revoked, decision)
+    fn session_limited(&self, error: SessionError) {
+        let what = match error {
+            SessionError::UserLimit(_) => "sessions de cet utilisateur",
+            SessionError::TargetLimit(_) => "sessions vers cette ressource",
+            SessionError::ShuttingDown => "arrêt en cours",
+            SessionError::AgentLimit(_) | SessionError::DuplicateId => "sessions",
+        };
+        let limit = SshError::Limit(what);
+        tracing::warn!(
+            event = "ssh.connection_limited",
+            code = limit.code(),
+            cause = error.code(),
+            peer = %self.peer,
+            listener = %self.listener,
+            "{limit} : {error}"
+        );
+    }
+
+    fn access_refused(&self, request: &AccessRequest, refusal: Refusal) {
+        let error = SshError::AccessRefused {
+            code: refusal.code.clone(),
+            message: refusal.message,
+        };
+        tracing::warn!(
+            event = "ssh.access_refused",
+            code = error.code(),
+            cause = %refusal.code,
+            peer = %self.peer,
+            listener = %self.listener,
+            subject = %format_uuid(&request.identity.subject),
+            login_session = %format_uuid(&request.identity.login_session),
+            account = %sanitize(&request.account),
+            resource = %request.resource,
+            "{error}"
+        );
     }
 
     /// The certificate checked a second time, the user name, then the
@@ -584,9 +608,19 @@ impl<A: Authorizer> Handler<A> {
             limited(self.peer, self.listener, "autorisations en cours");
             return Auth::reject();
         };
-        let Ok(permit) = self.shared.sessions.clone().try_acquire_owned() else {
-            limited(self.peer, self.listener, "sessions");
-            return Auth::reject();
+        // The slot is reserved while the authoriser decides: a revocation
+        // of the login session arriving before the decision is not lost.
+        let reservation = match self.shared.sessions.reserve(Claim {
+            protocol: Protocol::Ssh,
+            subject: identity.subject,
+            login_session: identity.login_session,
+            target: Arc::from(login.resource),
+        }) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.session_limited(error);
+                return Auth::reject();
+            }
         };
         let request = AccessRequest {
             identity,
@@ -594,58 +628,50 @@ impl<A: Authorizer> Handler<A> {
             resource: login.resource.to_owned(),
             client_address: self.peer,
         };
-        let (id, revoked, decision) = self.decide(&request).await;
-        match decision {
-            Ok(authorized) => {
-                if let Ok(mut slot) = self.conn.live.lock() {
-                    *slot = Some((id, revoked));
-                }
-                self.session_id = authorized.session_id;
-                // Eagerly: the target is reached while the client opens its
-                // channel.
-                let shared = self.shared.clone();
-                let target = authorized.target.clone();
-                let host_key = authorized.target_host_key;
-                let account = authorized.account.clone();
-                let label = format!("{}@{}", sanitize(&account), sanitize(&request.resource));
-                self.target = Some(tokio::spawn(async move {
-                    driver::connect(
-                        &target,
-                        &host_key,
-                        &account,
-                        shared.target_key.clone(),
-                        shared.settings.target_connect_timeout,
-                        &label,
-                    )
-                    .await
-                }));
-                self.access = Some((request.clone(), authorized.clone()));
-                if let Ok(mut slot) = self.conn.authorized.lock() {
-                    *slot = Some((permit, request, authorized));
-                }
-                self.authenticated.send_replace(true);
-                Auth::Accept
-            }
+        let authorized = match self.shared.authorizer.authorize(request.clone()).await {
+            Ok(authorized) => authorized,
             Err(refusal) => {
-                let error = SshError::AccessRefused {
-                    code: refusal.code.clone(),
-                    message: refusal.message,
-                };
-                tracing::warn!(
-                    event = "ssh.access_refused",
-                    code = error.code(),
-                    cause = %refusal.code,
-                    peer = %self.peer,
-                listener = %self.listener,
-                    subject = %format_uuid(&request.identity.subject),
-                    login_session = %format_uuid(&request.identity.login_session),
-                    account = %sanitize(&request.account),
-                    resource = %request.resource,
-                    "{error}"
-                );
-                Auth::reject()
+                self.access_refused(&request, refusal);
+                return Auth::reject();
             }
+        };
+        let session = match reservation.activate(authorized.session_id, authorized.max_session) {
+            Ok(session) => session,
+            Err(error) => {
+                let refusal = Refusal {
+                    code: error.code().to_owned(),
+                    message: error.to_string(),
+                };
+                self.access_refused(&request, refusal);
+                return Auth::reject();
+            }
+        };
+        self.session_id = authorized.session_id;
+        self.activity = Some(session.activity());
+        // Eagerly: the target is reached while the client opens its channel.
+        let shared = self.shared.clone();
+        let target = authorized.target.clone();
+        let params = TargetParams {
+            host_key: authorized.target_host_key,
+            account: authorized.account.clone(),
+            label: format!(
+                "{}@{}",
+                sanitize(&authorized.account),
+                sanitize(&request.resource)
+            ),
+        };
+        self.target = Some(tokio::spawn(async move {
+            shared
+                .driver
+                .connect(&target, params, shared.settings.target_connect_timeout)
+                .await
+        }));
+        self.access = Some((request.clone(), authorized.clone()));
+        if let Ok(mut slot) = self.conn.authorized.lock() {
+            *slot = Some((session, request, authorized));
         }
+        self.authenticated.send_replace(true);
+        Auth::Accept
     }
 
     /// Relays a request to the target and its answer to the user.
@@ -752,10 +778,14 @@ impl<A: Authorizer> Handler<A> {
         let Some(transcript) = self.transcript() else {
             return Ok(());
         };
+        let Some(activity) = self.activity.clone() else {
+            return Ok(());
+        };
         tokio::spawn(user_to_target(
             user_read,
             target_write.clone(),
             self.conn.to_target.clone(),
+            activity,
         ));
         tokio::spawn(target_to_user(
             target_read,
@@ -791,15 +821,17 @@ impl<A: Authorizer> Handler<A> {
 }
 
 /// From the user to the target: data, end of data, close. Keystrokes are
-/// not recorded (ADR-0016).
+/// not recorded (ADR-0016); they are the traffic of the idle delay.
 async fn user_to_target(
     mut user: russh::ChannelReadHalf,
     target: Arc<ChannelWriteHalf<client::Msg>>,
     count: Arc<AtomicU64>,
+    activity: Activity,
 ) {
     while let Some(message) = user.wait().await {
         let sent = match message {
             ChannelMsg::Data { data } => {
+                activity.touch();
                 count.fetch_add(data.len() as u64, Ordering::Relaxed);
                 target.data_bytes(data).await
             }
@@ -1215,20 +1247,6 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
     }
 }
 
-/// Unregisters a session from `live` when dropped.
-struct Registered<'a, A> {
-    shared: &'a Shared<A>,
-    id: u64,
-}
-
-impl<A> Drop for Registered<'_, A> {
-    fn drop(&mut self) {
-        if let Ok(mut live) = self.shared.live.lock() {
-            live.remove(&self.id);
-        }
-    }
-}
-
 /// A connection not yet authenticated: the global permit and the count of
 /// its source address, both released when dropped.
 struct PreAuth<A> {
@@ -1346,6 +1364,7 @@ async fn connection<A: Authorizer>(
         access: None,
         session_id: [0; 16],
         terminal: None,
+        activity: None,
     };
     let grace = tokio::time::Instant::now() + shared.settings.login_grace;
     let stream = Prechecked::new(
@@ -1390,13 +1409,7 @@ async fn connection<A: Authorizer>(
     // Every granted access goes through the close below, exactly once,
     // whatever ended the connection.
     let granted = conn.authorized.lock().ok().and_then(|mut a| a.take());
-    let registration = conn.live.lock().ok().and_then(|mut l| l.take());
-    let _registered = registration.as_ref().map(|(id, _)| Registered {
-        shared: &shared,
-        id: *id,
-    });
-    let (Some((permit, request, authorized)), Some((_, mut revoked))) = (granted, registration)
-    else {
+    let Some((mut managed, request, authorized)) = granted else {
         if !conn.certificate_checked.load(Ordering::Relaxed) {
             let error = SshError::UserCertificate(cert::CertError::Refused(
                 "aucun certificat accepté par la bibliothèque SSH (expiré, pas encore valide, \
@@ -1414,7 +1427,6 @@ async fn connection<A: Authorizer>(
     };
     drop(unauthenticated);
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + authorized.max_session;
     let session_text = format_uuid(&authorized.session_id);
     let transcript = authorized.transcript.clone();
     let reason = if ended {
@@ -1424,32 +1436,53 @@ async fn connection<A: Authorizer>(
             // A revocation that arrived during the authorisation is seen here
             // at once.
             biased;
-            () = async { let _ = revoked.wait_for(|r| *r).await; } => {
-                tracing::warn!(
-                    event = "ssh.session_revoked",
-                    session = %session_text,
-                    login_session = %format_uuid(&request.identity.login_session),
-                    peer = %peer,
-                    listener = %listener,
-                    "session de connexion révoquée"
-                );
-                disconnect(&handle, "session de connexion révoquée").await;
-                "révoquée"
-            }
+            end = managed.ended() => match end {
+                SessionEnd::Revoked => {
+                    tracing::warn!(
+                        event = "ssh.session_revoked",
+                        session = %session_text,
+                        login_session = %format_uuid(&request.identity.login_session),
+                        peer = %peer,
+                        listener = %listener,
+                        "session de connexion révoquée"
+                    );
+                    disconnect(&handle, "session de connexion révoquée").await;
+                    "révoquée"
+                }
+                SessionEnd::Expired => {
+                    tracing::warn!(
+                        event = "ssh.session_expired",
+                        session = %session_text,
+                        peer = %peer,
+                        listener = %listener,
+                        "durée maximale de la session atteinte"
+                    );
+                    disconnect(&handle, "durée maximale de la session atteinte").await;
+                    "expirée"
+                }
+                SessionEnd::Idle => {
+                    tracing::warn!(
+                        event = "ssh.session_idle",
+                        session = %session_text,
+                        peer = %peer,
+                        listener = %listener,
+                        "délai d'inactivité de la session atteint"
+                    );
+                    disconnect(&handle, "délai d'inactivité atteint").await;
+                    IDLE
+                }
+                SessionEnd::Shutdown => {
+                    disconnect(&handle, "arrêt de l'agent").await;
+                    "arrêt"
+                }
+                SessionEnd::Closed | SessionEnd::Error => {
+                    disconnect(&handle, "session coupée par l'agent").await;
+                    "coupée"
+                }
+            },
             _ = &mut session => {
                 ended = true;
                 "fermée"
-            }
-            () = tokio::time::sleep_until(deadline) => {
-                tracing::warn!(
-                    event = "ssh.session_expired",
-                    session = %session_text,
-                    peer = %peer,
-                    listener = %listener,
-                    "durée maximale de la session atteinte"
-                );
-                disconnect(&handle, "durée maximale de la session atteinte").await;
-                "expirée"
             }
             () = async { let _ = stop.wait_for(|s| *s).await; } => {
                 disconnect(&handle, "arrêt de l'agent").await;
@@ -1477,12 +1510,15 @@ async fn connection<A: Authorizer>(
     if let Some(target) = target {
         target.close().await;
     }
-    let end = match reason {
-        "révoquée" => EndReason::Revoked,
-        "expirée" => EndReason::Expired,
-        "arrêt" => EndReason::Shutdown,
-        TRANSCRIPT_LOST => EndReason::Error,
-        _ => EndReason::Closed,
+    // The transcript has no idle reason (ADR-0016): an idle session
+    // reached a limit of the agent, as an expired one.
+    let (end, managed_end) = match reason {
+        "révoquée" => (EndReason::Revoked, SessionEnd::Revoked),
+        "expirée" => (EndReason::Expired, SessionEnd::Expired),
+        IDLE => (EndReason::Expired, SessionEnd::Idle),
+        "arrêt" => (EndReason::Shutdown, SessionEnd::Shutdown),
+        TRANSCRIPT_LOST | "coupée" => (EndReason::Error, SessionEnd::Error),
+        _ => (EndReason::Closed, SessionEnd::Closed),
     };
     // Bounded: the permit and the report below are always given back.
     let ended = tokio::time::timeout(END_TIMEOUT, transcript.end(end))
@@ -1504,7 +1540,6 @@ async fn connection<A: Authorizer>(
             "{e}"
         );
     }
-    drop(permit);
     let summary = SessionSummary {
         session_id: authorized.session_id,
         subject: request.identity.subject,
@@ -1528,6 +1563,8 @@ async fn connection<A: Authorizer>(
         "session SSH terminée"
     );
     shared.authorizer.closed(summary);
+    // Released once its end is handed over: what a stop waits for.
+    managed.finish(managed_end);
 }
 
 #[cfg(test)]
