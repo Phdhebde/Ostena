@@ -306,6 +306,189 @@ fn the_transcript_reaches_the_core_and_its_loss_is_seen() {
     });
 }
 
+/// Runs the transcript of `session` with a grace: what the agent SSH
+/// server does.
+fn record_with_grace(
+    gateway: &Gateway,
+    session: ostena_tunnel::gateway::SshSession,
+    grace: Duration,
+) -> (
+    ostena_ssh::transcript::Transcript,
+    tokio::task::JoinHandle<Result<(), ostena_tunnel::TunnelError>>,
+) {
+    use ostena_tunnel::recording::{Options, QUEUE, Resume, run};
+    let (transcript, rx) = ostena_ssh::transcript::Transcript::channel(QUEUE);
+    let options = Options {
+        resume: Some(Resume {
+            link: gateway.link().clone(),
+            session: session.session.session_id,
+            grace,
+        }),
+        ..Options::default()
+    };
+    (
+        transcript,
+        tokio::spawn(run(rx, session.recording, options)),
+    )
+}
+
+/// The frames of a transcript received by the test core.
+fn frames_of(bytes: &[u8]) -> Vec<ostena_recorder::Frame> {
+    use ostena_recorder::{Decoder, Limits as RecLimits};
+    let mut decoder = Decoder::new(RecLimits::default());
+    decoder.feed(bytes);
+    let mut frames = Vec::new();
+    while let Some(frame) = decoder.next_frame().unwrap() {
+        frames.push(frame);
+    }
+    decoder.finish().unwrap();
+    frames
+}
+
+/// The connection to the core is lost during a session, shorter than the
+/// grace: the session goes on, what it showed meanwhile is buffered, the
+/// transcript is resumed on the new connection and reaches the core whole
+/// and in order (ADR-0016).
+#[test]
+fn a_cut_shorter_than_the_grace_keeps_the_session_and_its_transcript() {
+    use ostena_recorder::{EndReason, Event};
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("transcript-grace");
+        let gateway = agent(&core, &dir, allow(&["10.0.0.0/8"])).await;
+        push(&core, &gateway, allow(&["10.20.0.0/16"]), true).await;
+        core.add_ssh_resource("srv-lab01", SshResource::new("10.20.0.5", 22, target_key()));
+        let store = MemoryReplayStore::new();
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let id = session.session.session_id;
+        let (transcript, pumped) = record_with_grace(&gateway, session, Duration::from_secs(30));
+        transcript.start(None, None).await.unwrap();
+        transcript.output(b"before\n").await.unwrap();
+        // The transcript is known to the core before the cut.
+        for _ in 0..100 {
+            if core.recording(id).is_some_and(|(b, _)| !b.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        core.stop();
+        // Shown while the link is down: buffered, not lost.
+        for i in 0..20 {
+            transcript
+                .output(format!("during {i}\n").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        core.restart().await.unwrap();
+
+        transcript.output(b"after\n").await.unwrap();
+        transcript.end(EndReason::Closed).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), transcript.closed())
+                .await
+                .is_err(),
+            "session kept"
+        );
+        drop(transcript);
+        tokio::time::timeout(Duration::from_secs(30), pumped)
+            .await
+            .expect("transcript resumed and acknowledged")
+            .unwrap()
+            .unwrap();
+        // Acknowledged once written; read to its end soon after.
+        let (bytes, finished) = core
+            .finished_recording(id, Duration::from_secs(5))
+            .await
+            .expect("transcript read to its end by the core");
+        assert!(finished);
+        let outputs: Vec<Vec<u8>> = frames_of(&bytes)
+            .into_iter()
+            .filter_map(|f| match f.event {
+                Event::Output(data) => Some(data),
+                _ => None,
+            })
+            .collect();
+        let mut expected = vec![b"before\n".to_vec()];
+        expected.extend((0..20).map(|i| format!("during {i}\n").into_bytes()));
+        expected.push(b"after\n".to_vec());
+        assert_eq!(outputs, expected);
+    });
+}
+
+/// A cut longer than the grace: the session is cut (fail closed), and the
+/// pump says how much of the transcript the core never acknowledged.
+#[test]
+fn a_cut_longer_than_the_grace_cuts_the_session() {
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("transcript-grace-over");
+        let gateway = agent(&core, &dir, allow(&["10.0.0.0/8"])).await;
+        push(&core, &gateway, allow(&["10.20.0.0/16"]), true).await;
+        core.add_ssh_resource("srv-lab01", SshResource::new("10.20.0.5", 22, target_key()));
+        let store = MemoryReplayStore::new();
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let (transcript, pumped) = record_with_grace(&gateway, session, Duration::from_secs(2));
+        transcript.start(None, None).await.unwrap();
+        core.stop();
+        transcript.output(b"unacknowledged").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), transcript.closed())
+            .await
+            .expect("session cut once the grace is over");
+        let error = pumped.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("grâce"), "{error}");
+        assert!(error.contains("non acquitté"), "{error}");
+        assert_eq!(
+            transcript.output(b"x").await.unwrap_err().code(),
+            "SSH-E021"
+        );
+    });
+}
+
+/// A full buffer while the link is down cuts the session at once: nothing
+/// more is shown that could not be recorded.
+#[test]
+fn a_full_buffer_during_a_cut_cuts_the_session() {
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("transcript-grace-full");
+        let gateway = agent(&core, &dir, allow(&["10.0.0.0/8"])).await;
+        push(&core, &gateway, allow(&["10.20.0.0/16"]), true).await;
+        core.add_ssh_resource("srv-lab01", SshResource::new("10.20.0.5", 22, target_key()));
+        let store = MemoryReplayStore::new();
+        let session = gateway
+            .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
+            .await
+            .unwrap();
+        let (transcript, pumped) = record_with_grace(&gateway, session, Duration::from_secs(60));
+        transcript.start(None, None).await.unwrap();
+        core.stop();
+        let writer = tokio::spawn({
+            let transcript = transcript.clone();
+            async move {
+                for _ in 0..160 {
+                    transcript.output(&[b'x'; 16 * 1024]).await?;
+                }
+                Ok::<_, ostena_ssh::SshError>(())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(20), transcript.closed())
+            .await
+            .expect("session cut when the buffer is full");
+        let error = pumped.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("tampon"), "{error}");
+        assert_eq!(writer.await.unwrap().unwrap_err().code(), "SSH-E021");
+    });
+}
+
 /// A core that accepts the transcript stream but no longer reads it: the
 /// pump gives up after its write delay, resets the stream, and the
 /// transcript is lost (the session is cut).
@@ -339,8 +522,9 @@ fn a_transcript_the_core_does_not_read_is_lost_in_the_delay() {
         let writer = tokio::spawn({
             let transcript = transcript.clone();
             async move {
-                // Far beyond the window of the stream.
-                for _ in 0..64 {
+                // Far beyond the buffer of the agent and the window of
+                // the stream.
+                for _ in 0..160 {
                     transcript.output(&[b'x'; 16 * 1024]).await?;
                 }
                 Ok::<_, ostena_ssh::SshError>(())

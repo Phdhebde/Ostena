@@ -1,11 +1,12 @@
 # ADR-0008 : Tunnel entre l'agent et le core, et enrôlement
 
-- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (lot L2, PR 3b). La reconnexion (backoff borné avec gigue complète, état dans `ostena agent status`) est implémentée (lot L2). Le repli TLS 1.3 sur TCP, avec son multiplexeur et le mode `auto`, est implémenté (jalon M2, PR 2a et 2b). La grâce qui garde les sessions SSH pendant une coupure courte viendra à la PR 2c. Les messages de l'accès SSH natif sont implémentés côté agent et dans le core de test (jalon M1, PR 4) ; leur traitement par le core viendra à la PR 5 du jalon M1.
+- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (lot L2, PR 3b). La reconnexion (backoff borné avec gigue complète, état dans `ostena agent status`) est implémentée (lot L2). Le repli TLS 1.3 sur TCP, avec son multiplexeur et le mode `auto`, est implémenté (jalon M2, PR 2a et 2b). La grâce qui garde les sessions SSH pendant une coupure courte est implémentée (jalon M2, PR 2c, ADR-0016). Les messages de l'accès SSH natif sont implémentés côté agent et dans le core de test (jalon M1, PR 4) ; leur traitement par le core viendra à la PR 5 du jalon M1.
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-15, messages de l'accès SSH natif et `TUN-E030` (jalon M1, PR 4)
 - **Révision** : 2026-11-25, autorités d'hôtes dans `ssh_trust`, liaison du grant exigée par l'agent (jalon M1, PR 5a)
 - **Révision** : 2026-11-25, classe de flux `enregistrement` pour les transcripts, quatre flux par session (jalon M1, PR 8, ADR-0016)
 - **Révision** : 2026-11-26, repli TLS 1.3 sur TCP : multiplexeur, écoute TCP du core, mode `auto` et `tunnel.fallback` (jalon M2, PR 2a et 2b)
+- **Révision** : 2026-11-26, grâce de reconnexion des sessions SSH, reprise du flux de transcript, nouvelle tentative rapprochée pendant la grâce (jalon M2, PR 2c, ADR-0016)
 
 ## Contexte
 
@@ -111,11 +112,12 @@ Le flux d'enregistrement passe avant l'affichage et le transfert : une sortie n'
 - **Reconnexion** (`ostena_tunnel::link::AgentLink`, démarré avec l'agent, quel que soit le transport) :
   - backoff exponentiel de 1 s à 60 s, avec une **gigue complète** : un délai tiré au hasard entre zéro et la borne, pour que des agents coupés ensemble ne reviennent pas ensemble ;
   - la séquence repart de zéro après une connexion restée stable 60 s ;
+  - tant qu'un transcript de session attend sa reprise (grâce, ADR-0016), le délai est ramené à 2 s au plus : la grâce court ;
   - l'adresse du core est résolue à chaque tentative ;
   - la clé et le certificat sont **relus à chaque connexion**, si bien qu'un certificat renouvelé sert dès la suivante ;
   - l'état est partagé avec le plan de contrôle : `ostena agent status` affiche « connecté (QUIC) depuis N s, RTT … » (ou « (TCP) » ; sur TCP, le RTT est mesuré par les `PING` du multiplexeur) ou « non connecté, nouvelle tentative dans N s (code : cause) », et l'échéance du certificat.
 - **Démarrage** : les noms des composants Ostena sont résolus **avant** le lien. En production, un nom introuvable refuse le démarrage (`CFG-P010`). Les noms sont résolus de nouveau toutes les 5 minutes ; un échec garde les adresses précédentes, et l'union garde les anciennes adresses une période de plus. Sans `tls_core_ca` (développement), le lien n'est pas démarré et `status` le dit.
-- **État de l'agent** : la clé, le certificat et le journal anti-rejeu sont sur disque. La politique et le jeu de clés sont repoussés par le core à chaque connexion. Les sessions en cours sont fermées à la coupure (v1).
+- **État de l'agent** : la clé, le certificat et le journal anti-rejeu sont sur disque. La politique et le jeu de clés sont repoussés par le core à chaque connexion. Les sessions SSH en cours survivent à une coupure plus courte que leur grâce (`[agent.ssh] reconnect_grace_secs`, 60 s par défaut) : leur transcript est gardé sur l'agent, en mémoire et borné, puis repris sur la nouvelle connexion ; au-delà, elles sont coupées (ADR-0016).
 
 ### Messages de contrôle v1
 

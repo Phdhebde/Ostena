@@ -889,6 +889,7 @@ fn ssh_section_parses_with_safe_defaults() {
     assert_eq!(ssh.max_unauthenticated_per_source, 4);
     assert_eq!(ssh.login_grace_secs, 30);
     assert_eq!(ssh.target_connect_timeout_secs, 5);
+    assert_eq!(ssh.reconnect_grace_secs, 60);
     let paths = a.ssh_paths().unwrap();
     let state = Path::new("/var/lib/ostena");
     assert_eq!(paths.host_key, state.join("ssh_host_key"));
@@ -931,6 +932,8 @@ fn v015_ssh_addresses_bounds_and_keys() {
         ("login_grace_secs", 121, 120),
         ("target_connect_timeout_secs", 0, 1),
         ("target_connect_timeout_secs", 31, 30),
+        ("reconnect_grace_secs", 301, 0),
+        ("reconnect_grace_secs", 1000, 300),
     ] {
         let c = agent_ssh(&format!("{field} = {bad}\n"));
         assert_eq!(agent_codes(&c), vec![Code::AgentSsh], "{field} = {bad}");

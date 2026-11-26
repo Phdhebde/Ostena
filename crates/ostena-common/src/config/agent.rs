@@ -161,6 +161,11 @@ pub const DEFAULT_SSH_MAX_UNAUTHENTICATED_PER_SOURCE: u32 = 4;
 pub const DEFAULT_SSH_LOGIN_GRACE_SECS: u64 = 30;
 /// Default delay to reach a target, in seconds.
 pub const DEFAULT_SSH_TARGET_CONNECT_TIMEOUT_SECS: u64 = 5;
+/// Default grace of the SSH sessions while the link to the core is lost
+/// (ADR-0016).
+pub const DEFAULT_SSH_RECONNECT_GRACE_SECS: u64 = 60;
+/// Longest grace of the SSH sessions while the link to the core is lost.
+pub const MAX_SSH_RECONNECT_GRACE_SECS: u64 = 300;
 /// Default file names of the SSH identity, in the state directory (the
 /// directory of `agent.replay_journal`).
 pub const DEFAULT_SSH_HOST_KEY: &str = "ssh_host_key";
@@ -180,6 +185,9 @@ const fn default_ssh_login_grace() -> u64 {
 }
 const fn default_ssh_connect_timeout() -> u64 {
     DEFAULT_SSH_TARGET_CONNECT_TIMEOUT_SECS
+}
+const fn default_ssh_reconnect_grace() -> u64 {
+    DEFAULT_SSH_RECONNECT_GRACE_SECS
 }
 
 /// `[agent.ssh]`: the native SSH server of the agent and its driver to the
@@ -218,6 +226,11 @@ pub struct AgentSshConfig {
     /// Delay to reach a target, 1 to 30 s.
     #[serde(default = "default_ssh_connect_timeout")]
     pub target_connect_timeout_secs: u64,
+    /// How long a session goes on while the link to the core is lost, its
+    /// transcript buffered until it is resumed, 0 to 300 s; 0 cuts the
+    /// sessions at once (ADR-0016).
+    #[serde(default = "default_ssh_reconnect_grace")]
+    pub reconnect_grace_secs: u64,
 }
 
 /// The paths of the SSH identity, defaults applied.
@@ -341,7 +354,12 @@ fn ssh_consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
     let optional = ssh
         .max_sessions
         .map(|v| ("max_sessions", u64::from(v), 1..=256));
-    let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 4] = [
+    let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 5] = [
+        (
+            "reconnect_grace_secs",
+            ssh.reconnect_grace_secs,
+            0..=MAX_SSH_RECONNECT_GRACE_SECS,
+        ),
         (
             "max_unauthenticated",
             u64::from(ssh.max_unauthenticated),

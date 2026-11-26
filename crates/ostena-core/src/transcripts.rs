@@ -21,6 +21,15 @@
 //! A transcript left unsealed by a stop of the core is sealed as
 //! incomplete at the next start ([`recover`]), from the file as it is.
 //!
+//! **Acknowledgements and resumption.** The core acknowledges on the
+//! stream the transcript bytes written to the file (flushed to the kernel,
+//! synced at the end). When the stream of a session is lost with its
+//! connection, the sealing is deferred: the decoder, the file and the
+//! counts are kept for the grace the agent announced (bounded, plus
+//! [`RESUME_MARGIN`]), and a stream that resumes the transcript, from the
+//! same agent, goes on from the bytes received. Past the grace, the
+//! transcript is sealed incomplete (`REC-E005`), as before.
+//!
 //! The stream is read and decoded on the async workers; the file is
 //! written by a blocking task ([`tokio::task::spawn_blocking`]) fed through
 //! a bounded queue, behind a 64 KiB buffer: a slow disk slows down the
@@ -28,16 +37,20 @@
 //! workers. A write reaches the kernel cache, not the disk, until the
 //! final sync; the directory is synced after the file is created.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Duration;
 
 use ostena_audit::{Event, EventKind, Outcome, field};
 use ostena_crypto::hmac::HmacKey;
 use ostena_recorder::{CastWriter, Decoder, EndReason, Frame, Limits, RecorderError, Sealed};
-use ostena_tunnel::{Channel, Uuid};
+use ostena_tunnel::recording::{self, Preamble, RESET_STALLED, STOP_REPLACED, send_offset};
+use ostena_tunnel::{Channel, StreamError, Uuid};
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::audit::{self, Recorder};
 use crate::error::CoreError;
@@ -50,6 +63,13 @@ pub const REFUSED: &str = "REC-E002";
 pub const WRITE_FAILED: &str = "REC-E004";
 /// Code of a transcript cut before its end frame.
 pub const INCOMPLETE: &str = "REC-E005";
+/// Code of a malformed transcript stream.
+const MALFORMED: &str = "REC-E001";
+
+/// Added to the grace announced by the agent: the core and the agent do
+/// not see a lost connection at the same instant (each after its idle
+/// delay).
+pub const RESUME_MARGIN: Duration = Duration::from_secs(30);
 
 /// Domain of the keyed hash of a command: never the same input as another
 /// use of the key.
@@ -70,6 +90,30 @@ pub struct Transcripts {
     mac: HmacKey,
     key_id: String,
     limits: Limits,
+    /// The transcripts being recorded, by session: their agent, and where
+    /// a stream that resumes one is handed over.
+    recording: Mutex<HashMap<Uuid, (Uuid, mpsc::Sender<Channel>)>>,
+}
+
+/// Removes a transcript from the ones being recorded.
+struct Recording<'a> {
+    store: &'a Transcripts,
+    session: Uuid,
+}
+
+impl Drop for Recording<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut recording) = self.store.recording.lock() {
+            recording.remove(&self.session);
+        }
+    }
+}
+
+/// What the reading loop hands to the file writer.
+enum Item {
+    Frame(Frame),
+    /// The transcript bytes up to here are complete frames, queued before.
+    Mark(u64),
 }
 
 /// The keyed hash of the command of an `exec`, its length and the
@@ -173,6 +217,7 @@ impl Transcripts {
             mac,
             key_id,
             limits: Limits::default(),
+            recording: Mutex::default(),
         })
     }
 
@@ -402,16 +447,22 @@ fn write_file(
     file: File,
     path: &Path,
     session: Uuid,
-    mut frames: mpsc::Receiver<Frame>,
+    mut items: mpsc::Receiver<Item>,
+    written: &watch::Sender<u64>,
 ) -> Result<Sealed, RecorderError> {
     let mut writer = CastWriter::new(
         BufWriter::with_capacity(WRITE_BUFFER, file),
         session.to_bytes(),
     );
-    while let Some(frame) = frames.blocking_recv() {
-        writer.push(&frame)?;
-        if frames.is_empty() {
+    let mut mark = 0;
+    while let Some(item) = items.blocking_recv() {
+        match item {
+            Item::Frame(frame) => writer.push(&frame)?,
+            Item::Mark(at) => mark = at,
+        }
+        if items.is_empty() {
             writer.flush()?;
+            written.send_if_modified(|w| std::mem::replace(w, mark) != mark);
         }
     }
     let (sealed, inner) = writer.finish()?;
@@ -421,6 +472,7 @@ fn write_file(
     file.sync_all()
         .map_err(|e| RecorderError::Io(e.to_string()))?;
     seal_rights(path).map_err(|e| RecorderError::Io(e.to_string()))?;
+    written.send_replace(mark);
     Ok(sealed)
 }
 
@@ -454,8 +506,95 @@ async fn remember_command(pool: &PgPool, session: Uuid, command: &Command) {
     }
 }
 
+/// Where a transcript stream goes on after a loss.
+struct Resumption<'a> {
+    /// Streams that resume the transcript.
+    streams: &'a mut mpsc::Receiver<Channel>,
+    /// How long a lost stream waits for its resumption; zero: not at all.
+    wait: Duration,
+}
+
+/// Whether a stream error may be followed by a resumption: the connection
+/// is lost, or the agent gave up a stream the core no longer acknowledged.
+fn resumable(error: &StreamError) -> bool {
+    matches!(
+        error,
+        StreamError::ConnectionLost(_) | StreamError::Closed | StreamError::Reset(RESET_STALLED)
+    )
+}
+
+/// Replaces the stream of a transcript by the one that resumes it, and
+/// tells the agent where to resume from: the bytes received, a partial
+/// frame included (the decoder keeps it).
+async fn switch(
+    channel: &mut Channel,
+    resumed: Channel,
+    received: u64,
+    agent: Uuid,
+    session: Uuid,
+) {
+    let mut old = std::mem::replace(channel, resumed);
+    let _ = old.recv.stop(STOP_REPLACED);
+    let _ = old.send.reset(STOP_REPLACED);
+    drop(old);
+    tracing::info!(
+        event = "transcript.resumed",
+        agent = %agent,
+        session = %session,
+        offset = received,
+        "flux de transcript repris par l'agent"
+    );
+    // A failure shows on the next read.
+    let _ = send_offset(channel, received).await;
+}
+
+/// Keeps what the seal needs from `frame`: the keyed hash of the command
+/// of an `exec` (consigned at once, `access.ssh_exec`), the end reason.
+async fn note(
+    pool: &PgPool,
+    store: &Transcripts,
+    recorder: &Recorder,
+    agent: Uuid,
+    session: Uuid,
+    frame: &Frame,
+    out: &mut Received,
+) {
+    match &frame.event {
+        ostena_recorder::Event::Start {
+            command: Some(command),
+            ..
+        } => {
+            let hashed = Command {
+                tag: store.command_tag(session, command),
+                len: command.len(),
+                kid: store.key_id().to_owned(),
+            };
+            remember_command(pool, session, &hashed).await;
+            recorder.emit(
+                agent_event(EventKind::AccessSshExec, Outcome::Success, agent)
+                    .uuid(field::ACCESS_SESSION, session.to_bytes())
+                    .bytes(field::COMMAND_HMAC, hashed.tag)
+                    .u64(field::LENGTH, command.len() as u64)
+                    .text(field::KID, hashed.kid.as_str()),
+            );
+            out.command = Some(hashed);
+            tracing::info!(
+                event = "access.ssh_exec",
+                agent = %agent,
+                session = %session,
+                length = command.len(),
+                "commande d'une session SSH, empreinte à clé consignée"
+            );
+        }
+        ostena_recorder::Event::End { reason, .. } => out.reason = Some(*reason),
+        _ => {}
+    }
+}
+
 /// Reads the stream into the queue of the file writer until its end or
-/// the first failure.
+/// the first failure, acknowledging what the writer wrote; a stream lost
+/// with its connection waits for its resumption.
+#[allow(clippy::too_many_arguments)]
 async fn read_stream(
     pool: &PgPool,
     store: &Transcripts,
@@ -463,10 +602,14 @@ async fn read_stream(
     agent: Uuid,
     session: Uuid,
     channel: &mut Channel,
-    writer: &mpsc::Sender<Frame>,
+    writer: &mpsc::Sender<Item>,
+    written: &mut watch::Receiver<u64>,
+    resumption: Resumption<'_>,
 ) -> Received {
+    let Resumption { streams, wait } = resumption;
     let mut decoder = Decoder::new(store.limits);
     let mut buf = vec![0u8; READ_CHUNK];
+    let mut received = 0u64;
     let mut out = Received {
         failure: None,
         reason: None,
@@ -474,8 +617,23 @@ async fn read_stream(
         output_bytes: 0,
     };
     'stream: loop {
-        match channel.recv.read(&mut buf).await {
+        let read = tokio::select! {
+            biased;
+            Some(resumed) = streams.recv() => {
+                switch(channel, resumed, received, agent, session).await;
+                continue;
+            }
+            Ok(()) = written.changed() => {
+                let acked = *written.borrow_and_update();
+                // A failure shows on the next read.
+                let _ = send_offset(channel, acked).await;
+                continue;
+            }
+            read = channel.recv.read(&mut buf) => read,
+        };
+        match read {
             Ok(Some(n)) => {
+                received += n as u64;
                 decoder.feed(&buf[..n]);
                 loop {
                     let frame = match decoder.next_frame() {
@@ -486,46 +644,38 @@ async fn read_stream(
                             break 'stream;
                         }
                     };
-                    match &frame.event {
-                        ostena_recorder::Event::Start {
-                            command: Some(command),
-                            ..
-                        } => {
-                            let hashed = Command {
-                                tag: store.command_tag(session, command),
-                                len: command.len(),
-                                kid: store.key_id().to_owned(),
-                            };
-                            remember_command(pool, session, &hashed).await;
-                            recorder.emit(
-                                agent_event(EventKind::AccessSshExec, Outcome::Success, agent)
-                                    .uuid(field::ACCESS_SESSION, session.to_bytes())
-                                    .bytes(field::COMMAND_HMAC, hashed.tag)
-                                    .u64(field::LENGTH, command.len() as u64)
-                                    .text(field::KID, hashed.kid.as_str()),
-                            );
-                            out.command = Some(hashed);
-                            tracing::info!(
-                                event = "access.ssh_exec",
-                                agent = %agent,
-                                session = %session,
-                                length = command.len(),
-                                "commande d'une session SSH, empreinte à clé consignée"
-                            );
-                        }
-                        ostena_recorder::Event::End { reason, .. } => out.reason = Some(*reason),
-                        _ => {}
-                    }
+                    note(pool, store, recorder, agent, session, &frame, &mut out).await;
                     // Stopped on an error: it is told at the end.
-                    if writer.send(frame).await.is_err() {
+                    if writer.send(Item::Frame(frame)).await.is_err() {
                         break 'stream;
                     }
+                }
+                let complete = received - decoder.pending() as u64;
+                if writer.send(Item::Mark(complete)).await.is_err() {
+                    break 'stream;
                 }
                 out.output_bytes = decoder.output_bytes();
             }
             Ok(None) => {
                 out.failure = decoder.finish().err();
                 break;
+            }
+            Err(e) if !wait.is_zero() && resumable(&e) => {
+                tracing::warn!(
+                    event = "transcript.interrupted",
+                    agent = %agent,
+                    session = %session,
+                    wait_secs = wait.as_secs(),
+                    "flux de transcript interrompu ({e}) : scellement différé, reprise attendue"
+                );
+                if let Ok(Some(resumed)) = tokio::time::timeout(wait, streams.recv()).await {
+                    switch(channel, resumed, received, agent, session).await;
+                } else {
+                    out.failure = Some(RecorderError::Incomplete(
+                        "flux interrompu, non repris pendant la grâce",
+                    ));
+                    break;
+                }
             }
             Err(_) => {
                 out.failure = Some(RecorderError::Incomplete("flux interrompu"));
@@ -538,8 +688,9 @@ async fn read_stream(
 }
 
 /// Reads the stream of `session` into `file`, written by a blocking task;
-/// returns what was read and what the writer sealed. A writer error is the
-/// failure of the stream if it had none.
+/// returns what was read, what the writer sealed and the transcript bytes
+/// it wrote. A writer error is the failure of the stream if it had none.
+#[allow(clippy::too_many_arguments)]
 async fn record(
     pool: &PgPool,
     store: &Transcripts,
@@ -548,31 +699,62 @@ async fn record(
     session: Uuid,
     channel: &mut Channel,
     file: File,
-) -> (Received, Result<Sealed, RecorderError>) {
-    let (frames, queued) = mpsc::channel(WRITE_QUEUE);
-    let written = {
+    resumption: Resumption<'_>,
+) -> (Received, Result<Sealed, RecorderError>, u64) {
+    let (items, queued) = mpsc::channel(WRITE_QUEUE);
+    let (acked, mut written) = watch::channel(0u64);
+    let writing = {
         let path = store.path(session);
-        tokio::task::spawn_blocking(move || write_file(file, &path, session, queued))
+        tokio::task::spawn_blocking(move || write_file(file, &path, session, queued, &acked))
     };
-    let mut read = read_stream(pool, store, recorder, agent, session, channel, &frames).await;
-    drop(frames);
-    let written = written
+    let mut read = read_stream(
+        pool,
+        store,
+        recorder,
+        agent,
+        session,
+        channel,
+        &items,
+        &mut written,
+        resumption,
+    )
+    .await;
+    drop(items);
+    let sealed = writing
         .await
         .unwrap_or_else(|e| Err(RecorderError::Io(e.to_string())));
     if read.failure.is_none()
-        && let Err(e) = &written
+        && let Err(e) = &sealed
     {
         read.failure = Some(e.clone());
     }
-    (read, written)
+    let acked = *written.borrow();
+    (read, sealed, acked)
+}
+
+/// Hands a stream that resumes the transcript of `session` to the task
+/// that records it, if it is one of `agent`; otherwise gives it back.
+fn hand_over(store: &Transcripts, agent: Uuid, session: Uuid, channel: Channel) -> Option<Channel> {
+    let to = store.recording.lock().ok().and_then(|r| {
+        r.get(&session)
+            .filter(|(a, _)| *a == agent)
+            .map(|(_, tx)| tx.clone())
+    });
+    match to {
+        Some(tx) => tx.try_send(channel).err().map(|e| match e {
+            mpsc::error::TrySendError::Full(c) | mpsc::error::TrySendError::Closed(c) => c,
+        }),
+        None => Some(channel),
+    }
 }
 
 /// Receives the transcript stream of `session` from `agent`, writes it and
-/// seals it (see the module documentation). Each refusal of the stream is
-/// first counted by `refusal_allowed`, which closes the tunnel of an agent
-/// beyond its limit: only refusals within the limit are reported one by
-/// one.
-#[allow(clippy::too_many_arguments)]
+/// seals it (see the module documentation); a stream that resumes a
+/// transcript is handed to the task recording it. Each refusal of the
+/// stream is first counted by `refusal_allowed`, which closes the tunnel of
+/// an agent beyond its limit: only refusals within the limit are reported
+/// one by one.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn receive(
     pool: &PgPool,
     recorder: &Recorder,
@@ -586,7 +768,7 @@ pub async fn receive(
     // Stops the stream at once (the agent cuts the session), then gives the
     // record to write, within the limit of refusals.
     let refuse = |channel: &mut Channel, code: &str, reason: &str| {
-        ostena_tunnel::recording::refuse(channel);
+        recording::refuse(channel);
         refusal_allowed().then(|| {
             tracing::warn!(
                 event = "transcript.refused",
@@ -597,6 +779,25 @@ pub async fn receive(
             );
             refused_event(agent, session, code, reason)
         })
+    };
+    let grace = match Preamble::read(&mut channel).await {
+        Ok(Preamble::New { grace_secs }) => Duration::from_secs(grace_secs.into()),
+        Ok(Preamble::Resume) => {
+            if let Some(mut channel) = hand_over(store, agent, session, channel) {
+                let event = refuse(
+                    &mut channel,
+                    REFUSED,
+                    "reprise d'un transcript inconnu, terminé ou d'un autre agent",
+                );
+                protect(pool, recorder, event).await;
+            }
+            return;
+        }
+        Err(e) => {
+            let event = refuse(&mut channel, MALFORMED, &e.to_string());
+            protect(pool, recorder, event).await;
+            return;
+        }
     };
     let refusal = match register(pool, agent, session, now()).await {
         Ok(true) => None,
@@ -611,6 +812,11 @@ pub async fn receive(
         protect(pool, recorder, event).await;
         return;
     }
+    let (resume_to, mut resumed) = mpsc::channel(1);
+    if let Ok(mut recording) = store.recording.lock() {
+        recording.insert(session, (agent, resume_to));
+    }
+    let registered = Recording { store, session };
     let path = store.path(session);
     let created = {
         let path = path.clone();
@@ -621,6 +827,7 @@ pub async fn receive(
     let file = match created {
         Ok(file) => file,
         Err(e) => {
+            drop(registered);
             let event = refuse(
                 &mut channel,
                 WRITE_FAILED,
@@ -641,7 +848,26 @@ pub async fn receive(
             return;
         }
     };
-    let (read, written) = record(pool, store, recorder, agent, session, &mut channel, file).await;
+    let resumption = Resumption {
+        streams: &mut resumed,
+        wait: if grace.is_zero() {
+            Duration::ZERO
+        } else {
+            grace + RESUME_MARGIN
+        },
+    };
+    let (read, written, acked) = record(
+        pool,
+        store,
+        recorder,
+        agent,
+        session,
+        &mut channel,
+        file,
+        resumption,
+    )
+    .await;
+    drop(registered);
     let code = read.failure.as_ref().map(RecorderError::code);
     if let Some(failure) = &read.failure {
         if matches!(failure, RecorderError::Incomplete(_)) {
@@ -651,6 +877,10 @@ pub async fn receive(
             let event = refuse(&mut channel, failure.code(), &failure.to_string());
             protect(pool, recorder, event).await;
         }
+    } else {
+        // Written and synced: the agent may let the transcript go.
+        let _ = send_offset(&mut channel, acked).await;
+        let _ = channel.send.finish();
     }
     let Some((sealed, code)) = finish(written, &path, session, code).await else {
         // Left unsealed, sealed at the next start of the core (or the
@@ -835,18 +1065,22 @@ mod tests {
         let path = dir.join(format!("{session}.cast"));
         let file = create(&path).unwrap();
         assert!(create(&path).is_err(), "never over another file");
+        let (acked, written_mark) = watch::channel(0u64);
         let sealed = rt.block_on(async {
             let (tx, rx) = mpsc::channel(1);
             let written = {
                 let path = path.clone();
-                tokio::task::spawn_blocking(move || write_file(file, &path, session, rx))
+                tokio::task::spawn_blocking(move || write_file(file, &path, session, rx, &acked))
             };
-            for frame in frames() {
-                tx.send(frame).await.unwrap();
+            for (i, frame) in frames().into_iter().enumerate() {
+                tx.send(Item::Frame(frame)).await.unwrap();
+                tx.send(Item::Mark(i as u64 + 1)).await.unwrap();
             }
             drop(tx);
             written.await.unwrap().unwrap()
         });
+        // Every mark is acknowledged once written, the last after the sync.
+        assert_eq!(*written_mark.borrow(), frames().len() as u64);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(sealed.size, bytes.len() as u64);
         assert_eq!(sealed.sha256, ostena_crypto::sha256::digest(&bytes));

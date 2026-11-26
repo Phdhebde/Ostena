@@ -241,6 +241,7 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 | `max_unauthenticated_per_source` | 4 | 1 à 256 |
 | `login_grace_secs` | 30 | 5 à 120 |
 | `target_connect_timeout_secs` | 5 | 1 à 30 |
+| `reconnect_grace_secs` | 60 | 0 à 300 ; durée de vie d'une session sans lien avec le core (ADR-0016, jalon M2) |
 
 Les quotas et le délai d'inactivité, communs à tous les protocoles, sont dans `[agent.sessions]` (ADR-0018). Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et les cibles donnent `CFG-V015`. Une clé SSH lisible par un autre compte, ou le dossier d'une clé pas encore créée modifiable par un autre compte, donne `CFG-P008`.
 
