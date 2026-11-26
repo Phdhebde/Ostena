@@ -854,6 +854,25 @@ fn bind_tcp(
     })
 }
 
+/// How long a refused TCP connection is drained before it is closed.
+const LINGER: Duration = Duration::from_secs(1);
+
+/// Closes a connection whose handshake the core refused, once the alert is
+/// sent: end of the write side, then what the agent already sent is read
+/// and dropped, for at most [`LINGER`]. A socket closed with unread data is
+/// reset (always on Windows), and a reset can discard the alert before the
+/// agent reads it: the agent would see a lost connection instead of the
+/// reason (`TUN-E004`, `TUN-E012`…).
+async fn linger(mut tcp: TcpStream) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let _ = tcp.shutdown().await;
+    let mut sink = [0u8; 4096];
+    let _ = tokio::time::timeout(LINGER, async {
+        while matches!(tcp.read(&mut sink).await, Ok(n) if n > 0) {}
+    })
+    .await;
+}
+
 async fn accept_tcp(
     tcp: TcpStream,
     acceptor: TlsAcceptor,
@@ -862,10 +881,13 @@ async fn accept_tcp(
     let conn = within(limits.handshake_timeout, "poignée de main TCP", async {
         tcp.set_nodelay(true)
             .map_err(|e| TunnelError::Io(e.to_string()))?;
-        let stream = acceptor
-            .accept(tcp)
-            .await
-            .map_err(|e| TunnelError::from_tls_io(&e))?;
+        let stream = match acceptor.accept(tcp).into_fallible().await {
+            Ok(stream) => stream,
+            Err((e, tcp)) => {
+                linger(tcp).await;
+                return Err(TunnelError::from_tls_io(&e));
+            }
+        };
         let session = stream.get_ref().1;
         if session.alpn_protocol() != Some(ALPN) {
             return Err(TunnelError::ApplicationProtocol);
