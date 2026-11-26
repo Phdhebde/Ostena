@@ -25,7 +25,7 @@ use ostena_common::config::{CoreConfig, KeySource};
 use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::{IssuingAuthority, Validity};
-use ostena_crypto::tls::{self, ClientAuth, Identity, TrustAnchor};
+use ostena_crypto::tls::{self, ClientAuth, Identity, TrustAnchor, WebGroups};
 use ostena_grant::Issuer;
 use ostena_tunnel::control::{AgentMessage, CoreMessage, PROTOCOL_VERSION};
 use ostena_tunnel::enroll::{AgentRegistry, EnrollmentService};
@@ -34,7 +34,7 @@ use sqlx::postgres::PgListener;
 use tokio::task::JoinHandle;
 
 use crate::access::{self, Refusal, SshRequest};
-use crate::api::{Limits as LoginLimits, LoginListener};
+use crate::api::{Attempts, Limits as LoginLimits, LoginListener};
 use crate::audit::{self, Cadence, HeadSigner, Recorder, SystemClock};
 use crate::authn::PgAuthenticator;
 use crate::cache::AgentCache;
@@ -44,6 +44,8 @@ use crate::grant_keys::GrantAuthority;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
 use crate::transcripts::{self, Transcripts};
+use crate::web::pg::PgWebBackend;
+use crate::web::{WebListener, WebSettings};
 use crate::{login, pushes, rate};
 use ostena_crypto::hmac::HmacKey;
 
@@ -434,15 +436,17 @@ fn start_events(signer: &HeadSigner, info: &StartInfo) -> Vec<Event> {
     events
 }
 
-/// The login listener of `[core.login]` (ADR-0010, ADR-0015).
+/// The listeners of `[core.login]` (ADR-0010, ADR-0015) and of
+/// `[core.web]` (ADR-0020): one authenticator and one attempt limiter for
+/// both.
 async fn start_login(
     config: &CoreConfig,
     keys: &Keys,
     store: &PgStore,
     recorder: &Arc<Recorder>,
-) -> Result<Option<LoginListener>, CoreError> {
+) -> Result<(Option<LoginListener>, Option<WebListener>), CoreError> {
     let Some(settings) = &config.login else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let (Some(ssh), Some(totp)) = (keys.ssh.clone(), keys.totp.clone()) else {
         return Err(CoreError::Startup(
@@ -451,16 +455,48 @@ async fn start_login(
     };
     let tls = tls::server_config(&keys.server, ClientAuth::None, &[b"http/1.1"])
         .map_err(|e| CoreError::Startup(e.to_string()))?;
-    let authenticator =
-        PgAuthenticator::new(store.pool().clone(), recorder.clone(), ssh, totp, settings);
-    LoginListener::bind(
+    let authenticator = Arc::new(PgAuthenticator::new(
+        store.pool().clone(),
+        recorder.clone(),
+        ssh,
+        totp,
+        settings,
+    ));
+    let limits = LoginLimits::from_config(settings);
+    let attempts = Arc::new(Attempts::new(limits.attempts_per_minute));
+    let login = LoginListener::bind_sharing(
         settings.listen,
         tls,
-        LoginLimits::from_config(settings),
-        Arc::new(authenticator),
+        limits,
+        authenticator.clone(),
+        attempts.clone(),
     )
-    .await
-    .map(Some)
+    .await?;
+    let Some(web) = &config.web else {
+        return Ok((Some(login), None));
+    };
+    let groups = if web.tls_classic_fallback {
+        WebGroups::HybridThenClassic
+    } else {
+        WebGroups::Hybrid
+    };
+    let tls = tls::web_server_config(&keys.server, groups)
+        .map_err(|e| CoreError::Startup(e.to_string()))?;
+    let listener = WebListener::bind(
+        web.listen,
+        tls,
+        WebSettings::from_config(web),
+        Arc::new(PgWebBackend::new(authenticator)),
+        attempts,
+    )
+    .await?;
+    tracing::info!(
+        event = "web.tls_groups",
+        groups = ?groups.names(),
+        origin = %web.origin,
+        "groupes TLS de l'écouteur web (X25519MLKEM768 : écart admis, ADR-0009)"
+    );
+    Ok((Some(login), Some(listener)))
 }
 
 /// A started core. Dropping it does not stop it: call [`RunningCore::stop`].
@@ -472,6 +508,7 @@ pub struct RunningCore {
     writer: JoinHandle<()>,
     signer: Arc<HeadSigner>,
     login: Option<LoginListener>,
+    web: Option<WebListener>,
 }
 
 impl std::fmt::Debug for RunningCore {
@@ -563,7 +600,7 @@ impl RunningCore {
             ],
         )
         .await?;
-        let login = start_login(config, keys, &shared.store, &recorder).await?;
+        let (login, web) = start_login(config, keys, &shared.store, &recorder).await?;
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
         let notices = listen(shared.store.pool()).await?;
@@ -586,6 +623,7 @@ impl RunningCore {
             grant_kid = %shared.grants.kid(),
             ssh = shared.ssh.is_some(),
             login = ?login.as_ref().map(LoginListener::local_addr),
+            web = ?web.as_ref().map(WebListener::local_addr),
             "core démarré"
         );
         Ok(Self {
@@ -596,7 +634,13 @@ impl RunningCore {
             writer,
             signer,
             login,
+            web,
         })
+    }
+
+    /// The bound address of the web listener, if `[core.web]` is set.
+    pub fn web_addr(&self) -> Option<SocketAddr> {
+        self.web.as_ref().map(WebListener::local_addr)
     }
 
     /// The bound address of the login listener, if `[core.login]` is set.
@@ -643,6 +687,9 @@ impl RunningCore {
         }
         if let Some(login) = &self.login {
             login.close();
+        }
+        if let Some(web) = &self.web {
+            web.close();
         }
         self.listener.close();
         self.shared.enrollment.close();

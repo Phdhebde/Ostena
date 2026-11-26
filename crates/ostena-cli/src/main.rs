@@ -361,6 +361,26 @@ enum CoreUserCommand {
         /// Login name.
         name: String,
     },
+    /// Give a role of the portal to a user (`admin`).
+    RoleGrant {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+        /// Role: `admin`.
+        role: String,
+    },
+    /// Take a role of the portal from a user.
+    RoleRevoke {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Login name.
+        name: String,
+        /// Role: `admin`.
+        role: String,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -1101,30 +1121,7 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
             }
             CoreGroupCommand::List { config } => inv::group_list(&config),
         },
-        CoreCommand::User { command } => match command {
-            CoreUserCommand::Add {
-                config,
-                name,
-                display_name,
-            } => inv::user_add(&config, &name, &display_name),
-            CoreUserCommand::List { config } => inv::user_list(&config),
-            CoreUserCommand::Disable { config, name } => inv::user_disable(&config, &name),
-            CoreUserCommand::SetPassword {
-                config,
-                name,
-                stdin,
-            } => core_credential::set_password(&config, &name, stdin),
-            CoreUserCommand::TotpEnroll {
-                config,
-                name,
-                confirm,
-                stdin,
-            } => core_credential::totp_enroll(&config, &name, confirm, stdin),
-            CoreUserCommand::TotpReset { config, name } => {
-                core_credential::totp_reset(&config, &name)
-            }
-            CoreUserCommand::Unlock { config, name } => core_credential::unlock(&config, &name),
-        },
+        CoreCommand::User { command } => run_core_user(command),
         CoreCommand::Resource { command } => match command {
             CoreResourceCommand::Add {
                 config,
@@ -1178,6 +1175,40 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
         | CoreCommand::Db { .. }
         | CoreCommand::Agent { .. }
         | CoreCommand::Audit { .. } => ExitCode::FAILURE,
+    }
+}
+
+/// `ostena core user …`.
+#[cfg(target_os = "linux")]
+fn run_core_user(command: CoreUserCommand) -> ExitCode {
+    use core_inventory as inv;
+    match command {
+        CoreUserCommand::Add {
+            config,
+            name,
+            display_name,
+        } => inv::user_add(&config, &name, &display_name),
+        CoreUserCommand::List { config } => inv::user_list(&config),
+        CoreUserCommand::Disable { config, name } => inv::user_disable(&config, &name),
+        CoreUserCommand::SetPassword {
+            config,
+            name,
+            stdin,
+        } => core_credential::set_password(&config, &name, stdin),
+        CoreUserCommand::TotpEnroll {
+            config,
+            name,
+            confirm,
+            stdin,
+        } => core_credential::totp_enroll(&config, &name, confirm, stdin),
+        CoreUserCommand::TotpReset { config, name } => core_credential::totp_reset(&config, &name),
+        CoreUserCommand::Unlock { config, name } => core_credential::unlock(&config, &name),
+        CoreUserCommand::RoleGrant { config, name, role } => {
+            inv::user_role(&config, &name, &role, true)
+        }
+        CoreUserCommand::RoleRevoke { config, name, role } => {
+            inv::user_role(&config, &name, &role, false)
+        }
     }
 }
 

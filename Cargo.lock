@@ -2055,6 +2055,7 @@ dependencies = [
  "ostena-ssh",
  "ostena-tunnel",
  "proptest",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror",

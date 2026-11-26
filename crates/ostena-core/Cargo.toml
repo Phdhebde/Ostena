@@ -34,6 +34,8 @@ ostena-scope.workspace = true
 # core never runs (ADR-0014).
 ostena-ssh = { path = "../ostena-ssh", default-features = false }
 ostena-tunnel.workspace = true
+# The responses of the portal API (ADR-0020).
+serde.workspace = true
 # The stored scope policy (JSON) and the digest of a pushed SSH trust.
 serde_json.workspace = true
 sqlx.workspace = true
@@ -54,6 +56,11 @@ toml.workspace = true
 hyper = { workspace = true, features = ["client"] }
 # The property test of the login rate limiter.
 proptest.workspace = true
+
+[[bench]]
+# Cost of one authenticated request on the portal API.
+name = "web_request"
+harness = false
 
 [lints]
 workspace = true

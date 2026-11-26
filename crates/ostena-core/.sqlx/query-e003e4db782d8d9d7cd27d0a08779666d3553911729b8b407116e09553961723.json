@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO login_session (id, user_id, channel, started_at, expires_at)\n         VALUES ($1::text::uuid, $2::text::uuid, 'web', $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e003e4db782d8d9d7cd27d0a08779666d3553911729b8b407116e09553961723"
+}

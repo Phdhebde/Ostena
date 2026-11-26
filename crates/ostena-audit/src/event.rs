@@ -138,6 +138,19 @@ event_kinds! {
     /// A transcript stream was refused (unknown session, malformed, limit,
     /// storage).
     TranscriptRefused => "transcript.refused",
+    /// A browser session ended without activity, or at its absolute end
+    /// (ADR-0020); its login session is revoked.
+    WebSessionExpired => "web_session.expired",
+    /// A browser session was presented from another source than the one
+    /// that opened it; it is revoked (ADR-0020).
+    WebSessionSourceChanged => "web_session.source_changed",
+    /// The user of a browser session gave both factors again; the cookie
+    /// got a new value (ADR-0020).
+    WebSessionReauthenticated => "web_session.reauthenticated",
+    /// A role was given to a user.
+    UserRoleGranted => "user.role_granted",
+    /// A role was taken from a user.
+    UserRoleRevoked => "user.role_revoked",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -269,6 +282,13 @@ pub mod field {
     pub const LENGTH: &str = "length";
     /// Whether a transcript is complete (ended by its end frame).
     pub const COMPLETE: &str = "complete";
+    /// How a login session is opened: `cli` (`ostena login`) or `web` (the
+    /// portal).
+    pub const CHANNEL: &str = "channel";
+    /// A role of the portal (`admin`).
+    pub const ROLE: &str = "role";
+    /// The source a browser session is bound to (IPv4 address or IPv6 /64).
+    pub const SOURCE: &str = "source";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -334,6 +354,9 @@ pub mod field {
         COMMAND_HMAC,
         LENGTH,
         COMPLETE,
+        CHANNEL,
+        ROLE,
+        SOURCE,
     ];
 }
 
@@ -503,7 +526,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 50);
+        assert_eq!(names.len(), 55);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

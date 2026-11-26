@@ -26,5 +26,6 @@ pub mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
 pub mod transcripts;
+pub mod web;
 
 pub use error::CoreError;

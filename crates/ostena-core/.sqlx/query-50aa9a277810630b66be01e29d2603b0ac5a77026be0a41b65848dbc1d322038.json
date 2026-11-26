@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO web_session\n                 (login_session_id, cookie_sha256, source, authenticated_at,\n                  last_activity_at)\n             VALUES ($1::text::uuid, $2, $3, $4, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "50aa9a277810630b66be01e29d2603b0ac5a77026be0a41b65848dbc1d322038"
+}

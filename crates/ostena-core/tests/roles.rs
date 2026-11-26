@@ -42,6 +42,8 @@ const EXPECTED: &[(&str, &[&str])] = &[
     ("target_account", &["INSERT", "SELECT"]),
     ("target_account.disabled_at", &["UPDATE"]),
     ("user_credential", &["INSERT", "SELECT", "UPDATE"]),
+    ("user_role", &["DELETE", "INSERT", "SELECT"]),
+    ("web_session", &["INSERT", "SELECT", "UPDATE"]),
 ];
 
 /// The privileges of `grantee` (a role name, or `PUBLIC`) on the objects of

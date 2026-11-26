@@ -1,0 +1,733 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Ostena — API REST du portail",
+    "version": "1",
+    "summary": "API du portail web d'Ostena, servie par l'écouteur core.web (ADR-0020).",
+    "description": "Contrat écrit à la main, relu en revue comme un document. Les tests d'ostena-core vérifient qu'il décrit exactement la table de routes du core (méthode, chemin, authentification, rôle, ré-authentification) et que chaque exemple passe par le type Rust strict correspondant puis se réencode à l'identique.\n\nToute méthode autre que GET exige `Origin` égale à l'origine du portail, `Sec-Fetch-Site: same-origin` quand l'en-tête est présent et `Content-Type: application/json` (sauf `POST /api/v1/csp-report`). Une route `/api/` inconnue répond 401 sans session valide, 404 avec une session. Chaque réponse porte les en-têtes de sécurité et la CSP de l'ADR-0020.",
+    "license": {
+      "name": "AGPL-3.0-or-later",
+      "identifier": "AGPL-3.0-or-later"
+    }
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "L'origine du portail (core.web.origin)."
+    }
+  ],
+  "security": [
+    {
+      "session": []
+    }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "portal",
+        "summary": "Racine du portail.",
+        "description": "Sert le portail (PR 8c). Sans portail embarqué dans le binaire : 503 WEB-E008.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "La page du portail.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/NoPortal"
+          }
+        }
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Le core répond.",
+        "security": [],
+        "responses": {
+          "204": {
+            "description": "Le core répond ; aucun corps."
+          }
+        }
+      }
+    },
+    "/api/v1/csp-report": {
+      "post": {
+        "operationId": "cspReport",
+        "summary": "Rapport de violation de la CSP, envoyé par le navigateur.",
+        "description": "Journalisé avec un débit limité, jamais dans la chaîne d'audit. Exempté des contrôles CSRF : le navigateur l'envoie lui-même. 8 Kio au plus.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/csp-report": {},
+            "application/reports+json": {}
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Rapport reçu."
+          },
+          "413": {
+            "$ref": "#/components/responses/BadBody"
+          },
+          "415": {
+            "$ref": "#/components/responses/BadBody"
+          }
+        }
+      }
+    },
+    "/api/v1/session": {
+      "post": {
+        "operationId": "login",
+        "summary": "Connexion : nom, mot de passe et code TOTP en une requête.",
+        "description": "Le succès ouvre une session de connexion de type web et pose le cookie `__Host-ostena_session` (Secure, HttpOnly, SameSite=Strict, Path=/), d'une valeur neuve. Le refus est toujours AUTH-E001, sans dire pourquoi. Les tentatives sont limitées par source avec le même compteur que `ostena login` (AUTH-E002).",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session ouverte.",
+            "headers": {
+              "Set-Cookie": {
+                "$ref": "#/components/headers/SetSessionCookie"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/InvalidCredentials"
+          },
+          "403": {
+            "$ref": "#/components/responses/CrossSite"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      },
+      "get": {
+        "operationId": "whoAmI",
+        "summary": "La session courante et ses échéances.",
+        "description": "Avec `X-Ostena-Background: 1`, la requête ne repousse pas l'échéance d'inactivité.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Background"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "La session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NoSession"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "logout",
+        "summary": "Déconnexion : révoque la session et efface le cookie.",
+        "responses": {
+          "204": {
+            "description": "Session révoquée ; `Clear-Site-Data: \"cookies\", \"storage\"`.",
+            "headers": {
+              "Set-Cookie": {
+                "$ref": "#/components/headers/ClearSessionCookie"
+              },
+              "Clear-Site-Data": {
+                "schema": {
+                  "type": "string",
+                  "const": "\"cookies\", \"storage\""
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NoSession"
+          },
+          "403": {
+            "$ref": "#/components/responses/CrossSite"
+          }
+        }
+      }
+    },
+    "/api/v1/session/reauthenticate": {
+      "post": {
+        "operationId": "reauthenticate",
+        "summary": "Ré-authentification pour une action sensible.",
+        "description": "Les deux facteurs de l'utilisateur de la session. Le succès pose un cookie d'une valeur neuve ; l'ancienne ne vaut plus rien.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReauthenticateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session authentifiée de nouveau.",
+            "headers": {
+              "Set-Cookie": {
+                "$ref": "#/components/headers/SetSessionCookie"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/InvalidCredentials"
+          },
+          "403": {
+            "$ref": "#/components/responses/CrossSite"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "summary": "Ce document.",
+        "responses": {
+          "200": {
+            "description": "Le document OpenAPI embarqué dans le binaire.",
+            "content": {
+              "application/json": {}
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NoSession"
+          }
+        }
+      }
+    },
+    "/api/v1/login-sessions": {
+      "get": {
+        "operationId": "listLoginSessions",
+        "summary": "Les sessions de connexion ouvertes (ostena login et portail).",
+        "x-ostena-role": "admin",
+        "responses": {
+          "200": {
+            "description": "Les sessions ni révoquées ni expirées, les plus récentes d'abord, 500 au plus.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginSessionList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/NoSession"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/api/v1/login-sessions/{id}": {
+      "delete": {
+        "operationId": "revokeLoginSession",
+        "summary": "Révoque une session de connexion.",
+        "description": "Les agents coupent tout de suite les sessions ouvertes avec elle. Exige une authentification de moins de 5 minutes (WEB-E007). Révoquer une session révoquée ne change rien.",
+        "x-ostena-role": "admin",
+        "x-ostena-fresh-authentication": true,
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "La session de connexion, UUID canonique en minuscules.",
+            "schema": {
+              "$ref": "#/components/schemas/Uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Session révoquée."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/NoSession"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "session": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-ostena_session",
+        "description": "256 bits aléatoires en base64url (43 caractères). La base ne garde que leur SHA-256. Inactivité : core.web.idle_minutes (15 min par défaut) ; durée absolue : core.web.session_max_hours (8 h au plus). Liée à la source qui l'a ouverte."
+      }
+    },
+    "parameters": {
+      "Background": {
+        "name": "X-Ostena-Background",
+        "in": "header",
+        "required": false,
+        "description": "1 pour une requête de fond, qui ne repousse pas l'échéance d'inactivité.",
+        "schema": {
+          "type": "string",
+          "const": "1"
+        }
+      }
+    },
+    "headers": {
+      "SetSessionCookie": {
+        "description": "`__Host-ostena_session=<valeur>; Path=/; Secure; HttpOnly; SameSite=Strict`",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "ClearSessionCookie": {
+        "description": "`__Host-ostena_session=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0`",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "responses": {
+      "NoSession": {
+        "description": "WEB-E001 : session absente, inconnue, expirée ou révoquée ; WEB-E007 : authentification de moins de 5 minutes exigée.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "InvalidCredentials": {
+        "description": "AUTH-E001 : identifiants invalides ou compte indisponible, sans autre détail ; ou WEB-E001 pour la ré-authentification sans session.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "AUTH-E002 : trop de tentatives depuis cette source sur la dernière minute.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "CrossSite": {
+        "description": "WEB-E002 : Origin absente ou étrangère ; WEB-E003 : Sec-Fetch-Site autre que same-origin, ou type de contenu autre que JSON.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "WEB-E004 : rôle insuffisant ; WEB-E002, WEB-E003 : voir CrossSite.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "WEB-E005 : route ou ressource inconnue (avec une session seulement).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "BadBody": {
+        "description": "WEB-E006 : corps invalide (400), trop grand (413) ou d'un autre type (415).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NoPortal": {
+        "description": "WEB-E008 : portail absent de ce binaire.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Uuid": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "examples": [
+          "0b8f4c1e-7a52-4d0e-9f3b-2c6d1a9e8f70"
+        ]
+      },
+      "Username": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+        "examples": [
+          "alice"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "enum": [
+          "admin"
+        ],
+        "examples": [
+          "admin"
+        ]
+      },
+      "Channel": {
+        "type": "string",
+        "enum": [
+          "cli",
+          "web"
+        ],
+        "description": "cli : ostena login ; web : le portail.",
+        "examples": [
+          "web"
+        ]
+      },
+      "SessionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "username",
+          "password",
+          "totp"
+        ],
+        "properties": {
+          "username": {
+            "$ref": "#/components/schemas/Username"
+          },
+          "password": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
+            "description": "De 1 à 1024 octets."
+          },
+          "totp": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16,
+            "description": "Le code à 6 chiffres de l'application d'authentification."
+          }
+        },
+        "examples": [
+          {
+            "username": "alice",
+            "password": "correct horse battery staple",
+            "totp": "123456"
+          }
+        ]
+      },
+      "ReauthenticateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "password",
+          "totp"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "totp": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16
+          }
+        },
+        "examples": [
+          {
+            "password": "correct horse battery staple",
+            "totp": "654321"
+          }
+        ]
+      },
+      "SessionInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "login_session",
+          "user",
+          "username",
+          "display_name",
+          "roles",
+          "authenticated_at",
+          "expires_at",
+          "idle_expires_at"
+        ],
+        "properties": {
+          "login_session": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "user": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "username": {
+            "$ref": "#/components/schemas/Username"
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "roles": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/Role"
+            },
+            "description": "Triés."
+          },
+          "authenticated_at": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Dernière authentification avec les deux facteurs, secondes Unix."
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Fin de la session quelle que soit l'activité, secondes Unix."
+          },
+          "idle_expires_at": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Fin de la session sans activité, secondes Unix ; jamais après expires_at."
+          }
+        },
+        "examples": [
+          {
+            "login_session": "0b8f4c1e-7a52-4d0e-9f3b-2c6d1a9e8f70",
+            "user": "5a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            "username": "alice",
+            "display_name": "Alice Martin",
+            "roles": [
+              "admin"
+            ],
+            "authenticated_at": 1800000000,
+            "expires_at": 1800028800,
+            "idle_expires_at": 1800000900
+          },
+          {
+            "login_session": "7c3e2a10-9b4d-4f6e-8a21-3d5c7e9f0b12",
+            "user": "1f2e3d4c-5b6a-4978-8695-a4b3c2d1e0f9",
+            "username": "bob",
+            "display_name": "Bob",
+            "roles": [],
+            "authenticated_at": 1800000000,
+            "expires_at": 1800003600,
+            "idle_expires_at": 1800000900
+          }
+        ]
+      },
+      "LoginSessionItem": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "user",
+          "username",
+          "channel",
+          "started_at",
+          "expires_at"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "user": {
+            "$ref": "#/components/schemas/Uuid"
+          },
+          "username": {
+            "$ref": "#/components/schemas/Username"
+          },
+          "channel": {
+            "$ref": "#/components/schemas/Channel"
+          },
+          "started_at": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "examples": [
+          {
+            "id": "0b8f4c1e-7a52-4d0e-9f3b-2c6d1a9e8f70",
+            "user": "5a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+            "username": "alice",
+            "channel": "cli",
+            "started_at": 1800000000,
+            "expires_at": 1800028800
+          }
+        ]
+      },
+      "LoginSessionList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/LoginSessionItem"
+            }
+          }
+        },
+        "examples": [
+          {
+            "sessions": [
+              {
+                "id": "0b8f4c1e-7a52-4d0e-9f3b-2c6d1a9e8f70",
+                "user": "5a1d2c3b-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+                "username": "alice",
+                "channel": "web",
+                "started_at": 1800000000,
+                "expires_at": 1800028800
+              }
+            ]
+          },
+          {
+            "sessions": []
+          }
+        ]
+      },
+      "RevokeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Sans caractère de contrôle ; écrite dans la chaîne d'audit."
+          }
+        },
+        "examples": [
+          {
+            "reason": "poste de l'utilisateur perdu"
+          }
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z]{2,4}-E[0-9]{3}$",
+            "description": "Code stable, que le portail traduit et affiche."
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "Pour les journaux et les tests ; le portail ne l'affiche jamais."
+          }
+        },
+        "examples": [
+          {
+            "code": "WEB-E001",
+            "message": "session absente, expirée ou révoquée"
+          },
+          {
+            "code": "AUTH-E001",
+            "message": "identifiants invalides ou compte indisponible"
+          }
+        ]
+      }
+    }
+  }
+}

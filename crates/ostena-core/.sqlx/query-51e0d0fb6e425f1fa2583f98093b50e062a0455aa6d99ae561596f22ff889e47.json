@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.role FROM user_role r JOIN app_user u ON u.id = r.user_id\n         WHERE u.name = $1 ORDER BY r.role",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "user_role",
+            "name": "role"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "51e0d0fb6e425f1fa2583f98093b50e062a0455aa6d99ae561596f22ff889e47"
+}
