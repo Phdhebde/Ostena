@@ -21,3 +21,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0015](0015-transport-https-de-l-api-du-core.md) | Transport HTTPS de l'API du core | Accepté |
 | [0016](0016-transcripts-des-sessions.md) | Transcripts des sessions | Accepté |
 | [0017](0017-signature-des-livrables.md) | Signature des livrables | Accepté |
+| [0018](0018-gestionnaire-de-sessions-et-trait-driver.md) | Gestionnaire de sessions de l'agent et trait `Driver` | Accepté |
