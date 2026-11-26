@@ -504,3 +504,235 @@ fn stdio_forwarding_without_the_function_is_refused() {
     );
     assert!(events_on(b.agent.addr, "ssh.forward_opened").is_empty());
 }
+
+impl Bench {
+    /// `ssh` with `extra` options first (the first value of an option
+    /// wins), the options and the port of the agent, then `args`, with the
+    /// environment `env`.
+    fn ssh(&self, env: &[(&str, &str)], extra: &[&str], args: &[&str]) -> Command {
+        let mut command = Command::new(openssh("ssh").unwrap());
+        command
+            .args(["-F", "none"])
+            .args(extra)
+            .args(&self.options)
+            .args(["-p", &self.agent.addr.port().to_string()])
+            .args(args)
+            .envs(env.iter().copied())
+            .current_dir(&self.local)
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// The text of the notes of the forwardings in `session`.
+    fn forwards(&self, session: &SessionSummary) -> Vec<String> {
+        self.notes(session)
+            .into_iter()
+            .filter(|(kind, _)| *kind == NoteKind::Forward)
+            .map(|(_, text)| text)
+            .collect()
+    }
+}
+
+/// Waits for an `ssh.target_channel_refused` event of `kind`.
+fn target_refused(kind: &str) -> bool {
+    for _ in 0..200 {
+        if !common::events_with("ssh.target_channel_refused", "kind", kind).is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+#[test]
+fn remote_forwarding_is_relayed_under_the_port_forwarding_function() {
+    let Some((runtime, b)) = bench("forward-remote", Rights::SSH_PORT_FORWARDING) else {
+        return;
+    };
+    let upper = runtime.block_on(upper_server());
+    let child = b
+        .ssh(
+            &[],
+            &["-o", "ExitOnForwardFailure=yes"],
+            &[
+                "-R",
+                &format!("127.0.0.1:0:127.0.0.1:{upper}"),
+                "127.0.0.1",
+                "sleep 4",
+            ],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The port the target chose, asked as 0.
+    let requested = wait_event(b.agent.addr, "ssh.forward_requested");
+    assert_eq!(requested[0].field("function"), "port-forwarding");
+    let detail = requested[0].field("detail").to_owned();
+    let port: u16 = detail
+        .strip_prefix("-R 127.0.0.1:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(port, 0);
+    // A program on the target side reaches the user's side.
+    let answer = runtime.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tcp.write_all(b"bonjour\n").await.unwrap();
+        let mut buf = [0u8; 8];
+        tcp.read_exact(&mut buf).await.unwrap();
+        buf
+    });
+    assert_eq!(&answer, b"BONJOUR\n");
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let opened = wait_event(b.agent.addr, "ssh.forward_opened");
+    assert_eq!(opened[0].field("function"), "port-forwarding");
+    let channel = format!("-R 127.0.0.1:{port} <- 127.0.0.1:");
+    assert!(opened[0].field("destination").starts_with(&channel));
+    let closed = b.closed(1);
+    let forwards = b.forwards(&closed[0]);
+    assert_eq!(forwards[0], format!("port-forwarding -R 127.0.0.1:{port}"));
+    assert!(
+        forwards[1].starts_with(&format!("port-forwarding {channel}")),
+        "{forwards:?}"
+    );
+}
+
+#[test]
+fn agent_forwarding_is_relayed_under_its_function() {
+    let Some((_runtime, b)) = bench("forward-agent", Rights::SSH_AGENT_FORWARDING) else {
+        return;
+    };
+    let Some(ssh_agent) = openssh("ssh-agent") else {
+        return;
+    };
+    // Not asked by the user: the channel the target opens is refused.
+    let out = b
+        .ssh(&[], &[], &["127.0.0.1", "ostena-agent"])
+        .output()
+        .unwrap();
+    assert_eq!(out.stdout, b"refused\n", "{}", stderr(&out));
+    assert!(target_refused("agent"));
+    // An agent holding the user's key, forwarded.
+    let socket = b.local.join("agent.sock");
+    let mut agent = Command::new(ssh_agent)
+        .args(["-D", "-a"])
+        .arg(&socket)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let added = Command::new(openssh("ssh-add").unwrap())
+        .arg(b.local.parent().unwrap().join("user"))
+        .env("SSH_AUTH_SOCK", &socket)
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(added.success());
+    let identity_agent = format!("IdentityAgent={}", socket.display());
+    let out = b
+        .ssh(
+            &[],
+            &["-o", &identity_agent, "-o", "ForwardAgent=yes"],
+            &["127.0.0.1", "ostena-agent"],
+        )
+        .output()
+        .unwrap();
+    let _ = agent.kill();
+    let _ = agent.wait();
+    // SSH_AGENT_IDENTITIES_ANSWER, with the key (and its certificate).
+    let answer = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        answer.starts_with("agent 12 ") && answer != "agent 12 0\n",
+        "{answer} {}",
+        stderr(&out)
+    );
+    let opened = wait_event(b.agent.addr, "ssh.forward_opened");
+    assert_eq!(opened[0].field("function"), "agent-forwarding");
+    let closed = b.closed(2);
+    let forwards: Vec<Vec<String>> = closed.iter().map(|s| b.forwards(s)).collect();
+    assert!(
+        forwards.contains(&vec![
+            "agent-forwarding agent".to_owned(),
+            "agent-forwarding agent channel".to_owned()
+        ]),
+        "{forwards:?}"
+    );
+}
+
+/// A display on the loopback that answers `X11OK` to its first connection,
+/// and the first byte that connection sent.
+fn fake_display() -> (u16, std::thread::JoinHandle<u8>) {
+    use std::io::{Read, Write};
+    let (display, listener) = (10..100)
+        .find_map(|n| {
+            std::net::TcpListener::bind(("127.0.0.1", 6000 + n))
+                .ok()
+                .map(|l| (n, l))
+        })
+        .unwrap();
+    let served = std::thread::spawn(move || {
+        let (mut tcp, _) = listener.accept().unwrap();
+        let mut setup = [0u8; 12];
+        tcp.read_exact(&mut setup).unwrap();
+        tcp.write_all(b"X11OK").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        setup[0]
+    });
+    (display, served)
+}
+
+#[test]
+fn x11_forwarding_is_relayed_under_its_function() {
+    let Some((_runtime, b)) = bench("forward-x11", Rights::SSH_X11_FORWARDING) else {
+        return;
+    };
+    // Not asked by the user: refused.
+    let out = b
+        .ssh(&[], &[], &["127.0.0.1", "ostena-x11"])
+        .output()
+        .unwrap();
+    assert_eq!(out.stdout, b"refused\n", "{}", stderr(&out));
+    assert!(target_refused("x11"));
+    // Trusted forwarding without xauth: the client makes up the cookie,
+    // checks it on the X11 channel and replaces it.
+    let (display, served) = fake_display();
+    let display = format!("127.0.0.1:{display}");
+    let out = b
+        .ssh(
+            &[("DISPLAY", &display)],
+            &[
+                "-o",
+                "ForwardX11=yes",
+                "-o",
+                "ForwardX11Trusted=yes",
+                "-o",
+                "XAuthLocation=/nonexistent",
+            ],
+            &["127.0.0.1", "ostena-x11"],
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.stdout, b"x11 X11OK\n", "{}", stderr(&out));
+    assert_eq!(served.join().unwrap(), b'l');
+    let opened = wait_event(b.agent.addr, "ssh.forward_opened");
+    assert_eq!(opened[0].field("function"), "x11-forwarding");
+    let closed = b.closed(2);
+    let forwards: Vec<Vec<String>> = closed.iter().map(|s| b.forwards(s)).collect();
+    assert!(
+        forwards.contains(&vec![
+            "x11-forwarding screen 0".to_owned(),
+            "x11-forwarding x11 <- 127.0.0.1:50000".to_owned()
+        ]),
+        "{forwards:?}"
+    );
+}

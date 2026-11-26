@@ -567,13 +567,40 @@ pub fn sftp_server() -> Option<PathBuf> {
 
 /// A target that runs what it is asked, as a minimal sshd would, in `dir`:
 /// a command through `sh -c`, the `sftp` subsystem through `sftp-server`;
-/// `direct-tcpip` connects to the address asked. Accepts the one `allowed`
-/// key. Unix only (tests of the transfers).
+/// `direct-tcpip` connects to the address asked, `tcpip-forward` listens
+/// and opens a `forwarded-tcpip` channel for each connection; agent and
+/// X11 forwarding are accepted. Two commands of its own open channels
+/// towards the client ([`ExecTarget::open_command`]): `ostena-agent` asks
+/// the forwarded agent for its identities, `ostena-x11` sends an X11
+/// connection setup with the cookie of the X11 request. Accepts the one
+/// `allowed` key. Unix only (tests of the transfers).
 pub struct ExecTarget {
     pub allowed: PublicKey,
     pub dir: PathBuf,
     /// Standard input of the process of each channel (per connection).
     stdins: Arc<Mutex<Stdins>>,
+    /// Protocol and cookie of the X11 request (per connection).
+    x11: Arc<Mutex<Option<(String, String)>>>,
+}
+
+/// The X11 connection setup a client sends first, little-endian, with
+/// `protocol` and the cookie `hex`.
+pub fn x11_setup(protocol: &str, hex: &str) -> Vec<u8> {
+    let cookie: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    let pad = |n: usize| (4 - n % 4) % 4;
+    let mut out = vec![b'l', 0];
+    out.extend_from_slice(&11u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&u16::try_from(protocol.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&u16::try_from(cookie.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(protocol.as_bytes());
+    out.extend(std::iter::repeat_n(0, pad(protocol.len())));
+    out.extend_from_slice(&cookie);
+    out.extend(std::iter::repeat_n(0, pad(cookie.len())));
+    out
 }
 
 /// The input of the process of each channel: `None` closes it.
@@ -586,7 +613,52 @@ impl ExecTarget {
             allowed,
             dir,
             stdins: Arc::default(),
+            x11: Arc::default(),
         }
+    }
+
+    /// Runs a command of the target itself that opens a channel towards
+    /// the client: prints what came back, or `refused`.
+    fn open_command(&self, command: &str, channel: ChannelId, handle: russh::server::Handle) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let x11 = self.x11.lock().unwrap().clone();
+        let command = command.to_owned();
+        tokio::spawn(async move {
+            let opened = if command == "ostena-agent" {
+                handle.channel_open_agent().await
+            } else {
+                handle.channel_open_x11("127.0.0.1", 50_000).await
+            };
+            let answer = match opened {
+                Ok(opened) => {
+                    let mut stream = opened.into_stream();
+                    let (request, want) = if command == "ostena-agent" {
+                        // SSH_AGENTC_REQUEST_IDENTITIES; the answer: length,
+                        // SSH_AGENT_IDENTITIES_ANSWER, count.
+                        (vec![0, 0, 0, 1, 11], 9)
+                    } else {
+                        let (protocol, cookie) = x11.unwrap_or_default();
+                        (x11_setup(&protocol, &cookie), 5)
+                    };
+                    stream.write_all(&request).await.unwrap();
+                    let mut buf = vec![0u8; want];
+                    match tokio::time::timeout(TIMEOUT, stream.read_exact(&mut buf)).await {
+                        Ok(Ok(_)) if command == "ostena-agent" => format!(
+                            "agent {} {}\n",
+                            buf[4],
+                            u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]])
+                        ),
+                        Ok(Ok(_)) => format!("x11 {}\n", String::from_utf8_lossy(&buf)),
+                        _ => "lost\n".to_owned(),
+                    }
+                }
+                Err(_) => "refused\n".to_owned(),
+            };
+            let _ = handle.data(channel, answer.into_bytes()).await;
+            let _ = handle.exit_status_request(channel, 0).await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        });
     }
 
     /// Runs `program` for `channel`: its input from the channel, its output
@@ -737,6 +809,10 @@ impl russh::server::Handler for ExecTarget {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         let command = String::from_utf8_lossy(data).into_owned();
+        if command == "ostena-agent" || command == "ostena-x11" {
+            self.open_command(&command, channel, session.handle());
+            return session.channel_success(channel);
+        }
         if self
             .spawn(
                 Path::new("/bin/sh"),
@@ -773,6 +849,63 @@ impl russh::server::Handler for ExecTarget {
             let _ = tx.send(None);
         }
         Ok(())
+    }
+
+    async fn agent_request(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+
+    async fn x11_request(
+        &mut self,
+        channel: ChannelId,
+        _single_connection: bool,
+        x11_auth_protocol: &str,
+        x11_auth_cookie: &str,
+        _x11_screen_number: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        *self.x11.lock().unwrap() =
+            Some((x11_auth_protocol.to_owned(), x11_auth_cookie.to_owned()));
+        session.channel_success(channel)
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Ok(listener) = TcpListener::bind((address, u16::try_from(*port).unwrap())).await else {
+            return Ok(false);
+        };
+        let local = u32::from(listener.local_addr().unwrap().port());
+        *port = local;
+        let handle = session.handle();
+        let address = address.to_owned();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, from)) = listener.accept().await {
+                let Ok(channel) = handle
+                    .channel_open_forwarded_tcpip(
+                        address.clone(),
+                        local,
+                        from.ip().to_string(),
+                        u32::from(from.port()),
+                    )
+                    .await
+                else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let mut stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+                });
+            }
+        });
+        Ok(true)
     }
 }
 

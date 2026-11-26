@@ -125,6 +125,7 @@ fn the_driver_offers_only_the_frozen_algorithms() {
                 std::sync::Arc::new(ostena_ssh::keys::load(&agent_key.private).unwrap()),
                 Duration::from_secs(5),
                 "kexinit",
+                None,
             )
             .await
         });
