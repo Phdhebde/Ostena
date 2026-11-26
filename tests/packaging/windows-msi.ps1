@@ -61,8 +61,15 @@ function Wait-State([string] $State, [int] $Seconds) {
     return $false
 }
 
+# msiexec shows a modal usage box, even with /qn, when its command line is
+# wrong: never wait for it forever.
 function Invoke-Msiexec([string[]] $Arguments) {
-    $p = Start-Process -FilePath msiexec.exe -ArgumentList $Arguments -Wait -PassThru
+    $p = Start-Process -FilePath msiexec.exe -ArgumentList $Arguments -PassThru
+    $null = $p.Handle # keeps the exit code readable once the process is gone
+    if (-not $p.WaitForExit(600000)) {
+        $p.Kill()
+        Fail "msiexec $($Arguments[0]) did not finish in 10 minutes"
+    }
     return $p.ExitCode
 }
 
@@ -169,14 +176,14 @@ switch ($LASTEXITCODE) {
 
 Write-Host '=== repair: setup again, nothing changes'
 $configBefore = Get-FileHash (Join-Path $Data 'ostena.toml')
-$code = Invoke-Msiexec @('/f', 'omus', "`"$Msi`"", '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
+$code = Invoke-Msiexec @('/fomus', "`"$Msi`"", '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
     "COREADDRESS=$CoreAddress", "GATEWAYGROUP=$Group")
 if ($code -ne 0) { Fail "msiexec /f: exit $code" }
 if (-not (Wait-State 'Running' 30)) { Fail 'the service is not running after a repair' }
 if ((Get-FileHash (Join-Path $Data 'ostena.toml')).Hash -ne $configBefore.Hash) { Fail 'the repair rewrote the configuration' }
 
 Write-Host '=== a conflicting core address is refused, the agent is left as it was'
-$code = Invoke-Msiexec @('/f', 'omus', "`"$Msi`"", '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
+$code = Invoke-Msiexec @('/fomus', "`"$Msi`"", '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
     'COREADDRESS=elsewhere.invalid:8443', "GATEWAYGROUP=$Group")
 if ($code -eq 0) { Fail 'a repair with another core address succeeded' }
 Write-Host "refused as expected (exit $code)"

@@ -125,7 +125,7 @@ Le core de test (exemple `test_core` d'`ostena-tunnel`, construit par `cargo xta
 - **plan de contrôle refusé à un non-administrateur** :
   - Windows : un utilisateur local créé pour le test ouvre le pipe en se faisant passer pour lui ; l'accès est refusé ;
   - Debian : `runuser -u nobody -- ostena agent status` échoue avec `AGT-E007` à `E009` sans rien lire, et le socket n'est même pas visible ;
-- une réparation (`msiexec /f`) ou un second `setup` qui ne changent rien, puis un paramètre contradictoire refusé sans toucher à l'agent en place ;
+- une réparation (`msiexec /fomus`) ou un second `setup` qui ne changent rien, puis un paramètre contradictoire refusé sans toucher à l'agent en place ;
 - la réinstallation (`dpkg -i` à nouveau) ;
 - la désinstallation : service et programme retirés, configuration conservée. Sous Debian, la purge retire tout.
 
