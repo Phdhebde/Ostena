@@ -1,0 +1,1 @@
+{"protocol":1,"ssh_port":2222,"accesses":[{"resource":"srv-lab01","account":"postgres","host":"bastion.lab","valid_until":1900000000},{"resource":"srv-lab01","account":"root","host":"bastion.lab","valid_until":1900000000}]}
