@@ -21,6 +21,7 @@ mod keyset_state;
 mod login;
 mod release;
 mod sessions;
+mod setup;
 #[cfg(feature = "ssh")]
 mod ssh;
 
@@ -802,6 +803,51 @@ enum AgentCommand {
         #[arg(long)]
         quiet: bool,
     },
+    /// What an installation package (MSI, .deb) runs: check and install the
+    /// root certificate, write a configuration if none exists, enrol if a
+    /// token is given, then `install`. Non-interactive; can be run again.
+    /// Empty values count as absent.
+    Setup {
+        /// Configuration file (kept if it exists).
+        #[arg(long, default_value_os_t = agent::default_config())]
+        config: PathBuf,
+        /// Executable to register (default: this one).
+        #[arg(long)]
+        executable: Option<PathBuf>,
+        /// Core address, `host:port` (new configuration).
+        #[arg(long)]
+        core_address: Option<String>,
+        /// Gateway group, a UUID (new configuration).
+        #[arg(long)]
+        gateway_group: Option<String>,
+        /// Enrolment address, `host:port`, if not port 8444 of the core host
+        /// (new configuration).
+        #[arg(long)]
+        enrollment_address: Option<String>,
+        /// Root certificate (PEM) to install next to the configuration.
+        #[arg(long)]
+        root_ca: Option<PathBuf>,
+        /// SHA-256 fingerprint of the root certificate, from the ceremony
+        /// record (required with --root-ca).
+        #[arg(long)]
+        root_fingerprint: Option<String>,
+        /// Enrolment token file (never the token itself), used if the agent
+        /// has no certificate yet.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Deadline for the exchange with the core, in seconds.
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+        /// Do not start the service.
+        #[arg(long)]
+        no_start: bool,
+        /// No output on success.
+        #[arg(long)]
+        quiet: bool,
+        /// Also append the messages to this file.
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
     /// Stop and unregister the service (configuration, data and account kept).
     Uninstall {
         /// No output on success.
@@ -912,6 +958,33 @@ fn run_agent(command: AgentCommand) -> ExitCode {
             no_start,
             quiet,
         } => agent::install(&config, executable, !no_start, quiet),
+        AgentCommand::Setup {
+            config,
+            executable,
+            core_address,
+            gateway_group,
+            enrollment_address,
+            root_ca,
+            root_fingerprint,
+            token_file,
+            timeout,
+            no_start,
+            quiet,
+            log,
+        } => setup::setup(setup::SetupArgs {
+            config,
+            executable,
+            core_address,
+            gateway_group,
+            enrollment_address,
+            root_ca,
+            root_fingerprint,
+            token_file,
+            timeout,
+            no_start,
+            quiet,
+            log,
+        }),
         AgentCommand::Uninstall { quiet } => agent::uninstall(quiet),
         AgentCommand::Run { config, service } => agent::run(&config, service),
         AgentCommand::Status { config, pid } => agent::status(&config, pid),

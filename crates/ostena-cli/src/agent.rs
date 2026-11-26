@@ -72,28 +72,7 @@ pub(crate) fn install(
     start: bool,
     quiet: bool,
 ) -> ExitCode {
-    let parsed = match read(config) {
-        Ok(c) => c,
-        Err(e) => return fail(&e),
-    };
-    if let Err(v) = parsed.validate() {
-        return fail(&v.to_string());
-    }
-    let Some(agent) = parsed.agent else {
-        return fail(&format!("{} : section [agent] absente", config.display()));
-    };
-    let executable = match executable.map_or_else(std::env::current_exe, Ok) {
-        Ok(p) => p,
-        Err(e) => return fail(&format!("exécutable introuvable : {e}")),
-    };
-    let options = InstallOptions {
-        executable,
-        config: config.to_path_buf(),
-        private_key: Some(agent.tls_private_key.clone()),
-        state_dir: agent.replay_journal.parent().map(Path::to_path_buf),
-        start,
-    };
-    match service_manager().and_then(|m| m.install(&options)) {
+    match install_service(config, executable, start) {
         Ok(()) => {
             say(
                 quiet,
@@ -105,8 +84,35 @@ pub(crate) fn install(
             );
             ExitCode::SUCCESS
         }
-        Err(e) => fail(&e.to_string()),
+        Err(e) => fail(&e),
     }
+}
+
+/// Registers the service, sets the permissions of its files and starts it
+/// if asked: `ostena agent install`, also the last step of `agent setup`.
+pub(crate) fn install_service(
+    config: &Path,
+    executable: Option<PathBuf>,
+    start: bool,
+) -> Result<(), String> {
+    let parsed = read(config)?;
+    parsed.validate().map_err(|v| v.to_string())?;
+    let agent = parsed
+        .agent
+        .ok_or_else(|| format!("{} : section [agent] absente", config.display()))?;
+    let executable = executable
+        .map_or_else(std::env::current_exe, Ok)
+        .map_err(|e| format!("exécutable introuvable : {e}"))?;
+    let options = InstallOptions {
+        executable,
+        config: config.to_path_buf(),
+        private_key: Some(agent.tls_private_key.clone()),
+        state_dir: agent.replay_journal.parent().map(Path::to_path_buf),
+        start,
+    };
+    service_manager()
+        .and_then(|m| m.install(&options))
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn uninstall(quiet: bool) -> ExitCode {
