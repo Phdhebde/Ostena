@@ -219,10 +219,11 @@ jobs:
           for account in ostena_ci ostena_ci_admin; do
             sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$account"
           done
-          dir="$(mktemp -d)"
-          chmod 711 "$dir"
-          install -m 0755 target/debug/ostena "$dir/ostena"
-          cat > "$dir/core.toml" <<EOF
+          # Owned by root, as in production (CFG-P006).
+          dir="$(sudo mktemp -d)"
+          sudo chmod 711 "$dir"
+          sudo install -m 0755 target/debug/ostena "$dir/ostena"
+          sudo tee "$dir/core.toml" > /dev/null <<EOF
           mode = "production"
 
           [core]
@@ -243,7 +244,7 @@ jobs:
           user = "ostena_ci"
           migration_user = "ostena_ci_admin"
           EOF
-          chmod 0644 "$dir/core.toml"
+          sudo chmod 0644 "$dir/core.toml"
           run() {
             local account="$1"; shift
             sudo -u "$account" -- "$dir/ostena" core "$@" --config "$dir/core.toml"

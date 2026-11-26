@@ -209,11 +209,12 @@ for account in "$svc" "$adm"; do
     accounts_made+=("$account")
   fi
 done
-# Les fichiers du core : un dossier que ces comptes et celui de PostgreSQL
-# traversent (le dossier de travail reste privé), le binaire compris.
-core_dir="$(mktemp -d "/tmp/ostena-demo-core.XXXXXX")"
-chmod 711 "$core_dir"
-install -m 0755 "$bin" "$core_dir/ostena"
+# Les fichiers du core, propriété de root comme en production (CFG-P006) :
+# un dossier que ces comptes et celui de PostgreSQL traversent (le dossier
+# de travail reste privé), le binaire compris.
+core_dir="$($SUDO mktemp -d "/tmp/ostena-demo-core.XXXXXX")"
+$SUDO chmod 711 "$core_dir"
+$SUDO install -m 0755 "$bin" "$core_dir/ostena"
 cbin="$core_dir/ostena"
 
 # --- 1. PKI ----------------------------------------------------------------
@@ -241,7 +242,7 @@ ostena ca key new-mac --out "$work/credentials/totp.key" > /dev/null
 cp "$work/root.pem" "$work/agent/root.pem"
 # Remis au compte du service : les certificats lisibles, les clés en
 # credentials à lui seul, les transcripts dans un dossier à lui seul (0700).
-install -m 0644 "$work/root.pem" "$work/server.pem" "$work/issuing.pem" "$core_dir/"
+$SUDO install -m 0644 "$work/root.pem" "$work/server.pem" "$work/issuing.pem" "$core_dir/"
 $SUDO install -d -o "$svc" -m 0700 "$core_dir/credentials" "$core_dir/transcripts"
 $SUDO install -d -o "$svc" -m 0755 "$core_dir/exports"
 $SUDO install -o "$svc" -m 0600 "$work"/credentials/*.key "$core_dir/credentials/"
@@ -250,7 +251,7 @@ info "clé publique d'audit pour l'auditeur : $work/audit.pub"
 
 # --- 2. Core ---------------------------------------------------------------
 step "PostgreSQL et core en mode production"
-cat > "$core_dir/core.toml" <<EOF
+$SUDO tee "$core_dir/core.toml" > /dev/null <<EOF
 mode = "production"
 
 [core]
@@ -286,7 +287,7 @@ name = "$db"
 user = "$svc"
 migration_user = "$adm"
 EOF
-chmod 0644 "$core_dir/core.toml"
+$SUDO chmod 0644 "$core_dir/core.toml"
 # Les commandes du core sous le compte du service, avec ses credentials.
 core() {
   as_user "$svc" env CREDENTIALS_DIRECTORY="$core_dir/credentials" \
@@ -394,8 +395,8 @@ ok "clé de l'agent déposée : ${line%% ecdsa*} …"
 
 # --- 5. Inventaire ----------------------------------------------------------
 step "Inventaire, droit et identifiants d'alice"
-printf '[[allow]]\nnetworks = ["%s"]\nports = ["%s"]\n' "$network" "$target_port" > "$core_dir/policy.toml"
-install -m 0644 "$work/target_host.pub" "$core_dir/target_host.pub"
+printf '[[allow]]\nnetworks = ["%s"]\nports = ["%s"]\n' "$network" "$target_port" | $SUDO tee "$core_dir/policy.toml" > /dev/null
+$SUDO install -m 0644 "$work/target_host.pub" "$core_dir/target_host.pub"
 core group policy demo "$core_dir/policy.toml" > /dev/null
 wait_log "$work/agent.log" agent.policy_applied
 core user add alice --display-name "Alice Martin" > /dev/null
