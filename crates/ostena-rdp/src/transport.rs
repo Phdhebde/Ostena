@@ -53,6 +53,11 @@ impl Transport {
         }
     }
 
+    /// The local address of the connection (Client Info PDU).
+    pub fn local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tcp.local_addr().ok()
+    }
+
     /// Bytes received since the last call (Auto-Detect bandwidth).
     pub fn take_received(&mut self) -> u64 {
         std::mem::take(&mut self.received)

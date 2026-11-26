@@ -5,10 +5,13 @@
 //! loop (without image at M2).
 #![forbid(unsafe_code)]
 
+pub mod connect;
 pub mod credssp;
+pub mod driver;
 pub mod error;
 pub mod guard;
 pub mod profile;
+pub mod session;
 pub mod transport;
 
 pub use error::RdpError;
