@@ -8,6 +8,7 @@
 - **Révision** : 2026-11-25, relecture de sécurité de la PR 6 : confiance fermée par défaut (identité retirée sur un push inapplicable), identité réévaluée aux dates du certificat d'hôte, arrêt dans un seul délai de grâce avec les bilans envoyés avant la fermeture du lien, clés et certificat d'hôte écrits de façon atomique, dossier des clés vérifié avant leur création
 - **Révision** : 2026-11-25, `ostena login` et `ostena logout` : fichiers, API, codes `AUTH-E001` à `AUTH-E006` et `LOGIN-E001` à `LOGIN-E006`, événements (jalon M1, PR 7)
 - **Révision** : 2026-11-25, transcripts (ADR-0016) : `ssh.exec` ne porte plus que la longueur, l'empreinte à clé est consignée par le core (`access.ssh_exec`) ; session coupée quand le transcript est perdu, y compris à la coupure du tunnel et au redémarrage du core (`SSH-E021`, `ssh.transcript_lost`) ; crochet `SessionObserver` retiré (jalon M1, PR 8)
+- **Révision** : 2026-11-26, sessions tenues par le gestionnaire de sessions de l'agent (ADR-0018) : quotas par utilisateur et par ressource, identifiant de session unique, délai d'inactivité, `ssh.session_idle` (jalon M2, PR 1)
 
 ## Contexte
 
@@ -200,9 +201,9 @@ Il en sort l'identité : sujet, session de connexion, terminal permis, SHA-256 d
 
 Un certificat refusé par la bibliothèque elle-même (expiré, pas encore valide, signature invalide) n'atteint pas ces contrôles ; il est tout de même audité à la fin de la connexion (`ssh.auth_refused`, `SSH-E011`).
 
-La session est inscrite parmi les sessions vivantes **avant** que l'autorisation ne décide : une révocation de la session de connexion arrivée pendant la décision la coupe dès son ouverture. Tout accès accordé est clos **une et une seule fois** (`Authorizer::closed` et `ssh.session_closed`), quoi qui mette fin à la connexion, puisque le grant est consommé.
+La session réserve sa place dans le gestionnaire de sessions de l'agent (ADR-0018) **avant** que l'autorisation ne décide : une révocation de la session de connexion arrivée pendant la décision la coupe dès son ouverture. L'identifiant de session donné par le core doit être unique sur l'agent (`SSH-E013`, cause `SES-E004`). Tout accès accordé est clos **une et une seule fois** (`Authorizer::closed` et `ssh.session_closed`), quoi qui mette fin à la connexion, puisque le grant est consommé.
 
-**Bornes** (`SSH-E019`, `ssh.connection_limited`) : connexions non authentifiées (16 par défaut, et 4 par adresse source), sessions authentifiées (64), autorisations en cours (32). Une connexion doit s'authentifier dans le délai `login_grace` (30 s).
+**Bornes** (`SSH-E019`, `ssh.connection_limited`) : connexions non authentifiées (16 par défaut, et 4 par adresse source), autorisations en cours (32), et les quotas du gestionnaire de sessions (ADR-0018) : sessions de l'agent (64), d'un utilisateur et vers une ressource (sans borne propre par défaut) ; l'événement porte alors la cause (`SES-E001` à `SES-E003`). Une connexion doit s'authentifier dans le délai `login_grace` (30 s).
 
 **Un seul canal de session par connexion** (un second : `SSH-E017`). Sont relayés vers la cible, avec sa réponse :
 - le terminal, seulement si le certificat porte `permit-pty`, borné (type de 64 caractères, 10 000 colonnes ou lignes) ;
@@ -215,7 +216,7 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 
 **Transcript, échec fermé** (ADR-0016) : à l'ouverture du shell ou de la commande, le serveur démarre le transcript sur le flux `Recording` ouvert avec la session (ADR-0008). Chaque sortie de la cible est remise à l'enregistreur **avant** d'être relayée à l'utilisateur ; les changements de taille de la fenêtre aussi. Si le transcript ne peut plus être transmis (flux refusé ou arrêté par le core, tunnel coupé, core redémarré), la session est coupée : `SSH-E021`, `ssh.transcript_lost`. La raison de fin (fermeture, révocation, expiration, arrêt, perte) est écrite dans la trame de fin.
 
-**Relais** : une tâche par sens ; fin de données, code de sortie et signal sont rendus au client ; les octets relayés sont comptés et remis à `Authorizer::closed`. Une session prend fin à sa durée maximale (`ssh.session_expired`), à la révocation de sa session de connexion (`revoke_login`, `ssh.session_revoked`) ou à l'arrêt.
+**Relais** : une tâche par sens ; fin de données, code de sortie et signal sont rendus au client ; les octets relayés sont comptés et remis à `Authorizer::closed`. Une session prend fin à sa durée maximale (`ssh.session_expired`), à son délai d'inactivité s'il est configuré (`ssh.session_idle`, raison `inactive`, trame de fin `expired` : le format du transcript n'a pas de raison propre ; seules les données de l'utilisateur comptent comme activité), à la révocation de sa session de connexion (`revoke_login`, `ssh.session_revoked`) ou à l'arrêt. Le gestionnaire de sessions décide de ces fins ; le serveur déconnecte.
 
 
 ### Driver vers les cibles (`ostena_ssh::driver`)
@@ -233,6 +234,9 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 | `listen` | requis | liste d'adresses `hôte:port` |
 | `host_key`, `target_key`, `host_certificate` | `ssh_host_key`, `ssh_target_key`, `ssh_host_certificate` dans le dossier d'état (celui du journal anti-rejeu) | chemins absolus (`CFG-V008`) ; `host_key` et `target_key` distincts |
 | `max_sessions` | 64 | 1 à 256 |
+| `max_sessions_per_user` | aucune (seule `max_sessions`) | 1 à 256 |
+| `max_sessions_per_target` | aucune (seule `max_sessions`) | 1 à 256 |
+| `idle_timeout_secs` | aucun (pas de coupure pour inactivité) | 60 à 86 400 |
 | `max_unauthenticated` | 16 | 1 à 256 |
 | `max_unauthenticated_per_source` | 4 | 1 à 256 |
 | `login_grace_secs` | 30 | 5 à 120 |
@@ -269,7 +273,7 @@ Quand `[agent.ssh]` est présent, `ostena agent run` démarre le serveur SSH à 
 | `SSH-E020` | révocations perdues (canal débordé) : toutes les sessions SSH coupées |
 | `SSH-E021` | transcript perdu (flux refusé ou arrêté par le core, tunnel coupé) : session coupée |
 
-Événements (journal structuré, messages en français, textes du pair bornés et assainis : caractères de contrôle et de format Unicode, dont les contrôles bidirectionnels, remplacés ; aucun nom de champ masqué par la règle des journaux) : `ssh.connection_limited`, `ssh.connection_refused`, `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`, `ssh.exec`, `ssh.session_expired`, `ssh.session_revoked`, `ssh.session_closed` (raison, octets dans chaque sens, durée), `ssh.channel_refused`, `ssh.transcript_lost` ; côté driver `ssh.target_host_key_mismatch`, `ssh.target_auth_failed`, `ssh.target_unreachable`, `ssh.target_channel_refused` ; côté tunnel `agent.ssh_trust_applied`, `agent.ssh_trust_refused`, `agent.login_revoked` (ADR-0008) ; côté agent `agent.ssh_started`, `agent.ssh_stopped`, `agent.ssh_unavailable`, `agent.ssh_key_created`, `agent.ssh_host_key_sent`, `agent.ssh_host_key_unsent`, `agent.ssh_identity_ready`, `agent.ssh_identity_refused`, `agent.login_revocation_applied`, `agent.session_report_lost`, `agent.transcript_lost`, `ssh.revocations_lost`. Les événements du serveur portent l'adresse du client (`peer`) et celle d'écoute (`listener`).
+Événements (journal structuré, messages en français, textes du pair bornés et assainis : caractères de contrôle et de format Unicode, dont les contrôles bidirectionnels, remplacés ; aucun nom de champ masqué par la règle des journaux) : `ssh.connection_limited`, `ssh.connection_refused`, `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`, `ssh.exec`, `ssh.session_expired`, `ssh.session_idle`, `ssh.session_revoked`, `ssh.session_closed` (raison, octets dans chaque sens, durée), `ssh.channel_refused`, `ssh.transcript_lost` ; côté driver `ssh.target_host_key_mismatch`, `ssh.target_auth_failed`, `ssh.target_unreachable`, `ssh.target_channel_refused` ; côté tunnel `agent.ssh_trust_applied`, `agent.ssh_trust_refused`, `agent.login_revoked` (ADR-0008) ; côté agent `agent.ssh_started`, `agent.ssh_stopped`, `agent.ssh_unavailable`, `agent.ssh_key_created`, `agent.ssh_host_key_sent`, `agent.ssh_host_key_unsent`, `agent.ssh_identity_ready`, `agent.ssh_identity_refused`, `agent.login_revocation_applied`, `agent.session_report_lost`, `agent.transcript_lost`, `ssh.revocations_lost`. Les événements du serveur portent l'adresse du client (`peer`) et celle d'écoute (`listener`).
 
 ### Défaut amont : clés P-256 à scalaire court
 
