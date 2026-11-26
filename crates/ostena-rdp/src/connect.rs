@@ -153,7 +153,10 @@ impl Phase {
             ClientConnectorState::EnhancedSecurityUpgrade { .. } => Self::Tls,
             ClientConnectorState::Credssp { .. } => Self::Credssp,
             ClientConnectorState::LicensingExchange { .. } => Self::Licensing,
-            ClientConnectorState::CapabilitiesExchange { .. }
+            // After the licences, waiting for the Demand Active.
+            ClientConnectorState::MultitransportBootstrapping { .. }
+            | ClientConnectorState::MultitransportPending { .. }
+            | ClientConnectorState::CapabilitiesExchange { .. }
             | ClientConnectorState::ConnectionFinalization { .. }
             | ClientConnectorState::Connected { .. } => Self::Activation,
             _ => Self::Mcs,
@@ -316,6 +319,19 @@ async fn read_hinted(
     }
 }
 
+/// Whether `pdu` is a licensing PDU (`SEC_LICENSE_PKT` in its basic
+/// security header, [MS-RDPBCGR] 2.2.8.1.1.2.1).
+fn is_license_pdu(pdu: &[u8]) -> bool {
+    ironrdp_pdu::mcs::decode_send_data_indication(pdu)
+        .ok()
+        .and_then(|data| {
+            data.user_data
+                .get(..2)
+                .map(|f| u16::from_le_bytes([f[0], f[1]]))
+        })
+        .is_some_and(|flags| flags & 0x0080 != 0)
+}
+
 /// What the sequence observed, for the profile.
 #[derive(Default)]
 struct Observed {
@@ -452,6 +468,14 @@ async fn run_to_connected(
             if waiting_response {
                 observed.server = server_settings(&pdu);
             }
+            // The first licence PDU may arrive while the connector still
+            // waits for connect-time Auto-Detect: the phase is that of the PDU.
+            let phase = if is_license_pdu(&pdu) {
+                clock.enter(Phase::Licensing);
+                Phase::Licensing
+            } else {
+                phase
+            };
             connector
                 .step(&pdu, Some(clock.now()), &mut buf)
                 .map_err(|e| connector_error(phase, &e))?;

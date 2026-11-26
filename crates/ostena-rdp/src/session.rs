@@ -40,7 +40,7 @@ use crate::transport::{MAX_PDU, Transport};
 /// Error information codes that end a session normally ([MS-RDPBCGR]
 /// 2.2.5.1.1): disconnection or logoff by an administrator tool, logoff by
 /// the user, and the idle and logon limits of the target.
-const NORMAL_END_CODES: &[u32] = &[0x0001, 0x0002, 0x0003, 0x0004, 0x000C];
+const NORMAL_END_CODES: &[u32] = &[0x0001, 0x0002, 0x0003, 0x0004, 0x000B, 0x000C];
 
 /// How a session loop ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
