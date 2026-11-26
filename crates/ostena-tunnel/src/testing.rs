@@ -306,6 +306,9 @@ struct State {
     /// Transcript streams received, by session, and whether each ended
     /// cleanly (finished by the agent).
     recordings: Mutex<HashMap<Uuid, (Vec<u8>, bool)>>,
+    /// Stream generation of each transcript: a resumed stream replaces the
+    /// previous one.
+    recording_streams: Mutex<HashMap<Uuid, u64>>,
     /// Session reports received: session and reason.
     closed: Mutex<Vec<(String, String)>>,
 }
@@ -321,6 +324,7 @@ impl State {
             errors: Mutex::default(),
             tunnels: Mutex::default(),
             recordings: Mutex::default(),
+            recording_streams: Mutex::default(),
             closed: Mutex::default(),
             grants: Grants {
                 issuer: Issuer::new(generate()?),
@@ -969,23 +973,72 @@ async fn echo_channels(tunnel: Arc<CoreTunnel>, state: Arc<State>, stall_recordi
     }
 }
 
-/// Keeps what a transcript stream carries, without decoding it.
+/// Keeps what a transcript stream carries, without decoding it, and
+/// acknowledges each read at once (ADR-0016); a resumed stream goes on
+/// from what was received.
 async fn keep_recording(session: Uuid, mut channel: Channel, state: Arc<State>) {
+    use crate::recording::{Preamble, refuse, send_offset};
+    let Ok(preamble) = Preamble::read(&mut channel).await else {
+        refuse(&mut channel);
+        return;
+    };
+    let generation = {
+        let Ok(mut streams) = state.recording_streams.lock() else {
+            return;
+        };
+        let known = streams.contains_key(&session);
+        if preamble == Preamble::Resume && !known {
+            drop(streams);
+            refuse(&mut channel);
+            return;
+        }
+        let generation = streams.get(&session).map_or(0, |g| g + 1);
+        streams.insert(session, generation);
+        generation
+    };
+    let current = |state: &State| {
+        state
+            .recording_streams
+            .lock()
+            .is_ok_and(|s| s.get(&session) == Some(&generation))
+    };
+    let mut received = state
+        .recordings
+        .lock()
+        .ok()
+        .and_then(|r| r.get(&session).map(|(b, _)| b.len() as u64))
+        .unwrap_or(0);
+    if preamble == Preamble::Resume {
+        if send_offset(&mut channel, received).await.is_err() {
+            return;
+        }
+    } else if let Ok(mut r) = state.recordings.lock() {
+        r.insert(session, (Vec::new(), false));
+    }
     let mut buf = vec![0u8; 16 * 1024];
     let clean = loop {
         match channel.recv.read(&mut buf).await {
             Ok(Some(n)) => {
+                if !current(&state) {
+                    return;
+                }
                 if let Ok(mut r) = state.recordings.lock() {
                     r.entry(session).or_default().0.extend_from_slice(&buf[..n]);
                 }
+                received += n as u64;
+                let _ = send_offset(&mut channel, received).await;
             }
             Ok(None) => break true,
             Err(_) => break false,
         }
     };
+    if !current(&state) {
+        return;
+    }
     if let Ok(mut r) = state.recordings.lock() {
         r.entry(session).or_default().1 = clean;
     }
+    let _ = channel.send.finish();
 }
 
 /// Control messages from one agent: certificate renewal, session requests.

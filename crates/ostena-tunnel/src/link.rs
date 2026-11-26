@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 use crate::control::{AgentMessage, CoreMessage};
 use crate::error::TunnelError;
 use crate::limits::Limits;
+use crate::recording::Waiting;
 use crate::renewal;
 use crate::transport::{Transport, TransportMode};
 use crate::tunnel::{ALPN, AgentConfig, AgentTunnel, Hello, connect_with};
@@ -65,6 +66,10 @@ impl Backoff {
         Duration::from_millis(random % bound.saturating_add(1))
     }
 }
+
+/// Longest delay before a retry while a session transcript waits for the
+/// link to resume (ADR-0016): the grace of the sessions runs.
+pub const URGENT_RETRY: Duration = Duration::from_secs(2);
 
 /// State of the link, as `ostena agent status` shows it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -205,6 +210,7 @@ pub struct AgentLink {
     task: Mutex<Option<JoinHandle<()>>>,
     pushes: Mutex<Option<mpsc::Receiver<CoreMessage>>>,
     connected: watch::Receiver<Option<Connection>>,
+    waiting: Arc<Waiting>,
 }
 
 /// A connection established, as [`AgentLink::subscribe_connected`] tells
@@ -243,6 +249,7 @@ impl AgentLink {
         let (push_tx, push_rx) = mpsc::channel(64);
         let current = Current::default();
         let (connected_tx, connected) = watch::channel(None);
+        let waiting = Arc::new(Waiting::default());
         let task = tokio::spawn(run(
             params,
             status.clone(),
@@ -250,6 +257,7 @@ impl AgentLink {
             connected_tx,
             stop_rx,
             push_tx,
+            waiting.clone(),
         ));
         Self {
             status,
@@ -258,7 +266,14 @@ impl AgentLink {
             task: Mutex::new(Some(task)),
             pushes: Mutex::new(Some(push_rx)),
             connected,
+            waiting,
         }
+    }
+
+    /// The transcripts waiting for a connection to resume (ADR-0016):
+    /// while there are some, the link retries within [`URGENT_RETRY`].
+    pub(crate) fn waiting(&self) -> &Waiting {
+        &self.waiting
     }
 
     /// Changes each time a connection is established, once it can carry
@@ -290,6 +305,33 @@ impl AgentLink {
             None => Err(TunnelError::ConnectionLost(
                 "pas de connexion au core".into(),
             )),
+        }
+    }
+
+    /// Sends a control message on the connection in use; when there is
+    /// none, or the send fails, waits up to `within` for a new connection
+    /// and sends it there.
+    ///
+    /// # Errors
+    ///
+    /// The last failure, once `within` is over.
+    pub async fn send_within(
+        &self,
+        message: &AgentMessage,
+        within: Duration,
+    ) -> Result<(), TunnelError> {
+        let deadline = tokio::time::Instant::now() + within;
+        let mut connected = self.subscribe_connected();
+        connected.borrow_and_update();
+        loop {
+            let error = match self.send(message).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            let wait = tokio::time::timeout(Duration::from_secs(1), connected.changed());
+            if tokio::time::timeout_at(deadline, wait).await.is_err() {
+                return Err(error);
+            }
         }
     }
 
@@ -449,6 +491,7 @@ async fn run(
     connected: watch::Sender<Option<Connection>>,
     mut stop: watch::Receiver<bool>,
     pushes: mpsc::Sender<CoreMessage>,
+    waiting: Arc<Waiting>,
 ) {
     let overdue = {
         let certificate = params.certificate.clone();
@@ -513,7 +556,10 @@ async fn run(
         if started.elapsed() >= params.backoff.stable_after {
             attempt = 0;
         }
-        let delay = params.backoff.delay(attempt);
+        let mut delay = params.backoff.delay(attempt);
+        if waiting.any() {
+            delay = delay.min(URGENT_RETRY);
+        }
         attempt = attempt.saturating_add(1);
         tracing::warn!(
             event = "agent.core_disconnected",
@@ -528,8 +574,22 @@ async fn run(
                 error: failure.to_string(),
             };
         });
-        // Wait for the delay, or for the stop request.
-        let _ = tokio::time::timeout(delay, stop.changed()).await;
+        // Wait for the delay, for the stop request, or for a transcript
+        // that starts waiting (then within URGENT_RETRY).
+        let sleep = tokio::time::sleep(delay);
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                () = &mut sleep => break,
+                _ = stop.changed() => break,
+                () = waiting.woken() => {
+                    let soon = tokio::time::Instant::now() + URGENT_RETRY;
+                    if soon < sleep.deadline() {
+                        sleep.as_mut().reset(soon);
+                    }
+                }
+            }
+        }
     }
     overdue.abort();
     set(&status, |s| s.state = LinkState::Stopped);

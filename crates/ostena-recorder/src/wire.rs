@@ -286,6 +286,12 @@ impl Decoder {
         self.output
     }
 
+    /// Bytes fed but not decoded yet: the start of a frame still
+    /// incomplete.
+    pub fn pending(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     /// Whether the end frame was decoded.
     pub fn ended(&self) -> bool {
         self.state == State::Ended

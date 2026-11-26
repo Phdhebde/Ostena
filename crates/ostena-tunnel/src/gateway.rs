@@ -544,6 +544,11 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    /// The link to the core.
+    pub fn link(&self) -> &Arc<AgentLink> {
+        &self.link
+    }
+
     /// Starts applying what the core pushes on `link`.
     ///
     /// # Errors
