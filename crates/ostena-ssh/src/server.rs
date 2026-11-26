@@ -36,12 +36,17 @@
 //! an SFTP stream too, before they reach the target, but not the file
 //! contents. Without the port forwarding function, `direct-tcpip` (`-L`,
 //! `-W`, `ProxyJump`) is refused; with it, the channel is relayed to the
-//! target, which opens the connection, and noted. Remote forwarding, agent
-//! and X11 forwarding are refused without their function, and not relayed
-//! yet with it. Every refusal for lack of a function is logged
-//! (`ssh.request_refused`, `SSH-E022`) and noted in the transcript; other
-//! subsystems and Unix socket forwarding are refused (`ssh.channel_refused`,
-//! `SSH-E017`).
+//! target, which opens the connection, and noted. Remote forwarding (`-R`,
+//! under the port forwarding function), agent and X11 forwarding (under
+//! their own) are asked of the target as the user asked them
+//! (`ssh.forward_requested`); the channels the target then opens towards
+//! the agent are relayed to the user only for what the target agreed to
+//! (a port listened on, the agent, X11), at most [`MAX_FORWARDS`] at once,
+//! each noted in the transcript before it is relayed; any other is refused
+//! (`ssh.target_channel_refused`). Every refusal for lack of a function is
+//! logged (`ssh.request_refused`, `SSH-E022`) and noted in the transcript;
+//! other subsystems and Unix socket forwarding are refused
+//! (`ssh.channel_refused`, `SSH-E017`).
 //!
 //! **Transcript** (ADR-0016). Every authorised access comes with its
 //! [`Transcript`]: the start (terminal, command), the outputs of the target
@@ -54,7 +59,7 @@
 //! `ssh.exec`, `ssh.session_expired`, `ssh.session_idle`,
 //! `ssh.session_revoked`, `ssh.session_closed`, `ssh.channel_refused`,
 //! `ssh.transcript_lost`, `ssh.request_refused`, `ssh.transfer_started`,
-//! `ssh.forward_opened`, `ssh.transfer_unreadable`.
+//! `ssh.forward_requested`, `ssh.forward_opened`, `ssh.transfer_unreadable`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -77,7 +82,9 @@ use tokio::task::JoinHandle;
 
 use crate::cert::{self, UserIdentity, format_uuid};
 use crate::config;
-use crate::driver::{SshDriver, TargetParams, TargetSession, sec1_point};
+use crate::driver::{
+    SshDriver, TargetChannel, TargetChannels, TargetParams, TargetSession, sec1_point,
+};
 use crate::error::SshError;
 use crate::login::parse_login;
 use crate::precheck::Role;
@@ -105,8 +112,14 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSCRIPT_LOST: &str = "transcript perdu";
 /// Reason of a session cut at its idle delay.
 const IDLE: &str = "inactive";
-/// Forwarded channels open at once on one connection.
+/// Forwarded channels open at once on one connection, both ways.
 const MAX_FORWARDS: usize = 8;
+/// Ports the target listens on at once for one connection (`-R`).
+const MAX_REMOTE: usize = 4;
+/// Longest address of a remote forwarding.
+const MAX_ADDRESS: usize = 255;
+/// Longest X11 authentication protocol name or cookie relayed.
+const MAX_X11_TEXT: usize = 128;
 /// Longest text of a note built from what the client asked.
 const MAX_LABEL: usize = 200;
 
@@ -529,6 +542,174 @@ struct Relay {
     observer: Arc<Mutex<Option<SftpObserver>>>,
 }
 
+/// What the target agreed to open towards the user, under the functions of
+/// the right: the channels it opens are relayed only for these.
+struct Inbound {
+    session_id: [u8; 16],
+    peer: SocketAddr,
+    listener: SocketAddr,
+    transcript: Transcript,
+    /// The user's connection, known at its first request.
+    user: Mutex<Option<russh::server::Handle>>,
+    /// Ports the target listens on for the user (`-R`), as asked.
+    remote: Mutex<Vec<(String, u32)>>,
+    agent: AtomicBool,
+    x11: AtomicBool,
+    forwards: Arc<AtomicUsize>,
+    to_target: Arc<AtomicU64>,
+    from_target: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for Inbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inbound")
+            .field("session", &format_uuid(&self.session_id))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Inbound {
+    fn set_user(&self, handle: russh::server::Handle) {
+        if let Ok(mut user) = self.user.lock() {
+            user.get_or_insert(handle);
+        }
+    }
+
+    fn listens(&self, address: &str, port: u32) -> bool {
+        self.remote
+            .lock()
+            .is_ok_and(|r| r.iter().any(|(a, p)| a == address && *p == port))
+    }
+}
+
+/// Opens on the user's connection the channel matching `kind`.
+async fn open_towards_user(
+    user: &russh::server::Handle,
+    kind: &TargetChannel,
+) -> Result<Channel<Msg>, russh::Error> {
+    match kind {
+        TargetChannel::ForwardedTcpip {
+            address,
+            port,
+            originator,
+            originator_port,
+        } => {
+            user.channel_open_forwarded_tcpip(
+                address.clone(),
+                *port,
+                originator.clone(),
+                *originator_port,
+            )
+            .await
+        }
+        TargetChannel::Agent => user.channel_open_agent().await,
+        TargetChannel::X11 {
+            originator,
+            originator_port,
+        } => {
+            user.channel_open_x11(originator.clone(), *originator_port)
+                .await
+        }
+    }
+}
+
+impl TargetChannels for Inbound {
+    fn offer(
+        &self,
+        kind: TargetChannel,
+        channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+    ) -> Result<(), client::ChannelOpenHandle> {
+        let (function, what) = match &kind {
+            TargetChannel::ForwardedTcpip {
+                address,
+                port,
+                originator,
+                originator_port,
+            } if self.listens(address, *port) => (
+                "port-forwarding",
+                format!(
+                    "-R {}:{port} <- {}:{originator_port}",
+                    sanitize(address),
+                    sanitize(originator)
+                ),
+            ),
+            TargetChannel::Agent if self.agent.load(Ordering::SeqCst) => {
+                ("agent-forwarding", "agent channel".to_owned())
+            }
+            TargetChannel::X11 {
+                originator,
+                originator_port,
+            } if self.x11.load(Ordering::SeqCst) => (
+                "x11-forwarding",
+                format!("x11 <- {}:{originator_port}", sanitize(originator)),
+            ),
+            _ => return Err(reply),
+        };
+        let Some(user) = self.user.lock().ok().and_then(|u| u.clone()) else {
+            return Err(reply);
+        };
+        if self.forwards.fetch_add(1, Ordering::SeqCst) >= MAX_FORWARDS {
+            self.forwards.fetch_sub(1, Ordering::SeqCst);
+            limited(self.peer, self.listener, "redirections ouvertes");
+            return Err(reply);
+        }
+        let transcript = self.transcript.clone();
+        let forwards = self.forwards.clone();
+        let to_target = self.to_target.clone();
+        let from_target = self.from_target.clone();
+        let (session, peer, listener) = (self.session_id, self.peer, self.listener);
+        tokio::spawn(async move {
+            // Noted before anything is relayed: refused if it cannot be.
+            let opened = match transcript
+                .note(NoteKind::Forward, &label(&format!("{function} {what}")))
+                .await
+            {
+                Ok(()) => open_towards_user(&user, &kind)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            let user_channel = match opened {
+                Ok(c) => c,
+                Err(e) => {
+                    forwards.fetch_sub(1, Ordering::SeqCst);
+                    reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                    let error = SshError::Refused("canal de la cible non relayé");
+                    tracing::warn!(
+                        event = "ssh.channel_refused",
+                        code = error.code(),
+                        session = %format_uuid(&session),
+                        peer = %peer,
+                        listener = %listener,
+                        kind = %what,
+                        "{error} : {}",
+                        sanitize(&e)
+                    );
+                    return;
+                }
+            };
+            reply.accept().await;
+            tracing::info!(
+                event = "ssh.forward_opened",
+                session = %format_uuid(&session),
+                peer = %peer,
+                listener = %listener,
+                function,
+                destination = %what,
+                "canal ouvert par la cible relayé à l'utilisateur"
+            );
+            let (user_read, user_write) = user_channel.split();
+            let (target_read, target_write) = channel.split();
+            let to = tokio::spawn(pipe(user_read, target_write, to_target));
+            let from = tokio::spawn(pipe(target_read, user_write, from_target));
+            let _ = tokio::join!(to, from);
+            forwards.fetch_sub(1, Ordering::SeqCst);
+        });
+        Ok(())
+    }
+}
+
 /// A note text from what the client asked: printable ASCII and spaces,
 /// anything else `?`, at most [`MAX_LABEL`] bytes.
 fn label(text: &str) -> Vec<u8> {
@@ -565,6 +746,8 @@ struct Handler<A> {
     terminal: Option<Terminal>,
     /// Marks the traffic of the user, for the idle delay.
     activity: Option<Activity>,
+    /// What the target agreed to open towards the user.
+    inbound: Option<Arc<Inbound>>,
 }
 
 impl<A: Authorizer> Handler<A> {
@@ -653,6 +836,42 @@ impl<A: Authorizer> Handler<A> {
             detail = sanitize(detail),
             noted,
             "{error}"
+        );
+    }
+
+    /// What the target of `authorized` may open towards the user: nothing
+    /// until the user asks and the target agrees.
+    fn inbound_for(&self, authorized: &Authorized) -> Arc<Inbound> {
+        Arc::new(Inbound {
+            session_id: authorized.session_id,
+            peer: self.peer,
+            listener: self.listener,
+            transcript: authorized.transcript.clone(),
+            user: Mutex::new(None),
+            remote: Mutex::new(Vec::new()),
+            agent: AtomicBool::new(false),
+            x11: AtomicBool::new(false),
+            forwards: self.conn.forwards.clone(),
+            to_target: self.conn.to_target.clone(),
+            from_target: self.conn.from_target.clone(),
+        })
+    }
+
+    /// A forwarding the target agreed to, for the user: noted and logged
+    /// (`ssh.forward_requested`).
+    fn forward_requested(&self, function: &'static str, detail: &str) {
+        let noted = self.transcript().is_some_and(|t| {
+            t.note_later(NoteKind::Forward, &label(&format!("{function} {detail}")))
+        });
+        tracing::info!(
+            event = "ssh.forward_requested",
+            session = %format_uuid(&self.session_id),
+            peer = %self.peer,
+            listener = %self.listener,
+            function,
+            detail = sanitize(detail),
+            noted,
+            "redirection acceptée par la cible"
         );
     }
 
@@ -769,6 +988,7 @@ impl<A: Authorizer> Handler<A> {
             session = %format_uuid(&self.session_id),
             peer = %self.peer,
             listener = %self.listener,
+            function = "port-forwarding",
             destination = %what,
             "redirection de port relayée à la cible"
         );
@@ -858,7 +1078,10 @@ impl<A: Authorizer> Handler<A> {
         // Eagerly: the target is reached while the client opens its channel.
         let shared = self.shared.clone();
         let target = authorized.target.clone();
+        let inbound = self.inbound_for(&authorized);
+        self.inbound = Some(inbound.clone());
         let params = TargetParams {
+            channels: Some(inbound),
             host_key: authorized.target_host_key,
             account: authorized.account.clone(),
             label: format!(
@@ -887,17 +1110,22 @@ impl<A: Authorizer> Handler<A> {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
-        let ok = match &mut self.relay {
+        if self.replied().await {
+            session.channel_success(channel)
+        } else {
+            session.channel_failure(channel)
+        }
+    }
+
+    /// The answer of the target to the request just relayed on the session
+    /// channel; `false` without one in [`REPLY_TIMEOUT`].
+    async fn replied(&mut self) -> bool {
+        match &mut self.relay {
             Some(relay) => matches!(
                 tokio::time::timeout(REPLY_TIMEOUT, relay.replies.recv()).await,
                 Ok(Some(true))
             ),
             None => false,
-        };
-        if ok {
-            session.channel_success(channel)
-        } else {
-            session.channel_failure(channel)
         }
     }
 
@@ -1533,48 +1761,140 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
     async fn x11_request(
         &mut self,
         channel: ChannelId,
-        _single_connection: bool,
-        _x11_auth_protocol: &str,
-        _x11_auth_cookie: &str,
-        _x11_screen_number: u32,
+        single_connection: bool,
+        x11_auth_protocol: &str,
+        x11_auth_cookie: &str,
+        x11_screen_number: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.rights().contains(Rights::SSH_X11_FORWARDING) {
-            self.channel_refused("x11 (pas encore relayé)");
-        } else {
+        if !self.rights().contains(Rights::SSH_X11_FORWARDING) {
             self.refuse_request("x11-forwarding", "");
+            return session.channel_failure(channel);
         }
-        session.channel_failure(channel)
+        let (Some(target), Some(inbound)) = (self.relay(channel), self.inbound.clone()) else {
+            return session.channel_failure(channel);
+        };
+        // Relayed as the client sent them: its cookie is a stand-in, which
+        // the client checks and replaces on each X11 channel.
+        let valid = x11_auth_protocol.len() <= MAX_X11_TEXT
+            && x11_auth_cookie.len() <= MAX_X11_TEXT
+            && x11_auth_protocol.bytes().all(|b| b.is_ascii_graphic())
+            && x11_auth_cookie.bytes().all(|b| b.is_ascii_hexdigit());
+        if !valid {
+            self.channel_refused("x11 (paramètres invalides)");
+            return session.channel_failure(channel);
+        }
+        inbound.set_user(session.handle());
+        let sent = target
+            .request_x11(
+                true,
+                single_connection,
+                x11_auth_protocol,
+                x11_auth_cookie,
+                x11_screen_number,
+            )
+            .await;
+        if sent.is_err() || !self.replied().await {
+            self.channel_refused("x11 (refusé par la cible)");
+            return session.channel_failure(channel);
+        }
+        inbound.x11.store(true, Ordering::SeqCst);
+        self.forward_requested("x11-forwarding", &format!("screen {x11_screen_number}"));
+        session.channel_success(channel)
     }
 
     async fn agent_request(
         &mut self,
-        _channel: ChannelId,
-        _session: &mut Session,
+        channel: ChannelId,
+        session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        if self.rights().contains(Rights::SSH_AGENT_FORWARDING) {
-            self.channel_refused("agent (pas encore relayé)");
-        } else {
+        if !self.rights().contains(Rights::SSH_AGENT_FORWARDING) {
             self.refuse_request("agent-forwarding", "");
+            return Ok(false);
         }
-        Ok(false)
+        let (Some(target), Some(inbound)) = (self.relay(channel), self.inbound.clone()) else {
+            return Ok(false);
+        };
+        inbound.set_user(session.handle());
+        if target.agent_forward(true).await.is_err() || !self.replied().await {
+            self.channel_refused("agent (refusé par la cible)");
+            return Ok(false);
+        }
+        inbound.agent.store(true, Ordering::SeqCst);
+        self.forward_requested("agent-forwarding", "agent");
+        Ok(true)
     }
 
     async fn tcpip_forward(
         &mut self,
         address: &str,
         port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let what = format!("-R {}:{port}", sanitize(address));
+        if !self.rights().contains(Rights::SSH_PORT_FORWARDING) {
+            self.refuse_request("port-forwarding", &what);
+            return Ok(false);
+        }
+        let Some(inbound) = self.inbound.clone() else {
+            return Ok(false);
+        };
+        if address.len() > MAX_ADDRESS || *port > u32::from(u16::MAX) {
+            self.channel_refused(&format!("tcpip-forward {what} (invalide)"));
+            return Ok(false);
+        }
+        if inbound
+            .remote
+            .lock()
+            .map_or(true, |r| r.len() >= MAX_REMOTE)
+        {
+            limited(self.peer, self.listener, "redirections distantes");
+            return Ok(false);
+        }
+        inbound.set_user(session.handle());
+        let listening = match self.target_session().await {
+            Ok(target) => target.tcpip_forward(address, *port).await,
+            Err(e) => Err(e),
+        };
+        let listening = match listening {
+            Ok(p) => p,
+            Err(e) => {
+                self.channel_refused(&format!("tcpip-forward {what} : {e}"));
+                return Ok(false);
+            }
+        };
+        *port = listening;
+        if let Ok(mut remote) = inbound.remote.lock() {
+            remote.push((address.to_owned(), listening));
+        }
+        self.forward_requested(
+            "port-forwarding",
+            &format!("-R {}:{listening}", sanitize(address)),
+        );
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        if self.rights().contains(Rights::SSH_PORT_FORWARDING) {
-            self.channel_refused("tcpip-forward (pas encore relayé)");
-        } else {
-            self.refuse_request(
-                "port-forwarding",
-                &format!("-R {}:{port}", sanitize(address)),
-            );
+        let Some(inbound) = self.inbound.clone() else {
+            return Ok(false);
+        };
+        if !inbound.listens(address, port) {
+            return Ok(false);
         }
-        Ok(false)
+        // No longer relayed, whatever the target answers.
+        if let Ok(mut remote) = inbound.remote.lock() {
+            remote.retain(|(a, p)| !(a == address && *p == port));
+        }
+        let cancelled = match self.target_session().await {
+            Ok(target) => target.cancel_tcpip_forward(address, port).await.is_ok(),
+            Err(_) => false,
+        };
+        Ok(cancelled)
     }
 
     async fn streamlocal_forward(
@@ -1705,6 +2025,7 @@ async fn connection<A: Authorizer>(
         session_id: [0; 16],
         terminal: None,
         activity: None,
+        inbound: None,
     };
     let grace = tokio::time::Instant::now() + shared.settings.login_grace;
     let stream = Prechecked::new(

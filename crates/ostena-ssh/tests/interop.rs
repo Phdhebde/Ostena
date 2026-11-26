@@ -818,6 +818,7 @@ fn driver_pins_the_target_host_key_and_authenticates_with_the_agent_key() {
             agent.clone(),
             timeout,
             "driver-ok",
+            None,
         )
         .await
         .unwrap();
@@ -846,6 +847,7 @@ fn driver_pins_the_target_host_key_and_authenticates_with_the_agent_key() {
             agent.clone(),
             timeout,
             "driver-mismatch",
+            None,
         )
         .await
         .unwrap_err();
@@ -858,6 +860,7 @@ fn driver_pins_the_target_host_key_and_authenticates_with_the_agent_key() {
             Arc::new(load(&other_path)),
             timeout,
             "driver-auth",
+            None,
         )
         .await
         .unwrap_err();
@@ -873,6 +876,7 @@ fn driver_pins_the_target_host_key_and_authenticates_with_the_agent_key() {
             agent,
             timeout,
             "driver-down",
+            None,
         )
         .await
         .unwrap_err();
@@ -927,6 +931,7 @@ fn driver_refuses_channels_opened_by_the_target() {
             Arc::new(load(&agent_path)),
             std::time::Duration::from_secs(5),
             "driver-channels",
+            None,
         )
         .await
         .unwrap();

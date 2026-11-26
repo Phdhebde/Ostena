@@ -8,6 +8,12 @@
 //!
 //! [`SshDriver`] is the [`Driver`] of the session manager (ADR-0018).
 //!
+//! A target opens channels towards the agent only for what the user asked
+//! and the right allows (ADR-0010): a connection to a port it listens on
+//! for the user (`forwarded-tcpip`, `-R`), the user's agent, an X11 client.
+//! Each is offered to the [`TargetChannels`] of the session, which relays
+//! it or gives it back; any other channel, or one given back, is refused.
+//!
 //! Events: `ssh.target_host_key_mismatch` (`SSH-E014`),
 //! `ssh.target_auth_failed` (`SSH-E015`), `ssh.target_unreachable`
 //! (`SSH-E016`), `ssh.target_channel_refused` (`SSH-E017`: a channel opened
@@ -35,6 +41,51 @@ struct Pinned {
     host_key: [u8; ostena_crypto::p256::PUBLIC_KEY_LEN],
     mismatch: Arc<AtomicBool>,
     label: String,
+    channels: Option<Arc<dyn TargetChannels>>,
+}
+
+/// A channel the target opens towards the agent, as the target describes
+/// it (texts not checked: the [`TargetChannels`] decides).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetChannel {
+    /// A connection to `address:port`, where the target listens for the
+    /// user (`tcpip-forward`, `-R`), from `originator:originator_port`.
+    ForwardedTcpip {
+        /// Address the target listens on, as the forward asked it.
+        address: String,
+        /// Port the target listens on.
+        port: u32,
+        /// Address of the program that connected.
+        originator: String,
+        /// Its port.
+        originator_port: u32,
+    },
+    /// A program on the target asks the user's agent.
+    Agent,
+    /// An X11 client on the target, from `originator:originator_port`.
+    X11 {
+        /// Address of the X11 client.
+        originator: String,
+        /// Its port.
+        originator_port: u32,
+    },
+}
+
+/// Takes the channels a target opens: relays those the user asked for
+/// under the functions of the right.
+pub trait TargetChannels: std::fmt::Debug + Send + Sync + 'static {
+    /// Takes `channel` and answers `reply`, or gives `reply` back to refuse
+    /// it (the driver refuses and logs it).
+    ///
+    /// # Errors
+    ///
+    /// `reply`, given back, when the channel is not relayed.
+    fn offer(
+        &self,
+        kind: TargetChannel,
+        channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+    ) -> Result<(), client::ChannelOpenHandle>;
 }
 
 /// The SEC1 point of an ECDSA P-256 public key, if it is one.
@@ -69,20 +120,27 @@ impl client::Handler for Pinned {
     }
 
     // The library accepts the channels a server opens by default: a target
-    // must never open one towards the agent (forwarded ports, agent, X11,
-    // sessions). Each is refused and audited.
+    // opens one towards the agent only for what the user asked (forwarded
+    // ports, agent, X11), offered to the session; anything else (sessions,
+    // direct channels, Unix sockets) is refused and audited.
 
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
-        _channel: Channel<client::Msg>,
-        _connected_address: &str,
-        _connected_port: u32,
-        _originator_address: &str,
-        _originator_port: u32,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
         reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        self.refuse("forwarded-tcpip", reply);
+        let kind = TargetChannel::ForwardedTcpip {
+            address: connected_address.to_owned(),
+            port: connected_port,
+            originator: originator_address.to_owned(),
+            originator_port,
+        };
+        self.offer("forwarded-tcpip", kind, channel, reply);
         Ok(())
     }
 
@@ -99,11 +157,11 @@ impl client::Handler for Pinned {
 
     async fn server_channel_open_agent_forward(
         &mut self,
-        _channel: Channel<client::Msg>,
+        channel: Channel<client::Msg>,
         reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        self.refuse("agent", reply);
+        self.offer("agent", TargetChannel::Agent, channel, reply);
         Ok(())
     }
 
@@ -154,18 +212,40 @@ impl client::Handler for Pinned {
 
     async fn server_channel_open_x11(
         &mut self,
-        _channel: Channel<client::Msg>,
-        _originator_address: &str,
-        _originator_port: u32,
+        channel: Channel<client::Msg>,
+        originator_address: &str,
+        originator_port: u32,
         reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        self.refuse("x11", reply);
+        let kind = TargetChannel::X11 {
+            originator: originator_address.to_owned(),
+            originator_port,
+        };
+        self.offer("x11", kind, channel, reply);
         Ok(())
     }
 }
 
 impl Pinned {
+    /// Offers a channel to the session; refused if it gives it back.
+    fn offer(
+        &self,
+        name: &str,
+        kind: TargetChannel,
+        channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+    ) {
+        let reply = match &self.channels {
+            Some(channels) => match channels.offer(kind, channel, reply) {
+                Ok(()) => return,
+                Err(reply) => reply,
+            },
+            None => reply,
+        };
+        self.refuse(name, reply);
+    }
+
     /// Refuses a channel opened by the target (dropping the handle sends the
     /// refusal) and audits it.
     fn refuse(&self, kind: &str, reply: client::ChannelOpenHandle) {
@@ -231,6 +311,35 @@ impl TargetSession {
             .map_err(|_| SshError::Refused("redirection refusée par la cible"))
     }
 
+    /// Asks the target to listen on `address:port` for the user (`-R`);
+    /// the port it listens on (chosen by the target when `port` is 0).
+    ///
+    /// # Errors
+    ///
+    /// [`SshError::Refused`] if the target refuses (its configuration, or
+    /// the `restrict` option of the agent key) or the connection is gone.
+    pub async fn tcpip_forward(&self, address: &str, port: u32) -> Result<u32, SshError> {
+        let listening = self
+            .handle
+            .tcpip_forward(address, port)
+            .await
+            .map_err(|_| SshError::Refused("redirection distante refusée par la cible"))?;
+        Ok(if port == 0 { listening } else { port })
+    }
+
+    /// Asks the target to stop listening on `address:port`.
+    ///
+    /// # Errors
+    ///
+    /// [`SshError::Refused`] if the target refuses or the connection is
+    /// gone.
+    pub async fn cancel_tcpip_forward(&self, address: &str, port: u32) -> Result<(), SshError> {
+        self.handle
+            .cancel_tcpip_forward(address, port)
+            .await
+            .map_err(|_| SshError::Refused("fin de redirection refusée par la cible"))
+    }
+
     /// Closes the connection.
     pub async fn close(&self) {
         let _ = self
@@ -286,6 +395,7 @@ pub async fn connect(
     agent_key: Arc<PrivateKey>,
     timeout: Duration,
     label: &str,
+    channels: Option<Arc<dyn TargetChannels>>,
 ) -> Result<TargetSession, SshError> {
     let attempt = async {
         let tcp = dial(target).await?;
@@ -295,6 +405,7 @@ pub async fn connect(
             host_key: host_key.to_bytes(),
             mismatch: mismatch.clone(),
             label: label.to_owned(),
+            channels,
         };
         let mut handle = match client::connect_stream(config::client(), stream, handler).await {
             Ok(handle) => handle,
@@ -348,6 +459,8 @@ pub async fn connect(
 /// What the SSH driver needs besides the target.
 #[derive(Debug, Clone)]
 pub struct TargetParams {
+    /// Takes the channels the target opens (none: all refused).
+    pub channels: Option<Arc<dyn TargetChannels>>,
     /// The target host key, pinned in the inventory.
     pub host_key: VerifyingKey,
     /// Account on the target.
@@ -398,6 +511,7 @@ impl Driver for SshDriver {
                 key,
                 timeout,
                 &params.label,
+                params.channels,
             )
             .await
         }
