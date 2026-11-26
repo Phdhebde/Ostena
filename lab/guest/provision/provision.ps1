@@ -136,8 +136,9 @@ function Enable-RemoteDesktop {
 # ---------------------------------------------------------------- dc
 
 function Step-DcPromote {
-    Send-Report 'running' 'installing AD DS and AD CS'
-    Install-WindowsFeature -Name AD-Domain-Services, ADCS-Cert-Authority -IncludeManagementTools | Out-Null
+    # AD CS comes after the promotion: its presence blocks the prerequisites.
+    Send-Report 'running' 'installing AD DS'
+    Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools | Out-Null
     Import-Module ADDSDeployment
     Send-Report 'running' "creating the forest $($Cfg.domain.fqdn)"
     Install-ADDSForest -DomainName $Cfg.domain.fqdn -DomainNetbiosName $Cfg.domain.netbios `
@@ -201,6 +202,7 @@ function Step-DcConfigure {
     $caConfig = 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration'
     if (-not (Get-ItemProperty -Path $caConfig -Name Active -ErrorAction SilentlyContinue)) {
         Send-Report 'running' 'installing the enterprise CA'
+        Install-WindowsFeature -Name ADCS-Cert-Authority -IncludeManagementTools | Out-Null
         Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName 'Ostena Lab Root CA' `
             -CryptoProviderName 'ECDSA_P256#Microsoft Software Key Storage Provider' -KeyLength 256 `
             -HashAlgorithmName SHA256 -ValidityPeriod Years -ValidityPeriodUnits 2 -Force | Out-Null
