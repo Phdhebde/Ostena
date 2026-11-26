@@ -8,7 +8,8 @@ Le script [`lab/demo-m1.sh`](../lab/demo-m1.sh) joue ce parcours de bout en bout
 
 Prérequis sur un hôte Linux :
 
-- PostgreSQL 16 joignable par socket Unix, en authentification `peer`, avec un rôle au nom de l'utilisateur courant qui a les droits `CREATEDB` et `CREATEROLE` (il joue le superutilisateur de `ostena core db init`, et à la fois le compte du service et celui des migrations : le journal du core le signale par `core.database_role_weak`) ;
+- PostgreSQL 16 joignable par socket Unix, en authentification `peer`, avec son compte superutilisateur `postgres` (pour `ostena core db init`) ;
+- root ou `sudo` : le core tourne en production sous deux comptes système distincts (ADR-0011), `ostena_demo` pour le service et `ostena_demo_admin` pour les migrations, créés s'ils manquent puis retirés à la fin (`OSTENA_DEMO_SERVICE_USER`, `OSTENA_DEMO_MIGRATION_USER`, `OSTENA_DEMO_DB_SUPERUSER` pour d'autres noms). Ses fichiers vivent dans un dossier `/tmp/ostena-demo-core.*` qu'ils traversent : clés en credentials et transcripts à l'unique compte du service ;
 - OpenSSH 9.x (client et `sshd`) et `ssh-keygen` ;
 - `ip` (iproute2), plus les droits root ou `sudo`, pour créer l'espace de noms réseau de la cible ;
 - la toolchain Rust du dépôt, si le binaire et le générateur TOTP doivent être construits.
@@ -51,7 +52,7 @@ Le fichier `OSTENA_DEMO_TARGET_HOST_KEY` contient la clé d'hôte ECDSA P-256 de
 | Étape | Commandes du produit | Résultat attendu |
 |---|---|---|
 | 1. Cérémonie et clés | `ostena ca root init` (deux supports, trois parts), `ca server sign` et `ca issuing sign` avec deux parts, `ca key new` (grants, audit, CA SSH), `ca key new-mac` (empreinte des commandes, clé TOTP) | racine hors ligne, clés en credentials (`$CREDENTIALS_DIRECTORY`) |
-| 2. Core | `ostena core db init` (rôles et base), `ostena core migrate`, `ostena core run` en **mode production** | `core.started` |
+| 2. Core | `ostena core db init` (rôles et base) sous `postgres`, `ostena core migrate` sous le compte des migrations, `ostena core run` sous celui du service, en **mode production** | `core.started`, aucun `core.database_role_weak` |
 | 3. Agent | `core group add`, `core agent token`, `agent enroll`, `agent run` avec `[agent.ssh]` et un plafond local `[agent.scope]` | `agent.core_connected` ; certificat d'hôte SSH émis (`ssh.host_certified`, `agent.ssh_identity_ready`) |
 | 4. Cible | netns et veth, `sshd`, `ostena agent ssh-key --from 10.77.0.1 --line` dans `authorized_keys` | la clé de l'agent est déposée en `restrict,from=` |
 | 5. Inventaire | `core group policy`, `user add alice`, `resource add srv-demo` (clé d'hôte épinglée), `account add`, `right grant`, `user set-password --stdin`, `user totp-enroll` puis `--confirm` | alice : mot de passe, TOTP confirmé, droit sur le compte cible |
