@@ -401,7 +401,11 @@ fn a_cut_shorter_than_the_grace_keeps_the_session_and_its_transcript() {
             .expect("transcript resumed and acknowledged")
             .unwrap()
             .unwrap();
-        let (bytes, finished) = core.recording(id).unwrap();
+        // Acknowledged once written; read to its end soon after.
+        let (bytes, finished) = core
+            .finished_recording(id, Duration::from_secs(5))
+            .await
+            .expect("transcript read to its end by the core");
         assert!(finished);
         let outputs: Vec<Vec<u8>> = frames_of(&bytes)
             .into_iter()
