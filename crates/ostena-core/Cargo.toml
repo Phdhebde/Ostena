@@ -57,5 +57,10 @@ hyper = { workspace = true, features = ["client"] }
 # The property test of the login rate limiter.
 proptest.workspace = true
 
+[[bench]]
+# Cost of one authenticated request on the portal API.
+name = "web_request"
+harness = false
+
 [lints]
 workspace = true
