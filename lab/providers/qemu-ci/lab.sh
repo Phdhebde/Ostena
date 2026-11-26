@@ -288,6 +288,15 @@ print("\n".join(vals))' "$LAB_STATE/secrets.json"); do
       fi
     done
   fi
+  # Artifacts are not always at hand: the end of each guest log goes to the
+  # job log too (checked above, no secret).
+  local f
+  for f in "$dest"/*.serial; do
+    [[ -f "$f" ]] || continue
+    echo "::group::$(basename "$f") (last 80 lines)"
+    tail -n 80 "$f" | tr -d '\r'
+    echo "::endgroup::"
+  done
   log "diagnostics in $dest"
 }
 

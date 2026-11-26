@@ -63,12 +63,18 @@ function ConvertTo-Secure([string]$Text) { ConvertTo-SecureString -String $Text 
 function Wait-Until([string]$What, [int]$Minutes, [scriptblock]$Test) {
     $deadline = (Get-Date).AddMinutes($Minutes)
     $last = ''
+    $attempt = 0
     while ($true) {
         try {
             $result = & $Test
             if ($result) { return $result }
         } catch { $last = $_.Exception.Message }
         if ((Get-Date) -gt $deadline) { throw "timed out after $Minutes min waiting for ${What}: $last" }
+        # Say why we are still waiting, every three minutes or so.
+        if ((++$attempt % 12) -eq 0) {
+            Write-Log "still waiting for ${What}: $last"
+            Send-Report 'running' "waiting for ${What}: $last"
+        }
         Start-Sleep -Seconds 15
     }
 }
@@ -203,10 +209,19 @@ function Step-DcConfigure {
     if (-not (Get-ItemProperty -Path $caConfig -Name Active -ErrorAction SilentlyContinue)) {
         Send-Report 'running' 'installing the enterprise CA'
         Install-WindowsFeature -Name ADCS-Cert-Authority -IncludeManagementTools | Out-Null
-        Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName 'Ostena Lab Root CA' `
+        $r = Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName 'Ostena Lab Root CA' `
             -CryptoProviderName 'ECDSA_P256#Microsoft Software Key Storage Provider' -KeyLength 256 `
-            -HashAlgorithmName SHA256 -ValidityPeriod Years -ValidityPeriodUnits 2 -Force | Out-Null
+            -HashAlgorithmName SHA256 -ValidityPeriod Years -ValidityPeriodUnits 2 -Force
+        if ($r -and $r.ErrorId -ne 0) { throw "AD CS: $($r.ErrorString)" }
     }
+    Wait-Until 'the certificate service' 10 {
+        $svc = Get-Service CertSvc
+        if ($svc.Status -ne 'Running') { Start-Service CertSvc; throw "CertSvc is $($svc.Status)" }
+        & cmd.exe /c "certutil.exe -ping >NUL 2>&1"
+        if ($LASTEXITCODE -ne 0) { throw "certutil -ping exit $LASTEXITCODE" }
+        $true
+    } | Out-Null
+    Write-Log 'dc: certificate service answering'
     $caCert = Wait-Until 'the CA certificate' 10 {
         Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq 'CN=Ostena Lab Root CA, DC=lab, DC=ostena, DC=test' -or ($_.Subject -like 'CN=Ostena Lab Root CA*' -and $_.Subject -eq $_.Issuer) } | Select-Object -First 1
     }
@@ -219,7 +234,9 @@ function Step-DcConfigure {
             ($_.EnhancedKeyUsageList | Where-Object ObjectId -eq '1.3.6.1.5.5.7.3.1')
         } | Select-Object -First 1
         if (-not $c) {
-            try { Get-Certificate -Template 'DomainController' -CertStoreLocation Cert:\LocalMachine\My | Out-Null } catch { }
+            # Its error, if any, is what Wait-Until reports.
+            $req = Get-Certificate -Template 'DomainController' -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop
+            if ($req.Status -ne 'Issued') { throw "DomainController request: $($req.Status)" }
         }
         $c
     }
@@ -276,7 +293,8 @@ function Step-MemberFinalize {
         if (-not $c) {
             # Fetches the enterprise roots from the directory, then enrolls.
             & certutil.exe -pulse | Out-Null
-            Get-Certificate -Template 'Machine' -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop | Out-Null
+            $req = Get-Certificate -Template 'Machine' -CertStoreLocation Cert:\LocalMachine\My -ErrorAction Stop
+            if ($req.Status -ne 'Issued') { throw "Machine request: $($req.Status)" }
         }
         $c
     }
