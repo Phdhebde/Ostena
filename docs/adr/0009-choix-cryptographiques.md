@@ -8,6 +8,7 @@
 - **Révision** : 2026-11-25, profil de release compilé en taille, chemin chaud gardé à `opt-level = 3` (PR 6bis)
 - **Révision** : 2026-11-25, identités locales : mots de passe, TOTP et écart HMAC-SHA-1 (amendement accepté, décision du responsable du projet, 2026-11-25)
 - **Révision** : 2026-11-25, HMAC-SHA-256 pour les empreintes à clé de l'audit (ADR-0016)
+- **Révision** : 2026-11-26, écart RDP : cryptographie d'IronRDP et de `sspi` dans `ostena-rdp`, profil TLS 1.2 des cibles Windows, règle NTLM (amendement accepté, décision du responsable du projet, 2026-11-26)
 
 ## Contexte
 
@@ -278,6 +279,46 @@ Variantes refusées :
 - **Pas de TLS vers la base** : celle de sqlx ajoute les racines publiques à la CA configurée (ADR-0011).
 
 **Réexamen** : avec la base distante en TLS épinglée (après M1), qui ramènera SCRAM en production.
+
+#### RDP : la cryptographie d'IronRDP et de `sspi` dans `ostena-rdp`, et le profil TLS des cibles (décidé le 2026-11-26)
+
+- **Statut** : Accepté (décision du responsable du projet, 2026-11-26), sur la proposition de l'ADR-0019.
+- **Portée** : le driver RDP de l'agent (`ostena-rdp`, jalon M2, PR 7 et suivantes), et seulement lui.
+
+**L'écart.** Comme russh pour SSH, IronRDP et `sspi` apportent leur propre cryptographie, et Windows en impose une partie hors de la liste figée :
+
+| Usage | Mécanismes | Implémentation |
+|---|---|---|
+| Kerberos | AES256-CTS-HMAC-SHA1-96 puis AES128, PBKDF2-HMAC-SHA1 | `picky-krb` (RustCrypto) |
+| NTLM, seulement quand il est admis (ci-dessous) | MD4, MD5, HMAC-MD5, RC4 | `sspi` (RustCrypto, RC4 propre) |
+| CredSSP version 6 | SHA-256 (hachage du nonce), chiffrement GSS de Kerberos ou NTLM | `sspi` |
+| Licences RDS ([MS-RDPELE]) | RSA brut (sans bourrage, pas en temps constant), RC4, MD5, SHA-1 | `ironrdp-pdu` |
+| Présents mais jamais appelés par Ostena | DES et 3DES (Kerberos), RC2, AES-KW, Ed25519, X25519, P-384, P-521, RSA de `picky` | `picky`, `picky-krb` |
+| TLS vers la cible | profil ci-dessous | `ostena-crypto` (aws-lc-rs) |
+
+**Profil TLS vers les cibles Windows** (`ostena_crypto::tls::target`). Le profil du tunnel (TLS 1.3, `SecP256r1MLKEM768` seul) est inapplicable : Windows ne propose pas ML-KEM et, pour Windows Server 2016 et 2019, pas TLS 1.3 pour RDP. Profil figé, non négociable par une cible ni par un grant :
+
+- TLS 1.3 quand la cible le propose, sinon **TLS 1.2 avec *extended master secret* exigé** ; ni reprise de session, ni 0-RTT ;
+- suites : `TLS13_AES_256_GCM_SHA384`, `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` ;
+- groupes : P-256 et P-384 (échange classique, sans ML-KEM : la cible ne sait pas mieux) ;
+- clés de certificat et signatures de la poignée de main : **RSA de 2 048 à 8 192 bits** (PKCS#1 v1.5 avec SHA-256, 384 ou 512 en TLS 1.2, PSS) ou ECDSA P-256 / SHA-256 ;
+- validation : empreinte SHA-256 épinglée (`pinned`, défaut) ou chaîne vers l'autorité du client (`pki`), avant tout envoi d'identifiant (ADR-0019, section 3).
+
+La fonctionnalité `tls12` de rustls est activée **dans `ostena-crypto` seulement**, pour ce seul profil. Toutes les autres configurations (tunnel, API du core) fixent explicitement TLS 1.3 ; un test vérifie qu'un client du tunnel refuse un serveur TLS 1.2.
+
+**Règle NTLM.** NTLM n'authentifie pas la cible par son nom : un relais qui obtient une réponse valide recevrait un mot de passe délégué. NTLM n'est donc admis **qu'en Restricted Admin** (aucun secret transmis à la cible), et seulement si `rdp.ntlm_fallback = true`, journalisé à chaque session (`rdp.ntlm_used`). Avec la délégation du mot de passe (`rdp.password_delegation = true`), le repli NTLM est **refusé en production** (`CFG-P003`) ; l'agent le refuse aussi à l'exécution, en contrôlant chaque jeton sortant (ADR-0019).
+
+**Confinement.**
+- IronRDP (`ironrdp-*`), `sspi`, `picky*` et les crates cryptographiques qu'ils tirent ne sont dépendances que d'`ostena-rdp`. `deny.toml` les enveloppe comme celles de russh : chaque crate n'est admise que sous ses parents directs dans cette chaîne, si bien qu'aucune autre crate d'Ostena ne peut les déclarer ni les importer.
+- **`des`**, interdite partout ailleurs, n'est admise que sous `picky-krb` (types de chiffrement Kerberos que `sspi` ne demande jamais : la liste offerte est AES256 puis AES128, et un KDC qui n'offre rien d'autre est refusé, `RDP-E006`). Les nouvelles crates `md4`, `rc2`, `rsa`, `aes-kw`, `x25519-dalek`, `crypto-mac` sont enveloppées de la même façon.
+- **Portée** : ces mécanismes ne protègent que le segment agent-cible, à l'intérieur de la TLS validée, et seulement parce que Windows les impose. Le secret des licences ne protège qu'une licence.
+- **Versions épinglées exactement** (`=`), voir l'ADR-0019 section 1 ; `picky` en version préliminaire, imposée exactement par `ironrdp-connector` et `sspi`.
+
+**Impact CSPN.** L'évaluateur doit examiner un deuxième écart, plus large que celui de SSH, et imposé par le protocole : RSA et RC4 des licences, Kerberos avec SHA-1, et une TLS 1.2 vers les cibles. Le périmètre de la cible de sécurité doit le dire. Aucune de ces primitives n'est atteignable hors du driver RDP.
+
+**Conditions de sortie.** Aucune pour Kerberos et les licences, imposés par Windows. Pour TLS : passer au profil du tunnel quand les cibles proposeront TLS 1.3 et un groupe hybride avec ML-KEM.
+
+**Réexamen** à chaque montée d'IronRDP ou de `sspi`, à la sortie de `picky` 7 stable, et à tout avis RustSec sur ces crates.
 
 #### Question ouverte : échange de clés SSH hybride post-quantique
 
