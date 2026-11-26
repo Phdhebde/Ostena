@@ -77,6 +77,7 @@ fn params(core: &TestCore, name: &str, validity: Validity) -> (LinkParams, Files
             gateway_group: group(),
             config_fingerprint: format!("sha256:{}", "0".repeat(64)),
         },
+        transport: ostena_tunnel::TransportMode::Auto,
         limits: fast(),
         backoff: Backoff {
             base: Duration::from_millis(100),

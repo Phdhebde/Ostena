@@ -1,6 +1,7 @@
-//! The QUIC tunnel: the agent dials the core, opens the control stream and
-//! says hello; then both sides exchange control messages, answer each
-//! other's heartbeat and open prioritised session channels.
+//! The tunnel: the agent dials the core (QUIC, or TLS 1.3 over TCP with the
+//! multiplexer of [`crate::mux`]), opens the control stream and says hello;
+//! then both sides exchange control messages, answer each other's heartbeat
+//! and open prioritised session channels.
 
 use std::marker::PhantomData;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -8,17 +9,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ostena_crypto::tls::{self, CertificateDer, ClientConfig, ServerConfig};
+use ostena_crypto::tls::{self, CertificateDer, ClientConfig, ServerConfig, ServerName};
 use quinn::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
-use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
-use tokio::sync::mpsc;
+use quinn::{Connection, Endpoint, VarInt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::channel::{self, CONTROL_PRIORITY, StreamClass};
 use crate::control::{self, AgentMessage, CoreMessage, MAX_FRAME, MAX_MESSAGE, Message};
 use crate::error::TunnelError;
 use crate::ids::Uuid;
 use crate::limits::Limits;
+use crate::mux::{self, Side};
+use crate::transport::{ChannelRecv, ChannelSend, Conn, Transport, TransportMode};
 
 /// Application protocol of the tunnel (ALPN).
 pub const ALPN: &[u8] = b"ostena-tunnel/1";
@@ -27,14 +32,17 @@ pub const ALPN: &[u8] = b"ostena-tunnel/1";
 const CLOSE_ERROR: u32 = 1;
 /// Messages buffered for the application before the reader waits.
 const INBOX: usize = 64;
+/// TLS handshakes over TCP the core runs at once; more connections wait.
+const TCP_HANDSHAKES: usize = 32;
 
-/// A session channel: one bidirectional QUIC stream.
+/// A session channel: one bidirectional stream (QUIC, or the TCP
+/// multiplexer).
 #[derive(Debug)]
 pub struct Channel {
     /// Towards the peer.
-    pub send: SendStream,
+    pub send: ChannelSend,
     /// From the peer.
-    pub recv: RecvStream,
+    pub recv: ChannelRecv,
     _open: OpenChannel,
 }
 
@@ -57,8 +65,8 @@ impl Drop for OpenChannel {
 
 #[derive(Debug)]
 struct Shared {
-    conn: Connection,
-    control: tokio::sync::Mutex<SendStream>,
+    conn: Conn,
+    control: tokio::sync::Mutex<ChannelSend>,
     failure: Mutex<Option<TunnelError>>,
     last_pong: Mutex<Instant>,
     /// Test core only: stop answering pings.
@@ -70,12 +78,12 @@ struct Shared {
 impl Shared {
     /// Records the first failure and closes the connection with its message.
     fn fail(&self, error: TunnelError) {
-        let reason = error.to_string();
+        // Recorded before the close: `closed` reads it once the close is seen.
+        let reason = error.clone();
         if let Ok(mut failure) = self.failure.lock() {
             failure.get_or_insert(error);
         }
-        let reason = &reason.as_bytes()[..reason.len().min(200)];
-        self.conn.close(VarInt::from_u32(CLOSE_ERROR), reason);
+        self.conn.close(CLOSE_ERROR, &reason);
     }
 
     async fn send<M: Message>(&self, message: &M) -> Result<(), TunnelError> {
@@ -105,8 +113,8 @@ pub type AgentTunnel = Tunnel<AgentMessage, CoreMessage>;
 /// The core end.
 pub type CoreTunnel = Tunnel<CoreMessage, AgentMessage>;
 
-pub(crate) async fn read_frame(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, TunnelError> {
-    let lost = |e: quinn::ReadExactError| TunnelError::ConnectionLost(e.to_string());
+pub(crate) async fn read_frame(recv: &mut ChannelRecv, max: usize) -> Result<Vec<u8>, TunnelError> {
+    let lost = |e: crate::transport::StreamError| TunnelError::ConnectionLost(e.to_string());
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await.map_err(lost)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -122,9 +130,9 @@ pub(crate) async fn read_frame(recv: &mut RecvStream, max: usize) -> Result<Vec<
 
 impl<Out: Message, In: Message> Tunnel<Out, In> {
     fn start(
-        conn: Connection,
-        control: SendStream,
-        mut recv: RecvStream,
+        conn: Conn,
+        control: ChannelSend,
+        mut recv: ChannelRecv,
         heartbeat: Duration,
         timeout: Duration,
         endpoint: Option<Endpoint>,
@@ -238,12 +246,7 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
         session: Uuid,
         class: StreamClass,
     ) -> Result<Channel, TunnelError> {
-        let (mut send, recv) = self
-            .shared
-            .conn
-            .open_bi()
-            .await
-            .map_err(TunnelError::from)?;
+        let (mut send, recv) = self.shared.conn.open_bi().await?;
         send.set_priority(class.priority())
             .map_err(|e| TunnelError::ConnectionLost(e.to_string()))?;
         send.write_all(&channel::encode_header(session, class))
@@ -264,12 +267,7 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
     /// [`TunnelError::Version`] for a bad header (the stream is refused, the
     /// tunnel stays up).
     pub async fn accept_channel(&self) -> Result<(Uuid, StreamClass, Channel), TunnelError> {
-        let (mut send, mut recv) = self
-            .shared
-            .conn
-            .accept_bi()
-            .await
-            .map_err(TunnelError::from)?;
+        let (mut send, mut recv) = self.shared.conn.accept_bi().await?;
         let mut header = [0u8; channel::HEADER_LEN];
         let read =
             tokio::time::timeout(Duration::from_secs(10), recv.read_exact(&mut header)).await;
@@ -283,8 +281,8 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
         let (session, class) = match decoded {
             Ok(v) => v,
             Err(e) => {
-                let _ = recv.stop(VarInt::from_u32(CLOSE_ERROR));
-                let _ = send.reset(VarInt::from_u32(CLOSE_ERROR));
+                let _ = recv.stop(CLOSE_ERROR);
+                let _ = send.reset(CLOSE_ERROR);
                 return Err(e);
             }
         };
@@ -306,21 +304,27 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
         self.shared.open_channels.load(Ordering::Relaxed)
     }
 
-    /// Smoothed round-trip time measured by QUIC.
+    /// Smoothed round-trip time, measured by QUIC or by the pings of the
+    /// TCP multiplexer.
     pub fn rtt(&self) -> Duration {
         self.shared.conn.rtt()
     }
 
+    /// The transport carrying this tunnel.
+    pub fn transport(&self) -> Transport {
+        self.shared.conn.transport()
+    }
+
     /// The certificate presented by the peer, if any.
     pub fn peer_certificate(&self) -> Option<CertificateDer<'static>> {
-        peer_certificate(&self.shared.conn)
+        self.shared.conn.peer_certificate()
     }
 
     /// Waits until the tunnel is closed and says why.
     pub async fn closed(&self) -> TunnelError {
         let error = self.shared.conn.closed().await;
         let own = self.shared.failure.lock().ok().and_then(|f| f.clone());
-        own.unwrap_or_else(|| error.into())
+        own.unwrap_or(error)
     }
 
     /// Closes the tunnel on `error`.
@@ -336,7 +340,7 @@ impl<Out: Message, In: Message> Tunnel<Out, In> {
 
     /// Whether the tunnel is closed.
     pub fn is_closed(&self) -> bool {
-        self.shared.conn.close_reason().is_some()
+        self.shared.conn.is_closed()
     }
 }
 
@@ -345,7 +349,13 @@ impl<Out: Message, In: Message> Drop for Tunnel<Out, In> {
         for task in &self.tasks {
             task.abort();
         }
-        self.shared.conn.close(VarInt::from_u32(0), b"");
+        match &self.shared.conn {
+            Conn::Quic(c) => c.close(VarInt::from_u32(0), b""),
+            Conn::Tcp { .. } => self
+                .shared
+                .conn
+                .close(0, &TunnelError::ConnectionLost("tunnel fermé".into())),
+        }
         if let Some(endpoint) = &self.endpoint {
             endpoint.close(VarInt::from_u32(0), b"");
         }
@@ -407,8 +417,10 @@ pub struct AgentConfig {
     /// Name expected in the core certificate (DNS name or IP address).
     pub server_name: String,
     /// TLS client configuration from [`ostena_crypto::tls::client_config`],
-    /// with [`ALPN`].
+    /// with [`ALPN`]. The same for both transports.
     pub tls: Arc<ClientConfig>,
+    /// Transport to dial.
+    pub transport: Transport,
     /// Bounds.
     pub limits: Limits,
     /// Hello content.
@@ -422,13 +434,7 @@ pub struct HelloAck {
     pub heartbeat: Duration,
 }
 
-/// Dials the core, says hello and returns the agent end of the tunnel.
-///
-/// # Errors
-///
-/// A TLS refusal (`TUN-E001` to `TUN-E009`, `TUN-E016`), a protocol error,
-/// a timeout or a local failure.
-pub async fn connect(config: &AgentConfig) -> Result<(AgentTunnel, HelloAck), TunnelError> {
+async fn dial_quic(config: &AgentConfig) -> Result<(Conn, Endpoint), TunnelError> {
     let limits = config.limits;
     let quic = QuicClientConfig::with_initial(config.tls.clone(), tls::quic_initial_suite())
         .map_err(|e| TunnelError::Config(e.to_string()))?;
@@ -448,6 +454,57 @@ pub async fn connect(config: &AgentConfig) -> Result<(AgentTunnel, HelloAck), Tu
     })
     .await?;
     check_alpn(&conn)?;
+    Ok((Conn::Quic(conn), endpoint))
+}
+
+async fn dial_tcp(config: &AgentConfig) -> Result<Conn, TunnelError> {
+    let limits = config.limits;
+    let name = ServerName::try_from(config.server_name.clone())
+        .map_err(|e| TunnelError::Config(format!("nom du core : {e}")))?;
+    within(limits.handshake_timeout, "connexion TCP au core", async {
+        let tcp = TcpStream::connect(config.core)
+            .await
+            .map_err(|e| TunnelError::ConnectionLost(format!("{} : {e}", config.core)))?;
+        tcp.set_nodelay(true)
+            .map_err(|e| TunnelError::Io(e.to_string()))?;
+        let stream = TlsConnector::from(config.tls.clone())
+            .connect(name, tcp)
+            .await
+            .map_err(|e| TunnelError::from_tls_io(&e))?;
+        let session = stream.get_ref().1;
+        if session.alpn_protocol() != Some(ALPN) {
+            return Err(TunnelError::ApplicationProtocol);
+        }
+        let peer = session
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| c.clone().into_owned());
+        // A refusal of our certificate by the core arrives here, as a TLS
+        // alert on the first read.
+        let conn =
+            mux::Connection::establish(stream, Side::Agent, limits, TunnelError::from_tls_io)
+                .await?;
+        Ok(Conn::Tcp { conn, peer })
+    })
+    .await
+}
+
+/// Dials the core over `config.transport`, says hello and returns the agent
+/// end of the tunnel.
+///
+/// # Errors
+///
+/// A TLS refusal (`TUN-E001` to `TUN-E009`, `TUN-E016`), a protocol error,
+/// a timeout or a local failure.
+pub async fn connect(config: &AgentConfig) -> Result<(AgentTunnel, HelloAck), TunnelError> {
+    let (conn, endpoint) = match config.transport {
+        Transport::Quic => {
+            let (conn, endpoint) = dial_quic(config).await?;
+            (conn, Some(endpoint))
+        }
+        Transport::Tcp => (dial_tcp(config).await?, None),
+    };
+    let limits = config.limits;
 
     // In TLS 1.3 the core checks the agent certificate after the agent has
     // finished its handshake: a refusal shows up here as a lost connection.
@@ -456,7 +513,7 @@ pub async fn connect(config: &AgentConfig) -> Result<(AgentTunnel, HelloAck), Tu
         match error {
             TunnelError::ConnectionLost(_) => {
                 match tokio::time::timeout(Duration::from_secs(1), conn.closed()).await {
-                    Ok(reason) => reason.into(),
+                    Ok(reason) => reason,
                     Err(_) => error,
                 }
             }
@@ -471,7 +528,7 @@ pub async fn connect(config: &AgentConfig) -> Result<(AgentTunnel, HelloAck), Tu
     };
     let hello = control::encode(&hello)?;
     let opened = async {
-        let (mut send, recv) = conn.open_bi().await.map_err(TunnelError::from)?;
+        let (mut send, recv) = conn.open_bi().await?;
         send.set_priority(CONTROL_PRIORITY)
             .map_err(|e| TunnelError::ConnectionLost(e.to_string()))?;
         send.write_all(&hello)
@@ -495,27 +552,118 @@ pub async fn connect(config: &AgentConfig) -> Result<(AgentTunnel, HelloAck), Tu
         Ok(CoreMessage::HelloAck { heartbeat_secs, .. }) => heartbeat_secs,
         Ok(_) => {
             let e = TunnelError::Protocol("réponse au hello inattendue".into());
-            conn.close(VarInt::from_u32(CLOSE_ERROR), e.to_string().as_bytes());
+            conn.close(CLOSE_ERROR, &e);
             return Err(e);
         }
         Err(e) => {
-            conn.close(VarInt::from_u32(CLOSE_ERROR), e.to_string().as_bytes());
+            conn.close(CLOSE_ERROR, &e);
             return Err(e);
         }
     };
     let heartbeat = Duration::from_secs(u64::from(heartbeat_secs))
         .min(limits.heartbeat_interval)
         .min(limits.heartbeat_timeout / 2);
+    let transport = conn.transport();
     let tunnel = Tunnel::start(
         conn,
         send,
         recv,
         heartbeat,
         limits.heartbeat_timeout,
-        Some(endpoint),
+        endpoint,
     );
-    tracing::info!(event = "tunnel.connected", core = %config.core, transport = "quic");
+    tracing::info!(
+        event = "tunnel.connected",
+        core = %config.core,
+        transport = transport.as_str()
+    );
     Ok((tunnel, HelloAck { heartbeat }))
+}
+
+/// How long `auto` waits for QUIC before it dials TCP in parallel.
+pub const FALLBACK_AFTER: Duration = Duration::from_secs(1);
+
+/// Whether QUIC failing with `error` is worth trying TCP: the path, not the
+/// peer, refused. A TLS refusal (certificate, group, suite, ALPN) would be
+/// the same over TCP.
+fn worth_tcp(error: &TunnelError) -> bool {
+    matches!(
+        error,
+        TunnelError::ConnectionLost(_) | TunnelError::Io(_) | TunnelError::Handshake(_)
+    )
+}
+
+fn fell_back(config: &AgentConfig, why: &str) {
+    tracing::warn!(
+        event = "tunnel.fallback",
+        core = %config.core,
+        transport = "tcp",
+        "repli TLS 1.3 sur TCP : {why} ; performance moindre, sécurité identique"
+    );
+}
+
+/// Dials the core as `mode` says: QUIC, TCP, or `auto`: QUIC first, and TCP
+/// in parallel if QUIC has not answered within [`FALLBACK_AFTER`] or failed
+/// on the path; the first tunnel up wins. Falling back is logged
+/// (`tunnel.fallback`).
+///
+/// # Errors
+///
+/// As [`connect`]; with `auto`, a refusal by the peer rather than a
+/// transport failure when there is one.
+pub async fn connect_with(
+    config: &AgentConfig,
+    mode: TransportMode,
+) -> Result<(AgentTunnel, HelloAck), TunnelError> {
+    let quic = AgentConfig {
+        transport: Transport::Quic,
+        ..config.clone()
+    };
+    let tcp = AgentConfig {
+        transport: Transport::Tcp,
+        ..config.clone()
+    };
+    match mode {
+        TransportMode::Quic => return connect(&quic).await,
+        TransportMode::Tcp => return connect(&tcp).await,
+        TransportMode::Auto => {}
+    }
+    // Boxed: each attempt holds a whole handshake.
+    let mut first = Box::pin(connect(&quic));
+    match tokio::time::timeout(FALLBACK_AFTER, &mut first).await {
+        Ok(Ok(up)) => return Ok(up),
+        Ok(Err(e)) if !worth_tcp(&e) => return Err(e),
+        Ok(Err(e)) => {
+            let up = connect(&tcp)
+                .await
+                .map_err(|t| if worth_tcp(&t) { e } else { t })?;
+            fell_back(config, "QUIC a échoué");
+            return Ok(up);
+        }
+        Err(_) => {}
+    }
+    let mut second = Box::pin(connect(&tcp));
+    tokio::select! {
+        q = &mut first => match q {
+            Ok(up) => Ok(up),
+            Err(e) if !worth_tcp(&e) => Err(e),
+            Err(e) => {
+                let up = second.await.map_err(|t| if worth_tcp(&t) { e } else { t })?;
+                fell_back(config, "QUIC a échoué");
+                Ok(up)
+            }
+        },
+        t = &mut second => match t {
+            Ok(up) => {
+                fell_back(config, "QUIC sans réponse en 1 s");
+                Ok(up)
+            }
+            Err(t) => match first.await {
+                Ok(up) => Ok(up),
+                Err(e) => Err(if worth_tcp(&t) { e } else { t }),
+            },
+        },
+    }
 }
 
 /// A connection the core accepted: the tunnel, the hello and the agent
@@ -530,37 +678,72 @@ pub struct Accepted {
     pub fingerprint: [u8; 32],
 }
 
-/// The core listener of the tunnel.
+/// The TCP side of the core listener: an accept task that runs the TLS
+/// handshakes (a bounded number at once) and queues the results.
+#[derive(Debug)]
+struct TcpSide {
+    addr: SocketAddr,
+    accepted: tokio::sync::Mutex<mpsc::Receiver<Result<Accepted, TunnelError>>>,
+    task: JoinHandle<()>,
+}
+
+/// The core listener of the tunnel: QUIC, and TLS 1.3 over TCP for the
+/// agents that fall back to it.
 #[derive(Debug)]
 pub struct CoreListener {
     endpoint: Endpoint,
     limits: Limits,
+    tcp: TcpSide,
+    /// Test core only: drop every QUIC connection attempt unanswered, as a
+    /// firewall that blocks UDP.
+    quic_dropped: AtomicBool,
 }
 
 impl CoreListener {
     /// Listens on `addr` with a TLS server configuration from
     /// [`ostena_crypto::tls::server_config`] (client certificate required,
-    /// [`ALPN`]).
+    /// [`ALPN`]): QUIC on UDP, and TLS 1.3 over TCP on the same port for the
+    /// agents that fall back to it, with the same TLS configuration.
     ///
     /// # Errors
     ///
-    /// [`TunnelError::Config`] or [`TunnelError::Io`].
+    /// [`TunnelError::Config`] or [`TunnelError::Io`] (the UDP or the TCP
+    /// port is taken).
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime.
     pub fn bind(
         addr: SocketAddr,
         tls: Arc<ServerConfig>,
         limits: Limits,
     ) -> Result<Self, TunnelError> {
-        let quic = QuicServerConfig::with_initial(tls, tls::quic_initial_suite())
+        let quic = QuicServerConfig::with_initial(tls.clone(), tls::quic_initial_suite())
             .map_err(|e| TunnelError::Config(e.to_string()))?;
         let mut server = quinn::ServerConfig::with_crypto(Arc::new(quic));
         server.transport_config(limits.transport()?);
         server.migration(false);
         let endpoint =
             Endpoint::server(server, addr).map_err(|e| TunnelError::Io(e.to_string()))?;
-        Ok(Self { endpoint, limits })
+        let bound = endpoint
+            .local_addr()
+            .map_err(|e| TunnelError::Io(e.to_string()))?;
+        let tcp = match bind_tcp(bound, tls, limits) {
+            Ok(tcp) => tcp,
+            Err(e) => {
+                endpoint.close(VarInt::from_u32(0), b"");
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            endpoint,
+            limits,
+            tcp,
+            quic_dropped: AtomicBool::new(false),
+        })
     }
 
-    /// The bound address.
+    /// The bound address (QUIC).
     ///
     /// # Errors
     ///
@@ -571,10 +754,28 @@ impl CoreListener {
             .map_err(|e| TunnelError::Io(e.to_string()))
     }
 
-    /// The next agent connection; `None` once the listener is closed.
+    /// The bound TCP address (the port of the QUIC one).
+    pub fn tcp_local_addr(&self) -> SocketAddr {
+        self.tcp.addr
+    }
+
+    /// The next agent connection, over either transport; `None` once the
+    /// listener is closed.
     pub async fn accept(&self) -> Option<Result<Accepted, TunnelError>> {
-        let incoming = self.endpoint.accept().await?;
-        let result = self.handshake(incoming).await;
+        let tcp = &self.tcp;
+        let result = loop {
+            break tokio::select! {
+                incoming = self.endpoint.accept() => {
+                    let incoming = incoming?;
+                    if self.quic_dropped.load(Ordering::Relaxed) {
+                        incoming.ignore();
+                        continue;
+                    }
+                    self.handshake(incoming).await
+                }
+                accepted = async { tcp.accepted.lock().await.recv().await } => accepted?,
+            };
+        };
         if let Err(e) = &result {
             tracing::warn!(event = "tunnel.refused", code = e.code(), "{e}");
         }
@@ -589,58 +790,149 @@ impl CoreListener {
         })
         .await?;
         check_alpn(&conn)?;
-        let certificate = peer_certificate(&conn).ok_or(TunnelError::NoClientCertificate)?;
-        let fingerprint = tls::fingerprint(&certificate);
-        let hello = within(limits.handshake_timeout, "hello de l'agent", async {
-            let (send, mut recv) = conn.accept_bi().await.map_err(TunnelError::from)?;
-            let frame = read_frame(&mut recv, MAX_MESSAGE).await?;
-            let hello = control::decode::<AgentMessage>(&frame)?;
-            Ok((send, recv, hello))
-        })
-        .await;
-        let (send, recv, hello) = match hello {
-            Ok(v) => v,
-            Err(e) => {
-                conn.close(VarInt::from_u32(CLOSE_ERROR), e.to_string().as_bytes());
-                return Err(e);
-            }
-        };
-        let AgentMessage::Hello {
-            agent_version,
-            gateway_group,
-            config_fingerprint,
-            ..
-        } = hello
-        else {
-            let e = TunnelError::Protocol("le premier message n'est pas un hello".into());
-            conn.close(VarInt::from_u32(CLOSE_ERROR), e.to_string().as_bytes());
-            return Err(e);
-        };
-        send.set_priority(CONTROL_PRIORITY)
-            .map_err(|e| TunnelError::ConnectionLost(e.to_string()))?;
-        let hello = Hello {
-            agent_version,
-            // Checked by `validate`.
-            gateway_group: Uuid::parse(&gateway_group).unwrap_or(Uuid::from_bytes([0; 16])),
-            config_fingerprint,
-        };
-        let tunnel = Tunnel::start(
-            conn,
-            send,
-            recv,
-            limits.heartbeat_interval,
-            limits.heartbeat_timeout,
-            None,
-        );
-        Ok(Accepted {
-            tunnel,
-            hello,
-            fingerprint,
-        })
+        accept_hello(Conn::Quic(conn), limits).await
+    }
+
+    /// Test core only: drop QUIC connection attempts unanswered.
+    #[cfg(feature = "testing")]
+    pub(crate) fn drop_quic_for_tests(&self) {
+        self.quic_dropped.store(true, Ordering::Relaxed);
     }
 
     /// Stops accepting and closes every connection.
     pub fn close(&self) {
         self.endpoint.close(VarInt::from_u32(0), b"");
+        self.tcp.task.abort();
     }
+}
+
+impl Drop for CoreListener {
+    fn drop(&mut self) {
+        self.tcp.task.abort();
+    }
+}
+
+fn bind_tcp(
+    addr: SocketAddr,
+    tls: Arc<ServerConfig>,
+    limits: Limits,
+) -> Result<TcpSide, TunnelError> {
+    let io = |e: std::io::Error| TunnelError::Io(format!("écoute TCP {addr} : {e}"));
+    let std_listener = std::net::TcpListener::bind(addr).map_err(io)?;
+    std_listener.set_nonblocking(true).map_err(io)?;
+    let listener = TcpListener::from_std(std_listener).map_err(io)?;
+    let bound = listener.local_addr().map_err(io)?;
+    let (tx, rx) = mpsc::channel(16);
+    let acceptor = TlsAcceptor::from(tls);
+    let permits = Arc::new(Semaphore::new(TCP_HANDSHAKES));
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok(permit) = permits.clone().acquire_owned().await else {
+                return;
+            };
+            let (tcp, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(event = "tunnel.accept_failed", "écoute TCP : {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let acceptor = acceptor.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = accept_tcp(tcp, acceptor, limits).await;
+                drop(permit);
+                let _ = tx.send(result).await;
+            });
+        }
+    });
+    Ok(TcpSide {
+        addr: bound,
+        accepted: tokio::sync::Mutex::new(rx),
+        task,
+    })
+}
+
+async fn accept_tcp(
+    tcp: TcpStream,
+    acceptor: TlsAcceptor,
+    limits: Limits,
+) -> Result<Accepted, TunnelError> {
+    let conn = within(limits.handshake_timeout, "poignée de main TCP", async {
+        tcp.set_nodelay(true)
+            .map_err(|e| TunnelError::Io(e.to_string()))?;
+        let stream = acceptor
+            .accept(tcp)
+            .await
+            .map_err(|e| TunnelError::from_tls_io(&e))?;
+        let session = stream.get_ref().1;
+        if session.alpn_protocol() != Some(ALPN) {
+            return Err(TunnelError::ApplicationProtocol);
+        }
+        let peer = session
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| c.clone().into_owned());
+        let conn = mux::Connection::establish(stream, Side::Core, limits, TunnelError::from_tls_io)
+            .await?;
+        Ok(Conn::Tcp { conn, peer })
+    })
+    .await?;
+    accept_hello(conn, limits).await
+}
+
+/// The common end of the handshake on the core: the agent certificate, then
+/// the control stream and its hello.
+async fn accept_hello(conn: Conn, limits: Limits) -> Result<Accepted, TunnelError> {
+    let certificate = conn
+        .peer_certificate()
+        .ok_or(TunnelError::NoClientCertificate)?;
+    let fingerprint = tls::fingerprint(&certificate);
+    let hello = within(limits.handshake_timeout, "hello de l'agent", async {
+        let (send, mut recv) = conn.accept_bi().await?;
+        let frame = read_frame(&mut recv, MAX_MESSAGE).await?;
+        let hello = control::decode::<AgentMessage>(&frame)?;
+        Ok((send, recv, hello))
+    })
+    .await;
+    let (send, recv, hello) = match hello {
+        Ok(v) => v,
+        Err(e) => {
+            conn.close(CLOSE_ERROR, &e);
+            return Err(e);
+        }
+    };
+    let AgentMessage::Hello {
+        agent_version,
+        gateway_group,
+        config_fingerprint,
+        ..
+    } = hello
+    else {
+        let e = TunnelError::Protocol("le premier message n'est pas un hello".into());
+        conn.close(CLOSE_ERROR, &e);
+        return Err(e);
+    };
+    send.set_priority(CONTROL_PRIORITY)
+        .map_err(|e| TunnelError::ConnectionLost(e.to_string()))?;
+    let hello = Hello {
+        agent_version,
+        // Checked by `validate`.
+        gateway_group: Uuid::parse(&gateway_group).unwrap_or(Uuid::from_bytes([0; 16])),
+        config_fingerprint,
+    };
+    let tunnel = Tunnel::start(
+        conn,
+        send,
+        recv,
+        limits.heartbeat_interval,
+        limits.heartbeat_timeout,
+        None,
+    );
+    Ok(Accepted {
+        tunnel,
+        hello,
+        fingerprint,
+    })
 }

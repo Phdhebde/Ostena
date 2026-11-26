@@ -96,8 +96,8 @@ deny = [
     { crate = "aws-lc-rs", wrappers = ["ostena-crypto", "rustls", "rustls-webpki", "rcgen", "quinn-proto", "russh"], reason = "only ostena-crypto may call aws-lc-rs" },
     { crate = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "only reachable through aws-lc-rs" },
     { crate = "rustls", wrappers = ["ostena-crypto", "quinn", "quinn-proto", "tokio-rustls"], reason = "TLS configurations are built by ostena-crypto::tls only; quinn and tokio-rustls only carry them" },
-    # HTTPS of the login API (ADR-0015): the core and its client only.
-    { crate = "tokio-rustls", wrappers = ["ostena-core", "ostena-cli"], reason = "HTTPS of the core API only (ADR-0015)" },
+    # HTTPS of the login API (ADR-0015) and the TCP fallback of the tunnel.
+    { crate = "tokio-rustls", wrappers = ["ostena-core", "ostena-cli", "ostena-tunnel"], reason = "HTTPS of the core API (ADR-0015) and the TCP fallback of the tunnel (ADR-0008)" },
     { crate = "hyper", wrappers = ["ostena-core", "ostena-cli", "hyper-util"], reason = "HTTP of the core API only (ADR-0015)" },
     # QUIC is the tunnel's business only (ADR-0008).
     { crate = "quinn", wrappers = ["ostena-tunnel"], reason = "QUIC is used by ostena-tunnel only" },

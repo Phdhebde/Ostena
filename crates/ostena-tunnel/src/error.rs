@@ -241,6 +241,32 @@ impl TunnelError {
             .and_then(Self::from_code)
             .unwrap_or_else(|| Self::ConnectionLost(reason.to_owned()))
     }
+
+    /// Maps an I/O error of a TLS stream over TCP: a handshake refused
+    /// here, an alert sent by the peer, or a plain loss.
+    pub(crate) fn from_tls_io(error: &std::io::Error) -> Self {
+        use ostena_crypto::tls::{HandshakeFailure as F, classify_io, received_alert};
+        let Some(failure) = classify_io(error) else {
+            return Self::ConnectionLost(error.to_string());
+        };
+        match failure {
+            F::NoCommonGroup => Self::NoCommonGroup,
+            F::NoCommonCipherSuite | F::ProtocolVersion => Self::Negotiation(error.to_string()),
+            F::UnknownIssuer => Self::UnknownIssuer,
+            F::Expired | F::NotYetValid => Self::CertificateValidity,
+            F::NameMismatch => Self::NameMismatch,
+            F::Revoked => Self::Revoked,
+            F::UnknownClient => Self::UnknownAgent,
+            F::NoClientCertificate => Self::NoClientCertificate,
+            F::NoApplicationProtocol => Self::ApplicationProtocol,
+            F::NotRootIssued => Self::NotRootIssued,
+            F::RegistryUnavailable => Self::RegistryUnavailable,
+            F::Other => match received_alert(error) {
+                Some(alert) => from_alert(alert, ""),
+                None => Self::Handshake(error.to_string()),
+            },
+        }
+    }
 }
 
 impl From<ConnectionError> for TunnelError {

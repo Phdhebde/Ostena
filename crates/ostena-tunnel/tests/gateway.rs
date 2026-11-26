@@ -108,6 +108,7 @@ async fn agent(
             gateway_group: group(),
             config_fingerprint: format!("sha256:{}", "0".repeat(64)),
         },
+        transport: ostena_tunnel::TransportMode::Auto,
         limits: Limits::default(),
         backoff: Backoff::default(),
         clock: Arc::new(SystemClock),

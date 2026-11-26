@@ -9,7 +9,8 @@
 //! - [`limits`] — bounds on sessions, streams, buffers and timers;
 //! - [`recording`] — the transcript stream of a session, agent side;
 //! - [`tunnel`] — connection, heartbeat, channels, on both ends;
-//! - [`mux`] — the multiplexer of the TLS 1.3 over TCP fallback.
+//! - [`mux`] — the multiplexer of the TLS 1.3 over TCP fallback;
+//! - [`transport`] — QUIC and TCP behind one interface.
 
 #![forbid(unsafe_code)]
 
@@ -25,6 +26,7 @@ pub mod mux;
 pub mod recording;
 pub mod renewal;
 pub mod ssh;
+pub mod transport;
 pub mod tunnel;
 
 #[cfg(feature = "testing")]
@@ -37,7 +39,8 @@ pub use channel::StreamClass;
 pub use error::TunnelError;
 pub use ids::Uuid;
 pub use limits::Limits;
+pub use transport::{ChannelRecv, ChannelSend, StreamError, Transport, TransportMode};
 pub use tunnel::{
-    ALPN, Accepted, AgentConfig, AgentTunnel, Channel, CoreListener, CoreTunnel, Hello, HelloAck,
-    connect,
+    ALPN, Accepted, AgentConfig, AgentTunnel, Channel, CoreListener, CoreTunnel, FALLBACK_AFTER,
+    Hello, HelloAck, connect, connect_with,
 };
