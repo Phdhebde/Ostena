@@ -174,16 +174,18 @@ switch ($LASTEXITCODE) {
     default { Fail "the non-administrator pipe test could not run ($LASTEXITCODE)" }
 }
 
+# A repair with properties: /i with REINSTALL (msiexec /f ignores the
+# properties of its command line).
 Write-Host '=== repair: setup again, nothing changes'
 $configBefore = Get-FileHash (Join-Path $Data 'ostena.toml')
-$code = Invoke-Msiexec @('/fomus', "`"$Msi`"", '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
+$code = Invoke-Msiexec @('/i', "`"$Msi`"", 'REINSTALL=ALL', 'REINSTALLMODE=omus', '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
     "COREADDRESS=$CoreAddress", "GATEWAYGROUP=$Group")
 if ($code -ne 0) { Fail "msiexec /f: exit $code" }
 if (-not (Wait-State 'Running' 30)) { Fail 'the service is not running after a repair' }
 if ((Get-FileHash (Join-Path $Data 'ostena.toml')).Hash -ne $configBefore.Hash) { Fail 'the repair rewrote the configuration' }
 
 Write-Host '=== a conflicting core address is refused, the agent is left as it was'
-$code = Invoke-Msiexec @('/fomus', "`"$Msi`"", '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
+$code = Invoke-Msiexec @('/i', "`"$Msi`"", 'REINSTALL=ALL', 'REINSTALLMODE=omus', '/qn', '/norestart', '/l*v', "`"$MsiLog`"",
     'COREADDRESS=elsewhere.invalid:8443', "GATEWAYGROUP=$Group")
 if ($code -eq 0) { Fail 'a repair with another core address succeeded' }
 Write-Host "refused as expected (exit $code)"
