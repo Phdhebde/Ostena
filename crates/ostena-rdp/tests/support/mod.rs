@@ -132,6 +132,10 @@ pub struct Seen {
     pub autodetect_responses: Vec<AutoDetectResponse>,
     /// Why the target stopped, if early.
     pub error: Option<String>,
+    /// Every PDU the target wrote, in clear (seeds of the fuzz corpora).
+    pub sent: Vec<Vec<u8>>,
+    /// Index in `sent` of the first PDU of the session (after activation).
+    pub session_start: Option<usize>,
 }
 
 /// A running target.
@@ -162,9 +166,17 @@ impl Target {
                 return seen;
             };
             tcp.set_read_timeout(Some(Duration::from_secs(20))).ok();
-            if let Err(e) = serve(tcp, options, &id, &mut seen) {
+            let mut stream = Stream {
+                tcp,
+                tls: None,
+                pending: Vec::new(),
+                received: 0,
+                sent: Vec::new(),
+            };
+            if let Err(e) = serve(&mut stream, options, &id, &mut seen) {
                 seen.error = Some(e);
             }
+            seen.sent = stream.sent;
             seen
         });
         Self {
@@ -191,6 +203,7 @@ struct Stream {
     tls: Option<ServerConnection>,
     pending: Vec<u8>,
     received: usize,
+    sent: Vec<Vec<u8>>,
 }
 
 impl Stream {
@@ -226,6 +239,7 @@ impl Stream {
     }
 
     fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        self.sent.push(data.to_vec());
         match &mut self.tls {
             None => self.tcp.write_all(data),
             Some(tls) => {
@@ -350,17 +364,11 @@ fn patch_version(bytes: &mut [u8], version: u8) {
     reason = "one scripted target, read top to bottom"
 )]
 fn serve(
-    tcp: TcpStream,
+    stream: &mut Stream,
     options: Options,
     identity: &TargetIdentity,
     seen: &mut Seen,
 ) -> Result<(), String> {
-    let mut stream = Stream {
-        tcp,
-        tls: None,
-        pending: Vec::new(),
-        received: 0,
-    };
     let size = DesktopSize {
         width: 1280,
         height: 720,
@@ -524,6 +532,7 @@ fn serve(
         }
     };
     seen.accepted = true;
+    seen.session_start = Some(stream.sent.len());
     let user = result.user_channel_id;
     let io = result.io_channel_id;
     let message = result.message_channel_id;
@@ -595,14 +604,14 @@ fn serve(
             ];
             for request in requests {
                 send(
-                    &mut stream,
+                    stream,
                     channel,
                     encode_vec(&AutoDetectReqPdu::new(request)).unwrap(),
                 )?;
             }
             // An undecodable request: ignored, never fatal.
             send(
-                &mut stream,
+                stream,
                 channel,
                 vec![0x00, 0x10, 0x00, 0x00, 0x06, 0x00, 0x09, 0x00, 0xff, 0xff],
             )?;
@@ -620,7 +629,7 @@ fn serve(
                 }
             }
             send(
-                &mut stream,
+                stream,
                 io,
                 error_info(ProtocolIndependentCode::LogoffByUser),
             )?;
@@ -628,21 +637,47 @@ fn serve(
         }
         Script::Logoff => {
             send(
-                &mut stream,
+                stream,
                 io,
                 error_info(ProtocolIndependentCode::LogoffByUser),
             )?;
             stream.write_all(&ultimatum()).map_err(|e| err("fin", e))?;
         }
         Script::ServerError => {
-            send(
-                &mut stream,
-                io,
-                error_info(ProtocolIndependentCode::OutOfMemory),
-            )?;
+            send(stream, io, error_info(ProtocolIndependentCode::OutOfMemory))?;
             stream.write_all(&ultimatum()).map_err(|e| err("fin", e))?;
         }
     }
     std::thread::sleep(Duration::from_millis(100));
     Ok(())
+}
+
+/// The scope of the tests: the loopback allowed on `port`, pinned.
+///
+/// # Panics
+///
+/// If the policy does not compile or the address is refused.
+pub async fn loopback(port: u16) -> ostena_scope::PinnedTarget {
+    use ostena_common::config::Mode;
+    use ostena_common::config::scope::{AllowRuleSpec, FloorExceptionSpec, PolicySpec};
+    let spec = PolicySpec {
+        gateway_group: "rdp-tests".into(),
+        allow: vec![AllowRuleSpec {
+            label: None,
+            networks: vec!["127.0.0.0/8".into()],
+            ports: vec![port.to_string()],
+        }],
+        floor_exceptions: vec![FloorExceptionSpec {
+            network: "127.0.0.0/8".into(),
+            reason: "tests: cible sur la boucle locale".into(),
+        }],
+        ..PolicySpec::default()
+    };
+    let policy = ostena_scope::CompiledPolicy::compile(&spec, Mode::Development).unwrap();
+    let scope = ostena_scope::Scope::new(
+        Arc::new(policy),
+        ostena_scope::SharedLocalAddresses::new(ostena_scope::LocalAddresses::from_addrs([])),
+        ostena_scope::SystemResolver::new(Duration::from_secs(5), 4),
+    );
+    scope.pin("127.0.0.1", port).await.unwrap()
 }

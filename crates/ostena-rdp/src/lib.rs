@@ -9,6 +9,7 @@ pub mod connect;
 pub mod credssp;
 pub mod driver;
 pub mod error;
+pub mod fuzz;
 pub mod guard;
 pub mod profile;
 pub mod session;

@@ -18,6 +18,7 @@ ostena-common = { path = "../crates/ostena-common" }
 ostena-crypto = { path = "../crates/ostena-crypto" }
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
+ostena-rdp = { path = "../crates/ostena-rdp" }
 ostena-recorder = { path = "../crates/ostena-recorder" }
 ostena-scope = { path = "../crates/ostena-scope" }
 ostena-ssh = { path = "../crates/ostena-ssh", default-features = false }
@@ -144,6 +145,41 @@ bench = false
 [[bin]]
 name = "tunnel_mux_decode"
 path = "fuzz_targets/tunnel_mux_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdp_x224"
+path = "fuzz_targets/rdp_x224.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdp_mcs_gcc"
+path = "fuzz_targets/rdp_mcs_gcc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdp_tsrequest"
+path = "fuzz_targets/rdp_tsrequest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdp_license"
+path = "fuzz_targets/rdp_license.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdp_session"
+path = "fuzz_targets/rdp_session.rs"
 test = false
 doc = false
 bench = false
