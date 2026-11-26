@@ -1409,6 +1409,17 @@ fn p016_transcript_directory_through_the_injected_checker() {
     let err = load_with(&path, &exposed).unwrap_err();
     assert_eq!(err.codes(), vec![Code::TranscriptsExposed]);
     assert!(err.to_string().contains("core.ssh.transcripts_dir"));
+    // The database commands run under other accounts and read none of the
+    // service files (ADR-0011); the configuration file is still checked.
+    assert!(load_for_database(&path, &exposed).is_ok());
+    let file_open = FakeChecker {
+        writable: vec![path.clone()],
+        exposed: vec![transcripts.clone()],
+    };
+    assert_eq!(
+        load_for_database(&path, &file_open).unwrap_err().codes(),
+        vec![Code::ConfigFileWritableByOthers]
+    );
 }
 
 #[test]
