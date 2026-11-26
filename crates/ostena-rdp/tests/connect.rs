@@ -326,6 +326,28 @@ async fn server_error_info_ends_the_session_with_its_code() {
     drop(target.join());
 }
 
+/// The error information that comes with the TLS close notification, in
+/// the same read and without disconnection PDU, is still the reason of the
+/// end (never a silent normal close).
+#[tokio::test]
+async fn server_error_info_with_close_notify_keeps_its_code() {
+    let target = Target::start(Options {
+        script: Script::ServerErrorThenClose,
+        ..Options::default()
+    });
+    let established = connect(&target, params(pinned(&target), Mechanism::Ntlm, false))
+        .await
+        .unwrap();
+    let (end, counters) = run_session(established).await;
+    assert_eq!(
+        end,
+        SessionEnd::Failed(RdpError::ServerError(0x0006)),
+        "{counters:?}"
+    );
+    assert_eq!(counters.error_info, Some(0x0006));
+    drop(target.join());
+}
+
 #[tokio::test]
 async fn stop_disconnects_cleanly() {
     let target = Target::start(Options {

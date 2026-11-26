@@ -337,18 +337,22 @@ pub(crate) enum StopSource {
 }
 
 impl StopSource {
-    async fn wait(self) {
+    /// Starts listening now (the signal handlers are installed before the
+    /// agent says it started) and returns the wait for the stop request.
+    fn arm(self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
         match self {
-            Self::Service(rx) => {
+            Self::Service(rx) => Box::pin(async move {
                 let _ = tokio::task::spawn_blocking(move || rx.recv()).await;
-            }
-            Self::Signals => wait_for_signals().await,
+            }),
+            Self::Signals => Box::pin(wait_for_signals()),
         }
     }
 }
 
+/// Installs the stop signal handlers at once, then returns the wait for the
+/// first signal: a signal received in between is not lost.
 #[cfg(unix)]
-pub(crate) async fn wait_for_signals() {
+pub(crate) fn wait_for_signals() -> impl Future<Output = ()> + Send + 'static {
     use std::sync::Arc;
     use tokio::signal::unix::{SignalKind, signal};
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -364,13 +368,23 @@ pub(crate) async fn wait_for_signals() {
             Err(e) => tracing::error!(event = "agent.signal_failed", "signal non installé : {e}"),
         }
     }
-    notify.notified().await;
+    async move { notify.notified().await }
 }
 
+/// Installs the Ctrl-C handler at once, then returns the wait for it.
 #[cfg(not(unix))]
-pub(crate) async fn wait_for_signals() {
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        tracing::error!(event = "agent.signal_failed", "Ctrl-C non installé : {e}");
+pub(crate) fn wait_for_signals() -> impl Future<Output = ()> + Send + 'static {
+    let installed = tokio::signal::windows::ctrl_c();
+    async move {
+        match installed {
+            Ok(mut ctrl_c) => {
+                ctrl_c.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(event = "agent.signal_failed", "Ctrl-C non installé : {e}");
+                std::future::pending::<()>().await;
+            }
+        }
     }
 }
 
@@ -613,6 +627,7 @@ async fn serve_until_stopped(
             resident_bytes = ostena_platform::memory::resident_bytes()
         );
     });
+    let stopped = stop.arm();
     ready();
     tracing::info!(
         event = "agent.started",
@@ -622,7 +637,7 @@ async fn serve_until_stopped(
         control_endpoint = %endpoint,
         pid = std::process::id(),
     );
-    stop.wait().await;
+    stopped.await;
     #[cfg(target_os = "linux")]
     ostena_platform::service::notify("STOPPING=1");
     tracing::info!(
