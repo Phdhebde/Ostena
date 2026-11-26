@@ -4,6 +4,7 @@
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-11, signature ECDSA P-256 / SHA-256 (algorithme 2) au lieu d'Ed25519, absent des guides ANSSI (ADR-0009)
 - **Révision** : 2026-11-25, format v2 (184 octets) : liaison signée à la session de connexion et au compte cible (jalon M1, PR 5a) ; la v1 est refusée
+- **Révision** : 2026-11-26, bit 9 des droits : redirection X11 SSH (jalon M2, PR 4a), sans nouvelle version
 
 ## Contexte
 
@@ -50,7 +51,7 @@ Retenu : une **structure binaire de taille fixe**. Le décodeur lit à des posit
 | 104 | 16 | liaison : session de connexion et compte cible (voir plus bas) | comparée par le vérificateur qui connaît les deux |
 | 120 | 64 | signature ECDSA P-256 / SHA-256 brute `r ‖ s` (32 + 32 octets, big-endian), forme low-S | |
 
-Droits (inchangés depuis la v1) : presse-papiers vers la cible (bit 0), presse-papiers depuis la cible (1), dépôt de fichiers (2), récupération de fichiers (3), redirection de lecteurs (4), d'imprimante (5), de l'audio (6), redirection de ports SSH (7), agent forwarding SSH (8). Toute évolution du format passe par une nouvelle version.
+Droits (inchangés depuis la v1) : presse-papiers vers la cible (bit 0), presse-papiers depuis la cible (1), dépôt de fichiers (2), récupération de fichiers (3), redirection de lecteurs (4), d'imprimante (5), de l'audio (6), redirection de ports SSH (7), agent forwarding SSH (8), redirection X11 SSH (9, ajouté à la PR 4a du jalon M2). Toute évolution du format passe par une nouvelle version. **Exception** : un bit de droit s'ajoute sans nouvelle version, parce qu'un vérificateur ancien refuse un bit inconnu (`GRT-E004`) : il échoue fermé, jamais en accordant plus. Pour SSH, les bits 2 et 3 (ensemble), 7, 8 et 9 portent les fonctions du droit (ADR-0010, ADR-0014).
 
 ### Liaison (v2)
 
