@@ -593,6 +593,7 @@ impl RunningCore {
         tracing::info!(
             event = "core.started",
             tunnel = %tunnel_addr,
+            tunnel_tcp = %listener.tcp_local_addr(),
             enrollment = %shared.enrollment.addr(),
             chain = %chain,
             kid = %signer.kid(),
