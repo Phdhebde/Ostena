@@ -42,6 +42,8 @@ const EXPECTED: &[(&str, &[&str])] = &[
     ("target_account", &["INSERT", "SELECT"]),
     ("target_account.disabled_at", &["UPDATE"]),
     ("user_credential", &["INSERT", "SELECT", "UPDATE"]),
+    ("user_group", &["INSERT", "SELECT"]),
+    ("user_group_member", &["DELETE", "INSERT", "SELECT"]),
     ("user_role", &["DELETE", "INSERT", "SELECT"]),
     ("web_session", &["INSERT", "SELECT", "UPDATE"]),
 ];

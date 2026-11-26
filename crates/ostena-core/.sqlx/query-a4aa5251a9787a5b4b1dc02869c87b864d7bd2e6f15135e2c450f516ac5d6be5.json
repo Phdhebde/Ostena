@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET state = 'disabled', disabled_at = now(), directory_disabled = true\n         WHERE id = $1::text::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a4aa5251a9787a5b4b1dc02869c87b864d7bd2e6f15135e2c450f516ac5d6be5"
+}

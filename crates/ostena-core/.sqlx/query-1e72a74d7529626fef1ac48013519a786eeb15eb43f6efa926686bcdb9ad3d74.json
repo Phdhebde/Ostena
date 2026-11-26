@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO user_group_member (group_id, user_id, source)\n                 SELECT id, $2::text::uuid, $3 FROM user_group WHERE name = $1\n                 ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1e72a74d7529626fef1ac48013519a786eeb15eb43f6efa926686bcdb9ad3d74"
+}

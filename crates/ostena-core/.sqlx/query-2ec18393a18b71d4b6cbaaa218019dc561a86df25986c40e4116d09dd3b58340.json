@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM user_group_member m USING user_group g\n                 WHERE g.id = m.group_id AND m.user_id = $1::text::uuid AND m.source = $2\n                   AND g.name = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2ec18393a18b71d4b6cbaaa218019dc561a86df25986c40e4116d09dd3b58340"
+}
