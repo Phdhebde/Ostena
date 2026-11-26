@@ -205,13 +205,16 @@ function Step-DcConfigure {
 
     # Enterprise root CA, ECDSA P-256 / SHA-256: issues the Remote Desktop
     # certificates of the members and the LDAPS certificate of this DC.
+    $admin = New-Object System.Management.Automation.PSCredential("$($Cfg.domain.netbios)\Administrator", (ConvertTo-Secure $Cfg.admin_password))
     $caConfig = 'HKLM:\SYSTEM\CurrentControlSet\Services\CertSvc\Configuration'
     if (-not (Get-ItemProperty -Path $caConfig -Name Active -ErrorAction SilentlyContinue)) {
         Send-Report 'running' 'installing the enterprise CA'
         Install-WindowsFeature -Name ADCS-Cert-Authority -IncludeManagementTools | Out-Null
+        # As the domain Administrator (an Enterprise Admin): SYSTEM may not
+        # write the certificate templates into the configuration partition.
         $r = Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -CACommonName 'Ostena Lab Root CA' `
             -CryptoProviderName 'ECDSA_P256#Microsoft Software Key Storage Provider' -KeyLength 256 `
-            -HashAlgorithmName SHA256 -ValidityPeriod Years -ValidityPeriodUnits 2 -Force
+            -HashAlgorithmName SHA256 -ValidityPeriod Years -ValidityPeriodUnits 2 -Credential $admin -Force
         if ($r -and $r.ErrorId -ne 0) { throw "AD CS: $($r.ErrorString)" }
     }
     Wait-Until 'the certificate service' 10 {
@@ -222,6 +225,24 @@ function Step-DcConfigure {
         $true
     } | Out-Null
     Write-Log 'dc: certificate service answering'
+
+    # The templates used by the lab must exist in the directory and be
+    # offered by the CA; done as the domain Administrator, over WinRM to
+    # this machine (on by default on Windows Server).
+    $published = Wait-Until 'the Machine and DomainController templates' 10 {
+        Invoke-Command -ComputerName localhost -Credential $admin -ErrorAction Stop -ScriptBlock {
+            & cmd.exe /c "certutil.exe -installdefaulttemplates >NUL 2>&1"
+            Import-Module ADCSAdministration
+            $have = @(Get-CATemplate | ForEach-Object Name)
+            $added = $false
+            foreach ($t in 'Machine', 'DomainController') {
+                if ($have -notcontains $t) { Add-CATemplate -Name $t -Force -ErrorAction Stop; $added = $true }
+            }
+            if ($added) { Restart-Service CertSvc }
+            @(Get-CATemplate | ForEach-Object Name) -join ','
+        }
+    }
+    Write-Log "dc: CA templates: $published"
     $caCert = Wait-Until 'the CA certificate' 10 {
         Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -eq 'CN=Ostena Lab Root CA, DC=lab, DC=ostena, DC=test' -or ($_.Subject -like 'CN=Ostena Lab Root CA*' -and $_.Subject -eq $_.Issuer) } | Select-Object -First 1
     }
