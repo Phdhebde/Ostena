@@ -231,6 +231,18 @@ fn from_alert(alert: u8, reason: &str) -> TunnelError {
     }
 }
 
+impl TunnelError {
+    /// The error behind the reason of a close sent by the peer: the peer
+    /// closed on one of our errors, its code is kept.
+    pub(crate) fn from_peer_close(reason: &str) -> Self {
+        reason
+            .strip_prefix('[')
+            .and_then(|r| r.get(..8))
+            .and_then(Self::from_code)
+            .unwrap_or_else(|| Self::ConnectionLost(reason.to_owned()))
+    }
+}
+
 impl From<ConnectionError> for TunnelError {
     fn from(error: ConnectionError) -> Self {
         match &error {
@@ -243,13 +255,7 @@ impl From<ConnectionError> for TunnelError {
                 None => Self::ConnectionLost(error.to_string()),
             },
             ConnectionError::ApplicationClosed(frame) => {
-                let reason = String::from_utf8_lossy(&frame.reason).into_owned();
-                // The peer closed on one of our errors: keep its code.
-                reason
-                    .strip_prefix('[')
-                    .and_then(|r| r.get(..8))
-                    .and_then(Self::from_code)
-                    .unwrap_or(Self::ConnectionLost(reason))
+                Self::from_peer_close(&String::from_utf8_lossy(&frame.reason))
             }
             ConnectionError::VersionMismatch => Self::Negotiation(error.to_string()),
             _ => Self::ConnectionLost(error.to_string()),
