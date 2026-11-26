@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(limits.max_sessions, 8);
         assert_eq!(limits.max_per_user, Some(2));
         assert_eq!(limits.max_per_target, None);
-        assert_eq!(limits.idle_timeout, Some(Duration::from_secs(900)));
+        assert_eq!(limits.idle_timeout, Some(Duration::from_mins(15)));
         assert_eq!(limits.max_duration, None);
     }
 

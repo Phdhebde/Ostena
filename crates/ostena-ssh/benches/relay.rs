@@ -126,6 +126,16 @@ struct Bench {
     next: std::sync::atomic::AtomicU64,
 }
 
+impl Bench {
+    fn new(target: ostena_scope::PinnedTarget, target_key: VerifyingKey) -> Self {
+        Self {
+            target,
+            target_key,
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+}
+
 impl Authorizer for Bench {
     async fn authorize(&self, request: AccessRequest) -> Result<Authorized, Refusal> {
         // The transcript is encoded and queued as in the agent; the queue is
@@ -346,11 +356,7 @@ async fn bench() {
         ServerSettings::default(),
         identity_rx,
         agent_key.clone(),
-        Arc::new(Bench {
-            target: pinned(target_addr.port()).await,
-            target_key,
-            next: std::sync::atomic::AtomicU64::new(1),
-        }),
+        Arc::new(Bench::new(pinned(target_addr.port()).await, target_key)),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let agent_addr = listener.local_addr().unwrap();
