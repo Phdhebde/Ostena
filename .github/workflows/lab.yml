@@ -10,8 +10,6 @@ name: Lab
 # `command` run in the same job once the lab is up, with LAB_JSON naming the
 # entry point (addresses, accounts, certificate fingerprints).
 on:
-  push:
-    branches: [m2/lab]
   workflow_dispatch:
     inputs:
       command:
