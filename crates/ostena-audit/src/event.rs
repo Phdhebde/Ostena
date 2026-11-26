@@ -159,6 +159,9 @@ event_kinds! {
     /// function of the right (transfer, forwarding, agent, X11), as recorded
     /// in the transcript (ADR-0010).
     AccessSshRequestRefused => "access.ssh_request_refused",
+    /// A port forwarding channel (`direct-tcpip`: `-L`, `-W`, `ProxyJump`)
+    /// relayed under the port forwarding function of the right (ADR-0010).
+    AccessSshForward => "access.ssh_forward",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -547,7 +550,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 57);
+        assert_eq!(names.len(), 58);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

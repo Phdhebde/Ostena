@@ -495,8 +495,9 @@ struct Received {
 const MAX_AUDITED_NOTES: usize = 32;
 
 /// The audit record of a note of the transcript of `session`: a transfer
-/// (`access.ssh_transfer`) or a refused request
-/// (`access.ssh_request_refused`); none for a file operation, which stays
+/// (`access.ssh_transfer`), a refused request
+/// (`access.ssh_request_refused`) or a forwarding relayed
+/// (`access.ssh_forward`); none for a file operation, which stays
 /// in the transcript, nor past [`MAX_AUDITED_NOTES`].
 fn note_event(
     agent: Uuid,
@@ -514,6 +515,11 @@ fn note_event(
         NoteKind::Refused => (
             EventKind::AccessSshRequestRefused,
             Outcome::Refused,
+            field::REQUEST,
+        ),
+        NoteKind::Forward => (
+            EventKind::AccessSshForward,
+            Outcome::Success,
             field::REQUEST,
         ),
         _ => return None,

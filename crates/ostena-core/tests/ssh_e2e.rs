@@ -37,7 +37,7 @@ use ostena_crypto::pki::{pem_certificate, pem_private_key};
 use ostena_crypto::tls::{self, Identity};
 use ostena_grant::{Issuer, MemoryReplayStore};
 use ostena_platform::private_file::{self, Reader};
-use ostena_recorder::EndReason;
+use ostena_recorder::{EndReason, NoteKind};
 use ostena_scope::{LocalAddresses, SharedLocalAddresses};
 use ostena_ssh::transcript::Transcript;
 use ostena_tunnel::enroll::AgentRegistry;
@@ -392,6 +392,8 @@ fn ssh_access_and_login_revocation_end_to_end() {
         // Its transcript (ADR-0016): received, written, sealed.
         let session_id = opened.session.session_id;
         let (transcript, pumped) = record(opened.recording);
+        // A refusal before the start is kept, then recorded (ADR-0010).
+        assert!(transcript.note_later(NoteKind::Refused, b"agent-forwarding "));
         transcript
             .start(None, Some(b"cat /etc/shadow"))
             .await
@@ -400,6 +402,12 @@ fn ssh_access_and_login_revocation_end_to_end() {
             .output(b"root:*:19000:0:99999:7:::\n")
             .await
             .unwrap();
+        transcript.note(NoteKind::Transfer, b"sftp").await.unwrap();
+        transcript
+            .note(NoteKind::Rename, b"/tmp/a\0/tmp/b")
+            .await
+            .unwrap();
+        assert!(transcript.note_later(NoteKind::Forward, b"port-forwarding 10.0.0.9:443"));
         transcript.end(EndReason::Closed).await.unwrap();
         drop(transcript);
         pumped.await.unwrap().unwrap();
@@ -409,6 +417,38 @@ fn ssh_access_and_login_revocation_end_to_end() {
         let text = String::from_utf8(written.clone()).unwrap();
         assert!(text.starts_with("{\"version\":2,"), "{text}");
         assert!(text.contains("cat /etc/shadow") && text.contains("root:*:19000"));
+        // The notes are markers of the transcript.
+        for marker in [
+            "\"m\",\"refused agent-forwarding \"]",
+            "\"m\",\"transfer sftp\"]",
+            "\"m\",\"file-rename /tmp/a -> /tmp/b\"]",
+            "\"m\",\"forward port-forwarding 10.0.0.9:443\"]",
+        ] {
+            assert!(text.contains(marker), "{marker} in {text}");
+        }
+        // Transfers, refusals and forwardings are audited, not file
+        // operations.
+        for (event, value) in [
+            ("access.ssh_request_refused", "agent-forwarding "),
+            ("access.ssh_transfer", "sftp"),
+            ("access.ssh_forward", "port-forwarding 10.0.0.9:443"),
+        ] {
+            let bodies: Vec<Vec<u8>> =
+                sqlx::query_scalar("SELECT body FROM audit_record WHERE event = $1")
+                    .bind(event)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(bodies.len(), 1, "{event}");
+            let record = ostena_audit::Record::decode(&bodies[0]).unwrap();
+            assert!(
+                record
+                    .fields
+                    .iter()
+                    .any(|f| f.value == ostena_audit::Value::Text(value.to_owned())),
+                "{event}: {record:?}"
+            );
+        }
         let (sha256, size, hmac, kid): (Vec<u8>, i64, Vec<u8>, String) = sqlx::query_as(
             "SELECT sha256, size, command_hmac, command_kid FROM session_transcript
              WHERE session_id = $1::uuid",
