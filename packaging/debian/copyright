@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Ostena
+Source: https://github.com/Phdhebde/Ostena
+
+Files: *
+Copyright: The Ostena contributors
+License: AGPL-3.0-or-later
+ The statically linked Rust dependencies are under permissive licenses
+ (MIT, Apache-2.0, BSD, ISC, Zlib, MPL-2.0, and Unicode-3.0 for the crates
+ listed in deny.toml); their list is the CycloneDX SBOM of the release.
+ .
+ Full text of the license of Ostena:
+ .

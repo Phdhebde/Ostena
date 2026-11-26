@@ -1,0 +1,26 @@
+#!/bin/sh
+# prerm of ostena-agent (ADR-0024). Idempotent.
+set -e
+
+UNIT=/etc/systemd/system/ostena-agent.service
+
+case "$1" in
+remove | deconfigure)
+    # Stop and unregister the service; configuration, identity and state
+    # are kept until purge.
+    if [ -e "$UNIT" ]; then
+        /usr/bin/ostena agent uninstall --quiet \
+            || echo "ostena-agent : arrêt du service impossible, voir journalctl -u ostena-agent" >&2
+    fi
+    ;;
+upgrade | failed-upgrade)
+    # The service keeps running; the postinst of the new version restarts
+    # it on the new binary.
+    ;;
+*)
+    echo "prerm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

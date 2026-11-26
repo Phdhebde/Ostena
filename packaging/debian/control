@@ -1,0 +1,18 @@
+Package: ostena-agent
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Ostena project <maintainers@ostena.invalid>
+Installed-Size: @SIZE@
+Depends: systemd (>= 252), passwd
+Section: admin
+Priority: optional
+Homepage: https://github.com/Phdhebde/Ostena
+Description: Ostena administration bastion, gateway agent
+ Gateway agent of the Ostena administration bastion (PAM): opens the SSH,
+ RDP and VNC sessions to the targets of its group and dials back to the
+ core through a mutual TLS tunnel. It listens on no network port unless its
+ native SSH server is configured.
+ .
+ The package installs the static ostena binary. "ostena agent setup" writes
+ the configuration, enrols the agent and starts the hardened systemd
+ service.

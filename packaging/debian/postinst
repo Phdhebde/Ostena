@@ -1,0 +1,42 @@
+#!/bin/sh
+# postinst of ostena-agent (ADR-0024). Idempotent: dpkg may run `configure`
+# again. The service itself is set up by the binary (`ostena agent setup`,
+# then `ostena agent install`), never by this script.
+set -e
+
+CONFIG=/etc/ostena/ostena.toml
+UNIT=/etc/systemd/system/ostena-agent.service
+
+case "$1" in
+configure)
+    # The system user of the service, as `ostena agent install` creates it.
+    if ! getent passwd ostena >/dev/null; then
+        useradd --system --user-group --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin ostena
+    fi
+    install -d -m 0755 /etc/ostena
+    if [ -e "$UNIT" ] && [ -f "$CONFIG" ]; then
+        # Upgrade of an installed agent: the unit is written again for this
+        # binary and the service restarted.
+        if [ -d /run/systemd/system ]; then
+            /usr/bin/ostena agent install --executable /usr/bin/ostena --config "$CONFIG" --quiet
+        fi
+    elif [ ! -e "$UNIT" ]; then
+        cat <<'EOF'
+ostena-agent : l'agent n'est pas encore configuré. Lancez, en root :
+  ostena agent setup --core-address <core:8443> --gateway-group <UUID> \
+    --root-ca <root.pem> --root-fingerprint <SHA-256 du procès-verbal> \
+    --token-file <fichier du jeton>
+Voir docs/exploitation/agent-installation.md.
+EOF
+    fi
+    ;;
+abort-upgrade | abort-remove | abort-deconfigure)
+    ;;
+*)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0
