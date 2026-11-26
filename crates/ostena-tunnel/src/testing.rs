@@ -599,6 +599,26 @@ impl TestCore {
         self.state.recordings.lock().ok()?.get(&session).cloned()
     }
 
+    /// The transcript stream of `session` once the test core has read it
+    /// to its end, waiting up to `within`; `None` past it. The agent's pump
+    /// returns once the transport acknowledged every byte and the end
+    /// (ADR-0016): the core has received them, not necessarily read them
+    /// yet.
+    pub async fn finished_recording(
+        &self,
+        session: Uuid,
+        within: Duration,
+    ) -> Option<(Vec<u8>, bool)> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            match self.recording(session) {
+                Some(recorded) if recorded.1 => return Some(recorded),
+                _ if tokio::time::Instant::now() >= deadline => return None,
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
+
     /// Open tunnels.
     pub fn tunnels(&self) -> usize {
         self.state
