@@ -53,6 +53,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "ssh_sftp"
+path = "fuzz_targets/ssh_sftp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "scope_target"
 path = "fuzz_targets/scope_target.rs"
 test = false

@@ -63,6 +63,11 @@ fn replay_ssh_login_corpus() {
 }
 
 #[test]
+fn replay_ssh_sftp_corpus() {
+    assert!(replay("ssh_sftp", ostena_ssh::fuzz::sftp) > 0);
+}
+
+#[test]
 fn certificate_seeds_from_ssh_keygen_parse() {
     for entry in std::fs::read_dir(corpus().join("../ssh_certificate")).expect("corpus") {
         let path = entry.expect("entry").path();
