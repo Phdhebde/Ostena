@@ -888,13 +888,14 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Fuzz target run by `cargo xtask fuzz`.
-const FUZZ_TARGETS: [&str; 15] = [
+const FUZZ_TARGETS: [&str; 16] = [
     "grant_decode",
     "scope_target",
     "scope_policy",
     "frame_decode",
     "frame_reassembly",
     "tunnel_control_decode",
+    "tunnel_mux_decode",
     "ssh_precheck",
     "ssh_certificate",
     "ssh_login",
