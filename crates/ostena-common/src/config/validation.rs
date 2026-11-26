@@ -95,11 +95,16 @@ pub enum Code {
     /// Core: transcript directory readable beyond the service account, or
     /// its parent writable by another account (ADR-0016).
     TranscriptsExposed,
+    /// Agent: invalid `[agent.sessions]` (bound out of range).
+    AgentSessions,
+    /// Agent: sessions never cut for inactivity
+    /// (`agent.sessions.idle_timeout_secs = 0`).
+    IdleTimeoutDisabled,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 36] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -134,6 +139,8 @@ impl Code {
         Self::CoreLogin,
         Self::TotpSha1,
         Self::TranscriptsExposed,
+        Self::AgentSessions,
+        Self::IdleTimeoutDisabled,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -173,6 +180,8 @@ impl Code {
             Self::CoreLogin => "CFG-V017",
             Self::TotpSha1 => "CFG-P015",
             Self::TranscriptsExposed => "CFG-P016",
+            Self::AgentSessions => "CFG-V018",
+            Self::IdleTimeoutDisabled => "CFG-P017",
         }
     }
 
@@ -195,6 +204,7 @@ impl Code {
                 | Self::InfrastructureUnresolved
                 | Self::TotpSha1
                 | Self::TranscriptsExposed
+                | Self::IdleTimeoutDisabled
         )
     }
 }

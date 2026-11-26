@@ -1,6 +1,6 @@
 # ADR-0019 : Driver RDP et passthrough vers le navigateur
 
-- **Statut** : Proposé. Trois points attendent la décision du responsable du projet : l'écart cryptographique propre à RDP (à ajouter à l'ADR-0009), le profil TLS imposé par les cibles Windows, et le stockage des mots de passe des comptes de ressource sur l'agent tant que le coffre-fort n'existe pas (voir « Points à trancher »).
+- **Statut** : Proposé. L'écart cryptographique propre à RDP et le profil TLS des cibles Windows sont décidés (amendement de l'ADR-0009 du 2026-11-26, PR 7). Restent à trancher : le stockage des mots de passe des comptes de ressource sur l'agent tant que le coffre-fort n'existe pas, et l'écart d'empreinte (voir « Points à trancher »).
 - **Date** : 2026-11-26
 
 ## Contexte

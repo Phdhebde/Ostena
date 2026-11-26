@@ -233,16 +233,13 @@ Sont refusés explicitement, avec `ssh.channel_refused` (`SSH-E017`) : les sous-
 |---|---|---|
 | `listen` | requis | liste d'adresses `hôte:port` |
 | `host_key`, `target_key`, `host_certificate` | `ssh_host_key`, `ssh_target_key`, `ssh_host_certificate` dans le dossier d'état (celui du journal anti-rejeu) | chemins absolus (`CFG-V008`) ; `host_key` et `target_key` distincts |
-| `max_sessions` | 64 | 1 à 256 |
-| `max_sessions_per_user` | aucune (seule `max_sessions`) | 1 à 256 |
-| `max_sessions_per_target` | aucune (seule `max_sessions`) | 1 à 256 |
-| `idle_timeout_secs` | aucun (pas de coupure pour inactivité) | 60 à 86 400 |
+| `max_sessions` | obsolète : borne de l'agent si `[agent.sessions] max_sessions` est absent | 1 à 256 |
 | `max_unauthenticated` | 16 | 1 à 256 |
 | `max_unauthenticated_per_source` | 4 | 1 à 256 |
 | `login_grace_secs` | 30 | 5 à 120 |
 | `target_connect_timeout_secs` | 5 | 1 à 30 |
 
-Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et les cibles donnent `CFG-V015`. Une clé SSH lisible par un autre compte, ou le dossier d'une clé pas encore créée modifiable par un autre compte, donne `CFG-P008`.
+Les quotas et le délai d'inactivité, communs à tous les protocoles, sont dans `[agent.sessions]` (ADR-0018). Une valeur hors bornes, une adresse invalide ou la même clé pour l'hôte et les cibles donnent `CFG-V015`. Une clé SSH lisible par un autre compte, ou le dossier d'une clé pas encore créée modifiable par un autre compte, donne `CFG-P008`.
 
 ### Liaison dans l'agent (jalon M1, PR 6)
 

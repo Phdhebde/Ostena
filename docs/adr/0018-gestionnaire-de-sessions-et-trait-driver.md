@@ -62,6 +62,17 @@ Le transcript (ADR-0016) n'a pas de raison « inactivité » : sa trame de fin p
 
 Trois clés facultatives dans `[agent.ssh]`, sans valeur par défaut, pour ne rien changer au comportement du jalon M1 : `max_sessions_per_user` et `max_sessions_per_target` (1 à 256), `idle_timeout_secs` (60 à 86 400). `max_sessions` reste la borne de l'agent (64). Hors bornes : `CFG-V015`. Ces clés passeront dans une section commune à tous les protocoles quand RDP arrivera (PR 7).
 
+**Section commune `[agent.sessions]` (PR 7, 2026-11-26).** Avec RDP, les quotas et le délai d'inactivité quittent `[agent.ssh]` (les trois clés ci-dessus n'avaient pas encore été livrées) pour une section commune à tous les protocoles, avec des valeurs par défaut sûres :
+
+| Clé | Défaut | Bornes | Raison du défaut |
+|---|---|---|---|
+| `max_sessions` | 64 (ou `agent.ssh.max_sessions` s'il est renseigné, clé du jalon M1 devenue obsolète) | 1 à 1 024 | inchangé depuis le jalon M1 |
+| `max_sessions_per_user` | 8 | 1 à 256 | un administrateur n'ouvre que quelques sessions à la fois ; un compte volé ne peut pas épuiser l'agent seul |
+| `max_sessions_per_target` | 8 | 1 à 256 | Windows Server n'admet que deux sessions d'administration sans licences RDS ; 8 laisse travailler une équipe sur une même cible Linux |
+| `idle_timeout_secs` | 900 (15 min) | 0 ou 60 à 86 400 | une session oubliée ouverte est coupée ; 0 (jamais) est refusé en production (`CFG-P017`) |
+
+Hors bornes : `CFG-V018`. Le délai d'inactivité compte ce que le driver déclare comme activité de l'utilisateur (en SSH, ses données vers la cible ; en RDP, ses entrées clavier et souris) : une session laissée sur un `tail -f` ou une vidéo est inactive. Ces défauts changent le comportement du jalon M1 : un 9ᵉ accès simultané d'un même utilisateur est refusé (`SES-E002`), et une session SSH sans frappe pendant 15 minutes est coupée (`ssh.session_idle`).
+
 ### Codes
 
 | Code | Signification |
