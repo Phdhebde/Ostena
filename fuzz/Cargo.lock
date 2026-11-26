@@ -1437,6 +1437,7 @@ dependencies = [
  "ostena-crypto",
  "ostena-frame",
  "ostena-grant",
+ "ostena-ldap",
  "ostena-rdp",
  "ostena-recorder",
  "ostena-scope",
@@ -1452,6 +1453,16 @@ dependencies = [
  "ostena-crypto",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "ostena-ldap"
+version = "0.0.0"
+dependencies = [
+ "ostena-common",
+ "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
