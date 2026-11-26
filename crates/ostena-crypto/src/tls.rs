@@ -584,13 +584,79 @@ pub fn server_config(
     Ok(Arc::new(config))
 }
 
+/// Key exchange groups of the web listener (`core.web`, ADR-0020; ADR-0009,
+/// amendment of 2026-11-26). Browsers do not offer `SecP256r1MLKEM768`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebGroups {
+    /// `SecP256r1MLKEM768`, then `X25519MLKEM768` (accepted deviation): the
+    /// only choice in production.
+    Hybrid,
+    /// The same, then classical `secp256r1` for browsers without a hybrid
+    /// group: a weakening refused in production (`core.web.tls_classic_fallback`).
+    HybridThenClassic,
+}
+
+impl WebGroups {
+    /// The IANA names of the groups, in the order of the server.
+    pub fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::Hybrid => &["SecP256r1MLKEM768", "X25519MLKEM768"],
+            Self::HybridThenClassic => &["SecP256r1MLKEM768", "X25519MLKEM768", "secp256r1"],
+        }
+    }
+}
+
+/// The provider of the web listener: the fixed suite and signature
+/// algorithm, and the groups of `groups`.
+///
+/// rustls picks the first group of the client's list that the server
+/// accepts: with [`WebGroups::Hybrid`] the exchange is always hybrid.
+pub fn web_provider(groups: WebGroups) -> Arc<CryptoProvider> {
+    let base = provider();
+    let mut kx_groups = vec![
+        aws_lc_rs::kx_group::SECP256R1MLKEM768,
+        aws_lc_rs::kx_group::X25519MLKEM768,
+    ];
+    if groups == WebGroups::HybridThenClassic {
+        kx_groups.push(aws_lc_rs::kx_group::SECP256R1);
+    }
+    Arc::new(CryptoProvider {
+        kx_groups,
+        ..(*base).clone()
+    })
+}
+
+/// The web listener of the core (portal and REST API, ADR-0020): presents
+/// `identity`, no client certificate, ALPN `http/1.1` only, TLS 1.3 with
+/// `TLS_AES_256_GCM_SHA384`, groups per `groups`.
+///
+/// # Errors
+///
+/// [`TlsError::Config`] if rustls refuses the configuration.
+pub fn web_server_config(
+    identity: &Identity,
+    groups: WebGroups,
+) -> Result<Arc<ServerConfig>, TlsError> {
+    let mut config = ServerConfig::builder_with_provider(web_provider(groups))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| TlsError::Config(e.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(identity.chain.clone(), identity.rustls_key())
+        .map_err(|e| TlsError::Config(e.to_string()))?;
+    config.session_storage = Arc::new(NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
+    config.max_early_data_size = 0;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 pub mod target;
 
 #[cfg(test)]
 mod tests;
 
 /// Deliberately non-compliant peers, to prove they are refused.
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use super::{
         Arc, ClientConfig, Identity, TlsError, TrustAnchor, WebPkiServerVerifier, aws_lc_rs,
@@ -646,6 +712,42 @@ pub mod testing {
             .with_client_auth_cert(identity.chain.clone(), identity.rustls_key())
             .map_err(|e| TlsError::Config(e.to_string()))?;
         config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        Ok(Arc::new(config))
+    }
+
+    /// A browser-like client on the stock aws-lc-rs provider: no client
+    /// certificate, the groups of `offer` (`Aes128Suite` offers
+    /// `X25519MLKEM768` with the 128-bit suites), trusts `core_ca`.
+    ///
+    /// # Errors
+    ///
+    /// [`TlsError::Config`] if rustls refuses the configuration.
+    pub fn browser_client_config(
+        offer: Offer,
+        core_ca: &TrustAnchor,
+    ) -> Result<Arc<ClientConfig>, TlsError> {
+        let mut p = aws_lc_rs::default_provider();
+        p.kx_groups = match offer {
+            Offer::X25519 => vec![aws_lc_rs::kx_group::X25519],
+            Offer::Secp256r1 => vec![aws_lc_rs::kx_group::SECP256R1],
+            Offer::X25519MlKem768 | Offer::Aes128Suite => {
+                vec![aws_lc_rs::kx_group::X25519MLKEM768]
+            }
+        };
+        if offer == Offer::Aes128Suite {
+            p.cipher_suites = vec![aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256];
+        }
+        let p = Arc::new(p);
+        let verifier = WebPkiServerVerifier::builder_with_provider(core_ca.roots()?, p.clone())
+            .build()
+            .map_err(|e| TlsError::Config(e.to_string()))?;
+        let mut config = ClientConfig::builder_with_provider(p)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| TlsError::Config(e.to_string()))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Arc::new(config))
     }
 }
