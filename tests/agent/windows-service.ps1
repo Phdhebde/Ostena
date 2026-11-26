@@ -62,6 +62,7 @@ if (-not (Wait-State 'Running' 30)) { Fail 'the service did not start' }
 Write-Host '=== service configuration'
 $qc = sc.exe qc $Service | Out-String
 if ($qc -notmatch 'NT SERVICE\\OstenaAgent') { Fail "account: $qc" }
+if ($qc -notmatch 'START_TYPE\s*:\s*2\s+AUTO_START\s+\(DELAYED\)') { Fail "start type: $qc" }
 $sid = sc.exe qsidtype $Service | Out-String
 if ($sid -notmatch 'RESTRICTED') { Fail "SID type: $sid" }
 $privs = sc.exe qprivs $Service | Out-String
