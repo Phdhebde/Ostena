@@ -40,6 +40,8 @@ use rustls::{
     RootCertStore, SignatureScheme,
 };
 
+/// A handshake error of rustls, as returned by a connection.
+pub use rustls::Error as TlsHandshakeError;
 pub use rustls::pki_types::{CertificateDer, ServerName};
 pub use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 

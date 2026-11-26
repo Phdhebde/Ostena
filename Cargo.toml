@@ -14,6 +14,7 @@ members = [
     "crates/ostena-platform",
     "crates/ostena-tunnel",
     "crates/ostena-ssh",
+    "crates/ostena-rdp",
     "crates/ostena-core",
     "crates/ostena-cli",
     "xtask",
@@ -37,6 +38,7 @@ ostena-frame = { path = "crates/ostena-frame" }
 ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 ostena-platform = { path = "crates/ostena-platform" }
+ostena-rdp = { path = "crates/ostena-rdp" }
 ostena-recorder = { path = "crates/ostena-recorder" }
 ostena-scope = { path = "crates/ostena-scope" }
 ostena-session = { path = "crates/ostena-session" }
@@ -78,6 +80,20 @@ sqlx = { version = "=0.9.0", default-features = false, features = ["postgres", "
 # Not used directly: pinned to the ASCII-only IDNA backend of url (pulled by
 # sqlx-core), so that no Unicode table (icu_*, Unicode-3.0) is linked.
 idna_adapter = "=1.0.0"
+# RDP driver of the agent (ADR-0019), in ostena-rdp only. Exact versions, all
+# of the 2026-10-27 generation: IronRDP breaks its API at every release. Their
+# own cryptography is an accepted exception confined to ostena-rdp (ADR-0009,
+# deny.toml). sspi without default features (no reqwest client, no DNS
+# resolver, no rustls of its own); the "scard" feature is forced by
+# ironrdp-connector (upstream note in docs/notes/).
+ironrdp-connector = { version = "=0.12.0", default-features = false }
+ironrdp-core = { version = "=0.3.1", default-features = false, features = ["std"] }
+ironrdp-pdu = { version = "=0.11.0", default-features = false, features = ["std"] }
+ironrdp-svc = { version = "=0.10.0", default-features = false }
+sspi = { version = "=0.23.0", default-features = false }
+url = { version = "2.5", default-features = false, features = ["std"] }
+# Test only: the server side of the sequence, for the test target.
+ironrdp-acceptor = { version = "=0.12.0", default-features = false }
 # Shamir secret sharing of the offline root secret (2 of 3), audited; used by ostena-crypto only.
 vsss-rs = { version = "6.0.1", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.10.1", default-features = false }
