@@ -163,6 +163,15 @@ cmd_wait() {
   log "lab ready in $(( total / 60 )) min $(( total % 60 )) s"
   "${LABCONFIG[@]}" assemble "$LAB_STATE" "$OUT" >/dev/null
   log "entry point: $OUT/lab.json"
+  # Public part only: no account, no password.
+  python3 - "$OUT/lab.json" <<'EOF'
+import json, sys
+lab = json.load(open(sys.argv[1]))
+print(f"domain {lab['domain']['fqdn']} ({lab['domain']['realm']}), CA SHA-256 {(lab.get('ca') or {}).get('sha256')}")
+for name, m in lab["machines"].items():
+    cert = (m.get("rdp") or m.get("ldaps") or {}).get("certificate") or {}
+    print(f"  {name:8} {m['role']:8} {m['ip']:12} {m['segment']:4} {m['os']}  {cert.get('sha256') or ''}")
+EOF
   if [[ -n "${GITHUB_ENV:-}" ]]; then
     echo "LAB_JSON=$OUT/lab.json" >>"$GITHUB_ENV"
   fi
