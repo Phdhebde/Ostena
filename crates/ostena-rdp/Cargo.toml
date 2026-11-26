@@ -1,0 +1,40 @@
+[package]
+name = "ostena-rdp"
+description = "RDP driver of the agent: hardened connection sequence (TLS validated by ostena-crypto, CredSSP driven by the agent, sequence guard), Auto-Detect, licences and target profile, session loop without image (ADR-0019)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+# Entry points of the fuzz targets (fuzz/), never in a release binary.
+fuzzing = []
+
+# No database, no API: a protocol crate, tested and fuzzed alone.
+[dependencies]
+ironrdp-connector.workspace = true
+ironrdp-core.workspace = true
+ironrdp-pdu.workspace = true
+ironrdp-svc.workspace = true
+ostena-common.workspace = true
+ostena-crypto.workspace = true
+ostena-scope.workspace = true
+ostena-session.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sspi.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+ironrdp-acceptor.workspace = true
+ostena-crypto = { workspace = true, features = ["testing"] }
+proptest.workspace = true
+tokio = { workspace = true, features = ["macros", "test-util"] }
+
+[lints]
+workspace = true
