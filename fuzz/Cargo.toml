@@ -133,3 +133,10 @@ path = "fuzz_targets/recorder_cast.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tunnel_mux_decode"
+path = "fuzz_targets/tunnel_mux_decode.rs"
+test = false
+doc = false
+bench = false

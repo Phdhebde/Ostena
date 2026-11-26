@@ -57,3 +57,16 @@ fn enrolment_seeds_decode() {
     let request = std::fs::read(dir.join("seed-enroll-request.json")).expect("seed");
     assert!(decode_client(&request).is_ok());
 }
+
+/// Replays the corpus of the TCP multiplexer (`fuzz/corpus/tunnel_mux_decode`).
+#[test]
+fn replay_tunnel_mux_decode_corpus() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/tunnel_mux_decode");
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir).expect("corpus directory must exist") {
+        let data = std::fs::read(entry.expect("entry").path()).expect("corpus file");
+        ostena_tunnel::fuzz::mux(&data);
+        count += 1;
+    }
+    assert!(count > 0, "empty corpus {}", dir.display());
+}
