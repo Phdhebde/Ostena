@@ -23,7 +23,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{TestDb, block_on};
 use ostena_common::api::login::LoginRequest;
-use ostena_common::config::{CoreLoginConfig, LdapSourceConfig};
+use ostena_common::config::{CoreLoginConfig, DirectoryTlsVersion, LdapSourceConfig};
 use ostena_common::secret::{SecretBytes, SecretString};
 use ostena_core::api::{ApiCode, Authenticator};
 use ostena_core::audit::{self, Recorder};
@@ -358,6 +358,21 @@ fn failover_plain_ldap_and_foreign_certificates() {
         )
         .await;
         assert_eq!(with(both).list(now()).await.unwrap().users.len(), 3);
+        // With `tls_min_version = "1.2"` (accepted deviation, ADR-0009), the
+        // TLS 1.2 only server is accepted.
+        let mut config = ad_config(&[tls12]);
+        config.tls_min_version = DirectoryTlsVersion::Tls12;
+        let corp = DirectorySource::new(&config, &ca_pem, secret(SVC_PASSWORD)).unwrap();
+        assert_eq!(corp.list(now()).await.unwrap().users.len(), 3);
+
+        // A server name on a cloud metadata address: refused before any
+        // connection, whatever the TLS.
+        let binds = directory.lock().unwrap().binds();
+        let metadata: SocketAddr = "169.254.169.254:636".parse().unwrap();
+        let err = with(metadata).list(now()).await.unwrap_err();
+        assert_eq!(err.code(), "IDN-E001");
+        assert!(err.to_string().contains("métadonnées"), "{err}");
+        assert_eq!(directory.lock().unwrap().binds(), binds);
 
         // A refused service account stops at once (IDN-E003).
         let mut config = ad_config(&[good]);

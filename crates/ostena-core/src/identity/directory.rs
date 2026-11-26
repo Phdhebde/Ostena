@@ -22,14 +22,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use ostena_common::config::{DirectoryKind, LdapSourceConfig, LdapsServer};
+use ostena_common::config::{DirectoryKind, DirectoryTlsVersion, LdapSourceConfig, LdapsServer};
 use ostena_common::secret::SecretString;
-use ostena_crypto::tls::directory::{anchors_from_pem, directory_client_config};
+use ostena_crypto::tls::directory::{DirectoryTls, anchors_from_pem, directory_client_config};
 use ostena_crypto::tls::{self, ClientConfig, HandshakeFailure, ServerName};
 use ostena_ldap::{Connection, Entry, Filter, LdapError, Limits, Scope, SearchRequest};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
+use tokio_rustls::rustls::ProtocolVersion;
 
 /// Users whose state is read in one search.
 pub const LOOKUP_BATCH: usize = 50;
@@ -47,10 +48,11 @@ pub enum IdentityError {
         /// What the last server said.
         detail: String,
     },
-    /// The TLS handshake with a server failed: certificate not issued by
-    /// the CA bundle, other name, TLS 1.2 only, suite or group outside the
-    /// profile.
-    #[error("[IDN-E002] TLS refusé avec {server} (source « {source_name} ») : {detail}")]
+    /// A server is refused: its TLS handshake failed (certificate not
+    /// issued by the CA bundle, other name, TLS 1.2 only without the
+    /// option, suite or group outside the profile), or its name resolves to
+    /// a cloud metadata address.
+    #[error("[IDN-E002] serveur {server} refusé (source « {source_name} ») : {detail}")]
     Tls {
         /// The source.
         source_name: String,
@@ -284,6 +286,8 @@ pub struct DirectorySource {
     rules: Vec<(String, String, String)>,
     connect_timeout: Duration,
     operation_timeout: Duration,
+    /// Whether TLS 1.2 is admitted (`tls_min_version = "1.2"`).
+    tls12: bool,
     preferred: AtomicUsize,
     available: AtomicBool,
 }
@@ -321,7 +325,13 @@ impl DirectorySource {
             detail,
         };
         let anchors = anchors_from_pem(ca_pem).map_err(|e| bad(format!("ca_bundle : {e}")))?;
-        let tls = directory_client_config(&anchors).map_err(|e| bad(e.to_string()))?;
+        let tls12 = config.tls_min_version == DirectoryTlsVersion::Tls12;
+        let mode = if tls12 {
+            DirectoryTls::AllowTls12
+        } else {
+            DirectoryTls::Tls13
+        };
+        let tls = directory_client_config(&anchors, mode).map_err(|e| bad(e.to_string()))?;
         let servers = config
             .servers
             .iter()
@@ -365,6 +375,7 @@ impl DirectorySource {
                 .collect(),
             connect_timeout: Duration::from_secs(u64::from(config.connect_timeout_secs)),
             operation_timeout: Duration::from_secs(u64::from(config.operation_timeout_secs)),
+            tls12,
             preferred: AtomicUsize::new(0),
             available: AtomicBool::new(true),
         })
@@ -411,7 +422,8 @@ impl DirectorySource {
         };
         let name = server_name(&server.host).map_err(|e| unavailable(e.clone()))?;
         let connect = async {
-            let tcp = TcpStream::connect((server.host.as_str(), server.port))
+            let addrs = self.resolve(server, &label).await?;
+            let tcp = TcpStream::connect(&addrs[..])
                 .await
                 .map_err(|e| unavailable(e.kind().to_string()))?;
             let _ = tcp.set_nodelay(true);
@@ -422,7 +434,12 @@ impl DirectorySource {
                     Some(failure) => IdentityError::Tls {
                         source_name: self.name.clone(),
                         server: label.clone(),
-                        detail: describe(failure).into(),
+                        detail: match failure {
+                            HandshakeFailure::ProtocolVersion if self.tls12 => {
+                                "TLS : ni TLS 1.3 ni TLS 1.2 proposés par le serveur".into()
+                            }
+                            _ => format!("TLS : {}", describe(failure)),
+                        },
                     },
                     None => unavailable(e.kind().to_string()),
                 })
@@ -430,6 +447,14 @@ impl DirectorySource {
         let stream = tokio::time::timeout(self.connect_timeout, connect)
             .await
             .unwrap_or_else(|_| Err(unavailable("délai de connexion dépassé".into())))?;
+        if self.tls12 && stream.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_2) {
+            tracing::warn!(
+                event = "identity.tls12",
+                source = %self.name,
+                server = %label,
+                "connexion à l'annuaire en TLS 1.2 (écart accepté, ADR-0009, CFG-P021)"
+            );
+        }
         let mut conn = Connection::new(stream, Limits::default());
         match self
             .timed(conn.bind(&self.bind_dn, &self.bind_password))
@@ -442,6 +467,44 @@ impl DirectorySource {
                 detail: ldap_detail(&e),
             }),
         }
+    }
+
+    /// The addresses of `server`, resolved here so that a name pointing at
+    /// a cloud metadata service is refused before any connection (the
+    /// floor of ADR-0005; the rest of the scope policy does not apply to
+    /// the directories of the configuration).
+    async fn resolve(
+        &self,
+        server: &LdapsServer,
+        label: &str,
+    ) -> Result<Vec<std::net::SocketAddr>, IdentityError> {
+        let addrs: Vec<_> = tokio::net::lookup_host((server.host.as_str(), server.port))
+            .await
+            .map_err(|e| IdentityError::Unavailable {
+                source_name: self.name.clone(),
+                detail: format!("{label} : résolution : {}", e.kind()),
+            })?
+            .collect();
+        if let Some(bad) = addrs.iter().find(|a| {
+            ostena_scope::floor_cause(a.ip()) == Some(ostena_scope::FloorCause::CloudMetadata)
+        }) {
+            return Err(IdentityError::Tls {
+                source_name: self.name.clone(),
+                server: label.to_owned(),
+                detail: format!(
+                    "adresse {} : {} (ADR-0005)",
+                    bad.ip(),
+                    ostena_scope::FloorCause::CloudMetadata.description()
+                ),
+            });
+        }
+        if addrs.is_empty() {
+            return Err(IdentityError::Unavailable {
+                source_name: self.name.clone(),
+                detail: format!("{label} : aucune adresse"),
+            });
+        }
+        Ok(addrs)
     }
 
     /// A connection bound as the service account, on the first server that
@@ -486,7 +549,7 @@ impl DirectorySource {
         Err(match last {
             Some(IdentityError::Tls { detail, server, .. }) => IdentityError::Unavailable {
                 source_name: self.name.clone(),
-                detail: format!("{server} : TLS refusé : {detail}"),
+                detail: format!("{server} refusé : {detail}"),
             },
             Some(e) => e,
             None => IdentityError::Config {
