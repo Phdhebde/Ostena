@@ -1,0 +1,32 @@
+#!/bin/sh
+# postrm of ostena-agent (ADR-0024). Idempotent.
+set -e
+
+UNIT=/etc/systemd/system/ostena-agent.service
+
+case "$1" in
+remove)
+    # Left behind only if the prerm could not unregister the service.
+    if [ -e "$UNIT" ]; then
+        rm -f "$UNIT"
+        if [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi
+    fi
+    ;;
+purge)
+    # What `ostena agent setup` and the service wrote: the configuration,
+    # the root, the agent identity (key, certificate, SSH keys) and the
+    # anti-replay journal. The agent must be enrolled again afterwards. The
+    # system user is kept (Debian policy: its uid may own files elsewhere).
+    rm -f /etc/ostena/ostena.toml /etc/ostena/root.pem /etc/ostena/setup.log
+    rmdir --ignore-fail-on-non-empty /etc/ostena 2>/dev/null || true
+    rm -rf /var/lib/ostena
+    ;;
+upgrade | failed-upgrade | abort-install | abort-upgrade | disappear)
+    ;;
+*)
+    echo "postrm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+
+exit 0

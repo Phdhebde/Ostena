@@ -8,7 +8,9 @@ name: Lab
 #
 # Other workflows reuse it with `uses: ./.github/workflows/lab.yml` and a
 # `command` run in the same job once the lab is up, with LAB_JSON naming the
-# entry point (addresses, accounts, certificate fingerprints).
+# entry point (addresses, accounts, certificate fingerprints). The caller's
+# artifacts named by the input `artifacts` are downloaded first, under
+# LAB_ARTIFACTS (lab/agent-msi.sh installs the agent package that way).
 on:
   workflow_dispatch:
     inputs:
@@ -23,6 +25,12 @@ on:
     inputs:
       command:
         description: Command run once the lab is up (LAB_JSON is set)
+        type: string
+        default: ""
+      artifacts:
+        description: >-
+          Artifacts of the calling run to download before the command, as a
+          name pattern; each lands in $LAB_ARTIFACTS/<name> (agent packages)
         type: string
         default: ""
       rebuild-base:
@@ -124,10 +132,17 @@ jobs:
       - name: Smoke checks
         run: lab/providers/qemu-ci/lab.sh smoke
 
+      - name: Caller's artifacts
+        if: inputs.artifacts != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ inputs.artifacts }}
+          path: ${{ runner.temp }}/lab-artifacts
       - name: Caller's command
         if: inputs.command != ''
         env:
           LAB_COMMAND: ${{ inputs.command }}
+          LAB_ARTIFACTS: ${{ runner.temp }}/lab-artifacts
         run: bash -c "$LAB_COMMAND"
 
       - name: Timings

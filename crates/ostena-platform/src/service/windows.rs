@@ -198,6 +198,12 @@ impl ServiceManager for Scm {
                 .map_err(|e| fail(Code::Install, "création du service", &e))?,
             Err(e) => return Err(fail(Code::Install, "ouverture du service", &e)),
         };
+        // Delayed automatic start (ADR-0024): the agent starts once the
+        // boot-time services are up (network, name resolution, domain), and
+        // does not compete with them; its link retries anyway.
+        service
+            .set_delayed_auto_start(true)
+            .map_err(|e| fail(Code::Install, "démarrage automatique différé", &e))?;
         service
             .set_description(DESCRIPTION)
             .map_err(|e| fail(Code::Install, "description", &e))?;

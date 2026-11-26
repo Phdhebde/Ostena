@@ -4,6 +4,7 @@
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-11, support Linux à partir de Debian 12 (systemd 252), Debian 11 abandonné
 - **Révision** : 2026-11-25, serveur SSH natif dans le service (`AGT-E010`, arrêt, statut), empreinte mesurée avec et sans SSH, seuil bloquant (jalon M1, PR 6)
+- **Révision** : 2026-11-26, service Windows en démarrage automatique différé, et `ostena agent setup` pour les paquets (ADR-0024, jalon M2, PR 18)
 
 ## Contexte
 
@@ -38,6 +39,7 @@ Un trait commun, `ServiceManager`, masque la différence entre le SCM et systemd
   - dossier d'état : modification pour le service (`CFG-P009`).
 
   Le propriétaire de ces objets est le groupe Administrateurs.
+- **Démarrage** : automatique différé (`AUTO_START (DELAYED)`, ADR-0024) : l'agent démarre une fois les services du démarrage en place.
 - **Redémarrage borné** : actions d'échec du SCM, 3 redémarrages après 5 s, compteur remis à zéro après 600 s, puis aucune action. Le service reste alors arrêté, et le SCM journalise les événements 7031 et 7034. Les échecs qui ne sont pas des plantages déclenchent aussi ces actions.
 - **Arrêt** : le service annonce `STOP_PENDING` avec un délai indicatif de 330 s (délai de grâce maximal de 300 s, plus une marge).
 

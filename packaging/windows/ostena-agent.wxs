@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSI of the Ostena gateway agent (ADR-0024), built offline by wixl
+  (msitools) from this WiX v3 source: packaging/windows/build-msi.sh.
+
+  The package only lays the files down. Everything else is done by the
+  binary itself, as SYSTEM, in deferred custom actions:
+  - install, repair, upgrade: `ostena agent setup` (root check, configuration,
+    enrolment, then `ostena agent install`: service, ACL, start);
+  - removal: `ostena agent uninstall` (stop, unregister). The configuration,
+    the key and the state in C:\ProgramData\Ostena are kept.
+
+  Public properties, all optional on the command line:
+    COREADDRESS        core address, host:port
+    GATEWAYGROUP       gateway group (UUID)
+    ENROLLMENTADDRESS  enrolment address, if not port 8444 of the core host
+    ROOTCAFILE         root certificate (PEM) to install
+    ROOTFINGERPRINT    its SHA-256, from the ceremony record (required with ROOTCAFILE)
+    ENROLLTOKENFILE    enrolment token file (single use, one per machine)
+  An existing C:\ProgramData\Ostena\ostena.toml is kept (deployment by GPO:
+  copy the configuration and the root first, then assign the package).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Ostena gateway agent"
+           Language="1033"
+           Version="$(var.Version)"
+           Manufacturer="Ostena project"
+           UpgradeCode="0d1f7ec7-66e5-42a8-b7e2-592ef600b962">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Ostena gateway agent"
+             Comments="Administration bastion gateway agent. License AGPL-3.0-or-later." />
+
+    <Media Id="1" Cabinet="ostena.cab" EmbedCab="yes" />
+
+    <!-- 64-bit Windows, NT 6.3 or later as seen by Windows Installer (Windows
+         Server 2016 reports 6.3 to an MSI without manifest). -->
+    <Condition Message="Ostena requires 64-bit Windows Server 2016 or later.">VersionNT64 &gt;= 603</Condition>
+
+    <!-- The service holds ostena.exe: our own custom action stops it before
+         the files are replaced; Restart Manager must not do it on its own. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/Phdhebde/Ostena" />
+
+    <Property Id="COREADDRESS" Secure="yes" />
+    <Property Id="GATEWAYGROUP" Secure="yes" />
+    <Property Id="ENROLLMENTADDRESS" Secure="yes" />
+    <Property Id="ROOTCAFILE" Secure="yes" />
+    <Property Id="ROOTFINGERPRINT" Secure="yes" />
+    <Property Id="ENROLLTOKENFILE" Secure="yes" />
+
+    <!-- Major upgrades only: every build has a new ProductCode, and the same
+         version replaces itself (a rebuild). The old version is removed first (its custom action unregisters the service),
+         then the new one is set up again with the configuration in place. -->
+    <Upgrade Id="0d1f7ec7-66e5-42a8-b7e2-592ef600b962">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes"
+                      Maximum="$(var.Version)" IncludeMaximum="yes"
+                      Property="OSTENA_OLDER" />
+      <UpgradeVersion Minimum="$(var.Version)" IncludeMinimum="no"
+                      OnlyDetect="yes" Property="OSTENA_NEWER" />
+    </Upgrade>
+    <Condition Message="A newer version of the Ostena gateway agent is already installed.">Installed OR NOT OSTENA_NEWER</Condition>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="Ostena">
+          <Component Id="OstenaExecutable" Guid="5f2a3c05-8996-4f3b-8c3c-603ff47dffa3" Win64="yes">
+            <File Id="OstenaExe" Name="ostena.exe" Source="$(var.Exe)" KeyPath="yes" />
+          </Component>
+          <Component Id="OstenaLicense" Guid="ca6903b6-1b0a-4df6-b5f3-b4aebb7b5bc4" Win64="yes">
+            <File Id="OstenaLicenseFile" Name="LICENSE.txt" Source="$(var.License)" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Agent" Title="Ostena gateway agent" Level="1">
+      <ComponentRef Id="OstenaExecutable" />
+      <ComponentRef Id="OstenaLicense" />
+    </Feature>
+
+    <!-- Deferred actions run as SYSTEM (Impersonate="no"). Their command line
+         is formatted when the script is generated, so the properties can be
+         used directly; an empty one is ignored by `agent setup`. The token
+         itself never appears on a command line, only its file. -->
+    <CustomAction Id="OstenaSetup"
+                  FileKey="OstenaExe"
+                  ExeCommand="agent setup --quiet --config &quot;[CommonAppDataFolder]Ostena\ostena.toml&quot; --executable &quot;[#OstenaExe]&quot; --log &quot;[CommonAppDataFolder]Ostena\setup.log&quot; --core-address &quot;[COREADDRESS]&quot; --gateway-group &quot;[GATEWAYGROUP]&quot; --enrollment-address &quot;[ENROLLMENTADDRESS]&quot; --root-ca &quot;[ROOTCAFILE]&quot; --root-fingerprint &quot;[ROOTFINGERPRINT]&quot; --token-file &quot;[ENROLLTOKENFILE]&quot;"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+    <!-- If the first setup fails, the rollback unregisters whatever it
+         registered, while ostena.exe is still there. Not on a repair: the
+         agent in place keeps running. -->
+    <CustomAction Id="OstenaSetupRollback"
+                  Property="OSTENA_EXE"
+                  ExeCommand="agent uninstall --quiet"
+                  Execute="rollback"
+                  Impersonate="no"
+                  Return="ignore" />
+    <!-- Removal: the executable is named by a property set from its
+         directory once costing is done (types 51 then 50), not by its File
+         row (type 18): during a removal the file is being uninstalled, and
+         Windows Installer refuses to resolve it (error 2731). -->
+    <CustomAction Id="OstenaExePath" Property="OSTENA_EXE" Value="[INSTALLDIR]ostena.exe" />
+    <CustomAction Id="OstenaUninstall"
+                  Property="OSTENA_EXE"
+                  ExeCommand="agent uninstall --quiet"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check" />
+
+    <InstallExecuteSequence>
+      <!-- Explicit sequence numbers: wixl does not always honour Before and
+           After. The path right after CostFinalize, so the deferred actions
+           see it; the removal right before RemoveFiles. -->
+      <Custom Action="OstenaExePath" Sequence="1001" />
+      <!-- Early removal of the old version: right after InstallInitialize. -->
+      <RemoveExistingProducts Sequence="1501" />
+      <Custom Action="OstenaUninstall" Sequence="3499">REMOVE="ALL"</Custom>
+      <Custom Action="OstenaSetupRollback" After="InstallFiles">NOT Installed AND NOT REMOVE="ALL"</Custom>
+      <Custom Action="OstenaSetup" After="OstenaSetupRollback">NOT REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>

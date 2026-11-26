@@ -86,20 +86,27 @@ async fn resolve(address: &str) -> Result<(String, std::net::SocketAddr), String
 
 /// `ostena agent enroll`.
 pub(crate) fn enroll_agent(config_path: &Path, token: &Path, timeout_secs: u64) -> ExitCode {
-    let config = match config::load_for_enrollment(config_path) {
-        Ok(c) => c,
-        Err(e) => return fail(&e.to_string()),
-    };
-    let Some(agent) = config.agent else {
-        return fail("la configuration n'a pas de section [agent]");
-    };
-    match run(&agent, token, Duration::from_secs(timeout_secs.max(1))) {
+    match enroll_with_config(config_path, token, timeout_secs) {
         Ok(text) => {
             let _ = writeln!(io::stdout(), "{text}");
             ExitCode::SUCCESS
         }
         Err(e) => fail(&e),
     }
+}
+
+/// Enrols the agent of `config_path`; returns what to tell the operator.
+/// Also a step of `ostena agent setup`.
+pub(crate) fn enroll_with_config(
+    config_path: &Path,
+    token: &Path,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let config = config::load_for_enrollment(config_path).map_err(|e| e.to_string())?;
+    let agent = config
+        .agent
+        .ok_or("la configuration n'a pas de section [agent]")?;
+    run(&agent, token, Duration::from_secs(timeout_secs.max(1)))
 }
 
 fn run(agent: &AgentConfig, token: &Path, timeout: Duration) -> Result<String, String> {
