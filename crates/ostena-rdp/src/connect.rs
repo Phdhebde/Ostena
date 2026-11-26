@@ -319,17 +319,14 @@ async fn read_hinted(
     }
 }
 
-/// Whether `pdu` is a licensing PDU (`SEC_LICENSE_PKT` in its basic
-/// security header, [MS-RDPBCGR] 2.2.8.1.1.2.1).
+/// Whether `pdu` is a licensing PDU: an indication whose data decodes as
+/// one (`SEC_LICENSE_PKT` in its basic security header, [MS-RDPBCGR]
+/// 2.2.8.1.1.2.1). The flag alone is not enough: with TLS, a Share Control
+/// PDU starts with its length, whose bit 0x0080 may be set.
 fn is_license_pdu(pdu: &[u8]) -> bool {
-    ironrdp_pdu::mcs::decode_send_data_indication(pdu)
-        .ok()
-        .and_then(|data| {
-            data.user_data
-                .get(..2)
-                .map(|f| u16::from_le_bytes([f[0], f[1]]))
-        })
-        .is_some_and(|flags| flags & 0x0080 != 0)
+    ironrdp_pdu::mcs::decode_send_data_indication(pdu).is_ok_and(|data| {
+        ironrdp_core::decode::<ironrdp_pdu::rdp::server_license::LicensePdu>(data.user_data).is_ok()
+    })
 }
 
 /// What the sequence observed, for the profile.
@@ -470,7 +467,8 @@ async fn run_to_connected(
             }
             // The first licence PDU may arrive while the connector still
             // waits for connect-time Auto-Detect: the phase is that of the PDU.
-            let phase = if is_license_pdu(&pdu) {
+            // Licensing comes before the capabilities exchange: never after.
+            let phase = if matches!(phase, Phase::Mcs | Phase::Licensing) && is_license_pdu(&pdu) {
                 clock.enter(Phase::Licensing);
                 Phase::Licensing
             } else {
@@ -573,5 +571,41 @@ fn log_report(label: &str, report: &ConnectReport) {
             removed = format!("0x{:04x}", report.early_capabilities_removed),
             "drapeaux de capacité précoce retirés par la garde"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use ironrdp_core::encode_vec;
+    use ironrdp_pdu::mcs::{McsMessage, SendDataIndication};
+    use ironrdp_pdu::x224::X224;
+
+    use super::is_license_pdu;
+
+    fn indication(data: &[u8]) -> Vec<u8> {
+        encode_vec(&X224(McsMessage::SendDataIndication(SendDataIndication {
+            initiator_id: 1002,
+            channel_id: 1003,
+            user_data: Cow::Borrowed(data),
+        })))
+        .unwrap()
+    }
+
+    /// A Share Control PDU of 0x01a0 bytes: its length has the bit of
+    /// `SEC_LICENSE_PKT`, it is not a licence PDU (seen on Windows Server
+    /// with a Demand Active).
+    #[test]
+    fn share_control_length_is_not_a_licence_flag() {
+        let mut data = vec![0u8; 0x01a0];
+        data[..6].copy_from_slice(&[0xa0, 0x01, 0x11, 0x00, 0xea, 0x03]);
+        assert!(!is_license_pdu(&indication(&data)));
+    }
+
+    #[test]
+    fn licence_pdu_is_recognised() {
+        let seed = include_bytes!("../../../fuzz/corpus/rdp_license/seed-autodetect-07");
+        assert!(is_license_pdu(seed));
     }
 }
