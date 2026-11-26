@@ -51,12 +51,12 @@ Reports de M1 repris ici : rôles séparés de la base, transcripts en stockage 
 | PR | Branche | Lot | Contenu | ADR | Dépend de | État |
 |----|---------|-----|---------|-----|-----------|------|
 | 12 | `m2/web-ssh` | L4 | Client SSH web (xterm.js) sur `ostena-frame`, même transcript que le SSH natif. | — | 8 | à faire |
-| 13 | `m2/rdp-egfx` | L5 | Passthrough EGFX vers le navigateur et décodage WebCodecs, repli tuiles, entrées clavier et souris prioritaires ; cibles de fuzz EGFX, DRDYNVC ; banc de latence navigateur. | 0019 | 7, 8 | à faire |
+| 13 | `m2/rdp-egfx` | L5 | Passthrough EGFX vers le navigateur et décodage WebCodecs, repli tuiles, entrées clavier et souris prioritaires ; `REG-RDP-02` ; cibles de fuzz EGFX, DRDYNVC ; banc de latence navigateur. | 0019 | 7, 8 | à faire |
 | 14 | `m2/rdp-recording` | L5, L6 | Enregistrement MKV du flux H.264 tel quel, scellé par la chaîne d'audit, lecteur dans le portail ; `REG-RDP-07`. | 0023 | 11, 13 | à faire |
 | 15 | `m2/identities-sso` | L3 | Plusieurs fournisseurs OIDC (code + PKCE) et SAML 2.0 simultanés (SAML initié par l'IdP désactivé par défaut, déconnexion propagée), WebAuthn/FIDO2, second facteur exigé si la source n'atteste pas d'une authentification forte. | 0021 | 8, 9 | à faire |
 | 15b | `m2/identities-kerberos` | L3 | Kerberos SPNEGO (plusieurs royaumes), RADIUS, *device flow* pour la CLI. | 0021 | 8, 9, 21 | à faire |
 | 16 | `m2/portal-v0` | L7 | Portail Svelte embarqué : connexion, catalogue des cibles autorisées, lancement en 2 clics (RDP et SSH), sessions et rejeu, administration minimale de l'inventaire ; thèmes clair et sombre, français et anglais ; E2E Playwright, aucune requête externe, axe. | 0020 | 8 (puis 12, 13, 14) | à faire |
-| 17 | `m2/rdp-channels` | L5 | Presse-papiers et RDPDR soumis aux droits ; `REG-RDP-01`, `REG-RDP-02`, `REG-RDP-05` ; cibles de fuzz CLIPRDR, RDPDR. | 0019 | 7 | à faire |
+| 17 | `m2/rdp-channels` | L5 | Presse-papiers et RDPDR soumis aux droits ; `REG-RDP-01`, `REG-RDP-05` ; cibles de fuzz CLIPRDR, RDPDR. | 0019 | 7 | à faire |
 
 ### Vague 4 : installation, campagne et démonstration
 
