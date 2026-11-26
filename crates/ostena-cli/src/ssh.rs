@@ -586,11 +586,18 @@ impl Report {
     }
 }
 
-/// Bounds of the server from `[agent.ssh]`.
-fn settings(ssh: &ostena_common::config::AgentSshConfig) -> ServerSettings {
+/// Bounds of the server from `[agent.ssh]`, and of the sessions from
+/// `[agent.sessions]` (common to every protocol, ADR-0018).
+fn settings(
+    ssh: &ostena_common::config::AgentSshConfig,
+    sessions: ostena_common::config::agent::SessionBounds,
+) -> ServerSettings {
     let size = |v: u32| usize::try_from(v).unwrap_or(usize::MAX);
     ServerSettings {
-        max_sessions: size(ssh.max_sessions),
+        max_sessions: size(sessions.max_sessions),
+        max_sessions_per_user: Some(size(sessions.max_sessions_per_user)),
+        max_sessions_per_target: Some(size(sessions.max_sessions_per_target)),
+        idle_timeout: sessions.idle_timeout_secs.map(Duration::from_secs),
         max_unauthenticated: size(ssh.max_unauthenticated),
         max_unauthenticated_per_source: size(ssh.max_unauthenticated_per_source),
         login_grace: Duration::from_secs(ssh.login_grace_secs),
@@ -650,7 +657,7 @@ pub(crate) async fn start(
     let (identity_tx, identity) = watch::channel(None);
     let reports = Reports::default();
     let server = SshServer::new(
-        settings(ssh),
+        settings(ssh, agent.session_bounds()),
         identity.clone(),
         target,
         Arc::new(TunnelAuthorizer {
@@ -696,7 +703,7 @@ pub(crate) async fn start(
     tracing::info!(
         event = "agent.ssh_started",
         listen = ?listen,
-        max_sessions = ssh.max_sessions,
+        sessions = ?agent.session_bounds(),
         "serveur SSH natif à l'écoute"
     );
     Ok(Some(SshService {
@@ -859,6 +866,29 @@ pub(crate) fn show_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_carry_the_session_quotas_and_idle_delay() {
+        let ssh: ostena_common::config::AgentSshConfig =
+            toml::from_str("listen = [\"127.0.0.1:2222\"]\n").unwrap();
+        let bounds = ostena_common::config::agent::SessionBounds {
+            max_sessions: 8,
+            max_sessions_per_user: 2,
+            max_sessions_per_target: 3,
+            idle_timeout_secs: Some(900),
+        };
+        let limits = settings(&ssh, bounds).limits();
+        assert_eq!(limits.max_sessions, 8);
+        assert_eq!(limits.max_per_user, Some(2));
+        assert_eq!(limits.max_per_target, Some(3));
+        assert_eq!(limits.idle_timeout, Some(Duration::from_mins(15)));
+        assert_eq!(limits.max_duration, None);
+        let never = ostena_common::config::agent::SessionBounds {
+            idle_timeout_secs: None,
+            ..bounds
+        };
+        assert_eq!(settings(&ssh, never).limits().idle_timeout, None);
+    }
 
     #[derive(Default, Clone)]
     struct Counter(Arc<(AtomicUsize, AtomicUsize)>);

@@ -99,6 +99,9 @@ deny = [
     # HTTPS of the login API (ADR-0015) and the TCP fallback of the tunnel.
     { crate = "tokio-rustls", wrappers = ["ostena-core", "ostena-cli", "ostena-tunnel"], reason = "HTTPS of the core API (ADR-0015) and the TCP fallback of the tunnel (ADR-0008)" },
     { crate = "hyper", wrappers = ["ostena-core", "ostena-cli", "hyper-util"], reason = "HTTP of the core API only (ADR-0015)" },
+    # The database belongs to the core: the session manager and the protocol
+    # crates are tested alone (ADR-0011, ADR-0018).
+    { crate = "sqlx", wrappers = ["ostena-core"], reason = "PostgreSQL is the core's business only (ADR-0011, ADR-0018)" },
     # QUIC is the tunnel's business only (ADR-0008).
     { crate = "quinn", wrappers = ["ostena-tunnel"], reason = "QUIC is used by ostena-tunnel only" },
     { crate = "quinn-proto", wrappers = ["quinn"], reason = "only reachable through quinn" },

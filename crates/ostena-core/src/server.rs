@@ -391,11 +391,10 @@ struct Shared {
 }
 
 /// What the start of the core writes to the audit chain besides
-/// `core.started`: the migrations it applied and the weakenings in effect.
+/// `core.started`: the weakenings in effect. The core no longer migrates:
+/// `ostena core migrate` writes `core.migrated` itself (ADR-0011).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartInfo {
-    /// Versions of the migrations applied at this start.
-    pub migrations: Vec<i64>,
     /// Weakening options and dated waivers in effect: (code, message).
     pub waivers: Vec<(String, String)>,
 }
@@ -425,19 +424,6 @@ fn core_event(kind: EventKind) -> Event {
 /// The start records besides `core.started`.
 fn start_events(signer: &HeadSigner, info: &StartInfo) -> Vec<Event> {
     let mut events = vec![signer.signing_started()];
-    if let Some(last) = info.migrations.last() {
-        let list = info
-            .migrations
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        events.push(
-            core_event(EventKind::CoreMigrated)
-                .text(field::MIGRATIONS, truncate(&list))
-                .u64(field::SCHEMA_VERSION, u64::try_from(*last).unwrap_or(0)),
-        );
-    }
     for (code, message) in &info.waivers {
         events.push(
             core_event(EventKind::ConfigWaiver)

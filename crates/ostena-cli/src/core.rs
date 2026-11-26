@@ -1,8 +1,11 @@
 //! `ostena core`: the core, a Linux component (ADR-0011).
 //!
-//! - `run` connects to PostgreSQL (Unix socket, `peer`), applies the
-//!   embedded migrations and serves the tunnel and enrolment listeners;
-//! - `migrate` applies or checks the migrations;
+//! - `run` connects to PostgreSQL (Unix socket, `peer`) as the service
+//!   role, checks the schema and the roles, and serves the tunnel and
+//!   enrolment listeners;
+//! - `migrate` applies, checks or reverts the migrations, as the owner of
+//!   the schema;
+//! - `db init` creates the roles and the database (ADR-0011);
 //! - `agent token|list|revoke` administer the registry, in the database,
 //!   while the core runs: it is notified and applies the change at once;
 //! - `audit export|head|verify|acknowledge-break` read the audit chain in
@@ -14,9 +17,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ostena_common::config::{self, Config, CoreConfig, LoggingConfig};
+use ostena_common::config::{self, Config, CoreConfig, DatabaseConfig, LoggingConfig};
 use ostena_core::audit::{self as core_audit, ExportSummary};
 use ostena_core::cache::AgentCache;
+use ostena_core::db::Role;
+use ostena_core::roles::{self, Logins};
 use ostena_core::schema::{self, SchemaState};
 use ostena_core::server::{self, Keys, RunningCore, StartInfo};
 use ostena_core::store::{self, PgStore};
@@ -48,14 +53,29 @@ struct Loaded {
 /// The validated configuration and its `[core]` section; weakenings and
 /// waivers are logged.
 fn load(path: &Path) -> Result<Loaded, String> {
-    let loaded = config::load_with(path, ostena_platform::permission_checker())
-        .map_err(|e| e.to_string())?;
+    loaded(config::load_with(
+        path,
+        ostena_platform::permission_checker(),
+    ))
+}
+
+/// [`load`] for `db init` and `migrate`, run under other accounts than the
+/// service: its keys and transcripts, private to it, are not checked.
+fn load_for_database(path: &Path) -> Result<Loaded, String> {
+    loaded(config::load_for_database(
+        path,
+        ostena_platform::permission_checker(),
+    ))
+}
+
+fn loaded(result: Result<config::LoadedConfig, config::ConfigError>) -> Result<Loaded, String> {
+    let loaded = result.map_err(|e| e.to_string())?;
     loaded.log_weakenings();
     let core = loaded
         .config
         .core
         .clone()
-        .ok_or_else(|| format!("section [core] absente de {}", path.display()))?;
+        .ok_or_else(|| format!("section [core] absente de {}", loaded.path.display()))?;
     let waivers = loaded
         .weakenings
         .iter()
@@ -121,19 +141,36 @@ async fn serve(loaded: Loaded) -> Result<(), CoreError> {
         waivers,
     } = loaded;
     let keys = Keys::load(&core, server::credentials_directory().as_deref())?;
-    let pool = db::connect(&core.database, config.mode).await?;
-    let migrations = schema::migrate(&pool).await?;
+    let pool = db::connect(&core.database, config.mode, Role::App).await?;
+    // The core never migrates (ADR-0011): `ostena core migrate`, under the
+    // administration account, does.
+    schema::require_up_to_date(&pool).await?;
+    roles::check_service(&pool).await?;
+    enforce_roles(&pool, &core.database, config.mode).await?;
     let store = PgStore::new(pool, Arc::new(AgentCache::default()));
-    let info = StartInfo {
-        migrations,
-        waivers,
-    };
+    let info = StartInfo { waivers };
     let running = RunningCore::start(&core, store, &keys, &info).await?;
     ostena_platform::service::notify("READY=1");
     crate::agent::wait_for_signals().await;
     ostena_platform::service::notify("STOPPING=1");
     running.stop().await;
     Ok(())
+}
+
+/// Logs what weakens the separation of the roles (`core.database_role_weak`)
+/// and refuses it in production (`CORE-E014`): the login role of the
+/// service is a superuser, could take the owner role or create roles, or is
+/// also the migration role.
+async fn enforce_roles(
+    pool: &db::Pool,
+    database: &DatabaseConfig,
+    mode: config::Mode,
+) -> Result<(), CoreError> {
+    let logins = Logins {
+        service: &database.user,
+        migration: &database.migration_user,
+    };
+    roles::enforce(pool, logins, mode).await
 }
 
 /// Runs an administration task against the database of `path`, on a small
@@ -145,7 +182,8 @@ pub(crate) fn admin<T>(
     let loaded = load(path)?;
     let rt = runtime(1)?;
     rt.block_on(async {
-        let pool = db::connect(&loaded.core.database, loaded.config.mode).await?;
+        let pool = db::connect(&loaded.core.database, loaded.config.mode, Role::App).await?;
+        enforce_roles(&pool, &loaded.core.database, loaded.config.mode).await?;
         schema::require_up_to_date(&pool).await?;
         task(pool).await
     })
@@ -160,26 +198,55 @@ pub(crate) fn admin_core<T>(
     let loaded = load(path)?;
     let rt = runtime(1)?;
     rt.block_on(async {
-        let pool = db::connect(&loaded.core.database, loaded.config.mode).await?;
+        let pool = db::connect(&loaded.core.database, loaded.config.mode, Role::App).await?;
+        enforce_roles(&pool, &loaded.core.database, loaded.config.mode).await?;
         schema::require_up_to_date(&pool).await?;
         task(pool, loaded.core).await
     })
     .map_err(|e| e.to_string())
 }
 
-/// `ostena core migrate [--check]`.
-pub(crate) fn migrate(path: &Path, check: bool) -> ExitCode {
+/// `ostena core migrate [--check | --revert-to <version>]`: as the owner
+/// of the schema; what changed is written to the audit chain
+/// (`core.migrated`, `core.migration_reverted`).
+pub(crate) fn migrate(path: &Path, check: bool, revert_to: Option<i64>) -> ExitCode {
     init_admin_logging(path);
-    let outcome = load(path).and_then(|loaded| {
+    let outcome = load_for_database(path).and_then(|loaded| {
         runtime(1)?
             .block_on(async {
-                let pool = db::connect(&loaded.core.database, loaded.config.mode).await?;
+                let pool =
+                    db::connect(&loaded.core.database, loaded.config.mode, Role::Owner).await?;
                 if check {
-                    schema::state(&pool).await
-                } else {
-                    schema::migrate(&pool).await?;
-                    Ok(SchemaState::UpToDate)
+                    return schema::state(&pool).await;
                 }
+                let (versions, version, reverted) = match revert_to {
+                    None => {
+                        let applied = schema::migrate(&pool).await?;
+                        (applied, schema::latest_version(), false)
+                    }
+                    Some(target) => (schema::revert(&pool, target).await?, target, true),
+                };
+                if !versions.is_empty() {
+                    ostena_core::audit::record_migration(&pool, &versions, version, reverted)
+                        .await?;
+                }
+                let _ = writeln!(
+                    io::stdout(),
+                    "schéma à la version {version}{}",
+                    if versions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} : {versions:?})",
+                            if reverted { "retirées" } else { "appliquées" }
+                        )
+                    }
+                );
+                Ok(if reverted {
+                    SchemaState::UpToDate
+                } else {
+                    schema::state(&pool).await?
+                })
             })
             .map_err(|e| e.to_string())
     });
@@ -187,6 +254,74 @@ pub(crate) fn migrate(path: &Path, check: bool) -> ExitCode {
         Ok(SchemaState::UpToDate) => ExitCode::SUCCESS,
         Ok(SchemaState::Pending(versions)) => {
             fail(&format!("migrations en attente : {versions:?}"))
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+/// `ostena core db init`: the roles, the database, and the objects an M1
+/// installation left to the service account, as `superuser`.
+pub(crate) fn db_init(path: &Path, superuser: &str) -> ExitCode {
+    init_admin_logging(path);
+    let outcome = load_for_database(path).and_then(|loaded| {
+        runtime(1)?
+            .block_on(async {
+                let database = &loaded.core.database;
+                let logins = Logins {
+                    service: &database.user,
+                    migration: &database.migration_user,
+                };
+                if loaded.config.mode == config::Mode::Production
+                    && database.user == database.migration_user
+                {
+                    return Err(CoreError::RolesWeak(format!(
+                        "{} sert au service et aux migrations : core.database.user et \
+                         migration_user doivent désigner deux comptes distincts",
+                        database.user
+                    )));
+                }
+                let cluster = DatabaseConfig {
+                    name: "postgres".into(),
+                    user: superuser.into(),
+                    max_connections: 1,
+                    ..database.clone()
+                };
+                let pool = db::connect(&cluster, loaded.config.mode, Role::Login).await?;
+                let mut changes = roles::init_cluster(&pool, logins).await?;
+                changes.extend(roles::init_database(&pool, &database.name, logins).await?);
+                pool.close().await;
+                let target = DatabaseConfig {
+                    name: database.name.clone(),
+                    ..cluster
+                };
+                let pool = db::connect(&target, loaded.config.mode, Role::Login).await?;
+                changes.extend(roles::adopt_m1_objects(&pool, &database.user).await?);
+                let weak = roles::weaknesses(&pool, logins).await?;
+                pool.close().await;
+                Ok::<_, CoreError>((changes, weak, loaded.config.mode))
+            })
+            .map_err(|e| e.to_string())
+    });
+    match outcome {
+        Ok((changes, weak, mode)) => {
+            let mut stdout = io::stdout().lock();
+            if changes.is_empty() {
+                let _ = writeln!(stdout, "rôles et base déjà en place : rien à faire");
+            }
+            for change in &changes {
+                tracing::info!(event = "core.database_initialized", change = %change);
+                let _ = writeln!(stdout, "{change}");
+            }
+            for reason in &weak {
+                tracing::warn!(event = "core.database_role_weak", reason = %reason);
+                let _ = writeln!(io::stderr(), "attention : {reason}");
+            }
+            drop(stdout);
+            if mode == config::Mode::Production && !weak.is_empty() {
+                // The core would refuse to start on these roles.
+                return fail(&CoreError::RolesWeak(weak.join(" ; ")).to_string());
+            }
+            ExitCode::SUCCESS
         }
         Err(e) => fail(&e),
     }

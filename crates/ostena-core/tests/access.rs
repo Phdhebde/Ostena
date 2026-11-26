@@ -21,7 +21,7 @@ use ostena_core::cache::AgentCache;
 use ostena_core::grant_keys::GrantAuthority;
 use ostena_core::ssh_ca::SshAuthorities;
 use ostena_core::store::PgStore;
-use ostena_core::{inventory, login, pushes, schema};
+use ostena_core::{inventory, login, pushes};
 use ostena_crypto::p256::SigningKey;
 use ostena_grant::{
     Binding, Claims, GatewayGroupId, Issuer, Protocol, ResourceId, Rights, SignedGrant, SubjectId,
@@ -87,8 +87,8 @@ async fn open_login(pool: &PgPool, user: Uuid, cert: [u8; 32], secs: u64) -> Uui
 /// login session of alice.
 async fn fixture(test: &str) -> Option<Fixture> {
     let db = TestDb::create(test).await?;
+    db.migrate().await;
     let pool = db.pool().await;
-    schema::migrate(&pool).await.unwrap();
     ostena_core::audit::ensure_genesis(&pool).await.unwrap();
     let store = PgStore::new(pool.clone(), Arc::new(AgentCache::default()));
     store.register([1; 32], GROUP, AGENT).await.unwrap();
@@ -569,12 +569,16 @@ fn disabling_a_user_during_a_grant_request_does_not_deadlock() {
             let pool = f.pool.clone();
             tokio::spawn(async move { inventory::disable_user(&pool, "alice").await })
         };
-        lock_waiters(&f.pool, 1).await;
+        // pg_stat_activity shows the waits of the sessions of a login role
+        // to that login role only, not to ostena_app.
+        let watcher = f.db.login_pool().await;
+        lock_waiters(&watcher, 1).await;
         let grant = {
             let f = f.clone();
             tokio::spawn(async move { f.grant(&f.request("srv-lab01", "root")).await })
         };
-        lock_waiters(&f.pool, 2).await;
+        lock_waiters(&watcher, 2).await;
+        watcher.close().await;
         blocker.rollback().await.unwrap();
         assert_eq!(disable.await.unwrap().unwrap(), 1);
         let refused = grant.await.unwrap().unwrap_err();

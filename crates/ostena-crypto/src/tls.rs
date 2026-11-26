@@ -15,6 +15,9 @@
 //!
 //! The transports receive the [`ClientConfig`] and [`ServerConfig`] built
 //! here; no other crate depends on rustls directly (`deny.toml`).
+//!
+//! The RDP targets have their own profile, confined to the RDP driver
+//! ([`target`], ADR-0009 « écart RDP »): it is the only use of TLS 1.2.
 
 use std::fmt;
 use std::sync::Arc;
@@ -593,6 +596,8 @@ pub fn server_config(
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(config))
 }
+
+pub mod target;
 
 #[cfg(test)]
 mod tests;

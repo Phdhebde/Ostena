@@ -121,6 +121,19 @@ impl russh::client::Handler for AnyHost {
 struct Bench {
     target: ostena_scope::PinnedTarget,
     target_key: VerifyingKey,
+    /// A fresh session identifier per access, as the core gives (a
+    /// duplicate is refused by the session manager, ADR-0018).
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Bench {
+    fn new(target: ostena_scope::PinnedTarget, target_key: VerifyingKey) -> Self {
+        Self {
+            target,
+            target_key,
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
 }
 
 impl Authorizer for Bench {
@@ -129,8 +142,15 @@ impl Authorizer for Bench {
         // drained here instead of the tunnel stream.
         let (transcript, mut rx) = ostena_ssh::transcript::Transcript::channel(8);
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut session_id = [7; 16];
+        session_id[..8].copy_from_slice(
+            &self
+                .next
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .to_be_bytes(),
+        );
         Ok(Authorized {
-            session_id: [7; 16],
+            session_id,
             target: self.target.clone(),
             target_host_key: self.target_key,
             account: request.account,
@@ -336,10 +356,7 @@ async fn bench() {
         ServerSettings::default(),
         identity_rx,
         agent_key.clone(),
-        Arc::new(Bench {
-            target: pinned(target_addr.port()).await,
-            target_key,
-        }),
+        Arc::new(Bench::new(pinned(target_addr.port()).await, target_key)),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let agent_addr = listener.local_addr().unwrap();

@@ -1,14 +1,64 @@
-//! Embedded migrations (ADR-0011): applied by `ostena core run` under the
-//! advisory lock of sqlx, checked by `ostena core migrate --check` and by the
-//! administration commands, which never change the schema.
+//! Embedded migrations (ADR-0011): applied by `ostena core migrate` under
+//! the advisory lock of sqlx, as the owner of the schema; checked by `ostena
+//! core migrate --check`, by `ostena core run` and by the administration
+//! commands, which never change the schema.
+//!
+//! From migration 6 on, each migration is reversible: a `.down.sql` file
+//! takes the schema back to the previous version without touching the rows
+//! that version knows (`ostena core migrate --revert-to`). Migrations 1 to 5
+//! (M1) have none.
 
 use sqlx::PgPool;
-use sqlx::migrate::Migrator;
+use sqlx::migrate::{Migration, Migrator};
 
+use crate::db::OWNER_ROLE;
 use crate::error::CoreError;
 
-/// The migrations of this binary.
+/// The migrations of this binary, up and down.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// The migrations that move the schema forward (no `.down.sql`).
+fn forward() -> impl Iterator<Item = &'static Migration> {
+    MIGRATOR
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+}
+
+/// The latest schema version of this binary.
+pub fn latest_version() -> i64 {
+    forward().map(|m| m.version).max().unwrap_or(0)
+}
+
+/// The lowest version `ostena core migrate --revert-to` accepts: every
+/// migration above it has a down migration.
+pub fn revert_floor() -> i64 {
+    forward()
+        .filter(|m| !has_down(m.version))
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(0)
+}
+
+fn has_down(version: i64) -> bool {
+    MIGRATOR
+        .iter()
+        .any(|m| m.version == version && m.migration_type.is_down_migration())
+}
+
+/// Refuses a session that is not the owner of the schema: objects created
+/// under another role would escape the separation of the roles.
+async fn require_owner(pool: &PgPool) -> Result<(), CoreError> {
+    let current: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(pool)
+        .await?;
+    if current == OWNER_ROLE {
+        Ok(())
+    } else {
+        Err(CoreError::Roles(format!(
+            "migrations sous le rôle {current} : seul {OWNER_ROLE} modifie le schéma"
+        )))
+    }
+}
 
 /// Where the schema of the database stands against this binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,15 +69,18 @@ pub enum SchemaState {
     Pending(Vec<i64>),
 }
 
-/// Applies the pending migrations; several cores starting together wait on
-/// the same advisory lock. Returns the versions that were pending (empty if
-/// none), for the `core.migrated` audit record.
+/// Applies the pending migrations, as [`OWNER_ROLE`] (a pool of
+/// [`crate::db::Role::Owner`]); two runs together wait on the same advisory
+/// lock. Returns the versions that were pending (empty if none), for the
+/// `core.migrated` audit record.
 ///
 /// # Errors
 ///
-/// [`CoreError::Migration`], or [`CoreError::Schema`] if the database holds
-/// a migration this binary does not know (a newer binary migrated it).
+/// [`CoreError::Migration`], [`CoreError::Roles`] for another role, or
+/// [`CoreError::Schema`] if the database holds a migration this binary does
+/// not know (a newer binary migrated it).
 pub async fn migrate(pool: &PgPool) -> Result<Vec<i64>, CoreError> {
+    require_owner(pool).await?;
     let before = state(pool).await?;
     MIGRATOR
         .run(pool)
@@ -40,6 +93,47 @@ pub async fn migrate(pool: &PgPool) -> Result<Vec<i64>, CoreError> {
         }
         SchemaState::UpToDate => Ok(Vec::new()),
     }
+}
+
+/// Reverts the applied migrations above `target`, newest first, with their
+/// down migrations, as [`OWNER_ROLE`]. Returns the reverted versions (empty
+/// if none), for the `core.migration_reverted` audit record.
+///
+/// # Errors
+///
+/// [`CoreError::Migration`] for a target below [`revert_floor`] or a failed
+/// down migration, [`CoreError::Roles`], [`CoreError::Schema`] as
+/// [`migrate`].
+pub async fn revert(pool: &PgPool, target: i64) -> Result<Vec<i64>, CoreError> {
+    require_owner(pool).await?;
+    let floor = revert_floor();
+    if target < floor {
+        return Err(CoreError::Migration(format!(
+            "retour à la version {target} impossible : les migrations 1 à {floor} n'ont pas de \
+             migration inverse"
+        )));
+    }
+    // A failed or unknown migration is refused before anything is undone.
+    let _ = state(pool).await?;
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM _sqlx_migrations WHERE version > $1 ORDER BY version DESC",
+    )
+    .bind(target)
+    .fetch_all(pool)
+    .await?;
+    MIGRATOR
+        .undo(pool, target)
+        .await
+        .map_err(|e| CoreError::Migration(e.to_string()))?;
+    if !applied.is_empty() {
+        tracing::info!(
+            event = "core.migration_reverted",
+            versions = ?applied,
+            schema_version = target,
+            "schéma ramené à une version antérieure"
+        );
+    }
+    Ok(applied)
 }
 
 /// Compares the applied migrations with those of this binary.
@@ -56,13 +150,29 @@ pub async fn state(pool: &PgPool) -> Result<SchemaState, CoreError> {
         // sqlx's own table: its shape is fixed by sqlx, not by our migrations.
         sqlx::query_as("SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version")
             .fetch_all(pool)
-            .await?
+            .await
+            .map_err(|e| {
+                // ostena_app reads it from migration 6 on: an M1 database
+                // not migrated yet.
+                if e.as_database_error()
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .is_some_and(|c| c == "42501")
+                {
+                    CoreError::Schema(
+                        "état des migrations illisible pour ce rôle : base antérieure à la \
+                         séparation des rôles ; lancez ostena core migrate"
+                            .into(),
+                    )
+                } else {
+                    CoreError::Database(e.to_string())
+                }
+            })?
     } else {
         Vec::new()
     };
     compare(
         &applied,
-        MIGRATOR.iter().map(|m| (m.version, m.checksum.as_ref())),
+        forward().map(|m| (m.version, m.checksum.as_ref())),
     )
 }
 
@@ -114,8 +224,8 @@ pub async fn require_up_to_date(pool: &PgPool) -> Result<(), CoreError> {
     match state(pool).await? {
         SchemaState::UpToDate => Ok(()),
         SchemaState::Pending(versions) => Err(CoreError::Schema(format!(
-            "migrations {versions:?} non appliquées ; démarrez le core (ostena core run) ou lancez \
-             ostena core migrate"
+            "migrations {versions:?} non appliquées ; lancez ostena core migrate sous le compte \
+             d'administration"
         ))),
     }
 }
@@ -152,8 +262,17 @@ mod tests {
     }
 
     #[test]
+    fn migrations_from_six_on_are_reversible() {
+        assert_eq!(revert_floor(), 5);
+        assert!(latest_version() >= 6);
+        for version in 6..=latest_version() {
+            assert!(has_down(version), "migration {version} sans .down.sql");
+        }
+    }
+
+    #[test]
     fn embedded_migrations_are_numbered_from_one() {
-        let versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+        let versions: Vec<i64> = forward().map(|m| m.version).collect();
         assert_eq!(versions[0], 1);
         assert!(
             versions.windows(2).all(|w| w[1] == w[0] + 1),

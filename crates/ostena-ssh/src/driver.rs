@@ -6,6 +6,8 @@
 //! control (anti-SSRF by type, no name resolution here). They are tried in
 //! order within the deadline.
 //!
+//! [`SshDriver`] is the [`Driver`] of the session manager (ADR-0018).
+//!
 //! Events: `ssh.target_host_key_mismatch` (`SSH-E014`),
 //! `ssh.target_auth_failed` (`SSH-E015`), `ssh.target_unreachable`
 //! (`SSH-E016`), `ssh.target_channel_refused` (`SSH-E017`: a channel opened
@@ -17,6 +19,7 @@ use std::time::Duration;
 
 use ostena_crypto::p256::VerifyingKey;
 use ostena_scope::PinnedTarget;
+use ostena_session::{Driver, DriverConnection, Protocol};
 use russh::client::{self, Handle};
 use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{Channel, Disconnect};
@@ -317,5 +320,74 @@ pub async fn connect(
             label,
             SshError::TargetUnreachable(format!("pas de session en {} s", timeout.as_secs())),
         )),
+    }
+}
+
+/// What the SSH driver needs besides the target.
+#[derive(Debug, Clone)]
+pub struct TargetParams {
+    /// The target host key, pinned in the inventory.
+    pub host_key: VerifyingKey,
+    /// Account on the target.
+    pub account: String,
+    /// Names the target in events (`account@resource`, sanitised).
+    pub label: String,
+}
+
+/// The SSH driver of the session manager: joins the targets with the key
+/// of the agent ([`connect`]).
+#[derive(Clone)]
+pub struct SshDriver {
+    key: Arc<PrivateKey>,
+}
+
+impl std::fmt::Debug for SshDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SshDriver")
+    }
+}
+
+impl SshDriver {
+    /// A driver authenticating with `key` on the targets.
+    pub fn new(key: Arc<PrivateKey>) -> Self {
+        Self { key }
+    }
+}
+
+impl Driver for SshDriver {
+    type Params = TargetParams;
+    type Connection = TargetSession;
+    type Error = SshError;
+
+    const PROTOCOL: Protocol = Protocol::Ssh;
+
+    fn connect(
+        &self,
+        target: &PinnedTarget,
+        params: TargetParams,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<TargetSession, SshError>> + Send {
+        let key = self.key.clone();
+        async move {
+            connect(
+                target,
+                &params.host_key,
+                &params.account,
+                key,
+                timeout,
+                &params.label,
+            )
+            .await
+        }
+    }
+}
+
+impl DriverConnection for TargetSession {
+    fn close(&self) -> impl Future<Output = ()> + Send {
+        TargetSession::close(self)
+    }
+
+    fn is_closed(&self) -> bool {
+        TargetSession::is_closed(self)
     }
 }

@@ -670,6 +670,52 @@ fn native_session_ends_at_its_maximum_length_or_on_revocation() {
     assert!(!wait_event(n.agent.addr, "ssh.session_revoked").is_empty());
 }
 
+#[test]
+fn native_session_ends_at_its_idle_delay_and_user_quota_holds() {
+    let runtime = runtime();
+    let settings = ServerSettings {
+        idle_timeout: Some(std::time::Duration::from_secs(1)),
+        max_sessions_per_user: Some(1),
+        ..ServerSettings::default()
+    };
+    let Some(n) = native(&runtime, "native-idle", settings) else {
+        return;
+    };
+    let certificate = n.certify(|_| {});
+    let child = std::thread::spawn({
+        let ssh = n.ssh.clone();
+        let args = n.args_for(&certificate);
+        move || Command::new(ssh).args(args).output().unwrap()
+    });
+    // While the first session holds the only slot of the user, a second
+    // one is refused by the session manager.
+    for _ in 0..200 {
+        if n.agent.server.sessions() == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let started = std::time::Instant::now();
+    let second = n.run("root@srv-lab01", Some(&certificate), &[], &["hold"]);
+    assert!(!second.status.success());
+    let limited = wait_event(n.agent.addr, "ssh.connection_limited");
+    assert_eq!(limited[0].code, "SSH-E019");
+    assert_eq!(limited[0].field("cause"), "SES-E002");
+    // The first one, silent, is cut at its idle delay.
+    assert!(!child.join().unwrap().status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    assert!(!wait_event(n.agent.addr, "ssh.session_idle").is_empty());
+    let closed = wait_event(n.agent.addr, "ssh.session_closed");
+    assert_eq!(closed[0].field("reason"), "inactive");
+    for _ in 0..200 {
+        if n.agent.server.in_progress() == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(n.agent.server.in_progress(), 0);
+}
+
 impl Native {
     /// The arguments of a `hold` session as `root@srv-lab01`.
     fn args_for(&self, certificate: &std::path::Path) -> Vec<String> {

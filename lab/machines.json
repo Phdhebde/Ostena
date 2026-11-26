@@ -1,0 +1,49 @@
+{
+  "comment": "Lab description, independent of the hypervisor (ADR-0025). A provider (lab/providers/<name>) turns it into virtual machines; the guest scripts (lab/guest) read the per-machine part from the configuration medium. Passwords are never written here: they are drawn at each run.",
+  "domain": {
+    "fqdn": "lab.ostena.test",
+    "netbios": "LAB",
+    "realm": "LAB.OSTENA.TEST"
+  },
+  "host": {
+    "comment": "The host runs the core under test and the lab control service. It owns the gateway address of each segment.",
+    "name": "bastion",
+    "control_port": 8089
+  },
+  "segments": {
+    "lab": {
+      "cidr": "10.20.0.0/24",
+      "gateway": "10.20.0.1",
+      "isolated": false
+    },
+    "dmz": {
+      "comment": "Isolated zone of the Windows gateway agent: no inbound flow at all, outbound only to the core on the host and to the targets.",
+      "cidr": "10.20.1.0/24",
+      "gateway": "10.20.1.1",
+      "isolated": true,
+      "egress": [
+        { "to": "host", "proto": "udp", "ports": [8443, 8444] },
+        { "to": "host", "proto": "tcp", "ports": [8443, 8444, 8445] },
+        { "to": "role:member", "proto": "tcp", "ports": [3389] },
+        { "to": "role:dc", "proto": "tcp", "ports": [53, 88, 464] },
+        { "to": "role:dc", "proto": "udp", "ports": [53, 88, 464] }
+      ]
+    }
+  },
+  "machines": [
+    { "name": "dc01", "role": "dc", "image": "ws2022", "segment": "lab", "ip": "10.20.0.10", "memory_mb": 2560, "cpus": 2 },
+    { "name": "srv2016", "role": "member", "image": "ws2016", "segment": "lab", "ip": "10.20.0.16", "memory_mb": 2048, "cpus": 2 },
+    { "name": "srv2022", "role": "member", "image": "ws2022", "segment": "lab", "ip": "10.20.0.22", "memory_mb": 2048, "cpus": 2 },
+    { "name": "gw2016", "role": "gateway", "image": "ws2016", "segment": "dmz", "ip": "10.20.1.10", "memory_mb": 2048, "cpus": 2 }
+  ],
+  "accounts": {
+    "comment": "Test accounts created at each run, with generated passwords.",
+    "domain": [
+      { "name": "ostena-user1", "groups": ["ostena-rdp-users"], "purpose": "RDP user allowed on the members" },
+      { "name": "ostena-user2", "groups": [], "purpose": "domain user without RDP right (refusal tests)" },
+      { "name": "ostena-admin", "groups": ["ostena-rdp-users", "Domain Admins"], "purpose": "domain administrator" }
+    ],
+    "service": { "name": "ostena-http", "spn": "HTTP/bastion.lab.ostena.test", "purpose": "Kerberos SPNEGO service account of the core, keytab exported" },
+    "local": { "name": "ostena-local", "purpose": "local account on each member, RDP allowed (non-domain tests)" }
+  }
+}

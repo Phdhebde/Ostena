@@ -27,8 +27,8 @@ use ostena_core::api::{ApiCode, Authenticator};
 use ostena_core::audit::{self, Recorder};
 use ostena_core::authn::PgAuthenticator;
 use ostena_core::credential::{self, TotpKey};
+use ostena_core::inventory;
 use ostena_core::ssh_ca::SshAuthorities;
-use ostena_core::{inventory, schema};
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::totp::{TotpAlgorithm, TotpSecret, step_at};
 use ostena_ssh::cert;
@@ -90,8 +90,8 @@ struct Fixture {
 /// secret (the confirmation consumed the current step).
 async fn fixture(test: &str) -> Option<Fixture> {
     let db = TestDb::create(test).await?;
+    db.migrate().await;
     let pool = db.pool().await;
-    schema::migrate(&pool).await.unwrap();
     audit::ensure_genesis(&pool).await.unwrap();
     inventory::add_user(&pool, "alice", "Alice Martin")
         .await

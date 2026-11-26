@@ -33,8 +33,8 @@ fn group() -> Uuid {
 /// A migrated test database and a store on it.
 async fn migrated(test: &str) -> Option<(TestDb, PgStore)> {
     let db = TestDb::create(test).await?;
+    db.migrate().await;
     let pool = db.pool().await;
-    schema::migrate(&pool).await.unwrap();
     // As `ostena core run` does before anything is audited.
     ostena_core::audit::ensure_genesis(&pool).await.unwrap();
     Some((db, PgStore::new(pool, Arc::new(AgentCache::default()))))
@@ -49,14 +49,18 @@ fn production_refuses_a_server_that_asks_for_a_password() {
         };
         if db.config.tcp.is_some() {
             // The local container authenticates TCP clients by SCRAM.
-            let e = db::connect(&db.config, Mode::Production).await.unwrap_err();
+            let e = db::connect(&db.config, Mode::Production, db::Role::App)
+                .await
+                .unwrap_err();
             assert!(
                 matches!(e, CoreError::NotPeer(ref m) if m.starts_with("scram")),
                 "{e}"
             );
         } else {
             // CI: the socket with peer is accepted in production.
-            let pool = db::connect(&db.config, Mode::Production).await.unwrap();
+            let pool = db::connect(&db.config, Mode::Production, db::Role::App)
+                .await
+                .unwrap();
             pool.close().await;
         }
         db.drop_database().await;
@@ -78,8 +82,15 @@ fn migrations_apply_once_and_are_checked() {
             schema::require_up_to_date(&pool).await.unwrap_err().code(),
             "CORE-E005"
         );
-        schema::migrate(&pool).await.unwrap();
-        schema::migrate(&pool).await.unwrap();
+        // The service role never changes the schema.
+        assert_eq!(
+            schema::migrate(&pool).await.unwrap_err().code(),
+            "CORE-E013"
+        );
+        let owner = db.owner_pool().await;
+        assert_ne!(schema::migrate(&owner).await.unwrap(), Vec::<i64>::new());
+        assert_eq!(schema::migrate(&owner).await.unwrap(), Vec::<i64>::new());
+        owner.close().await;
         assert_eq!(schema::state(&pool).await.unwrap(), SchemaState::UpToDate);
         schema::require_up_to_date(&pool).await.unwrap();
         pool.close().await;
