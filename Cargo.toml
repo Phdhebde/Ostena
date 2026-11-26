@@ -12,6 +12,7 @@ members = [
     "crates/ostena-frame",
     "crates/ostena-ws",
     "crates/ostena-session",
+    "crates/ostena-policy",
     "crates/ostena-platform",
     "crates/ostena-tunnel",
     "crates/ostena-ssh",
@@ -41,6 +42,7 @@ ostena-crypto = { path = "crates/ostena-crypto" }
 ostena-grant = { path = "crates/ostena-grant" }
 ostena-ldap = { path = "crates/ostena-ldap" }
 ostena-platform = { path = "crates/ostena-platform" }
+ostena-policy = { path = "crates/ostena-policy" }
 ostena-rdp = { path = "crates/ostena-rdp" }
 ostena-recorder = { path = "crates/ostena-recorder" }
 ostena-scope = { path = "crates/ostena-scope" }

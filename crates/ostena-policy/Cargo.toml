@@ -1,0 +1,22 @@
+[package]
+name = "ostena-policy"
+description = "Policy decision point: authorizations compiled in memory, separate administration roles."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+# No database, no API, no I/O: the core loads the policies and installs them
+# (ADR-0022). Tested alone.
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+# Proves that a decision does not allocate, and measures the footprint.
+dhat.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
