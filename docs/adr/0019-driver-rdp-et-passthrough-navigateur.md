@@ -246,21 +246,21 @@ Les cibles vérifient aussi qu'aucune entrée ne fait paniquer : les `unwrap()` 
 |---|---|---|
 | `REG-SEC-01` | certificat de cible différent de l'empreinte, ou hors PKI : refus avant tout identifiant ; `none` refusé en production | 7 |
 | `REG-SEC-02` | délégation du mot de passe sans Kerberos : aucun repli NTLM, refus ; configuration refusée en production | 7 |
-| `REG-RDP-03` | seuls les `earlyCapabilityFlags` de la table sont annoncés, chacun avec son module | 7 |
-| `REG-RDP-04` | demandes Auto-Detect de connexion et continues servies, sans blocage de la session | 7 |
+| `REG-RDP-03` | pas de coupure après 60 s : seuls les `earlyCapabilityFlags` de la table sont annoncés, chacun avec son module (saut de jonction des canaux annoncé seulement s'il est honoré) ; session de 2 h sans coupure | 7 |
+| `REG-RDP-04` | téléchargement depuis le lecteur redirigé jamais figé : demandes Auto-Detect de connexion et continues servies sans blocage ; 1 Go à un débit conforme au lien | 7, 17 |
 | `REG-RDP-06` | licence obtenue puis représentée à la session suivante, nom et identifiant de client stables, erreurs traduites | 7 |
 | `REG-PERF-01` | profil de cible mémorisé : moins d'allers-retours à la seconde connexion, écart de profil détecté | 7 |
-| `REG-RDP-01` | presse-papiers filtré selon le sens autorisé par le grant | 17 |
-| `REG-RDP-02` | lecteurs redirigés selon les droits de dépôt et de récupération | 17 |
-| `REG-RDP-05` | canaux et périphériques non autorisés (imprimantes, cartes à puce, ports, son, canaux dynamiques inconnus) refusés et journalisés | 17 |
-| `REG-RDP-07` | enregistrement MKV lisible, scellé, et toute modification détectée par la vérification hors ligne | 14 |
+| `REG-RDP-01` | transfert massif par le canal disque avec une passerelle Windows : copie de 5 Go sans erreur (gestion des tampons de sécurité de CredSSP et du chiffrement sur de longs flux) | 17 |
+| `REG-RDP-02` | traits d'un pixel en RLE 16 bpp : rejeu d'une capture dans le repli tuiles, comparaison pixel à pixel avec la référence | 13 |
+| `REG-RDP-05` | sous-dossier accessible malgré des erreurs : les réponses RDPDR d'erreur portent tous leurs champs (dont `Length`) ; navigation dans une arborescence avec erreurs provoquées (droits, fichiers verrouillés) ; canaux et périphériques non autorisés refusés et journalisés | 17 |
+| `REG-RDP-07` | enregistrement jamais noir en passthrough EGFX : sessions AVC420 et AVC444 enregistrées, images non vides et conformes, MKV lisible, scellé, toute modification détectée hors ligne | 14 |
 
 ### 8. Découpage de la mise en œuvre
 
 - **PR 7 `m2/rdp-driver`** : crate `ostena-rdp` (sans base ni API) ; dépendances et `deny.toml` (doublons, enveloppes des crates cryptographiques, section « Écart » ci-dessous) ; profil TLS cible et vérificateurs `pinned` et `pki` dans `ostena-crypto` ; CredSSP piloté (Kerberos, transport KDC, NTLM selon la règle, Restricted Admin, version 6) ; garde de séquence ; licences et profil de cible portés par `session_params` et le bilan ; boucle de session sans image ; implémentation du trait `Driver` (ADR-0018) ; codes `RDP-E0xx` et événements ; serveur de test et job Windows ; fuzz X.224, MCS/GCC, TSRequest, licences, session ; `REG-SEC-01`, `REG-SEC-02`, `REG-RDP-03`, `REG-RDP-04`, `REG-RDP-06`, `REG-PERF-01`.
-- **PR 13 `m2/rdp-egfx`** : DRDYNVC et client EGFX en passthrough, `ostena-frame` v2, décodage WebCodecs AVC420 puis AVC444, repli tuiles en WebAssembly, acquittements de bout en bout, entrées prioritaires, changement de taille ; fuzz EGFX et DRDYNVC ; banc de latence navigateur et mesure de la première image.
+- **PR 13 `m2/rdp-egfx`** : DRDYNVC et client EGFX en passthrough, `ostena-frame` v2, décodage WebCodecs AVC420 puis AVC444, repli tuiles en WebAssembly, acquittements de bout en bout, entrées prioritaires, changement de taille ; fuzz EGFX et DRDYNVC ; banc de latence navigateur et mesure de la première image ; `REG-RDP-02`.
 - **PR 14 `m2/rdp-recording`** (ADR-0023) : écrivain MKV du core, scellement, vérification hors ligne, lecteur du portail ; `REG-RDP-07`.
-- **PR 17 `m2/rdp-channels`** : CLIPRDR et RDPDR (lecteurs seulement) soumis aux droits du grant ; fuzz CLIPRDR et RDPDR ; `REG-RDP-01`, `REG-RDP-02`, `REG-RDP-05`.
+- **PR 17 `m2/rdp-channels`** : CLIPRDR et RDPDR (lecteurs seulement) soumis aux droits du grant ; fuzz CLIPRDR et RDPDR ; `REG-RDP-01`, `REG-RDP-05` (et `REG-RDP-04` pour le débit du lecteur redirigé).
 
 ### Écart cryptographique à ajouter à l'ADR-0009 (proposé)
 
