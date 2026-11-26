@@ -964,9 +964,17 @@ fn a_network_cut_shorter_than_the_grace_keeps_the_ssh_sessions() {
         inventory::add_account(&pool, "srv-lab01", "root")
             .await
             .unwrap();
-        inventory::grant_right(&pool, "alice", "srv-lab01", "root", now() + 86_400, 1800)
-            .await
-            .unwrap();
+        inventory::grant_right(
+            &pool,
+            "alice",
+            "srv-lab01",
+            "root",
+            now() + 86_400,
+            1800,
+            Functions::NONE,
+        )
+        .await
+        .unwrap();
 
         let port = free_port();
         let config = config(port);

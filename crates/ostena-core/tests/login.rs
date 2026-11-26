@@ -974,13 +974,22 @@ fn ssh_hosts_lists_the_valid_rights_of_the_session_user() {
                 account,
                 now() + 86_400 * days,
                 3600,
+                ostena_core::functions::Functions::NONE,
             )
             .await
             .unwrap();
         }
-        let revoked = inventory::grant_right(&f.pool, "alice", "srv-b", "root", until, 3600)
-            .await
-            .unwrap();
+        let revoked = inventory::grant_right(
+            &f.pool,
+            "alice",
+            "srv-b",
+            "root",
+            until,
+            3600,
+            ostena_core::functions::Functions::NONE,
+        )
+        .await
+        .unwrap();
         inventory::revoke_right(&f.pool, revoked).await.unwrap();
 
         let key = SigningKey::generate().unwrap().0;
