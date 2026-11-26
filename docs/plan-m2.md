@@ -8,7 +8,7 @@ Ce document découpe le jalon M2 en PR, avec leurs dépendances et ce qui peut a
 
 **Critères de sortie.**
 
-1. Lots L2 (agent passerelle), L3 (core v0) et L4 (SSH natif et web) terminés.
+1. Lots L2 (agent passerelle), L3 (core v0, tous les modes d'authentification : LDAPS, OIDC, SAML, WebAuthn, TOTP, Kerberos SPNEGO, RADIUS, device flow) et L4 (SSH natif et web) terminés.
 2. Lots L5 (RDP par navigateur), L6 (audit scellé) et L7 (portail) au niveau « fonctionnel » : critères de performance mesurés, pas encore tous tenus.
 3. Installation de l'agent validée sur la matrice Windows Server 2016+ et Debian 12+.
 4. Tests de non-régression nommés (`REG-RDP-*`, `REG-SEC-*`, `REG-PERF-*`) en place et verts.
@@ -34,6 +34,7 @@ Reports de M1 repris ici : rôles séparés de la base, transcripts en stockage 
 | 4 | `m2/ssh-transfers` | L4 | `scp`, `sftp`, `rsync` soumis aux droits de transfert ; forwarding et `ProxyJump` refusés sans droit, tentative journalisée ; `ostena config ssh` ; contrôle `ssh-audit` en CI ; `REG-SEC-03`, `REG-SEC-05`. | 0010 (fin) | — | à faire |
 | 5 | `m2/rdp-adr` | L5 | ADR du driver RDP : IronRDP + sspi-rs (licences, empreinte), CredSSP Kerberos joué par l'agent, épinglage du certificat de la cible, refus du repli NTLM en production, Restricted Admin, passthrough EGFX, cibles de test en CI. | 0019 | — | à faire |
 | 6 | `m2/web-adr` | L7 | ADR du portail et de la passerelle web : chaîne de build hors ligne du portail, session navigateur (cookie, TOTP puis WebAuthn), WebSocket portant `ostena-frame`, CSP stricte, routes REST et OpenAPI. | 0020 | — | à faire |
+| 21 | `m2/lab` | — | Laboratoire décrit en code, sans hyperviseur fourni : machines virtuelles QEMU/KVM dans les exécuteurs Linux de GitHub, Windows Server 2016 et 2022 en version d'évaluation installées sans intervention depuis les ISO de Microsoft, contrôleur de domaine AD, zone isolée sans flux entrant pour l'agent Windows ; mêmes scripts déployables plus tard sur Proxmox ou Hyper-V. | 0025 | — | à faire |
 
 ### Vague 2 : protocoles et identités
 
@@ -52,7 +53,8 @@ Reports de M1 repris ici : rôles séparés de la base, transcripts en stockage 
 | 12 | `m2/web-ssh` | L4 | Client SSH web (xterm.js) sur `ostena-frame`, même transcript que le SSH natif. | — | 8 | à faire |
 | 13 | `m2/rdp-egfx` | L5 | Passthrough EGFX vers le navigateur et décodage WebCodecs, repli tuiles, entrées clavier et souris prioritaires ; cibles de fuzz EGFX, DRDYNVC ; banc de latence navigateur. | 0019 | 7, 8 | à faire |
 | 14 | `m2/rdp-recording` | L5, L6 | Enregistrement MKV du flux H.264 tel quel, scellé par la chaîne d'audit, lecteur dans le portail ; `REG-RDP-07`. | 0023 | 11, 13 | à faire |
-| 15 | `m2/identities-sso` | L3 | Plusieurs fournisseurs OIDC (code + PKCE) et SAML 2.0 simultanés, WebAuthn, second facteur exigé si la source n'atteste pas d'une authentification forte. | 0021 | 8, 9 | à faire |
+| 15 | `m2/identities-sso` | L3 | Plusieurs fournisseurs OIDC (code + PKCE) et SAML 2.0 simultanés (SAML initié par l'IdP désactivé par défaut, déconnexion propagée), WebAuthn/FIDO2, second facteur exigé si la source n'atteste pas d'une authentification forte. | 0021 | 8, 9 | à faire |
+| 15b | `m2/identities-kerberos` | L3 | Kerberos SPNEGO (plusieurs royaumes), RADIUS, *device flow* pour la CLI. | 0021 | 8, 9, 21 | à faire |
 | 16 | `m2/portal-v0` | L7 | Portail Svelte embarqué : connexion, catalogue des cibles autorisées, lancement en 2 clics (RDP et SSH), sessions et rejeu, administration minimale de l'inventaire ; thèmes clair et sombre, français et anglais ; E2E Playwright, aucune requête externe, axe. | 0020 | 8 (puis 12, 13, 14) | à faire |
 | 17 | `m2/rdp-channels` | L5 | Presse-papiers et RDPDR soumis aux droits ; `REG-RDP-01`, `REG-RDP-02`, `REG-RDP-05` ; cibles de fuzz CLIPRDR, RDPDR. | 0019 | 7 | à faire |
 
@@ -77,11 +79,18 @@ Vague 1 :  1 session ─┬─────────────┐
            6 web-adr ── 8 gateway ────┤        └──── 17 channels
                               ├── 12 web-ssh
                               └── 16 portail
-                                       19 fuzz-campaign ── 20 démo
+           21 lab ─────────────── 15b kerberos      19 fuzz-campaign ── 20 démo
 ```
 
 Trois PR au plus avancent en même temps : la compilation de l'espace de travail est le goulot.
 
 ## Laboratoire
 
-Les tests de bout en bout RDP de la CI visent une cible Windows réelle sur les exécuteurs Windows de GitHub (service Bureau à distance activé en boucle locale, hors domaine) et le serveur de test d'IronRDP. La démonstration exige en plus un laboratoire avec un domaine Active Directory, Windows Server 2016 et 2022, et une zone isolée sans flux entrant pour l'agent Windows ; Windows Server 2016 et 2019 ne sont pas disponibles sur les exécuteurs GitHub et sont validés sur ce laboratoire.
+Aucun hyperviseur n'est disponible : le laboratoire est décrit en code (`lab/`, PR 21) et tourne dans la CI. Les exécuteurs Linux de GitHub exposent KVM ; un job y démarre des machines virtuelles QEMU : un contrôleur de domaine AD, Windows Server 2016 et 2022 membres du domaine, et l'agent Windows dans un segment isolé qui n'accepte aucun flux entrant et sort seulement vers le core. Les systèmes sont installés sans intervention depuis les ISO d'évaluation de Microsoft (180 jours) ; aucune image Windows n'est publiée ni conservée en artefact.
+
+Conséquences pour la démonstration :
+
+- elle est jouée par un job CI déclenché à la demande et chaque semaine ; Playwright pilote le portail et enregistre une vidéo de la connexion RDP, de la session SSH web et du rejeu, publiée avec le rapport du job ;
+- les tests RDP de chaque PR restent rapides : serveur de test d'IronRDP et cible Windows réelle hors domaine sur les exécuteurs Windows de GitHub ; le laboratoire complet tourne chaque nuit ;
+- la matrice d'installation de l'agent couvre Windows Server 2016 et 2022 dans le laboratoire, 2022 et 2025 sur les exécuteurs Windows, Debian 12 et 13 en machines virtuelles ou conteneurs ;
+- le jour où un hyperviseur existe, les mêmes scripts le visent.
