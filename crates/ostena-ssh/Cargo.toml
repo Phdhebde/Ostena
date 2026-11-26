@@ -52,6 +52,10 @@ name = "interop"
 required-features = ["russh"]
 
 [[test]]
+name = "algorithms"
+required-features = ["russh"]
+
+[[test]]
 name = "transfers"
 required-features = ["russh"]
 

@@ -173,7 +173,7 @@ jobs:
       # The transfer tests run the real sftp-server and rsync on the target
       # side (OSTENA_REQUIRE_OPENSSH makes them mandatory).
       - run: sudo apt-get install -y --no-install-recommends openssh-sftp-server rsync
-      - run: cargo test --locked -p ostena-ssh --test interop --test gateway --test transfers
+      - run: cargo test --locked -p ostena-ssh --test interop --test gateway --test transfers --test algorithms
         env:
           OSTENA_REQUIRE_OPENSSH: "1"
       - run: bash tests/ssh/debian12-target.sh
