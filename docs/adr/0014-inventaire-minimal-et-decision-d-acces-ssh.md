@@ -2,7 +2,7 @@
 
 - **Statut** : Accepté. Implémenté dans le lot M1, PR 5b.
 - **Date** : 2026-11-25
-- **Révision** : 2026-11-26, fonctions d'un droit SSH (`--allow`, migration `0006_ssh_functions`), portées par le grant, `ACC-E010` (jalon M2, PR 4a)
+- **Révision** : 2026-11-26, fonctions d'un droit SSH (`--allow`, migration `0008_ssh_functions`, réversible), portées par le grant, `ACC-E010` (jalon M2, PR 4a)
 
 ## Contexte
 
@@ -90,7 +90,7 @@ Les refus ne sont pas audités un par un, ce qui inonderait la chaîne : une lig
 
 ### Fonctions d'un droit (jalon M2, PR 4a)
 
-Un droit porte la liste de ses **fonctions** au-delà du terminal et des commandes (`access_right.functions`, migration `0006_ssh_functions`, contrainte sur les quatre noms connus) : `transfer`, `port-forwarding`, `agent-forwarding`, `x11-forwarding` (ADR-0010). Aucune par défaut. `right.granted` les consigne (`functions`), `right list` et `access check` les affichent.
+Un droit porte la liste de ses **fonctions** au-delà du terminal et des commandes (`access_right.functions`, migration `0008_ssh_functions`, réversible, contrainte sur les quatre noms connus) : `transfer`, `port-forwarding`, `agent-forwarding`, `x11-forwarding` (ADR-0010). Aucune par défaut. `right.granted` les consigne (`functions`), `right list` et `access check` les affichent.
 
 - **À la demande de grant**, le core retient le droit comme avant (le plus long, puis la plus longue session) et signe ses fonctions dans les droits du grant (ADR-0004). Les fonctions de plusieurs droits valides sur le même compte ne s'additionnent pas : accorder une fonction, c'est accorder un droit qui la porte, ou révoquer et accorder de nouveau. Le registre des grants garde ces bits (`access_grant.rights`), et `access.ssh_granted` les consigne (`functions`, `rights`).
 - **À l'ouverture de la session**, le droit retenu de nouveau doit **garder toutes les fonctions du grant** : un droit révoqué ou remplacé par un droit plus pauvre depuis l'émission donne `ACC-E010`. Un droit plus riche ne les étend pas : l'agent n'applique que ce que le grant signe. `access.session_opened` consigne les fonctions.
