@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id::text AS \"id!\", valid_until, max_session_secs FROM access_right\n           WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid AND protocol = 'ssh'\n             AND revoked_at IS NULL AND valid_from <= $3 AND valid_until > $3\n           ORDER BY valid_until DESC, max_session_secs DESC LIMIT 1 FOR SHARE",
+  "query": "SELECT id::text AS \"id!\", valid_until, max_session_secs, functions FROM access_right\n           WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid AND protocol = 'ssh'\n             AND revoked_at IS NULL AND valid_from <= $3 AND valid_until > $3\n           ORDER BY functions @> $4 DESC, valid_until DESC, max_session_secs DESC\n           LIMIT 1 FOR SHARE",
   "describe": {
     "columns": [
       {
@@ -30,20 +30,33 @@
             "name": "max_session_secs"
           }
         }
+      },
+      {
+        "ordinal": 3,
+        "name": "functions",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "functions"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Text",
         "Text",
-        "Int8"
+        "Int8",
+        "TextArray"
       ]
     },
     "nullable": [
       null,
       false,
+      false,
       false
     ]
   },
-  "hash": "4cafb086937a651e403da1dc0037d0c82cd51452294abfbf2635281eaedc51dc"
+  "hash": "fe2c234dd593aff0d9599a72a18713e6f30b75f8ee687d36ec98eca84c36ebab"
 }

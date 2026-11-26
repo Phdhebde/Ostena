@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO access_right (id, user_id, account_id, protocol, valid_from, valid_until,\n                                   max_session_secs, created_by, functions)\n         VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, 'ssh', $4, $5, $6, $7, $8)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int4",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "db202770beaf01e26eb3f004167d36183b17b0af79d2de2fd364d131737a6a34"
+}

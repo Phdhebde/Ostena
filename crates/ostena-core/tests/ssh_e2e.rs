@@ -24,6 +24,7 @@ use common::{TestDb, block_on};
 use ostena_common::config::scope::{AllowRuleSpec, PolicySpec};
 use ostena_common::config::{CoreConfig, Mode};
 use ostena_core::cache::AgentCache;
+use ostena_core::functions::Functions;
 use ostena_core::server::{Keys, RunningCore, StartInfo};
 use ostena_core::ssh_ca::SshAuthorities;
 use ostena_core::store::PgStore;
@@ -315,9 +316,17 @@ fn ssh_access_and_login_revocation_end_to_end() {
                 .await
                 .unwrap();
         }
-        inventory::grant_right(&pool, "alice", "srv-lab01", "root", now() + 86_400, 1800)
-            .await
-            .unwrap();
+        inventory::grant_right(
+            &pool,
+            "alice",
+            "srv-lab01",
+            "root",
+            now() + 86_400,
+            1800,
+            Functions::NONE,
+        )
+        .await
+        .unwrap();
 
         // The core, then the agent: it receives the pushes.
         let port = free_port();
@@ -653,9 +662,17 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
         inventory::add_account(&pool, "srv-lab01", "root")
             .await
             .unwrap();
-        inventory::grant_right(&pool, "alice", "srv-lab01", "root", now() + 86_400, 1800)
-            .await
-            .unwrap();
+        inventory::grant_right(
+            &pool,
+            "alice",
+            "srv-lab01",
+            "root",
+            now() + 86_400,
+            1800,
+            Functions::NONE,
+        )
+        .await
+        .unwrap();
 
         let port = free_port();
         let config = config(port);

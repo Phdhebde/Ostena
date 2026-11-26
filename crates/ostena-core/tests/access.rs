@@ -18,6 +18,7 @@ use ostena_audit::{ActorKind, Record};
 use ostena_common::config::scope::{AllowRuleSpec, PolicySpec};
 use ostena_core::access::{self, Refusal, SshRequest};
 use ostena_core::cache::AgentCache;
+use ostena_core::functions::Functions;
 use ostena_core::grant_keys::GrantAuthority;
 use ostena_core::ssh_ca::SshAuthorities;
 use ostena_core::store::PgStore;
@@ -122,12 +123,28 @@ async fn fixture(test: &str) -> Option<Fixture> {
             .await
             .unwrap();
     }
-    inventory::grant_right(&pool, "alice", "srv-lab01", "root", now() + 86_400, 3600)
-        .await
-        .unwrap();
-    inventory::grant_right(&pool, "alice", "srv-other", "root", now() + 86_400, 3600)
-        .await
-        .unwrap();
+    inventory::grant_right(
+        &pool,
+        "alice",
+        "srv-lab01",
+        "root",
+        now() + 86_400,
+        3600,
+        Functions::NONE,
+    )
+    .await
+    .unwrap();
+    inventory::grant_right(
+        &pool,
+        "alice",
+        "srv-other",
+        "root",
+        now() + 86_400,
+        3600,
+        Functions::NONE,
+    )
+    .await
+    .unwrap();
     let issuer = Arc::new(Issuer::new(SigningKey::generate().unwrap().0));
     let (authority, activated) = GrantAuthority::load(&pool, issuer).await.unwrap();
     assert!(activated.is_some());
@@ -411,6 +428,65 @@ fn a_grant_opens_one_session_once() {
     });
 }
 
+/// The functions of the right go into the grant as its rights bits; the
+/// right retained at the opening must keep them (`ACC-E010`).
+#[test]
+fn the_functions_of_the_right_are_signed_and_kept() {
+    block_on(async {
+        let Some(f) = fixture("the_functions_of_the_right_are_signed_and_kept").await else {
+            return;
+        };
+        // None by default.
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        assert_eq!(issued.content.claims.rights, Rights::NONE);
+        // A longer right with transfers and port forwarding: retained, signed.
+        let wider = inventory::grant_right(
+            &f.pool,
+            "alice",
+            "srv-lab01",
+            "root",
+            now() + 2 * 86_400,
+            3600,
+            Functions::parse(&["transfer", "port-forwarding"]).unwrap(),
+        )
+        .await
+        .unwrap();
+        let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        assert_eq!(
+            issued.content.claims.rights,
+            Rights::FILE_UPLOAD
+                .with(Rights::FILE_DOWNLOAD)
+                .with(Rights::SSH_PORT_FORWARDING)
+        );
+        let stored: i32 = sqlx::query_scalar("SELECT rights FROM access_grant WHERE jti = $1")
+            .bind(&issued.content.jti.to_bytes()[..])
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            u32::try_from(stored).unwrap(),
+            issued.content.claims.rights.bits()
+        );
+        let listed = inventory::list_rights(&f.pool).await.unwrap();
+        let right = listed.iter().find(|r| r.id == wider).unwrap();
+        assert_eq!(right.functions.label(), "transfer,port-forwarding");
+        let checked = access::check(&f.pool, "alice", "srv-lab01", "root", now())
+            .await
+            .unwrap();
+        assert_eq!(checked.right, wider);
+        // The wider right revoked before the opening: the right left does
+        // not keep the functions of the grant.
+        inventory::revoke_right(&f.pool, wider).await.unwrap();
+        assert_eq!(
+            f.open(&issued.grant).await.unwrap_err().code,
+            access::FUNCTIONS_REDUCED
+        );
+        // An unknown function is refused at the grant of the right.
+        assert!(Functions::parse(&["shell"]).is_err());
+        f.db.drop_database().await;
+    });
+}
+
 #[test]
 fn a_session_uses_any_valid_right_on_the_account() {
     block_on(async {
@@ -427,6 +503,7 @@ fn a_session_uses_any_valid_right_on_the_account() {
             "root",
             now() + 2 * 86_400,
             3600,
+            Functions::NONE,
         )
         .await
         .unwrap();
@@ -940,8 +1017,16 @@ fn administration_rules_and_dry_run() {
         ] {
             assert_eq!(
                 code(
-                    inventory::grant_right(&f.pool, "alice", "srv-lab01", "backup", until, max)
-                        .await
+                    inventory::grant_right(
+                        &f.pool,
+                        "alice",
+                        "srv-lab01",
+                        "backup",
+                        until,
+                        max,
+                        Functions::NONE
+                    )
+                    .await
                 ),
                 "CORE-E012",
                 "{until} {max}"
@@ -949,8 +1034,16 @@ fn administration_rules_and_dry_run() {
         }
         assert_eq!(
             code(
-                inventory::grant_right(&f.pool, "nobody", "srv-lab01", "root", now() + 60, 60)
-                    .await
+                inventory::grant_right(
+                    &f.pool,
+                    "nobody",
+                    "srv-lab01",
+                    "root",
+                    now() + 60,
+                    60,
+                    Functions::NONE
+                )
+                .await
             ),
             "CORE-E009"
         );

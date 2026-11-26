@@ -17,6 +17,7 @@ use sqlx::PgPool;
 
 use crate::audit::{self, Tx};
 use crate::error::CoreError;
+use crate::functions::Functions;
 use crate::store::{Notice, i64_of, notify_audit, notify_notice, truncate, unix_now, uuid};
 
 /// Longest validity of a right, seconds (366 days).
@@ -731,13 +732,16 @@ pub struct RightRow {
     pub valid_until: u64,
     /// Longest session, seconds.
     pub max_session_secs: u32,
+    /// Functions beyond the terminal and the commands.
+    pub functions: Functions,
     /// Revoked.
     pub revoked: bool,
 }
 
 /// Grants `user` SSH access to `account@resource` until `valid_until`
 /// (Unix seconds, at most 366 days ahead), sessions of at most
-/// `max_session_secs` (60 to 43 200).
+/// `max_session_secs` (60 to 43 200), with `functions` beyond the terminal
+/// and the commands (none by default: ADR-0010).
 ///
 /// # Errors
 ///
@@ -750,6 +754,7 @@ pub async fn grant_right(
     account: &str,
     valid_until: u64,
     max_session_secs: u32,
+    functions: Functions,
 ) -> Result<Uuid, CoreError> {
     let now = unix_now();
     if valid_until <= now || valid_until > now + MAX_RIGHT_SECS {
@@ -781,8 +786,8 @@ pub async fn grant_right(
     .ok_or_else(|| CoreError::NotFound(format!("compte {account}@{resource}")))?;
     sqlx::query!(
         "INSERT INTO access_right (id, user_id, account_id, protocol, valid_from, valid_until,
-                                   max_session_secs, created_by)
-         VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, 'ssh', $4, $5, $6, $7)",
+                                   max_session_secs, created_by, functions)
+         VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, 'ssh', $4, $5, $6, $7, $8)",
         id.to_string(),
         user_id,
         account_id,
@@ -790,6 +795,7 @@ pub async fn grant_right(
         i64_of(valid_until),
         i32::try_from(max_session_secs).unwrap_or(i32::MAX),
         actor,
+        &functions.names(),
     )
     .execute(&mut *tx)
     .await?;
@@ -799,9 +805,17 @@ pub async fn grant_right(
         .uuid(field::ACCOUNT_ID, uuid(&account_id)?.to_bytes())
         .text(field::PROTOCOL, "ssh")
         .u64(field::VALID_UNTIL, valid_until)
-        .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs));
+        .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
+        .text(field::FUNCTIONS, functions.label());
     commit_granting(tx, event).await?;
-    tracing::info!(event = "right.granted", right = %id, user, resource, account);
+    tracing::info!(
+        event = "right.granted",
+        right = %id,
+        user,
+        resource,
+        account,
+        functions = %functions.label()
+    );
     Ok(id)
 }
 
@@ -859,7 +873,7 @@ pub async fn list_rights(pool: &PgPool) -> Result<Vec<RightRow>, CoreError> {
     let rows = sqlx::query!(
         r#"SELECT ar.id::text AS "id!", u.name AS "user!", r.name AS "resource!",
                   a.name AS "account!", ar.protocol, ar.valid_until, ar.max_session_secs,
-                  ar.revoked_at IS NOT NULL AS "revoked!"
+                  ar.functions, ar.revoked_at IS NOT NULL AS "revoked!"
            FROM access_right ar JOIN app_user u ON u.id = ar.user_id
            JOIN target_account a ON a.id = ar.account_id JOIN resource r ON r.id = a.resource_id
            ORDER BY ar.created_at DESC, ar.id"#
@@ -876,6 +890,7 @@ pub async fn list_rights(pool: &PgPool) -> Result<Vec<RightRow>, CoreError> {
                 protocol: r.protocol,
                 valid_until: u64::try_from(r.valid_until).unwrap_or(0),
                 max_session_secs: u32::try_from(r.max_session_secs).unwrap_or(0),
+                functions: Functions::from_stored(&r.functions),
                 revoked: r.revoked,
             })
         })
