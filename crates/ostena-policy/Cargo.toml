@@ -18,5 +18,9 @@ thiserror.workspace = true
 dhat.workspace = true
 proptest.workspace = true
 
+[[bench]]
+name = "decision"
+harness = false
+
 [lints]
 workspace = true

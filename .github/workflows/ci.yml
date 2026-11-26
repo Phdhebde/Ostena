@@ -147,6 +147,7 @@ jobs:
         run: |
           cargo bench --locked -p ostena-scope
           cargo bench --locked -p ostena-frame
+          cargo bench --locked -p ostena-policy
 
   # The portal (ADR-0020, § 1): npm packages cached into vendor/npm/ while
   # connected (cargo xtask vendor npm), then built twice, offline, in two
