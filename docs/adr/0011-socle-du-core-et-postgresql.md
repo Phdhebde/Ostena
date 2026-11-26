@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté, y compris l'exception de licence Unicode-3.0 de `stringprep`, acceptée le 2026-11-15 (section « Écarts »). Implémenté dans le lot M1, PR 2.
 - **Date** : 2026-11-14
+- **Amendé** : 2026-11-26 — rôles PostgreSQL séparés (propriétaire du schéma, rôle du service, audit en insertion seule), `ostena core db init`, migrations réversibles à partir de la 6 (jalon M2, PR 3). Voir « Rôles de la base ».
 
 ## Contexte
 
@@ -12,7 +13,7 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
 ### Le core, composant Linux
 
 - **Nouvelle crate `ostena-core`**, seule autorisée à dépendre de sqlx (`deny.toml`).
-- **Commandes** : `ostena core run` (service), `ostena core migrate [--check]`, `ostena core agent token|list|revoke`.
+- **Commandes** : `ostena core run` (service), `ostena core db init` (rôles et base), `ostena core migrate [--check | --revert-to <version>]`, `ostena core agent token|list|revoke`.
 - **`ostena-cli` ne lie `ostena-core` que pour les cibles Linux.** Le binaire Windows, qui ne fait tourner que l'agent, n'embarque ni le core ni PostgreSQL. Ce n'est pas une liaison conditionnelle par plateforme pour des raisons d'empreinte : le core est Linux par conception (voir l'architecture dans CLAUDE.md). Le cas d'`ostena-ssh` est différent : l'agent Windows aura besoin du serveur SSH, et sa liaison n'est pas conditionnelle (ADR-0009).
 - La crate compile aussi sous Windows, pour clippy et les tests hors base.
 
@@ -25,13 +26,31 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
   - PostgreSQL 16 au moins (`CORE-E002`).
 - **Pourquoi pas TLS** : quand on lui donne une CA, sqlx l'**ajoute** au magasin des racines publiques (`webpki-roots`) au lieu de la mettre seule. N'importe quelle autorité publique pourrait alors présenter le serveur. En plus, `webpki-roots` est sous licence CDLA-Permissive-2.0. Une base distante avec une TLS épinglée viendra après M1, avec un correctif amont (racines remplacées, pas ajoutées ; voir la [note des correctifs](../notes/russh-correctifs-amont.md)).
 - **Environnement** : chaque champ de connexion vient de la configuration. sqlx lit les variables `PG*` et aucun réglage ne peut ensuite effacer `PGPASSWORD` ni `PGOPTIONS` (options passées au serveur, par exemple `-c search_path=…`) : le core refuse de démarrer si l'une des deux est définie (`CORE-E008`). Les autres variables (`PGHOST`, `PGUSER`, `PGSSLMODE`…) sont sans effet, ce que vérifie un test lancé dans un sous-processus. `~/.pgpass` n'est jamais lu.
-- **Un seul rôle**, propriétaire du schéma. Séparer un rôle DDL d'un rôle DML est préférable, mais avec `peer` il faut alors deux comptes système ou une table `pg_ident`. C'est noté pour après M1 ([note](../notes/core-roles-base.md)).
+- **Rôles séparés** (amendement du 2026-11-26) : voir « Rôles de la base ». En M1, un seul rôle possédait le schéma et l'appliquait lui-même au démarrage.
+
+### Rôles de la base
+
+En M1, le core se connectait avec un seul rôle, propriétaire du schéma : un core compromis pouvait modifier le schéma, par exemple désactiver les déclencheurs d'ajout seul de la chaîne d'audit. Depuis l'amendement du 2026-11-26 :
+
+- **Deux rôles de groupe**, sans connexion (`NOLOGIN`), aux noms fixes puisque les migrations les nomment :
+  - `ostena_owner` possède la base et tous les objets du schéma. Seul `ostena core migrate` le prend.
+  - `ostena_app` reçoit des migrations, table par table, les seuls droits DML dont le service a besoin. Sur la chaîne d'audit (`audit_record`, `audit_head`), c'est `SELECT` et `INSERT` seulement : ni `UPDATE`, ni `DELETE`, ni `TRUNCATE`, ni `TRIGGER`, ni la propriété des tables. Le service ne peut donc plus désactiver les déclencheurs d'ajout seul. Aucune requête du core ne supprime de ligne : `ostena_app` n'a `DELETE` sur aucune table. Une table seulement verrouillée (`FOR SHARE`) reçoit `UPDATE` sur une seule colonne (`disabled_at`), ce que PostgreSQL exige pour un verrou de ligne.
+- **Deux comptes système et deux rôles de connexion**, pour que `peer` reste la seule authentification (option la plus simple à auditer de la note M1, sans table `pg_ident`) :
+  - `core.database.user` (`ostena` par défaut) : le service et les commandes d'administration ;
+  - `core.database.migration_user` (`ostena_admin` par défaut, nouveau champ) : `ostena core migrate`, lancé par l'exploitant lors d'une mise à jour.
+  Chacun est membre de son rôle de groupe avec `SET TRUE` et `INHERIT FALSE` : sans `SET ROLE`, il ne peut rien faire d'autre que se connecter. Chaque connexion du core commence par `SET ROLE` (`ostena_app` ou `ostena_owner`), et le core vérifie `current_user` avant de servir le pool. Un rôle de connexion qui reprend le nom d'un rôle de groupe est refusé (`CFG-V013`).
+- **`ostena core db init`**, lancé sous le superutilisateur PostgreSQL (`sudo -u postgres`), crée ce qui manque : les deux rôles de groupe, les deux rôles de connexion et leurs appartenances, la base propriété d'`ostena_owner`, dont seuls les deux rôles de connexion peuvent ouvrir une session (`REVOKE ALL … FROM PUBLIC`, `GRANT CONNECT`). Sur une installation M1, il donne en plus à `ostena_owner` la base et les objets que possédait le compte du service (`REASSIGN OWNED`). Il est idempotent et signale ce qui affaiblit la séparation.
+- **Le core ne migre plus** : `ostena core run` exige un schéma à jour (`CORE-E005`), puis vérifie, avant tout, qu'aucun objet du schéma n'appartient à son rôle de connexion ni à `ostena_app` (installation M1 non convertie) et qu'`ostena_app` n'a aucun droit de modification sur la chaîne d'audit (`CORE-E013`, dans les deux modes).
+- **Affaiblissements signalés, pas refusés** : un rôle de connexion du service superutilisateur, membre d'`ostena_owner`, capable de créer des rôles, ou qui sert aussi aux migrations, est journalisé à chaque démarrage (`core.database_role_weak`) et par `ostena core db init`. Le refuser en production empêcherait les tests et la démonstration, qui tournent sous un seul compte système avec `peer` ; ce point est laissé à la décision du mainteneur (refus en production quand les tests d'intégration et la démonstration utiliseront deux comptes).
+- **Droits des tables futures** : toute migration qui ajoute une table accorde dans la même migration ce dont `ostena_app` a besoin. Le test des droits (`crates/ostena-core/tests/roles.rs`) liste chaque droit d'`ostena_app` et échoue sur tout autre, comme sur une table oubliée.
 
 ### Schéma et requêtes
 
-- **Migrations embarquées** (`sqlx::migrate!`), appliquées par `ostena core run` sous le verrou consultatif de sqlx.
+- **Migrations embarquées** (`sqlx::migrate!`), appliquées par `ostena core migrate` sous le verrou consultatif de sqlx, en tant qu'`ostena_owner` (en M1 : par `ostena core run` au démarrage).
   - Une base migrée par un binaire plus récent, une migration modifiée ou une migration en échec sont refusées (`CORE-E005`).
-  - Les commandes d'administration exigent un schéma à jour et ne le modifient jamais.
+  - `ostena core run` et les commandes d'administration exigent un schéma à jour et ne le modifient jamais.
+  - **Migrations réversibles à partir de la 6** : chacune a un fichier `.down.sql` (format réversible de sqlx, `MIGRATOR.undo`), qui ramène le schéma à la version précédente sans toucher aux lignes que celle-ci connaît. `ostena core migrate --revert-to <version>` les applique avant la réinstallation d'un binaire plus ancien ; une version antérieure à 5 est refusée (`CORE-E004`), les migrations M1 n'ayant pas d'inverse. Le test `crates/ostena-core/tests/migrations.rs`, lancé en CI, fait pour chaque migration réversible N : N-1 → N → N-1 → N sur une base qui contient des lignes, et compare le schéma (colonnes, contraintes, index, déclencheurs, fonctions, propriétaires, droits) et toutes les lignes.
+  - Les fichiers `.sql` simples des migrations 1 à 5 ne changent pas : leur somme de contrôle reste celle qu'une base M1 a enregistrée.
 - **Requêtes vérifiées à la compilation** (`query!`) contre le cache `crates/ostena-core/.sqlx`, versionné. `SQLX_OFFLINE=true` est fixé dans `.cargo/config.toml` : la compilation ne joint jamais de base. `cargo sqlx prepare` (outil de développement, absent du build isolé) régénère le cache, et la CI vérifie qu'il est à jour.
 - **Tables** : `agent` (identifiant, groupe, révocation), `agent_certificate` (empreinte SHA-256, agent, révocation), `enrollment_token` (identifiant, **condensat SHA-256 du secret de 256 bits, jamais le secret**, groupe, échéance, usage, échecs, brûlage).
 
@@ -71,6 +90,7 @@ Jusqu'ici, seul le core de test (`ostena-tunnel`, fonctionnalité `testing`) jou
 | `CORE-E010` | écriture d'audit impossible (chaîne ou export) : l'opération auditée est refusée, sauf si elle ne fait que retirer des droits (ADR-0012) |
 | `CORE-E011` | chaîne d'audit incohérente : le core cesse de signer et refuse de démarrer (ADR-0012) |
 | `CORE-E012` | requête d'administration invalide (ADR-0014) |
+| `CORE-E013` | rôles de la base absents ou mal attribués : rôle de groupe inaccessible au rôle de connexion, migration hors d'`ostena_owner`, objet du schéma possédé par le compte du service, ou droit de modification d'`ostena_app` sur la chaîne d'audit |
 
 Les refus d'accès (`ACC-E001` à `ACC-E009`) et d'inventaire (`INV-E001` à `INV-E005`) sont décrits dans l'ADR-0014.
 
@@ -79,7 +99,8 @@ Côté tunnel, `TUN-E029` signale un registre illisible (ADR-0008).
 ### Événements
 
 Les événements qui engagent une décision du core sont écrits dans la chaîne d'audit, avec leur classe d'échec d'écriture (accordant, protecteur, au mieux) : voir l'[ADR-0012](0012-chaine-d-audit-du-core.md). Le journal structuré reçoit aussi :
-- **démarrage** : `core.started`, `core.stopped`, `core.database_connected` (méthode d'authentification), `core.database_not_peer` (développement), `core.migrated`, `config.waiver` ;
+- **démarrage** : `core.started`, `core.stopped`, `core.database_connected` (méthode d'authentification, rôle de la session), `core.database_not_peer` (développement), `core.database_role_weak` (séparation des rôles affaiblie), `config.waiver` ;
+- **schéma** : `core.migrated` et `core.migration_reverted`, écrits aussi dans la chaîne d'audit par `ostena core migrate` (acteur : le compte de migration), `core.database_initialized` (`ostena core db init`, une ligne par changement) ;
 - **registre** : `core.registry_unavailable`, `core.registry_restored`, `core.registry_error`, `core.notices_interrupted` ;
 - **agents** : `tunnel.agent_connected`, `tunnel.refused`, `agent.certificate_renewed`, `agent.renewal_refused`, `agent.revoked`, `agent.revocation_applied` (tunnels fermés) ;
 - **enrôlement** (ADR-0008) : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted`, `enroll.refused`, `enroll.store_unavailable` ;
@@ -96,7 +117,8 @@ Les événements qui engagent une décision du core sont écrits dans la chaîne
 ## Conséquences
 
 - **Le vrai core existe** : l'agent s'enrôle auprès de lui, survit à ses redémarrages et en est coupé dès sa révocation. Un test de démonstration lance le vrai binaire des deux côtés (Linux, base réelle).
-- **Installation** : PostgreSQL 16 sur la machine du core, un rôle portant le nom du compte du service, et `local … peer` dans `pg_hba.conf` ([installation du core](../exploitation/core-installation.md)).
-- **Tests** : ceux qui demandent une base sont obligatoires en CI (`OSTENA_REQUIRE_DB=1`, socket et `peer`) et sautés en local avec un message sans serveur. Chaque test crée sa propre base.
+- **Installation** : PostgreSQL 16 sur la machine du core, deux comptes système (`ostena`, `ostena_admin`), `ostena core db init` sous `postgres`, et `local … peer` dans `pg_hba.conf` pour ces deux rôles ([installation du core](../exploitation/core-installation.md), avec la procédure de passage d'une installation M1).
+- **Mise à jour** : `ostena core migrate` sous le compte d'administration, puis redémarrage du service ; le service refuse de démarrer tant que le schéma n'est pas à jour.
+- **Tests** : ceux qui demandent une base sont obligatoires en CI (`OSTENA_REQUIRE_DB=1`, socket et `peer`) et sautés en local avec un message sans serveur. Chaque test crée sa propre base, propriété d'`ostena_owner` ; le rôle de test, qui doit pouvoir créer des rôles, joue les deux rôles de connexion, et les tests du core passent par `ostena_app` comme le service : un droit manquant à une migration fait échouer les tests existants.
 - **Dépendances** : le binaire Linux lie 58 crates de plus (sqlx et ses dépendances, dont une partie, comme `futures` ou `hmac`, était déjà dans l'espace de travail sans être liée au binaire). Le binaire Windows ne change pas. `sqlx-core` active aussi la macro `#[instrument]` de `tracing` (compilation seulement, `syn` 2 déjà présent). Le fichier `Cargo.lock` liste en plus les pilotes MySQL et SQLite de sqlx, jamais compilés. La revue complète figure dans la description de la PR.
 - **Le core de test reste** pour les tests d'`ostena-tunnel`. Le module `ostena_core::testing` (fonctionnalité `testing`) porte la même marque que lui, et `cargo xtask check-release` refuse l'un comme l'autre.
