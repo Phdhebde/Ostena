@@ -1,6 +1,7 @@
 //! What the core pushes and the session requests, against the in-process
 //! test core: policy intersection, key set versions kept across a restart,
-//! jti consumed by the agent then by the core.
+//! jti consumed by the agent then by the core, a grant replayed after a
+//! restart (REG-SEC-05).
 
 #![allow(
     clippy::unwrap_used,
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ostena_common::config::Mode;
-use ostena_grant::{MemoryReplayStore, Protocol};
+use ostena_grant::{FileReplayStore, MemoryReplayStore, Protocol};
 use ostena_platform::private_file::{self, Reader};
 use ostena_scope::{AllowRuleSpec, LocalAddresses, PolicySpec, SharedLocalAddresses};
 use ostena_tunnel::control::CoreMessage;
@@ -274,6 +275,51 @@ fn the_core_consumes_the_jti() {
             .await
             .unwrap();
         let refused = b
+            .open_session(&grant, now(), &MemoryReplayStore::new())
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "GRT-E010");
+        assert!(
+            refused.to_string().contains("refusé par le core"),
+            "{refused}"
+        );
+    });
+}
+
+/// REG-SEC-05: a grant used once is refused when presented again after a
+/// restart of the agent. The agent's own journal (kept on disk) refuses it
+/// before the core is asked; the core refuses it too, whatever the agent
+/// remembers (`the_core_consumes_the_jti`).
+#[test]
+fn reg_sec_05_grant_replayed_after_an_agent_restart_is_refused() {
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("replay-restart");
+        let journal = dir.0.join("replay.journal");
+        let grant = core
+            .issue_grant(group(), Protocol::Ssh, "10.20.0.5", 22)
+            .unwrap();
+        {
+            let gateway = agent(&core, &dir, "a", "a.version", allow(&["10.0.0.0/8"])).await;
+            push_all(&core, &gateway, allow(&["10.0.0.0/8"])).await;
+            let store = FileReplayStore::open(&journal).unwrap();
+            gateway.open_session(&grant, now(), &store).await.unwrap();
+        }
+        // Restart: a new agent, the same state and journal files.
+        let restarted = agent(&core, &dir, "b", "a.version", allow(&["10.0.0.0/8"])).await;
+        push_all(&core, &restarted, allow(&["10.0.0.0/8"])).await;
+        let store = FileReplayStore::open(&journal).unwrap();
+        let refused = restarted
+            .open_session(&grant, now(), &store)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "GRT-E010");
+        assert!(
+            !refused.to_string().contains("refusé par le core"),
+            "refused by the journal of the agent: {refused}"
+        );
+        // Even with its journal lost, the agent gets the core's refusal.
+        let refused = restarted
             .open_session(&grant, now(), &MemoryReplayStore::new())
             .await
             .unwrap_err();

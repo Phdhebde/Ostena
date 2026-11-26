@@ -599,6 +599,39 @@ fn ssh_session_params_need_account_and_host_key() {
     ));
 }
 
+/// REG-SEC-03: an SSH session whose parameters would loosen the host key
+/// verification of the target is refused. There is no way to ask for it:
+/// the pinned key is mandatory (no key means no session, never "accept
+/// what the target presents"), and any extra field, such as a request to
+/// skip or relax the check, is refused by the strict decoding. Then the
+/// driver compares the key exactly (`driver_pins_the_target_host_key_and_
+/// authenticates_with_the_agent_key`, `SSH-E014`), and the core issues no
+/// grant for a resource without a pinned key (`INV-E004`).
+#[test]
+fn reg_sec_03_session_params_cannot_loosen_the_host_key_check() {
+    let base = r#"{"type":"session_params","request_id":1,"session_id":"2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6","protocol":"ssh","host":"10.0.0.1","port":22,"max_session_secs":60,"account":"root""#;
+    let pinned = format!(r#"{base},"target_p256_public":"{}""#, point());
+    assert!(decode::<CoreMessage>(format!("{pinned}}}").as_bytes()).is_ok());
+    for json in [
+        // No pinned key, or an empty one.
+        format!("{base}}}"),
+        format!(r#"{base},"target_p256_public":null}}"#),
+        format!(r#"{base},"target_p256_public":""}}"#),
+        // A pinned key plus a request to relax the check.
+        format!(r#"{pinned},"strict_host_key_checking":false}}"#),
+        format!(r#"{pinned},"host_key_check":"accept-new"}}"#),
+        format!(r#"{pinned},"known_hosts":"none"}}"#),
+    ] {
+        assert!(
+            matches!(
+                decode::<CoreMessage>(json.as_bytes()),
+                Err(TunnelError::Protocol(_))
+            ),
+            "{json}"
+        );
+    }
+}
+
 #[test]
 fn ssh_field_names_are_not_redacted() {
     for name in [
