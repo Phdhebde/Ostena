@@ -837,11 +837,13 @@ async fn streams(tunnel: Arc<CoreTunnel>, agent: Uuid, shared: Arc<Shared>) {
     loop {
         let (session, class, mut channel) = match tunnel.accept_channel().await {
             Ok(accepted) => accepted,
-            Err(TunnelError::Protocol(e)) => {
+            // A bad stream header: the stream is refused, the tunnel stays
+            // up. Once the tunnel is closed, nothing more comes.
+            Err(TunnelError::Protocol(e)) if !tunnel.is_closed() => {
                 tracing::warn!(event = "tunnel.channel_refused", agent = %agent, "{e}");
                 continue;
             }
-            Err(TunnelError::Version(v)) => {
+            Err(TunnelError::Version(v)) if !tunnel.is_closed() => {
                 tracing::warn!(event = "tunnel.channel_refused", agent = %agent, version = v);
                 continue;
             }

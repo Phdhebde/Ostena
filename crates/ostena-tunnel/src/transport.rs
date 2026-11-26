@@ -233,9 +233,13 @@ impl Conn {
         }
     }
 
+    /// A stream cannot be opened or accepted: the connection is gone,
+    /// whatever closed it (as QUIC says of a connection closed here). The
+    /// reason of the close stays in the message; [`Conn::closed`] gives it
+    /// with its own code.
     async fn tcp_error(conn: &mux::Connection, e: StreamError) -> TunnelError {
         if conn.is_closed() {
-            conn.closed().await
+            TunnelError::ConnectionLost(conn.closed().await.to_string())
         } else {
             TunnelError::ConnectionLost(e.to_string())
         }

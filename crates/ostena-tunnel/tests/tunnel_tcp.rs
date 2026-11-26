@@ -146,6 +146,38 @@ fn stream_limit_is_enforced_by_the_peer() {
     });
 }
 
+/// Once the tunnel is closed, whatever its reason (here a protocol
+/// violation), opening or accepting a stream says the connection is gone,
+/// as over QUIC: a loop that accepts streams and skips bad headers
+/// (`TUN-E010`) stops instead of spinning.
+#[test]
+fn streams_of_a_closed_tunnel_say_it_is_gone() {
+    run(async {
+        let core = core();
+        let id = core.agent_identity(group(), valid(), true).unwrap();
+        let (tunnel, _) = connect(&tcp_config(&core, &id, group(), fast()).unwrap())
+            .await
+            .unwrap();
+        tunnel.close(TunnelError::Protocol("trop de flux refusés".into()));
+        let accepted = tokio::time::timeout(Duration::from_secs(2), tunnel.accept_channel())
+            .await
+            .unwrap();
+        assert!(
+            matches!(accepted, Err(TunnelError::ConnectionLost(_))),
+            "{accepted:?}"
+        );
+        let opened = tunnel
+            .open_channel(Uuid::random().unwrap(), StreamClass::Interactive)
+            .await;
+        assert!(
+            matches!(opened, Err(TunnelError::ConnectionLost(_))),
+            "{:?}",
+            opened.err()
+        );
+        assert_eq!(tunnel.closed().await.code(), "TUN-E010");
+    });
+}
+
 #[test]
 fn loss_of_the_core_is_detected() {
     run(async {
