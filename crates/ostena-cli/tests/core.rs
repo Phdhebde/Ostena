@@ -214,6 +214,10 @@ fn create_dirs(dir: &Path) {
 
 /// The PKI after a ceremony, the core configuration on `db`, and an agent
 /// configuration pointing at it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the files of one lab, written in order"
+)]
 fn lab(db: &TestDb) -> Lab {
     let dir = std::env::temp_dir().join(format!("ostena-core-demo-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -288,7 +292,8 @@ fn lab(db: &TestDb) -> Lab {
              totp_key = {{ credential = \"totp.key\" }}\nssh_hosts = [\"bastion.lab\"]\n\n\
              [core.audit]\nsigning_key = {{ credential = \"audit.key\" }}\nhead_interval_secs = 1\n\
              heartbeat_secs = 60\n\n\
-             [core.database]\nport = {}\nname = \"{}\"\nuser = \"{}\"\n{connection}",
+             [core.database]\nport = {}\nname = \"{}\"\nuser = \"{}\"\nmigration_user = \"{}\"\n\
+             {connection}",
             p("root.pem"),
             p("server.pem"),
             p("issuing.pem"),
@@ -296,6 +301,7 @@ fn lab(db: &TestDb) -> Lab {
             database.port,
             database.name,
             database.user,
+            database.migration_user,
         ),
     )
     .unwrap();
@@ -331,6 +337,32 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
         return;
     };
     let lab = lab(&db);
+    // The core never migrates (ADR-0011): refused until `core migrate`.
+    let refused = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["core", "run", "--config"])
+        .arg(&lab.core_config)
+        .env("CREDENTIALS_DIRECTORY", lab.dir.join("credentials"))
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(text.contains("CORE-E005"), "{text}");
+    // TestDb set up the roles and the database as `core db init` does:
+    // nothing left to do.
+    let init = command(
+        &["core", "db", "init", "--superuser", &db.config.user],
+        &lab.core_config,
+    );
+    assert!(init.contains("rien à faire"), "{init}");
+    let migrated = command(&["core", "migrate"], &lab.core_config);
+    assert!(migrated.contains("appliquées"), "{migrated}");
+    let again = command(&["core", "migrate"], &lab.core_config);
+    assert!(!again.contains("appliquées"), "{again}");
+    command(&["core", "migrate", "--check"], &lab.core_config);
     let mut core = Process::spawn(&["core", "run"], &lab.core_config);
     core.wait_for("core.started");
 

@@ -127,24 +127,52 @@ const CORE_CONFIG: &str = "/etc/ostena/ostena.toml";
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Subcommand)]
+enum CoreDbCommand {
+    /// Create the roles (schema owner, service role and the two login roles
+    /// of the configuration) and the database owned by the schema owner; take
+    /// over what an M1 installation left to the service account. Run as
+    /// the PostgreSQL superuser (sudo -u postgres). Idempotent.
+    Init {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// The role allowed to create roles and databases, authenticated
+        /// as the configuration says (peer on the socket in production).
+        #[arg(long, default_value = "postgres")]
+        superuser: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
 enum CoreCommand {
-    /// Run the core (in the foreground, or as started by systemd): apply
-    /// the embedded migrations, then serve the tunnel and enrolment
-    /// listeners.
+    /// Run the core (in the foreground, or as started by systemd): check
+    /// that the schema is the one of this binary, then serve the tunnel and
+    /// enrolment listeners. Connects as `user`, with the service role.
     Run {
         /// Configuration file.
         #[arg(long, default_value = CORE_CONFIG)]
         config: PathBuf,
     },
     /// Apply the embedded migrations, or only check them (exit code 1 if
-    /// some are pending).
+    /// some are pending). Connects as `migration_user`, with the role
+    /// of the schema owner (run it under the administration account).
     Migrate {
         /// Configuration file.
         #[arg(long, default_value = CORE_CONFIG)]
         config: PathBuf,
         /// Check only, change nothing.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "revert_to")]
         check: bool,
+        /// Take the schema back to this version with the down migrations
+        /// (before an older binary is reinstalled).
+        #[arg(long, value_name = "VERSION")]
+        revert_to: Option<i64>,
+    },
+    /// The database: create its roles and the database itself.
+    Db {
+        #[command(subcommand)]
+        command: CoreDbCommand,
     },
     /// Administer the agents (the running core applies changes at once).
     Agent {
@@ -995,7 +1023,14 @@ fn run_audit(command: AuditCommand) -> ExitCode {
 fn run_core(command: CoreCommand) -> ExitCode {
     match command {
         CoreCommand::Run { config } => core::run(&config),
-        CoreCommand::Migrate { config, check } => core::migrate(&config, check),
+        CoreCommand::Migrate {
+            config,
+            check,
+            revert_to,
+        } => core::migrate(&config, check, revert_to),
+        CoreCommand::Db {
+            command: CoreDbCommand::Init { config, superuser },
+        } => core::db_init(&config, &superuser),
         CoreCommand::Agent { command } => match command {
             CoreAgentCommand::Token {
                 config,
@@ -1119,6 +1154,7 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
         } => inv::access_check(&config, &user, &resource, &account),
         CoreCommand::Run { .. }
         | CoreCommand::Migrate { .. }
+        | CoreCommand::Db { .. }
         | CoreCommand::Agent { .. }
         | CoreCommand::Audit { .. } => ExitCode::FAILURE,
     }

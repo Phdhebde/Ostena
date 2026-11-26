@@ -290,7 +290,14 @@ impl Default for DatabaseConfig {
 /// The group roles of the core database (ADR-0011): the owner of the
 /// schema and the role of the service. Their names are fixed (the
 /// migrations grant to them); `user` and `migration_user` cannot take them.
-pub const GROUP_ROLES: [&str; 2] = ["ostena_owner", "ostena_app"];
+pub const GROUP_ROLES: [&str; 2] = [OWNER_ROLE, APP_ROLE];
+
+/// Owner of the schema: DDL, taken by `ostena core migrate` only.
+pub const OWNER_ROLE: &str = "ostena_owner";
+
+/// Role of the service and of the administration commands: the DML each
+/// table needs, insertion only on the audit chain.
+pub const APP_ROLE: &str = "ostena_app";
 
 /// A TCP connection to PostgreSQL, in clear text: development only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

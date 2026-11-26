@@ -15,7 +15,6 @@ use ostena_audit::{
 };
 use ostena_core::audit::{self, Cadence, HeadSigner, ManualClock, Recorder};
 use ostena_core::cache::AgentCache;
-use ostena_core::schema;
 use ostena_core::store::{self, PgStore};
 use ostena_crypto::p256::SigningKey;
 use ostena_tunnel::enroll::{AgentRegistry, TokenRecord, TokenStore};
@@ -43,8 +42,8 @@ fn cadence() -> Cadence {
 /// A migrated test database, without any chain yet, and a store on it.
 async fn migrated_empty(test: &str) -> Option<(TestDb, PgStore)> {
     let db = TestDb::create(test).await?;
+    db.migrate().await;
     let pool = db.pool().await;
-    schema::migrate(&pool).await.unwrap();
     Some((db, PgStore::new(pool, Arc::new(AgentCache::default()))))
 }
 
@@ -148,10 +147,12 @@ fn codes(report: &Report) -> Vec<&'static str> {
     report.findings.iter().map(Finding::code).collect()
 }
 
-/// Runs `sql` as the owner with the user triggers of both tables disabled:
-/// what an administrator of the database can always do (ADR-0011, single
-/// role).
-async fn as_owner(pool: &PgPool, sql: &str) {
+/// Runs `sql` as the owner of the schema with the user triggers of both
+/// tables disabled: what an administrator of the database can always do,
+/// and the service no longer can (ADR-0011, separate roles).
+async fn as_owner(db: &TestDb, sql: &str) {
+    let owner = db.owner_pool().await;
+    let pool = &owner;
     let mut tx = pool.begin().await.unwrap();
     for statement in [
         "ALTER TABLE audit_record DISABLE TRIGGER USER",
@@ -170,6 +171,7 @@ async fn as_owner(pool: &PgPool, sql: &str) {
         sqlx::query(statement).execute(&mut *tx).await.unwrap();
     }
     tx.commit().await.unwrap();
+    owner.close().await;
 }
 
 #[test]
@@ -258,9 +260,18 @@ fn triggers_refuse_changes_and_wrong_numbers() {
             "DELETE FROM audit_head",
             "TRUNCATE audit_head",
         ] {
+            // The service: no privilege (tests/roles.rs).
             let e = sqlx::query(sql).execute(pool).await.unwrap_err();
             let code = e.as_database_error().unwrap().code().unwrap().into_owned();
             assert_eq!(code, "42501", "{sql}: {e}");
+            // The owner has every privilege: the triggers stop it, unless
+            // it disables them.
+            let owner = db.owner_pool().await;
+            let e = sqlx::query(sql).execute(&owner).await.unwrap_err();
+            let code = e.as_database_error().unwrap().code().unwrap().into_owned();
+            assert_eq!(code, "42501", "{sql}: {e}");
+            assert!(e.to_string().contains("en ajout seul"), "{sql}: {e}");
+            owner.close().await;
         }
         // The next seq only, the next head number only, never past the tip.
         let body: Vec<u8> = sqlx::query_scalar("SELECT body FROM audit_record WHERE seq = 2")
@@ -385,15 +396,13 @@ fn granting_operations_fail_closed_protective_ones_do_not() {
             .await
             .unwrap();
         // From now on, no audit record can be written.
-        sqlx::raw_sql(
+        db.execute(
             "CREATE FUNCTION test_refuse() RETURNS trigger LANGUAGE plpgsql AS $$
              BEGIN RAISE EXCEPTION 'audit indisponible (test)'; END; $$;
              CREATE TRIGGER z_test_refuse BEFORE INSERT ON audit_record
                  FOR EACH ROW EXECUTE FUNCTION test_refuse();",
         )
-        .execute(&pool)
-        .await
-        .unwrap();
+        .await;
         let records = count(&pool, "SELECT count(*) FROM audit_record").await;
 
         // Granting: refused, nothing committed.
@@ -578,7 +587,7 @@ fn tampering_stops_the_signer_and_is_found_by_the_verifier() {
                     .unwrap();
                 let hash = ostena_audit::record_hash(&body);
                 as_owner(
-                    &pool,
+                    &db,
                     &format!(
                         "INSERT INTO audit_record (seq, body, hash, event) VALUES (9, '\\x{}', '\\x{}', 'core.started')",
                         hex(&body),
@@ -587,7 +596,7 @@ fn tampering_stops_the_signer_and_is_found_by_the_verifier() {
                 )
                 .await;
             } else {
-                as_owner(&pool, sql).await;
+                as_owner(&db, sql).await;
             }
             let e = signer.signer.sign_now().await.unwrap_err();
             assert_eq!(e.code(), "CORE-E011", "{name}: {e}");
@@ -634,7 +643,7 @@ fn records_written_by_the_core_are_checked_before_signing() {
             .unwrap();
         let hash = ostena_audit::record_hash(&body);
         as_owner(
-            &pool,
+            &db,
             &format!(
                 "UPDATE audit_record SET body = '\\x{}', hash = '\\x{}' WHERE seq = {}",
                 hex(&body),
@@ -660,7 +669,7 @@ fn an_acknowledged_break_lets_the_signer_resume() {
             return;
         };
         let pool = store.pool().clone();
-        as_owner(&pool, "DELETE FROM audit_record WHERE seq = 5").await;
+        as_owner(&db, "DELETE FROM audit_record WHERE seq = 5").await;
         assert_eq!(
             signer.signer.sign_now().await.unwrap_err().code(),
             "CORE-E011"
@@ -718,7 +727,7 @@ fn tail_truncation_needs_an_external_head_or_freshness() {
         assert_eq!((kept.record_seq(), lost.record_seq()), (4, 7));
         // The owner removes the tail and the head that covers it.
         as_owner(
-            &pool,
+            &db,
             "DELETE FROM audit_head WHERE head_no = 2; DELETE FROM audit_record WHERE seq > 4",
         )
         .await;
@@ -933,7 +942,7 @@ fn only_the_core_starts_a_chain_and_never_over_signed_heads() {
         let signer = Fixture::new(&pool, store.recorder(), now_ms());
         signer.signer.sign_now().await.unwrap().unwrap();
         as_owner(
-            &pool,
+            &db,
             "ALTER TABLE audit_head DROP CONSTRAINT audit_head_record_seq_fkey;
              DELETE FROM audit_record;",
         )

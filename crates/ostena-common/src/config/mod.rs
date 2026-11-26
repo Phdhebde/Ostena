@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use self::core::{
-    CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig, DatabaseTcp,
-    GROUP_ROLES, KeySource, TotpAlgorithmSetting,
+    APP_ROLE, CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig,
+    DatabaseTcp, GROUP_ROLES, KeySource, OWNER_ROLE, TotpAlgorithmSetting,
 };
 pub use agent::{AgentConfig, AgentSshConfig, InfrastructureEndpoint, SshPaths};
 pub use permissions::{DefaultPermissions, PermissionChecker};

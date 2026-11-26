@@ -52,6 +52,14 @@ pub enum CoreError {
     /// the inventory (ADR-0014).
     #[error("[CORE-E012] demande refusée : {0}")]
     Invalid(String),
+    /// The roles of the database are missing or wrongly assigned: a login
+    /// role cannot take its group role, or the service role owns the
+    /// schema (ADR-0011, separate roles).
+    #[error(
+        "[CORE-E013] rôles de la base absents ou mal attribués : {0} ; voir `ostena core db \
+         init` (docs/exploitation/core-installation.md)"
+    )]
+    Roles(String),
 }
 
 impl CoreError {
@@ -70,6 +78,7 @@ impl CoreError {
             Self::AuditWrite(_) => "CORE-E010",
             Self::AuditChain(_) => "CORE-E011",
             Self::Invalid(_) => "CORE-E012",
+            Self::Roles(_) => "CORE-E013",
         }
     }
 }
@@ -99,6 +108,7 @@ mod tests {
             CoreError::AuditWrite("x".into()),
             CoreError::AuditChain("x".into()),
             CoreError::Invalid("x".into()),
+            CoreError::Roles("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("CORE-E{:03}", i + 1);

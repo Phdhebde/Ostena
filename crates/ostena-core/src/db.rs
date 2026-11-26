@@ -4,10 +4,18 @@
 //! authentication only: no password and no network. Every connection
 //! setting comes from the configuration; the `PG*` variables of the
 //! environment never change where or as whom the core connects.
+//!
+//! Two group roles hold the privileges (ADR-0011, separate roles): the
+//! owner of the schema, [`OWNER_ROLE`], taken by `ostena core migrate`
+//! only, and [`APP_ROLE`], taken by the service and the administration
+//! commands. A login role is only a member of its group role, without
+//! inheriting it: each connection starts with `SET ROLE`, and is checked to
+//! run as that role before the pool is handed out.
 
 use std::path::Path;
 use std::time::Duration;
 
+pub use ostena_common::config::{APP_ROLE, OWNER_ROLE};
 use ostena_common::config::{DatabaseConfig, Mode};
 use ostena_common::secret::SecretBytes;
 use sqlx::PgPool;
@@ -28,6 +36,39 @@ pub const APPLICATION_NAME: &str = "ostena-core";
 /// password, and server options (`-c search_path=…`). The core refuses to
 /// start while they are set rather than let them reach the server.
 pub const UNCLEARABLE_VARIABLES: [&str; 2] = ["PGPASSWORD", "PGOPTIONS"];
+
+/// Which login role connects, and which group role its sessions take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// `user`, then `SET ROLE ostena_app`: the service and the
+    /// administration commands.
+    App,
+    /// `migration_user`, then `SET ROLE ostena_owner`: `ostena core
+    /// migrate`.
+    Owner,
+    /// `user` as it is, without `SET ROLE`: the setup of the roles (`ostena
+    /// core db init`, test databases), as a role allowed to create them.
+    Login,
+}
+
+impl Role {
+    /// The group role its sessions take, if any.
+    pub const fn group(self) -> Option<&'static str> {
+        match self {
+            Self::App => Some(APP_ROLE),
+            Self::Owner => Some(OWNER_ROLE),
+            Self::Login => None,
+        }
+    }
+
+    /// The login role that connects, from `config`.
+    pub fn login(self, config: &DatabaseConfig) -> &str {
+        match self {
+            Self::App | Self::Login => &config.user,
+            Self::Owner => &config.migration_user,
+        }
+    }
+}
 
 /// Connection options built from `config` only.
 ///
@@ -94,27 +135,54 @@ pub fn check_environment(get: impl Fn(&str) -> Option<String>) -> Result<(), Cor
     }
 }
 
-/// Connects the pool, then checks the server version and, in production,
-/// that the server authenticated the core by `peer`.
+/// Connects the pool as `role`, then checks the server version, that the
+/// sessions run as the group role of `role` and, in production, that the
+/// server authenticated the login role by `peer`.
 ///
 /// # Errors
 ///
-/// [`CoreError`] with the reason (`CORE-E001` to `CORE-E003`, `CORE-E008`).
-pub async fn connect(config: &DatabaseConfig, mode: Mode) -> Result<PgPool, CoreError> {
+/// [`CoreError`] with the reason (`CORE-E001` to `CORE-E003`, `CORE-E008`,
+/// `CORE-E013` when the login role cannot take its group role).
+pub async fn connect(config: &DatabaseConfig, mode: Mode, role: Role) -> Result<PgPool, CoreError> {
     check_environment(|name| std::env::var(name).ok())?;
-    let options = options(config)?;
-    let pool = PgPoolOptions::new()
+    let options = options(config)?.username(role.login(config));
+    let mut pool = PgPoolOptions::new()
         .max_connections(config.max_connections)
-        .acquire_timeout(Duration::from_secs(config.connect_timeout_secs))
-        .connect_with(options)
-        .await
-        .map_err(|e| CoreError::Database(e.to_string()))?;
-    let (version, user): (i32, Option<String>) =
-        sqlx::query_as("SELECT current_setting('server_version_num')::int, system_user")
-            .fetch_one(&pool)
-            .await
-            .map_err(|e| CoreError::Database(e.to_string()))?;
+        .acquire_timeout(Duration::from_secs(config.connect_timeout_secs));
+    if let Some(group) = role.group() {
+        pool = pool.after_connect(move |conn, _| {
+            Box::pin(async move {
+                // A fixed name, never from the configuration.
+                sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET ROLE {group}")))
+                    .execute(conn)
+                    .await
+                    .map(|_| ())
+            })
+        });
+    }
+    let pool = pool.connect_with(options).await.map_err(|e| {
+        let text = e.to_string();
+        match role.group() {
+            Some(group) if is_role_refusal(&e) => CoreError::Roles(format!(
+                "{} ne peut pas prendre le rôle {group} ({text})",
+                role.login(config)
+            )),
+            _ => CoreError::Database(text),
+        }
+    })?;
+    let (version, user, current): (i32, Option<String>, String) = sqlx::query_as(
+        "SELECT current_setting('server_version_num')::int, system_user, current_user::text",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| CoreError::Database(e.to_string()))?;
     check_server(version, user.as_deref(), mode)?;
+    let expected = role.group().unwrap_or(role.login(config));
+    if current != expected {
+        return Err(CoreError::Roles(format!(
+            "session sous le rôle {current} au lieu de {expected}"
+        )));
+    }
     tracing::info!(
         event = "core.database_connected",
         server_version = version,
@@ -122,9 +190,18 @@ pub async fn connect(config: &DatabaseConfig, mode: Mode) -> Result<PgPool, Core
             .as_deref()
             .and_then(|u| u.split_once(':'))
             .map_or("trust", |(m, _)| m),
+        role = %expected,
         "base PostgreSQL jointe"
     );
     Ok(pool)
+}
+
+/// `SET ROLE` refused: the role is missing (`22023`, `42704`) or the login
+/// role is not allowed to take it (`42501`).
+fn is_role_refusal(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|c| matches!(c.as_ref(), "22023" | "42704" | "42501"))
 }
 
 /// The checks on the server: version 16 or later, and `peer`
