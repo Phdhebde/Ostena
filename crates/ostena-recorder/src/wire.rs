@@ -5,7 +5,7 @@
 //!
 //! | Size | Field |
 //! |---|---|
-//! | 1 | type: 1 start, 2 output, 3 resize, 4 end, 5 exit |
+//! | 1 | type: 1 start, 2 output, 3 resize, 4 end, 5 exit, 6 note |
 //! | 8 | time, microseconds since the start |
 //! | 4 | payload length |
 //! | n | payload |
@@ -14,7 +14,8 @@
 //! term ‖ has_command u8 (0 or 1) ‖ command` (the command runs to the end of
 //! the payload); output: the bytes; resize `cols u16 ‖ rows u16`; end
 //! `reason u8 ‖ output_bytes u64`; exit `1 ‖ status u32` or
-//! `2 ‖ core_dumped u8 (0 or 1) ‖ signal name` (to the end of the payload).
+//! `2 ‖ core_dumped u8 (0 or 1) ‖ signal name` (to the end of the payload);
+//! note `kind u8 ‖ text` (to the end of the payload).
 //!
 //! The decoder is strict: the start comes first, at time 0, and only once;
 //! times never decrease; at most one exit, before the end; the end comes
@@ -22,12 +23,16 @@
 //! `encode(decode(b)) == b`.
 
 use crate::error::RecorderError;
-use crate::event::{EndReason, Event, Exit, Frame, MAX_COMMAND, MAX_OUTPUT, MAX_TERM};
+use crate::event::{
+    EndReason, Event, Exit, Frame, MAX_COMMAND, MAX_NOTE, MAX_OUTPUT, MAX_TERM, NoteKind,
+};
 
 /// Length of a frame header.
 pub const FRAME_HEADER_LEN: usize = 13;
 /// Largest payload: a start with the longest terminal type and command.
 pub const MAX_PAYLOAD: usize = 14 + MAX_TERM + MAX_COMMAND;
+// The longest note fits in it.
+const _: () = assert!(MAX_NOTE < MAX_PAYLOAD);
 /// Largest frame.
 pub const MAX_FRAME_LEN: usize = FRAME_HEADER_LEN + MAX_PAYLOAD;
 
@@ -36,6 +41,7 @@ const OUTPUT: u8 = 2;
 const RESIZE: u8 = 3;
 const END: u8 = 4;
 const EXIT: u8 = 5;
+const NOTE: u8 = 6;
 const EXIT_STATUS: u8 = 1;
 const EXIT_SIGNAL: u8 = 2;
 
@@ -85,6 +91,7 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), RecorderError> {
         Event::End { .. } => (END, 9),
         Event::Exit(Exit::Status(_)) => (EXIT, 5),
         Event::Exit(Exit::Signal { name, .. }) => (EXIT, 2 + name.len()),
+        Event::Note { text, .. } => (NOTE, 1 + text.len()),
     };
     let len32 = len_u32(len)?;
     out.reserve(FRAME_HEADER_LEN + len);
@@ -133,6 +140,10 @@ pub fn encode(frame: &Frame, out: &mut Vec<u8>) -> Result<(), RecorderError> {
             out.push(EXIT_SIGNAL);
             out.push(u8::from(*core_dumped));
             out.extend_from_slice(name.as_bytes());
+        }
+        Event::Note { kind, text } => {
+            out.push(*kind as u8);
+            out.extend_from_slice(text);
         }
     }
     Ok(())
@@ -214,6 +225,14 @@ fn decode_payload(kind: u8, p: &[u8]) -> Result<Event, RecorderError> {
             }
         }
         EXIT => Event::Exit(decode_exit(p)?),
+        NOTE => match p {
+            [kind, text @ ..] => Event::Note {
+                kind: NoteKind::from_u8(*kind)
+                    .ok_or(RecorderError::Malformed("type de note inconnu"))?,
+                text: text.to_vec(),
+            },
+            [] => return Err(RecorderError::Malformed("note vide")),
+        },
         _ => return Err(RecorderError::Malformed("type de trame inconnu")),
     };
     event.check()?;
@@ -325,7 +344,7 @@ impl Decoder {
         let at_us = be_u64(&header[1..]);
         let len = u32::from_be_bytes([header[9], header[10], header[11], header[12]]);
         let len = usize::try_from(len).unwrap_or(usize::MAX);
-        if !(START..=EXIT).contains(&kind) {
+        if !(START..=NOTE).contains(&kind) {
             return Err(self.fail(RecorderError::Malformed("type de trame inconnu")));
         }
         if len > MAX_PAYLOAD {
@@ -364,7 +383,7 @@ impl Decoder {
                     return Err(RecorderError::Limit("taille maximale"));
                 }
             }
-            (State::Started, Event::Resize { .. }) => {}
+            (State::Started, Event::Resize { .. } | Event::Note { .. }) => {}
             (State::Started, Event::Exit(_)) => {
                 if self.exited {
                     return Err(RecorderError::Malformed("deuxième fin de commande"));

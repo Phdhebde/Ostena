@@ -10,8 +10,10 @@
 //! - Events: `[t, "o", text]` for output, `[t, "r", "COLSxROWS"]` for a
 //!   window change, a marker `[t, "m", "exit-status N"]` or
 //!   `[t, "m", "exit-signal NAME"]` (`exit-signal NAME core-dumped`) for
-//!   the end of the shell or the command; `t` in seconds with six
-//!   decimals.
+//!   the end of the shell or the command, a marker `[t, "m", "NAME TEXT"]`
+//!   for a note (`transfer sftp`, `refused port-forwarding …`,
+//!   `file-write /tmp/x`, `file-rename /a -> /b`, each path decoded as
+//!   UTF-8 on its own); `t` in seconds with six decimals.
 //! - Output is decoded as UTF-8 across events: an incomplete sequence at
 //!   the end of an event waits for the next one; each invalid sequence
 //!   becomes U+FFFD and is counted. Nothing is written for an event that
@@ -32,7 +34,7 @@ use std::io::Write;
 use ostena_crypto::sha256::Hasher;
 
 use crate::error::RecorderError;
-use crate::event::{Event, Exit, Frame};
+use crate::event::{Event, Exit, Frame, NoteKind};
 
 /// Size of a window when the session has no terminal.
 pub const DEFAULT_SIZE: (u16, u16) = (80, 24);
@@ -279,8 +281,33 @@ impl<W: Write> CastWriter<W> {
                 self.events += 1;
                 self.emit()
             }
+            Event::Note { kind, text } => self.note(frame.at_us, *kind, text),
             Event::End { .. } => self.flush_carry(frame.at_us),
         }
+    }
+
+    /// A note, as a marker: output still waiting for the end of a sequence
+    /// comes first.
+    fn note(&mut self, at_us: u64, kind: NoteKind, text: &[u8]) -> Result<(), RecorderError> {
+        self.flush_carry(at_us)?;
+        let mut marker = format!("{} ", kind.name());
+        if kind.has_two_paths() {
+            let mut paths = text.splitn(2, |b| *b == 0);
+            let first = paths.next().unwrap_or_default();
+            let second = paths.next().unwrap_or_default();
+            self.invalid_utf8 += decode_lossy(first, &mut marker, false).0;
+            marker.push_str(" -> ");
+            self.invalid_utf8 += decode_lossy(second, &mut marker, false).0;
+        } else {
+            self.invalid_utf8 += decode_lossy(text, &mut marker, false).0;
+        }
+        self.line.push('[');
+        push_time(&mut self.line, at_us);
+        self.line.push_str(",\"m\",");
+        push_json_str(&mut self.line, &marker);
+        self.line.push(']');
+        self.events += 1;
+        self.emit()
     }
 
     fn flush_carry(&mut self, at_us: u64) -> Result<(), RecorderError> {

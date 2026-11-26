@@ -294,6 +294,22 @@ fn arb_event() -> impl Strategy<Value = Event> {
     prop_oneof![
         proptest::collection::vec(any::<u8>(), 1..64).prop_map(Event::Output),
         (1..=MAX_CELLS_T, 1..=MAX_CELLS_T).prop_map(|(cols, rows)| Event::Resize { cols, rows }),
+        "[a-z -]{1,32}".prop_map(|t| Event::Note {
+            kind: NoteKind::Refused,
+            text: t.into_bytes(),
+        }),
+        proptest::collection::vec(1u8.., 1..64).prop_map(|p| Event::Note {
+            kind: NoteKind::Write,
+            text: p,
+        }),
+        (
+            proptest::collection::vec(1u8.., 1..16),
+            proptest::collection::vec(1u8.., 1..16)
+        )
+            .prop_map(|(a, b)| Event::Note {
+                kind: NoteKind::Rename,
+                text: [a, vec![0], b].concat(),
+            }),
     ]
 }
 
