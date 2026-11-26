@@ -8,6 +8,7 @@
 //! user, as for the agent commands.
 
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
+use ostena_common::api::web::Role;
 use ostena_common::config::Mode;
 use ostena_common::config::scope::PolicySpec;
 use ostena_crypto::p256::VerifyingKey;
@@ -450,6 +451,105 @@ pub async fn disable_user(pool: &PgPool, name: &str) -> Result<usize, CoreError>
     tx.commit().await?;
     tracing::warn!(event = "user.disabled", user = %id, revoked_sessions = sessions.len());
     Ok(sessions.len())
+}
+
+/// Gives `role` to the user `name` (portal, ADR-0020). Giving a role the
+/// user has changes nothing. Returns whether it was given now.
+///
+/// # Errors
+///
+/// [`CoreError::NotFound`], [`CoreError::AuditWrite`], [`CoreError::Database`].
+pub async fn grant_role(pool: &PgPool, name: &str, role: Role) -> Result<bool, CoreError> {
+    let mut tx = pool.begin().await?;
+    let actor = audit::admin_actor(&mut tx).await?;
+    let id = user_id(&mut tx, name).await?;
+    let granted = sqlx::query!(
+        "INSERT INTO user_role (user_id, role, granted_by) VALUES ($1::text::uuid, $2, $3)
+         ON CONFLICT DO NOTHING",
+        id.to_string(),
+        role.as_str(),
+        actor,
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if !granted {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let event = admin_event(EventKind::UserRoleGranted, actor)
+        .uuid(field::USER_ID, id.to_bytes())
+        .text(field::NAME, name)
+        .text(field::ROLE, role.as_str());
+    commit_granting(tx, event).await?;
+    tracing::info!(event = "user.role_granted", user = %id, role = role.as_str());
+    Ok(true)
+}
+
+/// Takes `role` from the user `name`; the browser sessions open see it at
+/// their next request. Returns whether the user had it.
+///
+/// # Errors
+///
+/// [`CoreError::NotFound`], [`CoreError::Database`].
+pub async fn revoke_role(pool: &PgPool, name: &str, role: Role) -> Result<bool, CoreError> {
+    let mut tx = pool.begin().await?;
+    let actor = audit::admin_actor(&mut tx).await?;
+    let id = user_id(&mut tx, name).await?;
+    let removed = sqlx::query!(
+        "DELETE FROM user_role WHERE user_id = $1::text::uuid AND role = $2",
+        id.to_string(),
+        role.as_str(),
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if !removed {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    notify_audit(&mut tx).await?;
+    // Protective, last statement before the commit.
+    audit::append_protective(
+        &mut tx,
+        admin_event(EventKind::UserRoleRevoked, actor)
+            .uuid(field::USER_ID, id.to_bytes())
+            .text(field::NAME, name)
+            .text(field::ROLE, role.as_str()),
+    )
+    .await;
+    tx.commit().await?;
+    tracing::warn!(event = "user.role_revoked", user = %id, role = role.as_str());
+    Ok(true)
+}
+
+/// The roles of the user `name`, sorted.
+///
+/// # Errors
+///
+/// [`CoreError::Database`].
+pub async fn user_roles(pool: &PgPool, name: &str) -> Result<Vec<Role>, CoreError> {
+    let rows = sqlx::query_scalar!(
+        "SELECT r.role FROM user_role r JOIN app_user u ON u.id = r.user_id
+         WHERE u.name = $1 ORDER BY r.role",
+        name,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().filter_map(|r| Role::parse(r)).collect())
+}
+
+async fn user_id(tx: &mut Tx<'_>, name: &str) -> Result<Uuid, CoreError> {
+    let id = sqlx::query_scalar!(
+        r#"SELECT id::text AS "id!" FROM app_user WHERE name = $1"#,
+        name
+    )
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| CoreError::NotFound(format!("utilisateur {name}")))?;
+    uuid(&id)
 }
 
 // ------------------------------------------------------------- resources

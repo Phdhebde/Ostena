@@ -331,7 +331,7 @@ async fn login_session(
         ));
     };
     if uuid(&s.user)? != subject
-        || certificate_sha256.is_some_and(|c| s.certificate_sha256.as_slice() != c)
+        || certificate_sha256.is_some_and(|c| s.certificate_sha256.as_deref() != Some(c.as_slice()))
     {
         return Err(Refusal::new(
             LOGIN_MISMATCH,

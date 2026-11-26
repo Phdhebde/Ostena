@@ -131,7 +131,7 @@ impl ApiError {
         self
     }
 
-    fn status(&self) -> StatusCode {
+    pub(crate) fn status(&self) -> StatusCode {
         self.status.unwrap_or_else(|| self.code.status())
     }
 }
@@ -230,17 +230,17 @@ pub fn source_of(ip: IpAddr) -> IpAddr {
 
 /// Open connections per source.
 #[derive(Debug, Default)]
-struct Sources(Mutex<HashMap<IpAddr, usize>>);
+pub(crate) struct Sources(Mutex<HashMap<IpAddr, usize>>);
 
 /// A connection counted for its source until dropped.
-struct SourceSlot {
+pub(crate) struct SourceSlot {
     sources: Arc<Sources>,
     source: IpAddr,
 }
 
 impl Sources {
     /// Counts a connection from `ip`, or `None` at `limit`.
-    fn take(self: &Arc<Self>, ip: IpAddr, limit: usize) -> Option<SourceSlot> {
+    pub(crate) fn take(self: &Arc<Self>, ip: IpAddr, limit: usize) -> Option<SourceSlot> {
         let source = source_of(ip);
         let mut map = self.0.lock().ok()?;
         let open = map.entry(source).or_insert(0);
@@ -425,7 +425,7 @@ impl Attempts {
 
 struct Shared<A> {
     authenticator: Arc<A>,
-    attempts: Attempts,
+    attempts: Arc<Attempts>,
     limits: Limits,
     sources: Arc<Sources>,
     connection_logs: LogBudget,
@@ -453,13 +453,31 @@ impl LoginListener {
         limits: Limits,
         authenticator: Arc<A>,
     ) -> Result<Self, CoreError> {
+        let attempts = Arc::new(Attempts::new(limits.attempts_per_minute));
+        Self::bind_sharing(addr, tls, limits, authenticator, attempts).await
+    }
+
+    /// As [`LoginListener::bind`], counting the attempts in `attempts`,
+    /// shared with the web listener (ADR-0020): one counter per source for
+    /// both.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Startup`] if the address cannot be bound.
+    pub async fn bind_sharing<A: Authenticator>(
+        addr: SocketAddr,
+        tls: Arc<ServerConfig>,
+        limits: Limits,
+        authenticator: Arc<A>,
+        attempts: Arc<Attempts>,
+    ) -> Result<Self, CoreError> {
         let startup =
             |e: std::io::Error| CoreError::Startup(format!("écouteur de connexion {addr} : {e}"));
         let listener = TcpListener::bind(addr).await.map_err(startup)?;
         let addr = listener.local_addr().map_err(startup)?;
         let shared = Arc::new(Shared {
             authenticator,
-            attempts: Attempts::new(limits.attempts_per_minute),
+            attempts,
             limits,
             sources: Arc::default(),
             connection_logs: LogBudget::default(),

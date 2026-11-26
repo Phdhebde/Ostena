@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE web_session SET last_activity_at = $2\n             WHERE login_session_id = $1::text::uuid AND last_activity_at < $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "55d4c3f67a6a098e06c86bed32ad83e8d3238bdf3e161bb501ee6c7665e3fb7b"
+}

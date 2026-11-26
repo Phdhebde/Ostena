@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE login_session\n               SET revoked_at = now(), revoked_by = $2, revocation_reason = $3\n               WHERE id = $1::text::uuid AND revoked_at IS NULL\n               RETURNING user_id::text AS \"user!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1288618e3fef28873d76c53a84966ae9da37daf106a2b5d333858bdb66a23911"
+}

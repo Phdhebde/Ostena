@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE web_session w\n               SET cookie_sha256 = $2, authenticated_at = $3, last_activity_at = $3\n               FROM login_session s\n               WHERE w.login_session_id = $1::text::uuid AND s.id = w.login_session_id\n                 AND user_id = $4::text::uuid\n                 AND s.revoked_at IS NULL AND s.expires_at > $3\n               RETURNING true AS \"renewed!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "renewed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1d4857f3d18bb5712d47d629d6bf8661f6c7628a8af322f0468bf76cb3f55c27"
+}

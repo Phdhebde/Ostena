@@ -65,6 +65,40 @@ pub async fn open_session(
     Ok(())
 }
 
+/// Opens the login session `session` of channel `web` (a browser session
+/// of the portal, ADR-0020, without certificate) for `user`, from `now`
+/// until `expires_at` (at most eight hours), in the transaction of the
+/// login.
+///
+/// # Errors
+///
+/// [`CoreError::Invalid`] for an expiry in the past or too far,
+/// [`CoreError::Database`] otherwise.
+pub async fn open_web_session(
+    tx: &mut Tx<'_>,
+    session: Uuid,
+    user: Uuid,
+    now: u64,
+    expires_at: u64,
+) -> Result<(), CoreError> {
+    if expires_at <= now || expires_at > now + MAX_LOGIN_SECS {
+        return Err(CoreError::Invalid(
+            "fin de session du portail passée ou à plus de 8 heures".into(),
+        ));
+    }
+    sqlx::query!(
+        "INSERT INTO login_session (id, user_id, channel, started_at, expires_at)
+         VALUES ($1::text::uuid, $2::text::uuid, 'web', $3, $4)",
+        session.to_string(),
+        user.to_string(),
+        i64_of(now),
+        i64_of(expires_at),
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Revokes `session` for `reason`; the actor is the database user. The
 /// running core tells the agents concerned. Revoking a revoked session
 /// changes nothing.

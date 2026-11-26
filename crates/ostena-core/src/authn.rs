@@ -36,7 +36,7 @@
 //! of the SSH accesses (`ostena config ssh`) is signed the same way, under
 //! another domain, and reads only.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +46,7 @@ use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
 use ostena_common::api::login::{
     self, LoginRequest, LoginResponse, LogoutRequest, SshAccess, SshHostsRequest, SshHostsResponse,
 };
+use ostena_common::api::web::Channel;
 use ostena_common::config::CoreLoginConfig;
 use ostena_common::secret::SecretString;
 use ostena_crypto::p256::{Signature, VerifyingKey};
@@ -118,10 +119,55 @@ struct Attempt<'a> {
     user: Uuid,
     name: &'a str,
     peer: SocketAddr,
+    channel: Channel,
+}
+
+/// What a successful authentication opens.
+pub(crate) enum Opening {
+    /// `ostena login`: a login session and its user certificate.
+    Cli {
+        public: VerifyingKey,
+        ttl_secs: Option<u64>,
+    },
+    /// The portal: a login session of channel `web` and its cookie
+    /// (ADR-0020).
+    Web {
+        cookie_sha256: [u8; 32],
+        source: IpAddr,
+        session_secs: u64,
+    },
+    /// The portal, again for an open browser session: a new cookie value.
+    Reauthenticate {
+        session: Uuid,
+        user: Uuid,
+        cookie_sha256: [u8; 32],
+    },
+}
+
+impl Opening {
+    fn channel(&self) -> Channel {
+        match self {
+            Self::Cli { .. } => Channel::Cli,
+            Self::Web { .. } | Self::Reauthenticate { .. } => Channel::Web,
+        }
+    }
+}
+
+/// What a successful authentication opened.
+pub(crate) enum Opened {
+    Cli(LoginResponse),
+    /// A browser session opened or authenticated again.
+    Web,
 }
 
 /// `login.refused` with its cause, for the audit chain only.
-fn refusal_event(cause: Cause, user: Option<Uuid>, name: &str, peer: SocketAddr) -> Event {
+fn refusal_event(
+    cause: Cause,
+    user: Option<Uuid>,
+    name: &str,
+    peer: SocketAddr,
+    channel: Channel,
+) -> Event {
     let actor = user.map_or_else(|| peer.ip().to_string(), |u| u.to_string());
     let kind = if user.is_some() {
         ActorKind::User
@@ -132,7 +178,8 @@ fn refusal_event(cause: Cause, user: Option<Uuid>, name: &str, peer: SocketAddr)
         .text(field::NAME, truncate(name))
         .text(field::CODE, ApiCode::InvalidCredentials.as_str())
         .text(field::REASON, cause.as_str())
-        .text(field::CLIENT_ADDR, peer.to_string());
+        .text(field::CLIENT_ADDR, peer.to_string())
+        .text(field::CHANNEL, channel.as_str());
     if let Some(user) = user {
         event = event.uuid(field::USER_ID, user.to_bytes());
     }
@@ -325,19 +372,15 @@ impl PgAuthenticator {
 
     async fn decide(
         &self,
-        request: LoginRequest,
-        public: VerifyingKey,
+        username: &str,
+        password: SecretString,
+        totp: &SecretString,
+        opening: Opening,
         peer: SocketAddr,
-    ) -> Result<LoginResponse, Failure> {
-        let LoginRequest {
-            username,
-            password,
-            totp,
-            ttl_secs,
-            ..
-        } = request;
+    ) -> Result<Opened, Failure> {
+        let channel = opening.channel();
         // Phase 1, no lock.
-        let (user, digest) = self.read_digest(&username).await?;
+        let (user, digest) = self.read_digest(username).await?;
         let stored = digest.as_deref().and_then(|d| PasswordHash::parse(d).ok());
         let (password_ok, rehash) = self.derive(password, stored).await?;
         let Some(user) = user else {
@@ -345,15 +388,19 @@ impl PgAuthenticator {
         };
         let attempt = Attempt {
             user,
-            name: &username,
+            name: username,
             peer,
+            channel,
         };
+        if let Opening::Reauthenticate { user: owner, .. } = &opening
+            && *owner != user
+        {
+            return Err(Failure::Refused(Cause::Changed, Some(user)));
+        }
 
         // Phase 2, the locks in the canonical order, everything checked again.
         let mut tx = self.pool.begin().await?;
-        let (locked_user, active) = lock_user(&mut tx, &username)
-            .await?
-            .unwrap_or((user, false));
+        let (locked_user, active) = lock_user(&mut tx, username).await?.unwrap_or((user, false));
         if locked_user != user {
             return Err(self.refuse(tx, Cause::Changed, &attempt).await);
         }
@@ -398,7 +445,7 @@ impl PgAuthenticator {
         };
         let last_step = u64::try_from(row.totp_last_step).unwrap_or(0);
         let checked = if password_ok {
-            self.check_code(user, algorithm, &sealed, &totp, now, last_step)
+            self.check_code(user, algorithm, &sealed, totp, now, last_step)
         } else {
             Err(Cause::Password)
         };
@@ -415,10 +462,9 @@ impl PgAuthenticator {
             tx,
             Success {
                 user,
-                public,
+                opening,
                 step,
                 rehash,
-                ttl_secs,
                 peer,
                 now,
             },
@@ -472,9 +518,11 @@ impl PgAuthenticator {
     /// Refuses a known account without counting a failure: `login.refused`
     /// is written in `tx` (protective), then committed.
     async fn refuse(&self, mut tx: Tx<'_>, cause: Cause, a: &Attempt<'_>) -> Failure {
-        let appended =
-            audit::append_protective(&mut tx, refusal_event(cause, Some(a.user), a.name, a.peer))
-                .await;
+        let appended = audit::append_protective(
+            &mut tx,
+            refusal_event(cause, Some(a.user), a.name, a.peer, a.channel),
+        )
+        .await;
         if let Err(e) = tx.commit().await {
             return Failure::Broken(e.into());
         }
@@ -505,9 +553,11 @@ impl PgAuthenticator {
             )
             .execute(&mut *tx)
             .await?;
-            let appended =
-                audit::append_protective(&mut tx, refusal_event(cause, Some(user), name, a.peer))
-                    .await;
+            let appended = audit::append_protective(
+                &mut tx,
+                refusal_event(cause, Some(user), name, a.peer, a.channel),
+            )
+            .await;
             tx.commit().await?;
             if let Some(appended) = appended {
                 self.recorder.critical(&[appended]);
@@ -525,15 +575,19 @@ impl PgAuthenticator {
         .execute(&mut *tx)
         .await?;
         // Protective, last statements before the commit.
-        let refused =
-            audit::append_protective(&mut tx, refusal_event(cause, Some(user), name, a.peer)).await;
+        let refused = audit::append_protective(
+            &mut tx,
+            refusal_event(cause, Some(user), name, a.peer, a.channel),
+        )
+        .await;
         let locked = audit::append_protective(
             &mut tx,
             user_event(EventKind::LoginLocked, Outcome::Failure, user)
                 .uuid(field::USER_ID, user.to_bytes())
                 .text(field::NAME, name)
                 .u64(field::FAILURES, u64::from(failures))
-                .u64(field::LOCKED_UNTIL, until),
+                .u64(field::LOCKED_UNTIL, until)
+                .text(field::CHANNEL, a.channel.as_str()),
         )
         .await;
         tx.commit().await?;
@@ -551,22 +605,7 @@ impl PgAuthenticator {
         Ok(())
     }
 
-    async fn succeed(&self, mut tx: Tx<'_>, s: Success) -> Result<LoginResponse, Failure> {
-        let session = sessions::new_session_id()?;
-        let ttl = s
-            .ttl_secs
-            .unwrap_or(self.settings.session_secs)
-            .clamp(60, self.settings.session_secs);
-        let valid_after = s.now.saturating_sub(CERTIFICATE_SKEW);
-        let valid_before = s.now + ttl;
-        let issued = self.ssh.issue_user(
-            &s.public,
-            s.user.to_bytes(),
-            session.to_bytes(),
-            valid_after,
-            valid_before,
-            true,
-        )?;
+    async fn succeed(&self, mut tx: Tx<'_>, s: Success) -> Result<Opened, Failure> {
         sqlx::query!(
             "UPDATE user_credential
              SET failed_attempts = 0, last_failure_at = NULL, locked_until = NULL,
@@ -582,29 +621,189 @@ impl PgAuthenticator {
         )
         .execute(&mut *tx)
         .await?;
-        sessions::open_session(&mut tx, session, s.user, issued.sha256, valid_before).await?;
-        let appended = audit::append(
-            &mut tx,
-            user_event(EventKind::LoginSucceeded, Outcome::Success, s.user)
-                .uuid(field::USER_ID, s.user.to_bytes())
-                .uuid(field::LOGIN_SESSION, session.to_bytes())
-                .bytes(field::CERTIFICATE_SHA256, issued.sha256)
-                .bytes(field::P256_PUBLIC, s.public.to_bytes())
-                .u64(field::EXPIRES_AT, valid_before)
-                .text(field::CLIENT_ADDR, s.peer.to_string()),
+        let rehashed = s.rehash.is_some();
+        match s.opening {
+            Opening::Cli { public, ttl_secs } => {
+                let granted = Granted {
+                    user: s.user,
+                    peer: s.peer,
+                    now: s.now,
+                    rehashed,
+                };
+                self.open_cli(tx, granted, &public, ttl_secs)
+                    .await
+                    .map(Opened::Cli)
+            }
+            Opening::Web {
+                cookie_sha256,
+                source,
+                session_secs,
+            } => {
+                let web = WebOpening {
+                    cookie_sha256,
+                    source,
+                    session_secs,
+                };
+                self.open_web(tx, s.user, s.peer, s.now, web, rehashed)
+                    .await
+            }
+            Opening::Reauthenticate {
+                session,
+                cookie_sha256,
+                ..
+            } => {
+                self.renew_web(tx, s.user, s.peer, s.now, session, cookie_sha256)
+                    .await
+            }
+        }
+    }
+
+    /// The browser: opens a login session of channel `web` and its cookie.
+    async fn open_web(
+        &self,
+        mut tx: Tx<'_>,
+        user: Uuid,
+        peer: SocketAddr,
+        now: u64,
+        web: WebOpening,
+        rehashed: bool,
+    ) -> Result<Opened, Failure> {
+        let WebOpening {
+            cookie_sha256,
+            source,
+            session_secs,
+        } = web;
+        let session = sessions::new_session_id()?;
+        let expires_at = now + session_secs.clamp(60, sessions::MAX_LOGIN_SECS);
+        sessions::open_web_session(&mut tx, session, user, now, expires_at).await?;
+        sqlx::query!(
+            "INSERT INTO web_session
+                 (login_session_id, cookie_sha256, source, authenticated_at,
+                  last_activity_at)
+             VALUES ($1::text::uuid, $2, $3, $4, $4)",
+            session.to_string(),
+            &cookie_sha256[..],
+            source.to_string(),
+            i64_of(now),
         )
+        .execute(&mut *tx)
         .await?;
+        let event = user_event(EventKind::LoginSucceeded, Outcome::Success, user)
+            .uuid(field::USER_ID, user.to_bytes())
+            .uuid(field::LOGIN_SESSION, session.to_bytes())
+            .u64(field::EXPIRES_AT, expires_at)
+            .text(field::CLIENT_ADDR, peer.to_string())
+            .text(field::SOURCE, source.to_string())
+            .text(field::CHANNEL, Channel::Web.as_str());
+        self.commit_granting(tx, event).await?;
+        tracing::info!(
+            event = "login.succeeded",
+            channel = "web",
+            user = %user,
+            login_session = %session,
+            expires_at,
+            client_addr = %peer,
+            rehashed,
+            "session du portail ouverte"
+        );
+        Ok(Opened::Web)
+    }
+
+    /// Re-authentication: a new cookie digest for a live web session.
+    async fn renew_web(
+        &self,
+        mut tx: Tx<'_>,
+        user: Uuid,
+        peer: SocketAddr,
+        now: u64,
+        session: Uuid,
+        cookie_sha256: [u8; 32],
+    ) -> Result<Opened, Failure> {
+        let renewed = sqlx::query_scalar!(
+            r#"UPDATE web_session w
+               SET cookie_sha256 = $2, authenticated_at = $3, last_activity_at = $3
+               FROM login_session s
+               WHERE w.login_session_id = $1::text::uuid AND s.id = w.login_session_id
+                 AND user_id = $4::text::uuid
+                 AND s.revoked_at IS NULL AND s.expires_at > $3
+               RETURNING true AS "renewed!""#,
+            session.to_string(),
+            &cookie_sha256[..],
+            i64_of(now),
+            user.to_string(),
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if renewed.is_none() {
+            // Revoked or expired meanwhile: nothing is renewed.
+            return Err(Failure::Refused(Cause::Changed, Some(user)));
+        }
+        let event = user_event(EventKind::WebSessionReauthenticated, Outcome::Success, user)
+            .uuid(field::USER_ID, user.to_bytes())
+            .uuid(field::LOGIN_SESSION, session.to_bytes())
+            .text(field::CLIENT_ADDR, peer.to_string());
+        self.commit_granting(tx, event).await?;
+        tracing::info!(
+            event = "web_session.reauthenticated",
+            user = %user,
+            login_session = %session,
+            client_addr = %peer,
+            "session du portail authentifiée de nouveau"
+        );
+        Ok(Opened::Web)
+    }
+
+    /// Appends the granting `event` and commits; a failed commit is an audit
+    /// failure (nothing is opened).
+    async fn commit_granting(&self, mut tx: Tx<'_>, event: Event) -> Result<(), Failure> {
+        let appended = audit::append(&mut tx, event).await?;
         tx.commit()
             .await
             .map_err(|e| CoreError::AuditWrite(e.to_string()))?;
         self.recorder.critical(&[appended]);
+        Ok(())
+    }
+
+    /// `ostena login`: issues the user certificate and opens its session.
+    async fn open_cli(
+        &self,
+        mut tx: Tx<'_>,
+        s: Granted,
+        public: &VerifyingKey,
+        ttl_secs: Option<u64>,
+    ) -> Result<LoginResponse, Failure> {
+        let session = sessions::new_session_id()?;
+        let ttl = ttl_secs
+            .unwrap_or(self.settings.session_secs)
+            .clamp(60, self.settings.session_secs);
+        let valid_after = s.now.saturating_sub(CERTIFICATE_SKEW);
+        let valid_before = s.now + ttl;
+        let issued = self.ssh.issue_user(
+            public,
+            s.user.to_bytes(),
+            session.to_bytes(),
+            valid_after,
+            valid_before,
+            true,
+        )?;
+        sessions::open_session(&mut tx, session, s.user, issued.sha256, valid_before).await?;
+        let event = user_event(EventKind::LoginSucceeded, Outcome::Success, s.user)
+            .uuid(field::USER_ID, s.user.to_bytes())
+            .uuid(field::LOGIN_SESSION, session.to_bytes())
+            .bytes(field::CERTIFICATE_SHA256, issued.sha256)
+            .bytes(field::P256_PUBLIC, public.to_bytes())
+            .u64(field::EXPIRES_AT, valid_before)
+            .text(field::CLIENT_ADDR, s.peer.to_string())
+            .text(field::CHANNEL, Channel::Cli.as_str());
+        self.commit_granting(tx, event).await?;
         tracing::info!(
             event = "login.succeeded",
+            channel = "cli",
             user = %s.user,
             login_session = %session,
             expires_at = valid_before,
             client_addr = %s.peer,
-            rehashed = s.rehash.is_some(),
+            rehashed = s.rehashed,
             "session de connexion ouverte"
         );
         Ok(LoginResponse {
@@ -804,15 +1003,16 @@ impl PgAuthenticator {
         &self,
         cause: Cause,
         user: Option<Uuid>,
-        name: &str,
-        peer: SocketAddr,
+        (name, peer, channel): (&str, SocketAddr, Channel),
         recorded: bool,
     ) {
         if !recorded {
-            self.recorder.emit(refusal_event(cause, user, name, peer));
+            self.recorder
+                .emit(refusal_event(cause, user, name, peer, channel));
         }
         tracing::info!(
             event = "login.refused",
+            channel = channel.as_str(),
             name = %truncate(name).escape_debug(),
             reason = cause.as_str(),
             client_addr = %peer,
@@ -823,12 +1023,26 @@ impl PgAuthenticator {
 
 struct Success {
     user: Uuid,
-    public: VerifyingKey,
+    opening: Opening,
     step: u64,
     rehash: Option<String>,
-    ttl_secs: Option<u64>,
     peer: SocketAddr,
     now: u64,
+}
+
+/// What a browser login opens.
+struct WebOpening {
+    cookie_sha256: [u8; 32],
+    source: IpAddr,
+    session_secs: u64,
+}
+
+/// A granted `ostena login`, for its certificate.
+struct Granted {
+    user: Uuid,
+    peer: SocketAddr,
+    now: u64,
+    rehashed: bool,
 }
 
 fn broken(e: &CoreError) -> ApiError {
@@ -863,6 +1077,45 @@ fn bastion_host<'a>(group_names: &'a [String], patterns: &[String]) -> Option<&'
         .map(String::as_str)
 }
 
+impl PgAuthenticator {
+    /// Checks the password and the TOTP code of `username` and, on
+    /// success, opens what `opening` asks for. Every refusal is
+    /// `AUTH-E001` after the refusal floor, its cause in the audit chain.
+    pub(crate) async fn authenticate(
+        &self,
+        username: &str,
+        password: SecretString,
+        totp: &SecretString,
+        opening: Opening,
+        peer: SocketAddr,
+        start: tokio::time::Instant,
+    ) -> Result<Opened, ApiError> {
+        let channel = opening.channel();
+        match self.decide(username, password, totp, opening, peer).await {
+            Ok(opened) => Ok(opened),
+            Err(Failure::Refused(cause, user)) => {
+                self.refused(cause, user, (username, peer, channel), false);
+                Err(self.invalid_credentials(start).await)
+            }
+            Err(Failure::Recorded(cause, user)) => {
+                self.refused(cause, Some(user), (username, peer, channel), true);
+                Err(self.invalid_credentials(start).await)
+            }
+            Err(Failure::Broken(e)) => Err(broken(&e)),
+        }
+    }
+
+    /// The pool of the store.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// The recorder of the audit chain.
+    pub(crate) fn recorder(&self) -> &Arc<Recorder> {
+        &self.recorder
+    }
+}
+
 impl Authenticator for PgAuthenticator {
     async fn login(
         &self,
@@ -876,18 +1129,20 @@ impl Authenticator for PgAuthenticator {
                 "clé publique refusée : point P-256 non compressé attendu",
             ));
         };
-        let name = request.username.clone();
-        match self.decide(request, public, peer).await {
-            Ok(response) => Ok(response),
-            Err(Failure::Refused(cause, user)) => {
-                self.refused(cause, user, &name, peer, false);
-                Err(self.invalid_credentials(start).await)
-            }
-            Err(Failure::Recorded(cause, user)) => {
-                self.refused(cause, Some(user), &name, peer, true);
-                Err(self.invalid_credentials(start).await)
-            }
-            Err(Failure::Broken(e)) => Err(broken(&e)),
+        let LoginRequest {
+            username,
+            password,
+            totp,
+            ttl_secs,
+            ..
+        } = request;
+        let opening = Opening::Cli { public, ttl_secs };
+        match self
+            .authenticate(&username, password, &totp, opening, peer, start)
+            .await?
+        {
+            Opened::Cli(response) => Ok(response),
+            Opened::Web => Err(ApiError::unavailable()),
         }
     }
 

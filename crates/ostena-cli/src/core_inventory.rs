@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+use ostena_common::api::web::Role;
 use ostena_common::config::scope::PolicySpec;
 use ostena_core::{access, credential, inventory, login};
 use ostena_tunnel::Uuid;
@@ -166,6 +167,34 @@ pub(crate) fn user_disable(path: &Path, name: &str) -> ExitCode {
         inventory::disable_user(&pool, name)
             .await
             .map(|n| format!("{name} désactivé, {n} session(s) de connexion révoquée(s)"))
+    }))
+}
+
+/// `ostena core user role-grant|role-revoke`: a role of the portal
+/// (ADR-0020).
+pub(crate) fn user_role(path: &Path, name: &str, role: &str, grant: bool) -> ExitCode {
+    init_admin_logging(path);
+    let Some(role) = Role::parse(role) else {
+        return fail(&format!(
+            "rôle « {} » inconnu : admin attendu",
+            role.escape_debug()
+        ));
+    };
+    done(admin(path, async move |pool| {
+        let changed = if grant {
+            inventory::grant_role(&pool, name, role).await?
+        } else {
+            inventory::revoke_role(&pool, name, role).await?
+        };
+        let roles = inventory::user_roles(&pool, name).await?;
+        let list: Vec<_> = roles.iter().map(|r| r.as_str()).collect();
+        let what = match (grant, changed) {
+            (true, true) => "rôle accordé",
+            (true, false) => "rôle déjà accordé",
+            (false, true) => "rôle retiré",
+            (false, false) => "rôle déjà absent",
+        };
+        Ok(format!("{name} : {what} ; rôles : {}", list.join(", ")))
     }))
 }
 

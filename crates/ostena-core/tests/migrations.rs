@@ -82,6 +82,21 @@ async fn rows_of(pool: &PgPool) -> Vec<String> {
     out
 }
 
+/// The lines of `rows` (from [`rows_of`]) whose table exists in `schema`
+/// (from [`schema_of`]): a table created by migration N goes with its down
+/// migration, and so do its rows, which N-1 does not know.
+fn known_at(rows: &[String], schema: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter(|line| {
+            let table = line.split(' ').next().unwrap_or_default();
+            schema
+                .iter()
+                .any(|s| s.starts_with(&format!("relation {table} ")))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Rows in the tables of M1, written as the owner (before migration 6 the
 /// service role has no privilege yet).
 async fn seed(pool: &PgPool, n: u8) {
@@ -134,7 +149,7 @@ fn every_reversible_migration_goes_down_and_up_without_loss() {
             }
             let rows = rows_of(&owner).await;
 
-            // N -> N-1: the schema of N-1 exactly, every row kept.
+            // N -> N-1: the schema of N-1 exactly, every row it knows kept.
             assert_eq!(
                 schema::revert(&owner, version - 1).await.unwrap(),
                 [version]
@@ -142,7 +157,7 @@ fn every_reversible_migration_goes_down_and_up_without_loss() {
             assert_eq!(schema_of(&owner).await, before, "retour de {version}");
             assert_eq!(
                 rows_of(&owner).await,
-                rows,
+                known_at(&rows, &before),
                 "lignes après retour de {version}"
             );
             // Nothing left to revert down to the same version.
@@ -193,6 +208,48 @@ fn reverting_below_the_m1_schema_is_refused() {
         let e = schema::require_up_to_date(&app).await.unwrap_err();
         assert_eq!(e.code(), "CORE-E005", "{e}");
         app.close().await;
+        owner.close().await;
+        db.drop_database().await;
+    });
+}
+
+#[test]
+fn reverting_the_portal_removes_only_the_browser_sessions() {
+    block_on(async {
+        let Some(db) =
+            TestDb::create("reverting_the_portal_removes_only_the_browser_sessions").await
+        else {
+            return;
+        };
+        db.migrate().await;
+        let owner = db.owner_pool().await;
+        for sql in [
+            "INSERT INTO app_user (id, name, display_name)
+             VALUES ('11111111-1111-1111-1111-111111111111', 'alice', 'Alice')",
+            "INSERT INTO login_session (id, user_id, certificate_sha256, started_at, expires_at)
+             VALUES ('22222222-2222-2222-2222-222222222222',
+                     '11111111-1111-1111-1111-111111111111', decode(repeat('ab', 32), 'hex'),
+                     1000, 2000)",
+            "INSERT INTO login_session (id, user_id, channel, started_at, expires_at)
+             VALUES ('33333333-3333-3333-3333-333333333333',
+                     '11111111-1111-1111-1111-111111111111', 'web', 1000, 2000)",
+            "INSERT INTO web_session (login_session_id, cookie_sha256, source,
+                                      authenticated_at, last_activity_at)
+             VALUES ('33333333-3333-3333-3333-333333333333', decode(repeat('cd', 32), 'hex'),
+                     '127.0.0.1', 1000, 1000)",
+            "INSERT INTO user_role (user_id, role, granted_by)
+             VALUES ('11111111-1111-1111-1111-111111111111', 'admin', 'peer:root')",
+        ] {
+            sqlx::query(sql).execute(&owner).await.unwrap();
+        }
+        // Migration 7 (the portal) goes: its tables and the login sessions of
+        // channel web; the session of `ostena login` stays.
+        assert_eq!(schema::revert(&owner, 6).await.unwrap(), [7]);
+        let left: Vec<String> = sqlx::query_scalar("SELECT id::text FROM login_session")
+            .fetch_all(&owner)
+            .await
+            .unwrap();
+        assert_eq!(left, ["22222222-2222-2222-2222-222222222222"]);
         owner.close().await;
         db.drop_database().await;
     });
