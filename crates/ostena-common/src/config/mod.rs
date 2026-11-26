@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 pub use self::core::{
     CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig, DatabaseTcp,
-    KeySource, TotpAlgorithmSetting,
+    GROUP_ROLES, KeySource, TotpAlgorithmSetting,
 };
 pub use agent::{AgentConfig, AgentSshConfig, InfrastructureEndpoint, SshPaths};
 pub use permissions::{DefaultPermissions, PermissionChecker};

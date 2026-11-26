@@ -1102,6 +1102,7 @@ fn core_section_defaults_are_safe() {
     let db = &core.database;
     assert_eq!(db.socket_dir, PathBuf::from("/var/run/postgresql"));
     assert_eq!((db.name.as_str(), db.user.as_str()), ("ostena", "ostena"));
+    assert_eq!(db.migration_user, "ostena_admin");
     assert_eq!(db.max_connections, 8);
     assert!(db.tcp.is_none());
     let audit = &core.audit;
@@ -1301,6 +1302,15 @@ fn v012_core_bounds() {
 #[test]
 fn v013_database_identifiers() {
     let c = core_with("[core.database]\nname = \"Ostena\"\nuser = \"a;drop\"\n");
+    assert_eq!(
+        core_codes(&c),
+        vec![Code::DatabaseIdentifier, Code::DatabaseIdentifier]
+    );
+    let c = core_with("[core.database]\nmigration_user = \"ostena-admin\"\n");
+    assert_eq!(core_codes(&c), vec![Code::DatabaseIdentifier]);
+    // The group roles of the schema are never login roles.
+    let c =
+        core_with("[core.database]\nuser = \"ostena_app\"\nmigration_user = \"ostena_owner\"\n");
     assert_eq!(
         core_codes(&c),
         vec![Code::DatabaseIdentifier, Code::DatabaseIdentifier]

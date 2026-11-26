@@ -255,8 +255,15 @@ pub struct DatabaseConfig {
     pub port: u16,
     /// Database name.
     pub name: String,
-    /// Role, which owns the schema; with `peer`, the service account name.
+    /// Login role of the service and of the administration commands; with
+    /// `peer`, the service account name. It only connects: its sessions
+    /// take the privileges of `ostena_app` (`SET ROLE`), never those of the
+    /// schema owner (ADR-0011).
     pub user: String,
+    /// Login role of `ostena core migrate`; with `peer`, the name of the
+    /// administration account. Its sessions take the role `ostena_owner`,
+    /// owner of the schema (ADR-0011).
+    pub migration_user: String,
     /// Connection pool size, 1 to 64.
     pub max_connections: u32,
     /// Connection timeout, 1 to 60 s.
@@ -272,12 +279,18 @@ impl Default for DatabaseConfig {
             port: 5432,
             name: "ostena".into(),
             user: "ostena".into(),
+            migration_user: "ostena_admin".into(),
             max_connections: DEFAULT_MAX_CONNECTIONS,
             connect_timeout_secs: 5,
             tcp: None,
         }
     }
 }
+
+/// The group roles of the core database (ADR-0011): the owner of the
+/// schema and the role of the service. Their names are fixed (the
+/// migrations grant to them); `user` and `migration_user` cannot take them.
+pub const GROUP_ROLES: [&str; 2] = ["ostena_owner", "ostena_app"];
 
 /// A TCP connection to PostgreSQL, in clear text: development only.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -555,6 +568,7 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
     for (field, value) in [
         ("core.database.name", &db.name),
         ("core.database.user", &db.user),
+        ("core.database.migration_user", &db.migration_user),
     ] {
         if !is_identifier(value) {
             out.push(Violation::new(
@@ -562,6 +576,21 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
                 format!(
                     "{field} = « {value} » : minuscules, chiffres et « _ » attendus \
                      (63 octets au plus, sans chiffre en tête)."
+                ),
+            ));
+        }
+    }
+    // The group roles of the schema (ADR-0011): never a login role.
+    for (field, value) in [
+        ("core.database.user", &db.user),
+        ("core.database.migration_user", &db.migration_user),
+    ] {
+        if GROUP_ROLES.contains(&value.as_str()) {
+            out.push(Violation::new(
+                Code::DatabaseIdentifier,
+                format!(
+                    "{field} = « {value} » : rôle de groupe réservé au schéma, pas un compte de \
+                     connexion."
                 ),
             ));
         }

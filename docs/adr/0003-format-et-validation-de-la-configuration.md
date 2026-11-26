@@ -4,6 +4,7 @@
 - **Date** : 2026-11-11
 - **Révisé** : 2026-11-11 — section `[agent]` (`CFG-V006` à `V010`, `CFG-P007` à `P010`) et `CFG-P006` sous Windows
 - **Révisé** : 2026-11-25 — `CFG-P016`, droits du répertoire des transcripts (ADR-0016)
+- **Révisé** : 2026-11-26 — `CFG-V013` couvre `core.database.migration_user` et les rôles de groupe du schéma (ADR-0011, rôles séparés)
 
 ## Contexte
 
@@ -57,7 +58,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P010` | production | nom d'infrastructure impossible à résoudre au démarrage de l'agent (vérifié avant le lien avec le core ; rafraîchi toutes les 5 minutes, un échec garde les adresses précédentes) |
 | `CFG-V011` | cohérence | point de contrôle local de l'agent invalide |
 | `CFG-V012` | cohérence | section `[core]` : valeur hors bornes (validité des certificats d'agent et des certificats d'hôte SSH 1 à 90 jours, threads 1 à 64, pool 1 à 64, délai de connexion 1 à 60 s, port nul) ou adresse d'enrôlement égale à celle du tunnel |
-| `CFG-V013` | cohérence | nom de base, rôle ou hôte PostgreSQL invalide (minuscules, chiffres et `_`, 63 octets au plus) |
+| `CFG-V013` | cohérence | nom de base, rôle (`user`, `migration_user`) ou hôte PostgreSQL invalide (minuscules, chiffres et `_`, 63 octets au plus), ou rôle de connexion qui reprend un rôle de groupe du schéma (`ostena_owner`, `ostena_app` ; ADR-0011) |
 | `CFG-V014` | cohérence | nom de credential systemd invalide pour une clé du core |
 | `CFG-V015` | cohérence | section `[agent.ssh]` : adresse d'écoute invalide ou absente, valeur hors bornes (`max_sessions`, `max_unauthenticated` et `max_unauthenticated_per_source` 1 à 256, `login_grace_secs` 5 à 120, `target_connect_timeout_secs` 1 à 30), ou clé d'hôte et clé vers les cibles dans le même fichier (ADR-0010) |
 | `CFG-V016` | cohérence | deux clés privées du core désignent la même source (fichier ou *credential*) : TLS, émission, tête d'audit, signature des grants, autorités SSH (ADR-0014), chiffrement des secrets TOTP (ADR-0010) |
