@@ -61,7 +61,7 @@ Ce que contient le paquet (`packaging/windows/ostena-agent.wxs`) :
 
 - **Fichiers** : `ostena.exe` et `LICENSE.txt` dans `C:\Program Files\Ostena`, x64, installation par machine, aucune interface.
 - **Propriétés publiques** : `COREADDRESS`, `GATEWAYGROUP`, `ENROLLMENTADDRESS`, `ROOTCAFILE`, `ROOTFINGERPRINT`, `ENROLLTOKENFILE`.
-- **Actions personnalisées** différées, exécutées en SYSTEM (`Impersonate="no"`, type 3090), qui appellent le binaire installé :
+- **Actions personnalisées** différées, exécutées en SYSTEM (`Impersonate="no"`), qui appellent le binaire installé : par sa ligne de la table `File` pour `setup` (type 3090), par une propriété posée depuis son dossier pour `uninstall` (type 3122), parce qu'à la désinstallation Windows Installer refuse de résoudre un fichier en cours de retrait (erreur 2731) :
   - après `InstallFiles` : `ostena agent setup --quiet --log C:\ProgramData\Ostena\setup.log …` à l'installation, à la réparation et à la mise à jour. Un échec fait échouer l'installation (1603) ;
   - si la première installation échoue, l'action d'annulation (*rollback*) lance `ostena agent uninstall` tant que `ostena.exe` est encore là. Une réparation qui échoue laisse l'agent en place tourner ;
   - avant `RemoveFiles`, à la désinstallation : `ostena agent uninstall`.

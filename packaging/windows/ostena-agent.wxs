@@ -96,22 +96,31 @@
          registered, while ostena.exe is still there. Not on a repair: the
          agent in place keeps running. -->
     <CustomAction Id="OstenaSetupRollback"
-                  FileKey="OstenaExe"
+                  Property="OSTENA_EXE"
                   ExeCommand="agent uninstall --quiet"
                   Execute="rollback"
                   Impersonate="no"
                   Return="ignore" />
+    <!-- Removal: the executable is named by a property set from its
+         directory once costing is done (types 51 then 50), not by its File
+         row (type 18): during a removal the file is being uninstalled, and
+         Windows Installer refuses to resolve it (error 2731). -->
+    <CustomAction Id="OstenaExePath" Property="OSTENA_EXE" Value="[INSTALLDIR]ostena.exe" />
     <CustomAction Id="OstenaUninstall"
-                  FileKey="OstenaExe"
+                  Property="OSTENA_EXE"
                   ExeCommand="agent uninstall --quiet"
                   Execute="deferred"
                   Impersonate="no"
                   Return="check" />
 
     <InstallExecuteSequence>
+      <!-- Explicit sequence numbers: wixl does not always honour Before and
+           After. The path right after CostFinalize, so the deferred actions
+           see it; the removal right before RemoveFiles. -->
+      <Custom Action="OstenaExePath" Sequence="1001" />
       <!-- Early removal of the old version: right after InstallInitialize. -->
       <RemoveExistingProducts Sequence="1501" />
-      <Custom Action="OstenaUninstall" Before="RemoveFiles">REMOVE="ALL"</Custom>
+      <Custom Action="OstenaUninstall" Sequence="3499">REMOVE="ALL"</Custom>
       <Custom Action="OstenaSetupRollback" After="InstallFiles">NOT Installed AND NOT REMOVE="ALL"</Custom>
       <Custom Action="OstenaSetup" After="OstenaSetupRollback">NOT REMOVE="ALL"</Custom>
     </InstallExecuteSequence>

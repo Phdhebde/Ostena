@@ -31,15 +31,20 @@ wixl --arch x64 \
     -o "$msi" "$here/ostena-agent.wxs"
 
 # The tables that make the package what ADR-0024 says it is: the setup and
-# removal run as deferred, non-impersonated actions (type 3090), the old
+# removal run as deferred, non-impersonated actions (types 3090 and
+# 3122: executable from the installed file, from a property), the old
 # version is removed right after InstallInitialize.
 if command -v msiinfo >/dev/null; then
     actions=$(msiinfo export "$msi" CustomAction)
     sequence=$(msiinfo export "$msi" InstallExecuteSequence)
     grep -q $'^OstenaSetup\t3090\tOstenaExe\tagent setup ' <<<"$actions" \
         || { echo "OstenaSetup is not a deferred, non-impersonated action" >&2; exit 1; }
-    grep -q $'^OstenaUninstall\t3090\tOstenaExe\tagent uninstall --quiet' <<<"$actions" \
+    grep -q $'^OstenaUninstall\t3122\tOSTENA_EXE\tagent uninstall --quiet' <<<"$actions" \
         || { echo "OstenaUninstall is not a deferred, non-impersonated action" >&2; exit 1; }
+    grep -q $'^OstenaExePath\t\t1001' <<<"$sequence" \
+        || { echo "OstenaExePath is not right after CostFinalize" >&2; exit 1; }
+    grep -q $'^OstenaUninstall\tREMOVE="ALL"\t3499' <<<"$sequence" \
+        || { echo "OstenaUninstall is not right before RemoveFiles" >&2; exit 1; }
     grep -q $'^RemoveExistingProducts\t\t1501' <<<"$sequence" \
         || { echo "RemoveExistingProducts is not right after InstallInitialize" >&2; exit 1; }
 fi
