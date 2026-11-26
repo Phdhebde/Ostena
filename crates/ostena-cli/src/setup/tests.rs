@@ -169,6 +169,14 @@ fn installs_root_and_configuration_then_is_idempotent() {
     let (result, said) = run(&args, &layout);
     result.unwrap();
     assert_eq!(fs::read_to_string(&layout.root).unwrap(), pem);
+    // The service account reads the root: public, unlike the configuration.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&layout.root), 0o644);
+        assert_eq!(mode(&dir.config()), 0o640);
+    }
     let config = agent::read(&dir.config()).unwrap();
     let agent = config.agent.unwrap();
     assert_eq!(agent.core_address, "core.example.test:8443");

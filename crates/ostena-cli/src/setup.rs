@@ -236,7 +236,7 @@ pub(crate) fn prepare(
             );
         }
         let text = render_config(core, group, args.enrollment_address.as_deref(), layout)?;
-        write_new(&args.config, text.as_bytes())?;
+        write_new(&args.config, text.as_bytes(), 0o640)?;
         say(&format!("Configuration écrite : {}", args.config.display()));
         layout.root.clone()
     };
@@ -245,7 +245,7 @@ pub(crate) fn prepare(
     // different one; an existing one is checked when a fingerprint is given.
     match (&given_root, root_path.exists()) {
         (Some(pem), false) => {
-            write_new(&root_path, pem)?;
+            write_new(&root_path, pem, 0o644)?;
             say(&format!(
                 "Certificat de la racine installé : {}",
                 root_path.display()
@@ -423,16 +423,21 @@ pub(crate) fn render_config(
     Ok(text)
 }
 
-/// Creates a new file (never overwrites), with its parent directory.
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// Creates a new file (never overwrites), with its parent directory; `mode`
+/// on Unix: 0640 for the configuration (`install` gives it to the service
+/// group), 0644 for the root certificate, which is public and read by the
+/// service.
+fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let failed = |e: io::Error| format!("{} : {e}", path.display());
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         fs::create_dir_all(dir).map_err(failed)?;
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o640);
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
     let mut file = options.open(path).map_err(failed)?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())

@@ -812,7 +812,7 @@ enum AgentCommand {
         #[arg(long, default_value_os_t = agent::default_config())]
         config: PathBuf,
         /// Executable to register (default: this one).
-        #[arg(long)]
+        #[arg(long, value_parser = path_or_empty())]
         executable: Option<PathBuf>,
         /// Core address, `host:port` (new configuration).
         #[arg(long)]
@@ -825,7 +825,7 @@ enum AgentCommand {
         #[arg(long)]
         enrollment_address: Option<String>,
         /// Root certificate (PEM) to install next to the configuration.
-        #[arg(long)]
+        #[arg(long, value_parser = path_or_empty())]
         root_ca: Option<PathBuf>,
         /// SHA-256 fingerprint of the root certificate, from the ceremony
         /// record (required with --root-ca).
@@ -833,7 +833,7 @@ enum AgentCommand {
         root_fingerprint: Option<String>,
         /// Enrolment token file (never the token itself), used if the agent
         /// has no certificate yet.
-        #[arg(long)]
+        #[arg(long, value_parser = path_or_empty())]
         token_file: Option<PathBuf>,
         /// Deadline for the exchange with the core, in seconds.
         #[arg(long, default_value_t = 15)]
@@ -845,7 +845,7 @@ enum AgentCommand {
         #[arg(long)]
         quiet: bool,
         /// Also append the messages to this file.
-        #[arg(long)]
+        #[arg(long, value_parser = path_or_empty())]
         log: Option<PathBuf>,
     },
     /// Stop and unregister the service (configuration, data and account kept).
@@ -948,6 +948,13 @@ enum ReplayStoreCommand {
         #[arg(long, default_value_t = 5)]
         clock_skew_secs: u64,
     },
+}
+
+/// A path that may be empty: the MSI passes every property of
+/// `agent setup`, set or not (clap's path parser refuses an empty value).
+fn path_or_empty() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
+    use clap::builder::TypedValueParser as _;
+    clap::builder::OsStringValueParser::new().map(PathBuf::from)
 }
 
 fn run_agent(command: AgentCommand) -> ExitCode {

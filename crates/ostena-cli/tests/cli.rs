@@ -305,3 +305,39 @@ fn agent_status_queries_the_control_plane() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// The MSI passes every property of `agent setup`, set or not: empty values
+/// are accepted by the parser (exit code 2 would be a usage error) and count
+/// as absent, so a missing configuration is reported (AGT-E012).
+#[test]
+fn agent_setup_accepts_empty_values() {
+    let dir = std::env::temp_dir().join(format!("ostena-setup-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(["agent", "setup", "--quiet", "--config"])
+        .arg(dir.join("ostena.toml"))
+        .args([
+            "--executable",
+            "",
+            "--log",
+            "",
+            "--core-address",
+            "",
+            "--gateway-group",
+            "",
+            "--enrollment-address",
+            "",
+            "--root-ca",
+            "",
+            "--root-fingerprint",
+            "",
+            "--token-file",
+            "",
+        ])
+        .output()
+        .expect("binary must run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("AGT-E012"), "{stderr}");
+    assert!(!dir.exists(), "nothing written");
+}
