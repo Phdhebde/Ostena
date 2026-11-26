@@ -6,6 +6,8 @@
 //!
 //! - `POST /v1/login`: [`LoginRequest`] → [`LoginResponse`];
 //! - `POST /v1/logout`: [`LogoutRequest`] → `204`.
+//! - `POST /v1/ssh-hosts`: [`SshHostsRequest`] → [`SshHostsResponse`], the
+//!   SSH accesses of the session's user (`ostena config ssh`).
 //!
 //! The listener bounds connections (in all and per source from `accept`),
 //! handshake, headers, body and the whole exchange, and limits attempts per
@@ -33,7 +35,8 @@ use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use ostena_common::api::login::{
-    self, ErrorResponse, LoginRequest, LoginResponse, LogoutRequest, WireError,
+    self, ErrorResponse, LoginRequest, LoginResponse, LogoutRequest, SshHostsRequest,
+    SshHostsResponse, WireError,
 };
 use ostena_common::config::CoreLoginConfig;
 use ostena_crypto::tls::ServerConfig;
@@ -149,6 +152,14 @@ pub trait Authenticator: Send + Sync + 'static {
         request: LogoutRequest,
         peer: SocketAddr,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Lists the SSH accesses of the user of a signed `request` from
+    /// `peer`.
+    fn ssh_hosts(
+        &self,
+        request: SshHostsRequest,
+        peer: SocketAddr,
+    ) -> impl Future<Output = Result<SshHostsResponse, ApiError>> + Send;
 }
 
 /// Bounds of the listener (ADR-0015).
@@ -651,7 +662,8 @@ async fn handle<A: Authenticator>(
 ) -> Result<Response<Full<Bytes>>, ApiError> {
     let path = request.uri().path();
     let is_login = path == login::LOGIN_PATH;
-    if !is_login && path != login::LOGOUT_PATH {
+    let is_hosts = path == login::SSH_HOSTS_PATH;
+    if !is_login && !is_hosts && path != login::LOGOUT_PATH {
         return Err(bad_request("route inconnue", StatusCode::NOT_FOUND));
     }
     if request.method() != Method::POST {
@@ -697,6 +709,18 @@ async fn handle<A: Authenticator>(
             Ok(request) => shared
                 .authenticator
                 .login(request, peer)
+                .await
+                .and_then(|response| {
+                    serde_json::to_vec(&response)
+                        .map(|b| json_response(StatusCode::OK, b))
+                        .map_err(|_| ApiError::unavailable())
+                }),
+            Err(e) => Err(wire_error(&e)),
+        },
+        Ok(()) if is_hosts => match SshHostsRequest::parse(&body) {
+            Ok(request) => shared
+                .authenticator
+                .ssh_hosts(request, peer)
                 .await
                 .and_then(|response| {
                     serde_json::to_vec(&response)

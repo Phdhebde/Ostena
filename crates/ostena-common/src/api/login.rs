@@ -21,6 +21,8 @@ pub const PROTOCOL: u16 = 1;
 pub const LOGIN_PATH: &str = "/v1/login";
 /// Path of the logout request.
 pub const LOGOUT_PATH: &str = "/v1/logout";
+/// Path of the list of the user's SSH accesses (`ostena config ssh`).
+pub const SSH_HOSTS_PATH: &str = "/v1/ssh-hosts";
 /// Largest body, in either direction.
 pub const MAX_BODY: usize = 16 * 1024;
 /// Longest user name, in bytes.
@@ -40,6 +42,12 @@ pub const MAX_SSH_LINE: usize = 8192;
 pub const MAX_MESSAGE: usize = 512;
 /// Most host patterns.
 pub const MAX_SSH_HOSTS: usize = 16;
+/// Largest body of an [`SshHostsResponse`].
+pub const MAX_HOSTS_BODY: usize = 256 * 1024;
+/// Most accesses in an [`SshHostsResponse`].
+pub const MAX_SSH_ACCESSES: usize = 512;
+/// Longest target account, in bytes (as the inventory).
+pub const MAX_ACCOUNT: usize = 256;
 
 /// Why a message is refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -47,8 +55,9 @@ pub enum WireError {
     /// Not the expected JSON (syntax, unknown or missing field, type).
     #[error("message JSON invalide : {0}")]
     Json(String),
-    /// Body larger than [`MAX_BODY`].
-    #[error("message de plus de 16 Kio")]
+    /// Body larger than [`MAX_BODY`] ([`MAX_HOSTS_BODY`] for a list of
+    /// accesses).
+    #[error("message trop long")]
     TooLarge,
     /// Another protocol version.
     #[error("version de protocole {0} non prise en charge (attendu : 1)")]
@@ -113,7 +122,11 @@ pub(super) fn secret_len(value: &SecretString) -> usize {
 }
 
 fn parse_json<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, WireError> {
-    if body.len() > MAX_BODY {
+    parse_json_within(body, MAX_BODY)
+}
+
+fn parse_json_within<'a, T: Deserialize<'a>>(body: &'a [u8], max: usize) -> Result<T, WireError> {
+    if body.len() > max {
         return Err(WireError::TooLarge);
     }
     let value: T = serde_json::from_slice(body).map_err(|e| WireError::Json(e.to_string()))?;
@@ -355,6 +368,111 @@ impl LogoutRequest {
     }
 }
 
+/// Client → core: `POST /v1/ssh-hosts`, the accesses of the session's user.
+/// The same fields as a [`LogoutRequest`], signed by the session key under
+/// another domain ([`ssh_hosts_message`]): a logout cannot be replayed as a
+/// listing, nor the reverse.
+pub type SshHostsRequest = LogoutRequest;
+
+/// Domain separation of the listing signature.
+const SSH_HOSTS_DOMAIN: &[u8] = b"ostena-ssh-hosts-v1\0";
+
+/// The bytes signed by an [`SshHostsRequest`].
+pub fn ssh_hosts_message(login_session: &str, issued_at: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SSH_HOSTS_DOMAIN.len() + 36 + 8);
+    out.extend_from_slice(SSH_HOSTS_DOMAIN);
+    out.extend_from_slice(login_session.as_bytes());
+    out.extend_from_slice(&issued_at.to_be_bytes());
+    out
+}
+
+/// Core → client: the SSH accesses the user holds now, to write `Host`
+/// aliases (`ostena config ssh`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshHostsResponse {
+    /// [`PROTOCOL`].
+    pub protocol: u16,
+    /// Port of the agents' SSH servers.
+    pub ssh_port: u16,
+    /// At most [`MAX_SSH_ACCESSES`], sorted by resource then account, each
+    /// pair once.
+    pub accesses: Vec<SshAccess>,
+}
+
+/// One account of one resource the user may reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshAccess {
+    /// The resource, as typed after the account (`[a-z0-9][a-z0-9.-]{0,62}`).
+    pub resource: String,
+    /// The account on the resource.
+    pub account: String,
+    /// The bastion host name to join it through (no pattern).
+    pub host: String,
+    /// End of the longest right, Unix seconds.
+    pub valid_until: u64,
+}
+
+/// A resource name, as the inventory stores it.
+pub fn is_resource(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+}
+
+/// A target account, as the inventory stores it: 1 to 256 bytes, no
+/// control character, no space at either end.
+pub fn is_account(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_ACCOUNT
+        && !s.chars().any(char::is_control)
+        && !s.starts_with(char::is_whitespace)
+        && !s.ends_with(char::is_whitespace)
+}
+
+impl SshHostsResponse {
+    /// Parses and checks a response body (up to [`MAX_HOSTS_BODY`]).
+    ///
+    /// # Errors
+    ///
+    /// [`WireError`].
+    pub fn parse(body: &[u8]) -> Result<Self, WireError> {
+        let response: Self = parse_json_within(body, MAX_HOSTS_BODY)?;
+        check_protocol(response.protocol)?;
+        if response.ssh_port == 0 {
+            return Err(WireError::Field("ssh_port", "port non nul attendu"));
+        }
+        if response.accesses.len() > MAX_SSH_ACCESSES {
+            return Err(WireError::Field("accesses", "512 accès au plus"));
+        }
+        for access in &response.accesses {
+            if !is_resource(&access.resource) {
+                return Err(WireError::Field("resource", "nom de ressource invalide"));
+            }
+            if !is_account(&access.account) {
+                return Err(WireError::Field("account", "compte invalide"));
+            }
+            if !is_host_pattern(&access.host) || access.host.contains(['*', '?']) {
+                return Err(WireError::Field("host", "nom d'hôte sans motif attendu"));
+            }
+        }
+        let sorted = response.accesses.windows(2).all(|w| {
+            (w[0].resource.as_str(), w[0].account.as_str())
+                < (w[1].resource.as_str(), w[1].account.as_str())
+        });
+        if !sorted {
+            return Err(WireError::Field(
+                "accesses",
+                "triés par ressource puis compte, sans doublon",
+            ));
+        }
+        Ok(response)
+    }
+}
+
 /// Core → client: a refusal, with its stable code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -412,6 +530,13 @@ pub fn fuzz(data: &[u8]) {
     if let Ok(r) = LogoutRequest::parse(data) {
         let again = serde_json::to_vec(&r).ok();
         assert_eq!(again.and_then(|b| LogoutRequest::parse(&b).ok()), Some(r));
+    }
+    if let Ok(r) = SshHostsResponse::parse(data) {
+        let again = serde_json::to_vec(&r).ok();
+        assert_eq!(
+            again.and_then(|b| SshHostsResponse::parse(&b).ok()),
+            Some(r)
+        );
     }
     if let Ok(r) = ErrorResponse::parse(data) {
         let again = serde_json::to_vec(&r).ok();

@@ -196,3 +196,86 @@ proptest! {
         fuzz(&body);
     }
 }
+
+fn access(resource: &str, account: &str) -> SshAccess {
+    SshAccess {
+        resource: resource.into(),
+        account: account.into(),
+        host: "bastion.corp".into(),
+        valid_until: 2_000_000_000,
+    }
+}
+
+fn hosts(accesses: Vec<SshAccess>) -> SshHostsResponse {
+    SshHostsResponse {
+        protocol: PROTOCOL,
+        ssh_port: 2222,
+        accesses,
+    }
+}
+
+fn refused(r: &SshHostsResponse) -> WireError {
+    SshHostsResponse::parse(&serde_json::to_vec(r).unwrap()).unwrap_err()
+}
+
+#[test]
+fn ssh_hosts_response_round_trips_and_is_checked() {
+    let ok = hosts(vec![
+        access("srv-lab01", "admin"),
+        access("srv-lab01", "root"),
+        access("srv-lab02", "DOMAIN\\svc ops"),
+    ]);
+    let body = serde_json::to_vec(&ok).unwrap();
+    assert_eq!(SshHostsResponse::parse(&body).unwrap(), ok);
+    // Not sorted, or twice the same pair.
+    for unsorted in [
+        vec![access("b", "root"), access("a", "root")],
+        vec![access("a", "root"), access("a", "root")],
+    ] {
+        assert!(matches!(
+            refused(&hosts(unsorted)),
+            WireError::Field("accesses", _)
+        ));
+    }
+    for (resource, account, field) in [
+        ("Srv", "root", "resource"),
+        ("-srv", "root", "resource"),
+        ("srv", "", "account"),
+        ("srv", " root", "account"),
+        ("srv", "ro\not", "account"),
+    ] {
+        let error = refused(&hosts(vec![access(resource, account)]));
+        assert!(
+            matches!(error, WireError::Field(f, _) if f == field),
+            "{resource} {account}"
+        );
+    }
+    let mut pattern = access("srv", "root");
+    pattern.host = "bastion*.corp".into();
+    assert!(matches!(
+        refused(&hosts(vec![pattern])),
+        WireError::Field("host", _)
+    ));
+    let mut zero = hosts(Vec::new());
+    zero.ssh_port = 0;
+    assert!(matches!(refused(&zero), WireError::Field("ssh_port", _)));
+    // More than 16 KiB is fine here, up to 256 KiB.
+    let many: Vec<SshAccess> = (0..MAX_SSH_ACCESSES)
+        .map(|i| access(&format!("srv-{i:04}"), "root"))
+        .collect();
+    let body = serde_json::to_vec(&hosts(many)).unwrap();
+    assert!(body.len() > MAX_BODY);
+    assert!(SshHostsResponse::parse(&body).is_ok());
+    let too_many: Vec<SshAccess> = (0..=MAX_SSH_ACCESSES)
+        .map(|i| access(&format!("srv-{i:04}"), "root"))
+        .collect();
+    assert!(matches!(
+        refused(&hosts(too_many)),
+        WireError::Field("accesses", _)
+    ));
+    // The listing and the logout sign different bytes.
+    assert_ne!(
+        ssh_hosts_message(&"0".repeat(36), 1),
+        logout_message(&"0".repeat(36), 1)
+    );
+}
