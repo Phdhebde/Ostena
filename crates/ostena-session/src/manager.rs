@@ -446,13 +446,15 @@ impl Reservation {
         let inner = self.guard.inner.clone();
         let info = {
             let mut state = inner.state();
-            if state.ids.insert(session_id) {
+            // The slot lives as long as its guard, held here.
+            if state.ids.contains(&session_id) || !state.slots.contains_key(&self.guard.key) {
+                None
+            } else {
+                state.ids.insert(session_id);
                 state.slots.get_mut(&self.guard.key).map(|slot| {
                     slot.info.session_id = Some(session_id);
                     slot.info.clone()
                 })
-            } else {
-                None
             }
         };
         let Some(info) = info else {
