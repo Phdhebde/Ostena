@@ -1,21 +1,8 @@
 # Note : séparer les rôles DDL et DML de la base du core
 
-- **Statut** : reporté après le jalon M1 (décision du 2026-11-14).
-- **Origine** : [ADR-0011](../adr/0011-socle-du-core-et-postgresql.md).
+- **Statut** : traitée au jalon M2 (PR 3, 2026-11-26).
+- **Décision** : [ADR-0011](../adr/0011-socle-du-core-et-postgresql.md), section « Rôles de la base » ; procédure dans l'[installation du core](../exploitation/core-installation.md).
 
-En M1, le core se connecte avec un seul rôle, propriétaire du schéma : il applique lui-même les migrations au démarrage. Un core compromis peut donc modifier le schéma, par exemple supprimer une table d'audit ou un déclencheur d'ajout seul.
+La note décrivait la séparation reportée après M1 : un propriétaire du schéma utilisé seulement par `ostena core migrate`, un rôle du service limité aux droits DML, `SELECT` et `INSERT` seulement sur la chaîne d'audit, et deux comptes système pour garder l'authentification `peer`. C'est ce que fait l'amendement de l'ADR-0011 (`ostena_owner`, `ostena_app`, comptes `ostena` et `ostena_admin`, `ostena core db init`).
 
-**Cible** : deux rôles.
-- `ostena_owner` possède le schéma et n'est utilisé que par `ostena core migrate`, lancé par l'exploitant lors d'une mise à jour.
-- `ostena_app` n'a que les droits DML nécessaires, table par table. Sur la chaîne d'audit (`audit_record`, `audit_head`, [ADR-0012](../adr/0012-chaine-d-audit-du-core.md)), ce sera `SELECT` et `INSERT` seulement : sans `UPDATE`, `DELETE`, `TRUNCATE` ni propriété des tables, le compte du service ne peut plus désactiver les déclencheurs d'ajout seul. En M1, ces déclencheurs n'arrêtent que les erreurs, puisque le rôle unique en est propriétaire ; l'intégrité repose sur le chaînage et les têtes signées.
-
-**Difficulté avec `peer`** : l'authentification `peer` associe un compte système à un rôle du même nom. Deux rôles demandent donc :
-- soit deux comptes système (`ostena` pour le service, `ostena-admin` pour les migrations) ;
-- soit une table `pg_ident.conf` qui autorise un compte système à prendre l'un ou l'autre rôle, ce qui affaiblit la séparation.
-
-La première option est la plus simple à auditer.
-
-**Conséquences à prévoir** :
-- `ostena core run` ne migre plus : il vérifie le schéma (`CORE-E005`) et refuse s'il n'est pas à jour ;
-- la procédure de mise à jour passe par `ostena core migrate` sous le compte d'administration ;
-- les migrations accordent explicitement les droits à `ostena_app`.
+Elle reste en place parce que la migration `0002_audit_chain.sql`, dont le texte ne peut plus changer (sa somme de contrôle est enregistrée dans les bases), renvoie vers elle.

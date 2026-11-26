@@ -28,7 +28,7 @@ use ostena_core::server::{Keys, RunningCore, StartInfo};
 use ostena_core::ssh_ca::SshAuthorities;
 use ostena_core::store::PgStore;
 use ostena_core::transcripts::Transcripts;
-use ostena_core::{inventory, login, schema};
+use ostena_core::{inventory, login};
 use ostena_crypto::hmac::HmacKey;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::testing::{TestPki, valid};
@@ -252,8 +252,8 @@ fn ssh_access_and_login_revocation_end_to_end() {
         let Some(db) = TestDb::create("ssh_access_and_login_revocation_end_to_end").await else {
             return;
         };
+        db.migrate().await;
         let pool = db.pool().await;
-        schema::migrate(&pool).await.unwrap();
         let dir =
             Dir(std::env::temp_dir().join(format!("ostena-core-ssh-e2e-{}", std::process::id())));
         let _ = std::fs::remove_dir_all(&dir.0);
@@ -594,8 +594,8 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
         else {
             return;
         };
+        db.migrate().await;
         let pool = db.pool().await;
-        schema::migrate(&pool).await.unwrap();
         let dir = Dir(
             std::env::temp_dir().join(format!("ostena-core-ssh-replay-{}", std::process::id()))
         );
@@ -708,13 +708,17 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
             .execute(&pool)
             .await
             .unwrap();
+        // As the login role: ostena_app sees neither the queries of the
+        // sessions nor may it end them.
+        let login = db.login_pool().await;
         let cut: Vec<bool> = sqlx::query_scalar(
             "SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity
              WHERE datname = current_database() AND query ILIKE 'LISTEN%'",
         )
-        .fetch_all(&pool)
+        .fetch_all(&login)
         .await
         .unwrap();
+        login.close().await;
         assert_eq!(cut, [true]);
         revoked(&mut revocations, session).await;
         until("certificat d'hôte des nouveaux noms", || {

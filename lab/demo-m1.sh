@@ -3,7 +3,8 @@
 #
 # Avec le binaire `ostena` et des processus locaux, sans Docker :
 #   1. cérémonie de la racine et clés du core ;
-#   2. PostgreSQL, core en mode production ;
+#   2. PostgreSQL, core en mode production, sous deux comptes système
+#      distincts : le service et les migrations (ADR-0011) ;
 #   3. agent enrôlé, serveur SSH de l'agent ;
 #   4. cible : un vrai sshd OpenSSH dans un espace de noms réseau (netns et
 #      veth), car le contrôle de périmètre refuse la boucle locale et les
@@ -27,10 +28,17 @@
 #                       totp_code d'ostena-crypto, construit s'il manque)
 #   OSTENA_DEMO_DIR     dossier de travail (défaut : un dossier temporaire,
 #                       supprimé à la fin sauf avec OSTENA_DEMO_KEEP=1)
-#   OSTENA_DEMO_DB_SOCKET, OSTENA_DEMO_DB_USER
-#                       PostgreSQL 16 par socket Unix et `peer` (défaut :
-#                       /var/run/postgresql et l'utilisateur courant ; le
-#                       rôle doit avoir CREATEDB)
+#   OSTENA_DEMO_DB_SOCKET  socket Unix de PostgreSQL 16 (défaut :
+#                       /var/run/postgresql), authentification `peer`
+#   OSTENA_DEMO_DB_SUPERUSER
+#                       compte système et rôle superutilisateur de
+#                       PostgreSQL pour `ostena core db init` (défaut :
+#                       postgres)
+#   OSTENA_DEMO_SERVICE_USER, OSTENA_DEMO_MIGRATION_USER
+#                       comptes système du service et des migrations
+#                       (défaut : ostena_demo et ostena_demo_admin), créés
+#                       s'ils manquent puis retirés à la fin ; il faut être
+#                       root ou avoir sudo
 #   Cible externe, si aucun netns n'est possible (pas de `ip` ou pas de
 #   droits) :
 #   OSTENA_DEMO_TARGET           hôte:port, pas une adresse de cet hôte
@@ -72,6 +80,13 @@ db="ostena_demo_$$"
 pids=()
 netns_made=""
 db_made=""
+accounts_made=()
+core_dir=""
+# Une commande sous un autre compte système (root : runuser ; sinon sudo).
+as_user() {
+  local account="$1"; shift
+  if [ -z "$SUDO" ]; then runuser -u "$account" -- "$@"; else sudo -u "$account" -- "$@"; fi
+}
 cleanup() {
   status=$?
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
@@ -82,10 +97,17 @@ cleanup() {
     $SUDO ip link del ostena-d0 2>/dev/null || true
     $SUDO ip netns del "$ns" 2>/dev/null || true
   fi
+  # The core runs under its account, behind runuser or sudo.
+  [ -z "${core_dir:-}" ] || $SUDO pkill -f "^$core_dir/ostena " 2>/dev/null || true
   wait 2>/dev/null || true
   if [ -n "$db_made" ]; then
-    dropdb -h "$db_socket" -U "$db_user" "$db" 2>/dev/null || true
+    as_user "$db_super" psql -h "$db_socket" -d postgres -q \
+      -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" 2>/dev/null || true
   fi
+  for account in "${accounts_made[@]}"; do
+    $SUDO userdel "$account" 2>/dev/null || true
+  done
+  [ -z "${core_dir:-}" ] || $SUDO rm -rf "$core_dir"
   if [ "$status" -ne 0 ]; then
     for log in core agent; do
       if [ -f "$work/$log.log" ]; then
@@ -103,7 +125,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Outils --------------------------------------------------------------
-for tool in ssh ssh-keygen createdb dropdb psql; do
+for tool in ssh ssh-keygen psql; do
   command -v "$tool" >/dev/null || die "outil absent : $tool"
 done
 sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
@@ -121,7 +143,13 @@ fi
 ostena() { "$bin" "$@"; }
 
 db_socket="${OSTENA_DEMO_DB_SOCKET:-/var/run/postgresql}"
-db_user="${OSTENA_DEMO_DB_USER:-$(id -un)}"
+db_super="${OSTENA_DEMO_DB_SUPERUSER:-postgres}"
+# Deux comptes système (ADR-0011) : le service, qui ne prend que le rôle
+# ostena_app, et les migrations, qui seules prennent ostena_owner. Un seul
+# compte pour les deux est refusé en production (CORE-E014).
+svc="${OSTENA_DEMO_SERVICE_USER:-ostena_demo}"
+adm="${OSTENA_DEMO_MIGRATION_USER:-ostena_demo_admin}"
+[ "$svc" != "$adm" ] || die "les comptes du service et des migrations doivent être distincts"
 
 # Ports : tunnel et enrôlement (UDP), connexion (TCP), serveur SSH de l'agent.
 tunnel_port="${OSTENA_DEMO_TUNNEL_PORT:-18443}"
@@ -174,10 +202,25 @@ fi
 echo "Ostena, démonstration M1 : $("$bin" --version)"
 echo "Dossier de travail : $work"
 
+# Les comptes système du core, créés s'ils manquent.
+for account in "$svc" "$adm"; do
+  if ! id "$account" >/dev/null 2>&1; then
+    $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin "$account"
+    accounts_made+=("$account")
+  fi
+done
+# Les fichiers du core, propriété de root comme en production (CFG-P006) :
+# un dossier que ces comptes et celui de PostgreSQL traversent (le dossier
+# de travail reste privé), le binaire compris.
+core_dir="$($SUDO mktemp -d "/tmp/ostena-demo-core.XXXXXX")"
+$SUDO chmod 711 "$core_dir"
+$SUDO install -m 0755 "$bin" "$core_dir/ostena"
+cbin="$core_dir/ostena"
+
 # --- 1. PKI ----------------------------------------------------------------
 step "Cérémonie de la racine et clés du core (ostena ca)"
-mkdir -p "$work/ceremony" "$work/credentials" "$work/agent" "$work/transcripts"
-chmod 700 "$work/credentials" "$work/transcripts"
+mkdir -p "$work/ceremony" "$work/credentials" "$work/agent"
+chmod 700 "$work/credentials"
 (
   cd "$work/ceremony"
   ostena ca root init --name "Ostena demo" --out media1 --out media2 > root-init.txt
@@ -197,23 +240,27 @@ done
 ostena ca key new-mac --out "$work/credentials/mac.key" > /dev/null
 ostena ca key new-mac --out "$work/credentials/totp.key" > /dev/null
 cp "$work/root.pem" "$work/agent/root.pem"
+# Remis au compte du service : les certificats lisibles, les clés en
+# credentials à lui seul, les transcripts dans un dossier à lui seul (0700).
+$SUDO install -m 0644 "$work/root.pem" "$work/server.pem" "$work/issuing.pem" "$core_dir/"
+$SUDO install -d -o "$svc" -m 0700 "$core_dir/credentials" "$core_dir/transcripts"
+$SUDO install -d -o "$svc" -m 0755 "$core_dir/exports"
+$SUDO install -o "$svc" -m 0600 "$work"/credentials/*.key "$core_dir/credentials/"
 ok "racine hors ligne (2 parts sur 3), certificats du core, clés en credentials"
 info "clé publique d'audit pour l'auditeur : $work/audit.pub"
 
 # --- 2. Core ---------------------------------------------------------------
 step "PostgreSQL et core en mode production"
-createdb -h "$db_socket" -U "$db_user" "$db"
-db_made=1
-cat > "$work/core.toml" <<EOF
+$SUDO tee "$core_dir/core.toml" > /dev/null <<EOF
 mode = "production"
 
 [core]
 tunnel_listen = "127.0.0.1:$tunnel_port"
 enrollment_listen = "127.0.0.1:$enroll_port"
-tls_root_ca = "$work/root.pem"
-tls_certificate = "$work/server.pem"
+tls_root_ca = "$core_dir/root.pem"
+tls_certificate = "$core_dir/server.pem"
 tls_private_key = { credential = "server.key" }
-issuing_certificate = "$work/issuing.pem"
+issuing_certificate = "$core_dir/issuing.pem"
 issuing_private_key = { credential = "issuing.key" }
 grant_signing_key = { credential = "grant.key" }
 
@@ -221,7 +268,7 @@ grant_signing_key = { credential = "grant.key" }
 user_ca_key = { credential = "user_ca.key" }
 host_ca_key = { credential = "host_ca.key" }
 command_mac_key = { credential = "mac.key" }
-transcripts_dir = "$work/transcripts"
+transcripts_dir = "$core_dir/transcripts"
 
 [core.login]
 listen = "127.0.0.1:$login_port"
@@ -237,20 +284,33 @@ heartbeat_secs = 60
 [core.database]
 socket_dir = "$db_socket"
 name = "$db"
-user = "$db_user"
+user = "$svc"
+migration_user = "$adm"
 EOF
-core() { ostena core "$@" --config "$work/core.toml"; }
-CREDENTIALS_DIRECTORY="$work/credentials" "$bin" core run --config "$work/core.toml" \
-  > "$work/core.log" 2>&1 &
+$SUDO chmod 0644 "$core_dir/core.toml"
+# Les commandes du core sous le compte du service, avec ses credentials.
+core() {
+  as_user "$svc" env CREDENTIALS_DIRECTORY="$core_dir/credentials" \
+    "$cbin" core "$@" --config "$core_dir/core.toml"
+}
+# Rôles et base sous le superutilisateur de PostgreSQL, schéma sous le
+# compte des migrations, puis le service (ADR-0011).
+as_user "$db_super" "$cbin" core db init --superuser "$db_super" --config "$core_dir/core.toml" \
+  | sed 's/^/      /'
+db_made=1
+as_user "$adm" "$cbin" core migrate --config "$core_dir/core.toml" | sed 's/^/      /'
+core run > "$work/core.log" 2>&1 &
 pids+=($!)
 wait_log "$work/core.log" core.started
-ok "core démarré (journal : core.log)"
+grep -q core.database_role_weak "$work/core.log" && die "séparation des rôles affaiblie"
+ok "core démarré sous $svc, schéma migré sous $adm (journal : core.log)"
 
 # --- 3. Agent --------------------------------------------------------------
 step "Agent passerelle : enrôlement et serveur SSH"
 group_id="$(cat /proc/sys/kernel/random/uuid)"
 core group add demo --id "$group_id" --host-name bastion.demo > /dev/null
-core agent token --group "$group_id" --out "$work/token" > /dev/null
+core agent token --group "$group_id" --out - > "$work/token"
+chmod 600 "$work/token"
 wait_log "$work/core.log" enroll.listener_opened
 cat > "$work/agent/ostena.toml" <<EOF
 mode = "production"
@@ -335,25 +395,25 @@ ok "clé de l'agent déposée : ${line%% ecdsa*} …"
 
 # --- 5. Inventaire ----------------------------------------------------------
 step "Inventaire, droit et identifiants d'alice"
-printf '[[allow]]\nnetworks = ["%s"]\nports = ["%s"]\n' "$network" "$target_port" > "$work/policy.toml"
-core group policy demo "$work/policy.toml" > /dev/null
+printf '[[allow]]\nnetworks = ["%s"]\nports = ["%s"]\n' "$network" "$target_port" | $SUDO tee "$core_dir/policy.toml" > /dev/null
+$SUDO install -m 0644 "$work/target_host.pub" "$core_dir/target_host.pub"
+core group policy demo "$core_dir/policy.toml" > /dev/null
 wait_log "$work/agent.log" agent.policy_applied
 core user add alice --display-name "Alice Martin" > /dev/null
 core resource add srv-demo --host "$target_host" --port "$target_port" --group demo \
-  --host-key "$work/target_host.pub" > /dev/null
+  --host-key "$core_dir/target_host.pub" > /dev/null
 core account add --resource srv-demo "$target_user" > /dev/null
 core right grant --user alice --resource srv-demo --account "$target_user" --days 1 \
   --max-session-mins 30 > /dev/null
 password="mot de passe de démonstration"
 printf '%s\n' "$password" | core user set-password alice --stdin > /dev/null
-enrol="$(CREDENTIALS_DIRECTORY="$work/credentials" ostena core user totp-enroll alice --config "$work/core.toml")"
+enrol="$(core user totp-enroll alice)"
 secret="$(printf '%s\n' "$enrol" | sed -n 's/^ *clé : //p')"
 [ -n "$secret" ] || die "secret TOTP non affiché"
 printf '%s\n' "$secret" > "$work/alice.totp"
 chmod 600 "$work/alice.totp"
 "$totp" < "$work/alice.totp" \
-  | CREDENTIALS_DIRECTORY="$work/credentials" ostena core user totp-enroll alice --confirm --stdin \
-      --config "$work/core.toml" > /dev/null
+  | core user totp-enroll alice --confirm --stdin > /dev/null
 core user list | sed 's/^/      /'
 ok "alice : droit sur $target_user@srv-demo, mot de passe et TOTP confirmés"
 
@@ -392,6 +452,13 @@ echo "$elapsed_ms" > "$work/session-ms"
 # --- 7. Transcript scellé ----------------------------------------------------
 step "Transcript écrit et scellé"
 wait_log "$work/core.log" transcript.sealed
+# Les transcripts appartiennent au compte du service : copie lisible.
+fetch_transcripts() {
+  mkdir -p "$1"
+  $SUDO cp -r "$core_dir/transcripts/." "$1"
+  $SUDO chown -R "$(id -u):$(id -g)" "$1"
+}
+fetch_transcripts "$work/transcripts"
 cast="$(ls "$work"/transcripts/*.cast)"
 [ "$(printf '%s\n' "$cast" | wc -l)" -eq 1 ] || die "un transcript attendu"
 info "$(basename "$cast") ($(stat -c '%a' "$cast"), $(stat -c '%s' "$cast") octets) :"
@@ -410,8 +477,9 @@ info "tête conservée hors du bastion : $(cut -c1-60 "$work/head-kept.txt")…"
 # la fin de la chaîne.
 for attempt in $(seq 1 20); do
   export_file="$work/audit-$attempt.ostaud"
-  core audit export --out "$export_file" > /dev/null
-  cp -r "$work/transcripts" "$work/transcripts-copy-$attempt"
+  core audit export --out "$core_dir/exports/audit-$attempt.ostaud" > /dev/null
+  $SUDO cat "$core_dir/exports/audit-$attempt.ostaud" > "$export_file"
+  fetch_transcripts "$work/transcripts-copy-$attempt"
   code=0
   ostena audit verify "$export_file" --key "$work/audit.pub" --head "$work/head-kept.txt" \
     --transcripts "$work/transcripts-copy-$attempt" > /dev/null || code=$?
@@ -437,16 +505,18 @@ size=$(stat -c '%s' "$work/export-tampered.ostaud")
 printf '\xff' | dd of="$work/export-tampered.ostaud" bs=1 seek=$((size / 2)) conv=notrunc status=none
 expect_verify 1 "AUD-E0" "$work/export-tampered.ostaud" --key "$work/audit.pub"
 
-step "Altération dans la base (propriétaire de la base, déclencheurs désactivés)"
-seq_sealed="$(psql -h "$db_socket" -U "$db_user" -d "$db" -tA \
+step "Altération dans la base (compte des migrations, propriétaire du schéma, déclencheurs désactivés)"
+seq_sealed="$(as_user "$adm" psql -h "$db_socket" -d "$db" -tA -q -c "SET ROLE ostena_owner" \
   -c "SELECT seq FROM audit_record WHERE event = 'transcript.sealed' ORDER BY seq LIMIT 1")"
 info "enregistrement transcript.sealed : seq $seq_sealed"
-psql -h "$db_socket" -U "$db_user" -d "$db" -q -v ON_ERROR_STOP=1 <<EOF
+as_user "$adm" psql -h "$db_socket" -d "$db" -q -v ON_ERROR_STOP=1 <<EOF
+SET ROLE ostena_owner;
 ALTER TABLE audit_record DISABLE TRIGGER USER;
 UPDATE audit_record SET body = overlay(body placing '\xff'::bytea from 80 for 1) WHERE seq = $seq_sealed;
 ALTER TABLE audit_record ENABLE TRIGGER USER;
 EOF
-core audit export --out "$work/audit-after-edit.ostaud" > /dev/null
+core audit export --out "$core_dir/exports/audit-after-edit.ostaud" > /dev/null
+$SUDO cat "$core_dir/exports/audit-after-edit.ostaud" > "$work/audit-after-edit.ostaud"
 expect_verify 1 AUD-E007 "$work/audit-after-edit.ostaud" --key "$work/audit.pub" --head "$work/head-kept.txt"
 
 printf '\n\033[1mDémonstration M1 réussie.\033[0m Session en %s ms.\n' "$elapsed_ms"

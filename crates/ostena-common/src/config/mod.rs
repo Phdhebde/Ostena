@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use self::core::{
-    CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig, DatabaseTcp,
-    KeySource, TotpAlgorithmSetting,
+    APP_ROLE, CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig,
+    DatabaseTcp, GROUP_ROLES, KeySource, OWNER_ROLE, TotpAlgorithmSetting,
 };
 pub use agent::{AgentConfig, AgentSshConfig, InfrastructureEndpoint, SshPaths};
 pub use permissions::{DefaultPermissions, PermissionChecker};
@@ -376,6 +376,38 @@ pub fn load_with(
     path: &Path,
     checker: &dyn PermissionChecker,
 ) -> Result<LoadedConfig, ConfigError> {
+    load_checked(path, checker, ServiceFiles::Checked)
+}
+
+/// [`load_with`] for the commands of the core database, `ostena core db
+/// init` and `ostena core migrate`, which run under the PostgreSQL
+/// superuser and the migration account (ADR-0011) and read none of the
+/// files of the service: its keys (`CFG-P011`) and its transcript directory
+/// (`CFG-P016`), private to the service account, are not checked; every
+/// other rule is, the configuration file (`CFG-P006`) included.
+///
+/// # Errors
+///
+/// [`ConfigError`] with every problem found.
+pub fn load_for_database(
+    path: &Path,
+    checker: &dyn PermissionChecker,
+) -> Result<LoadedConfig, ConfigError> {
+    load_checked(path, checker, ServiceFiles::Ignored)
+}
+
+/// Whether the rules on the files of the core service apply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceFiles {
+    Checked,
+    Ignored,
+}
+
+fn load_checked(
+    path: &Path,
+    checker: &dyn PermissionChecker,
+    service_files: ServiceFiles,
+) -> Result<LoadedConfig, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
@@ -383,7 +415,7 @@ pub fn load_with(
     let config = Config::from_toml_str(&text)?;
 
     let mut weakenings = config.weakenings();
-    weakenings.extend(file_rules(&config, path, checker));
+    weakenings.extend(file_rules(&config, path, checker, service_files));
     let mut errors = validation::consistency(&config);
     if config.mode == Mode::Production {
         errors.append(&mut weakenings);
@@ -419,7 +451,12 @@ pub fn load_for_enrollment(path: &Path) -> Result<Config, ConfigError> {
 
 /// Rules that need the file system: `CFG-P006`, for an agent `CFG-P008` and
 /// `CFG-P009`, for the core `CFG-P011` and `CFG-P016`.
-fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> Vec<Violation> {
+fn file_rules(
+    config: &Config,
+    path: &Path,
+    checker: &dyn PermissionChecker,
+    service_files: ServiceFiles,
+) -> Vec<Violation> {
     let mut out = Vec::new();
     if let Err(reason) = checker.not_writable_by_others(path) {
         out.push(Violation::new(
@@ -474,7 +511,11 @@ fn file_rules(config: &Config, path: &Path, checker: &dyn PermissionChecker) -> 
             ));
         }
     }
-    if let Some(core) = &config.core {
+    if let Some(core) = config
+        .core
+        .as_ref()
+        .filter(|_| service_files == ServiceFiles::Checked)
+    {
         for (field, key) in core::key_paths(core) {
             if let Err(reason) = checker.private(key) {
                 out.push(Violation::new(

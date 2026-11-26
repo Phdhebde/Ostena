@@ -318,7 +318,8 @@ pub async fn admin_actor(tx: &mut Tx<'_>) -> Result<String, CoreError> {
 
 /// Starts the chain if it is empty (`audit.chain_started` at seq 1) and
 /// returns its identifier. Idempotent, and safe when several processes
-/// call it together (advisory lock). Only `ostena core run` calls it.
+/// call it together (advisory lock). Called by `ostena core run`, and by
+/// `ostena core migrate` before its record.
 ///
 /// # Errors
 ///
@@ -1183,6 +1184,50 @@ pub async fn acknowledge_break(pool: &PgPool, first_bad_seq: u64) -> Result<Appe
         seq = appended.seq,
         "rupture de la chaîne d'audit reconnue"
     );
+    Ok(appended)
+}
+
+/// Writes what `ostena core migrate` changed (granting, ADR-0012): the
+/// applied migrations (`core.migrated`), or with `reverted` those it took
+/// back (`core.migration_reverted`), and the schema version reached; the
+/// actor is the migration account. The chain is started first if needed (a
+/// new installation is migrated before the core first starts).
+///
+/// # Errors
+///
+/// [`CoreError::AuditWrite`], [`CoreError::AuditChain`],
+/// [`CoreError::Database`]: the schema change itself is already committed.
+pub async fn record_migration(
+    pool: &PgPool,
+    versions: &[i64],
+    schema_version: i64,
+    reverted: bool,
+) -> Result<Appended, CoreError> {
+    ensure_genesis(pool).await?;
+    let mut tx = pool.begin().await?;
+    let actor = admin_actor(&mut tx).await?;
+    crate::store::notify_audit(&mut tx).await?;
+    let kind = if reverted {
+        EventKind::CoreMigrationReverted
+    } else {
+        EventKind::CoreMigrated
+    };
+    let list = versions
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let appended = append(
+        &mut tx,
+        Event::new(kind, Outcome::Success, ActorKind::Admin, actor)
+            .text(field::MIGRATIONS, crate::store::truncate(&list))
+            .u64(
+                field::SCHEMA_VERSION,
+                u64::try_from(schema_version).unwrap_or(0),
+            ),
+    )
+    .await?;
+    tx.commit().await.map_err(write_error)?;
     Ok(appended)
 }
 

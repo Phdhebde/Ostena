@@ -18,6 +18,7 @@ pub mod inventory;
 pub mod login;
 pub mod pushes;
 pub mod rate;
+pub mod roles;
 pub mod schema;
 pub mod server;
 pub mod ssh_ca;

@@ -47,6 +47,9 @@ event_kinds! {
     CoreStopped => "core.stopped",
     /// Migrations were applied.
     CoreMigrated => "core.migrated",
+    /// Applied migrations were reverted with their down migrations
+    /// (`ostena core migrate --revert-to`).
+    CoreMigrationReverted => "core.migration_reverted",
     /// Development only: the database did not authenticate the core by peer.
     CoreDatabaseNotPeer => "core.database_not_peer",
     /// A weakening option is in effect (outside production).
@@ -500,7 +503,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 49);
+        assert_eq!(names.len(), 50);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

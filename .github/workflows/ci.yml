@@ -177,7 +177,8 @@ jobs:
       - run: bash tests/ssh/native-e2e.sh
 
   # The core against PostgreSQL 16 as in production (ADR-0011): Unix socket,
-  # `peer` authentication, a role named after the runner account. Tests that
+  # `peer` authentication, a role named after the runner account, allowed to
+  # create the roles of the core (ostena_owner, ostena_app). Tests that
   # need a database are mandatory here (OSTENA_REQUIRE_DB). Then the offline
   # query cache (crates/ostena-core/.sqlx) is checked against the migrations.
   # Uses the PostgreSQL preinstalled on the runner (sudo).
@@ -204,12 +205,67 @@ jobs:
         run: |
           sudo systemctl start postgresql.service
           psql --version | grep -q ' 16\.'
-          sudo -u postgres createuser --createdb "$USER"
+          # One test account, which plays every login role: the tests of
+          # the binary run in development mode, which tolerates it, and
+          # check that production refuses it (CORE-E014, ADR-0011).
+          sudo -u postgres createuser --createdb --createrole "$USER"
           echo "OSTENA_TEST_DB_USER=$USER" >> "$GITHUB_ENV"
       - run: cargo test --locked -p ostena-core -p ostena-cli
+      - name: Production, two system accounts (service and migrations)
+        run: |
+          # As in production (ADR-0011): roles and database under the
+          # PostgreSQL superuser, the schema under the migration account,
+          # the service under its own account, which cannot migrate.
+          for account in ostena_ci ostena_ci_admin; do
+            sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$account"
+          done
+          # Owned by root, as in production (CFG-P006).
+          dir="$(sudo mktemp -d)"
+          sudo chmod 711 "$dir"
+          sudo install -m 0755 target/debug/ostena "$dir/ostena"
+          sudo tee "$dir/core.toml" > /dev/null <<EOF
+          mode = "production"
+
+          [core]
+          tunnel_listen = "127.0.0.1:7001"
+          enrollment_listen = "127.0.0.1:7002"
+          tls_root_ca = "$dir/root.pem"
+          tls_certificate = "$dir/server.pem"
+          tls_private_key = { credential = "server.key" }
+          issuing_certificate = "$dir/issuing.pem"
+          issuing_private_key = { credential = "issuing.key" }
+          grant_signing_key = { credential = "grant.key" }
+
+          [core.audit]
+          signing_key = { credential = "audit.key" }
+
+          [core.database]
+          name = "ostena_ci_roles"
+          user = "ostena_ci"
+          migration_user = "ostena_ci_admin"
+          EOF
+          sudo chmod 0644 "$dir/core.toml"
+          run() {
+            local account="$1"; shift
+            sudo -u "$account" -- "$dir/ostena" core "$@" --config "$dir/core.toml"
+          }
+          run postgres db init --superuser postgres
+          run ostena_ci_admin migrate
+          run ostena_ci_admin migrate --check
+          # The roles pass the production checks (no CORE-E014).
+          run ostena_ci user list
+          if run ostena_ci migrate; then
+            echo "the service account migrated" >&2
+            exit 1
+          fi
       - name: The offline query cache matches the migrations
         working-directory: crates/ostena-core
         run: |
+          # Migration 6 grants to ostena_app (ADR-0011): the role must exist
+          # (the tests above created it; created here if they did not run).
+          psql -h /var/run/postgresql -d postgres -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ostena_app') THEN
+              CREATE ROLE ostena_app NOLOGIN; END IF; END \$\$"
           createdb -h /var/run/postgresql ostena_prepare
           # sqlx wants a user and a host name; `host=` then selects the socket.
           export DATABASE_URL="postgres://$USER@localhost/ostena_prepare?host=/var/run/postgresql"
@@ -426,7 +482,8 @@ jobs:
   # real OpenSSH target in a network namespace, sealed transcript, offline
   # audit verification, then tampering found in a transcript, the export and
   # the database. Local processes only (PostgreSQL of the runner, sudo for
-  # the namespace).
+  # the namespace and the two system accounts of the core, service and
+  # migrations, which the script creates).
   demo-m1:
     needs: [changes, release-sign]
     if: needs.changes.outputs.code == 'true'
@@ -448,7 +505,6 @@ jobs:
         run: |
           sudo systemctl start postgresql.service
           psql --version | grep -q ' 16\.'
-          sudo -u postgres createuser --createdb "$USER"
           command -v sshd || test -x /usr/sbin/sshd \
             || (sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server)
           ssh -V
