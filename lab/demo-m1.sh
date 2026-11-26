@@ -30,7 +30,8 @@
 #   OSTENA_DEMO_DB_SOCKET, OSTENA_DEMO_DB_USER
 #                       PostgreSQL 16 par socket Unix et `peer` (défaut :
 #                       /var/run/postgresql et l'utilisateur courant ; le
-#                       rôle doit avoir CREATEDB)
+#                       rôle doit avoir CREATEDB et CREATEROLE : il joue
+#                       le superutilisateur de `ostena core db init`)
 #   Cible externe, si aucun netns n'est possible (pas de `ip` ou pas de
 #   droits) :
 #   OSTENA_DEMO_TARGET           hôte:port, pas une adresse de cet hôte
@@ -84,7 +85,9 @@ cleanup() {
   fi
   wait 2>/dev/null || true
   if [ -n "$db_made" ]; then
-    dropdb -h "$db_socket" -U "$db_user" "$db" 2>/dev/null || true
+    # The database belongs to ostena_owner (ostena core db init).
+    psql -h "$db_socket" -U "$db_user" -d postgres -q -c "SET ROLE ostena_owner" \
+      -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" 2>/dev/null || true
   fi
   if [ "$status" -ne 0 ]; then
     for log in core agent; do
@@ -103,7 +106,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Outils --------------------------------------------------------------
-for tool in ssh ssh-keygen createdb dropdb psql; do
+for tool in ssh ssh-keygen psql; do
   command -v "$tool" >/dev/null || die "outil absent : $tool"
 done
 sshd_bin="$(command -v sshd || echo /usr/sbin/sshd)"
@@ -202,8 +205,6 @@ info "clé publique d'audit pour l'auditeur : $work/audit.pub"
 
 # --- 2. Core ---------------------------------------------------------------
 step "PostgreSQL et core en mode production"
-createdb -h "$db_socket" -U "$db_user" "$db"
-db_made=1
 cat > "$work/core.toml" <<EOF
 mode = "production"
 
@@ -238,8 +239,15 @@ heartbeat_secs = 60
 socket_dir = "$db_socket"
 name = "$db"
 user = "$db_user"
+# The demonstration runs under one system account: it plays the
+# administration account too (core.database_role_weak in the log).
+migration_user = "$db_user"
 EOF
 core() { ostena core "$@" --config "$work/core.toml"; }
+# Roles and database (ADR-0011), then the schema, as the owner role.
+core db init --superuser "$db_user" > /dev/null
+db_made=1
+core migrate > /dev/null
 CREDENTIALS_DIRECTORY="$work/credentials" "$bin" core run --config "$work/core.toml" \
   > "$work/core.log" 2>&1 &
 pids+=($!)
@@ -437,11 +445,12 @@ size=$(stat -c '%s' "$work/export-tampered.ostaud")
 printf '\xff' | dd of="$work/export-tampered.ostaud" bs=1 seek=$((size / 2)) conv=notrunc status=none
 expect_verify 1 "AUD-E0" "$work/export-tampered.ostaud" --key "$work/audit.pub"
 
-step "Altération dans la base (propriétaire de la base, déclencheurs désactivés)"
-seq_sealed="$(psql -h "$db_socket" -U "$db_user" -d "$db" -tA \
+step "Altération dans la base (propriétaire du schéma, déclencheurs désactivés)"
+seq_sealed="$(psql -h "$db_socket" -U "$db_user" -d "$db" -tA -q -c "SET ROLE ostena_owner" \
   -c "SELECT seq FROM audit_record WHERE event = 'transcript.sealed' ORDER BY seq LIMIT 1")"
 info "enregistrement transcript.sealed : seq $seq_sealed"
 psql -h "$db_socket" -U "$db_user" -d "$db" -q -v ON_ERROR_STOP=1 <<EOF
+SET ROLE ostena_owner;
 ALTER TABLE audit_record DISABLE TRIGGER USER;
 UPDATE audit_record SET body = overlay(body placing '\xff'::bytea from 80 for 1) WHERE seq = $seq_sealed;
 ALTER TABLE audit_record ENABLE TRIGGER USER;

@@ -177,7 +177,8 @@ jobs:
       - run: bash tests/ssh/native-e2e.sh
 
   # The core against PostgreSQL 16 as in production (ADR-0011): Unix socket,
-  # `peer` authentication, a role named after the runner account. Tests that
+  # `peer` authentication, a role named after the runner account, allowed to
+  # create the roles of the core (ostena_owner, ostena_app). Tests that
   # need a database are mandatory here (OSTENA_REQUIRE_DB). Then the offline
   # query cache (crates/ostena-core/.sqlx) is checked against the migrations.
   # Uses the PostgreSQL preinstalled on the runner (sudo).
@@ -204,12 +205,17 @@ jobs:
         run: |
           sudo systemctl start postgresql.service
           psql --version | grep -q ' 16\.'
-          sudo -u postgres createuser --createdb "$USER"
+          sudo -u postgres createuser --createdb --createrole "$USER"
           echo "OSTENA_TEST_DB_USER=$USER" >> "$GITHUB_ENV"
       - run: cargo test --locked -p ostena-core -p ostena-cli
       - name: The offline query cache matches the migrations
         working-directory: crates/ostena-core
         run: |
+          # Migration 6 grants to ostena_app (ADR-0011): the role must exist
+          # (the tests above created it; created here if they did not run).
+          psql -h /var/run/postgresql -d postgres -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ostena_app') THEN
+              CREATE ROLE ostena_app NOLOGIN; END IF; END \$\$"
           createdb -h /var/run/postgresql ostena_prepare
           # sqlx wants a user and a host name; `host=` then selects the socket.
           export DATABASE_URL="postgres://$USER@localhost/ostena_prepare?host=/var/run/postgresql"
@@ -448,7 +454,7 @@ jobs:
         run: |
           sudo systemctl start postgresql.service
           psql --version | grep -q ' 16\.'
-          sudo -u postgres createuser --createdb "$USER"
+          sudo -u postgres createuser --createdb --createrole "$USER"
           command -v sshd || test -x /usr/sbin/sshd \
             || (sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server)
           ssh -V
