@@ -14,6 +14,7 @@
 
 pub mod agent;
 pub mod core;
+pub mod identity;
 mod permissions;
 pub mod scope;
 mod validation;
@@ -31,6 +32,9 @@ pub use self::core::{
 pub use agent::{
     AgentConfig, AgentSessionsConfig, AgentSshConfig, InfrastructureEndpoint, SessionBounds,
     SshPaths, TunnelTransport,
+};
+pub use identity::{
+    CoreIdentityConfig, DirectoryKind, GroupRule, LOCAL_SOURCE, LdapSourceConfig, LdapsServer,
 };
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{
@@ -526,6 +530,17 @@ fn file_rules(
                     Code::CoreKeyExposed,
                     format!("{field} {} : {reason}", key.display()),
                 ));
+            }
+        }
+        // The password files of the identity sources (ADR-0021).
+        if let Some(identity) = &core.identity {
+            for (field, file) in identity::secret_paths(identity) {
+                if let Err(reason) = checker.private(file) {
+                    out.push(Violation::new(
+                        Code::IdentitySecretExposed,
+                        format!("{field} {} : {reason}", file.display()),
+                    ));
+                }
             }
         }
         // The transcripts (ADR-0016): the directory is private (0700, owner

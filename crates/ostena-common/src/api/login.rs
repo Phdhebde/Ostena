@@ -25,8 +25,9 @@ pub const LOGOUT_PATH: &str = "/v1/logout";
 pub const SSH_HOSTS_PATH: &str = "/v1/ssh-hosts";
 /// Largest body, in either direction.
 pub const MAX_BODY: usize = 16 * 1024;
-/// Longest user name, in bytes.
-pub const MAX_USERNAME: usize = 64;
+/// Longest user name, in bytes: a name of 64 bytes and a domain suffix
+/// (ADR-0021).
+pub const MAX_USERNAME: usize = 320;
 /// Longest password, in bytes (as `ostena_crypto::password`).
 pub const MAX_PASSWORD: usize = 1024;
 /// Longest TOTP field accepted by the parser; the code itself has 6 digits.
@@ -67,15 +68,37 @@ pub enum WireError {
     Field(&'static str, &'static str),
 }
 
-/// A user name: `[a-z0-9._-]`, 1 to 64 bytes, starting with a letter or
-/// a digit.
+/// A login name in lower case (ADR-0021): `name`, `source/name` or
+/// `name@domain`, where `name` is `[a-z0-9][a-z0-9._-]{0,63}`, `source`
+/// `[a-z0-9][a-z0-9-]{0,31}` and `domain` `[a-z0-9.-]{1,253}`. Clients put
+/// what the user typed in lower case before sending it.
 pub fn is_username(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= MAX_USERNAME
-        && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && s.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
-        })
+    fn name(s: &str) -> bool {
+        (1..=64).contains(&s.len())
+            && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && s.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+            })
+    }
+    if s.len() > MAX_USERNAME {
+        return false;
+    }
+    if let Some((source, rest)) = s.split_once('/') {
+        return (1..=32).contains(&source.len())
+            && source.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && source
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && name(rest);
+    }
+    if let Some((rest, domain)) = s.split_once('@') {
+        return name(rest)
+            && (1..=253).contains(&domain.len())
+            && domain
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'));
+    }
+    name(s)
 }
 
 /// A canonical UUID: 36 lower-case characters, `8-4-4-4-12`.

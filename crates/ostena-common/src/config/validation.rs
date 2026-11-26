@@ -106,11 +106,17 @@ pub enum Code {
     WebSourceNotBound,
     /// Core: the web listener accepts a classical key exchange.
     WebTlsClassic,
+    /// Core: invalid `[core.identity]` (plain LDAP or another scheme than
+    /// `ldaps://`, name, DN, bound, suffix routed twice).
+    CoreIdentity,
+    /// Core: password file of an identity source readable beyond the
+    /// service account, or its directory writable by another account.
+    IdentitySecretExposed,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 41] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -150,6 +156,8 @@ impl Code {
         Self::CoreWeb,
         Self::WebSourceNotBound,
         Self::WebTlsClassic,
+        Self::CoreIdentity,
+        Self::IdentitySecretExposed,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -194,6 +202,8 @@ impl Code {
             Self::CoreWeb => "CFG-V019",
             Self::WebSourceNotBound => "CFG-P018",
             Self::WebTlsClassic => "CFG-P019",
+            Self::CoreIdentity => "CFG-V020",
+            Self::IdentitySecretExposed => "CFG-P020",
         }
     }
 
@@ -219,6 +229,7 @@ impl Code {
                 | Self::IdleTimeoutDisabled
                 | Self::WebSourceNotBound
                 | Self::WebTlsClassic
+                | Self::IdentitySecretExposed
         )
     }
 }

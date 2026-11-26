@@ -78,6 +78,10 @@ pub struct CoreConfig {
     /// is not started.
     #[serde(default)]
     pub web: Option<CoreWebConfig>,
+    /// Identity sources besides the local accounts (ADR-0021): absent,
+    /// only local accounts exist.
+    #[serde(default)]
+    pub identity: Option<super::identity::CoreIdentityConfig>,
 }
 
 /// `[core.ssh]`: the SSH certificate authorities of the core (ADR-0014).
@@ -739,6 +743,9 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
     }
     if let Some(web) = &core.web {
         web_rules(core, web, out);
+    }
+    if let Some(identity) = &core.identity {
+        super::identity::rules(identity, out);
     }
     let db = &core.database;
     path_rule(out, "core.database.socket_dir", &db.socket_dir);

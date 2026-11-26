@@ -126,7 +126,7 @@ fn codes_are_stable_and_unique() {
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
         "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
-        "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019",
+        "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019", "CFG-V020", "CFG-P020",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1791,4 +1791,123 @@ fn p017_p018_web_weakenings_are_refused_in_production() {
         dev.weakenings().iter().map(|v| v.code).collect::<Vec<_>>(),
         vec![Code::WebSourceNotBound]
     );
+}
+
+// ---------------------------------------------------------------- identity sources
+
+const IDENTITY: &str = r#"
+[core.identity]
+default_source = "corp"
+
+[[core.identity.ldap]]
+name = "corp"
+kind = "active-directory"
+servers = ["ldaps://dc01.corp.example", "ldaps://dc02.corp.example:636"]
+ca_bundle = "/etc/ostena/corp-ca.pem"
+bind_dn = "CN=svc-ostena,OU=Services,DC=corp,DC=example"
+bind_password = { credential = "corp-bind" }
+user_base = "OU=Users,DC=corp,DC=example"
+suffixes = ["corp.example"]
+
+[[core.identity.ldap.groups]]
+directory = "CN=Ostena-RDP,OU=Groups,DC=corp,DC=example"
+group = "rdp-users"
+
+[[core.identity.ldap]]
+name = "lab"
+kind = "openldap"
+servers = ["ldaps://ldap.lab.example"]
+ca_bundle = "/etc/ostena/lab-ca.pem"
+bind_dn = "cn=ostena,ou=services,dc=lab,dc=example"
+bind_password = { file = "/etc/ostena/lab-bind.secret" }
+user_base = "ou=people,dc=lab,dc=example"
+require_group = false
+"#;
+
+#[test]
+fn identity_sources_are_read_with_safe_defaults() {
+    let c = core_with(IDENTITY);
+    assert_eq!(core_codes(&c), Vec::new());
+    assert_eq!(production_codes(&c), Vec::new());
+    let identity = c.core.unwrap().identity.unwrap();
+    assert_eq!(identity.check_interval_secs, 20);
+    assert_eq!(identity.sync_interval_secs, 900);
+    let corp = &identity.ldap[0];
+    assert_eq!(corp.kind, DirectoryKind::ActiveDirectory);
+    assert!(corp.require_group);
+    assert_eq!(
+        (corp.connect_timeout_secs, corp.operation_timeout_secs),
+        (5, 10)
+    );
+    assert_eq!(identity.ldap[1].kind, DirectoryKind::Openldap);
+}
+
+/// Plain LDAP (and so StartTLS) is refused in every mode, not only in
+/// production.
+#[test]
+fn plain_ldap_is_refused_everywhere() {
+    for (from, to) in [
+        ("ldaps://dc01.corp.example\"", "ldap://dc01.corp.example\""),
+        ("ldaps://ldap.lab.example", "ldap://ldap.lab.example:389"),
+        ("ldaps://ldap.lab.example", "starttls://ldap.lab.example"),
+    ] {
+        let text = IDENTITY.replace(from, to);
+        let c = core_with(&text);
+        assert_eq!(core_codes(&c), vec![Code::CoreIdentity], "{to}");
+        let dev = parse(&format!("mode = \"development\"\n{CORE}{text}"));
+        assert_eq!(core_codes(&dev), vec![Code::CoreIdentity], "{to}");
+    }
+}
+
+#[test]
+fn identity_rules() {
+    for (from, to) in [
+        ("name = \"lab\"", "name = \"local\""),
+        ("name = \"lab\"", "name = \"corp\""),
+        ("name = \"lab\"", "name = \"Lab\""),
+        ("default_source = \"corp\"", "default_source = \"nowhere\""),
+        ("require_group = false", "require_group = true"),
+        ("group = \"rdp-users\"", "group = \"RDP users\""),
+        (
+            "ca_bundle = \"/etc/ostena/lab-ca.pem\"",
+            "ca_bundle = \"lab-ca.pem\"",
+        ),
+        (
+            "suffixes = [\"corp.example\"]",
+            "suffixes = [\"corp example\"]",
+        ),
+        (
+            "[core.identity]",
+            "[core.identity]\ncheck_interval_secs = 60",
+        ),
+        (
+            "[core.identity]",
+            "[core.identity]\nsync_interval_secs = 10",
+        ),
+        (
+            "require_group = false",
+            "require_group = false\nconnect_timeout_secs = 0",
+        ),
+        (
+            "bind_dn = \"cn=ostena,ou=services,dc=lab,dc=example\"",
+            "bind_dn = \"\"",
+        ),
+    ] {
+        let text = IDENTITY.replace(from, to);
+        assert_ne!(text, IDENTITY, "{to}");
+        let codes = core_codes(&core_with(&text));
+        assert!(
+            !codes.is_empty()
+                && codes
+                    .iter()
+                    .all(|c| matches!(c, Code::CoreIdentity | Code::RelativePath)),
+            "{to}: {codes:?}"
+        );
+    }
+    // The same suffix routed to two sources.
+    let text = IDENTITY.replace(
+        "require_group = false",
+        "require_group = false\nsuffixes = [\"CORP.example\"]",
+    );
+    assert_eq!(core_codes(&core_with(&text)), vec![Code::CoreIdentity]);
 }
