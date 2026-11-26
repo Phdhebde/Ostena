@@ -205,9 +205,58 @@ jobs:
         run: |
           sudo systemctl start postgresql.service
           psql --version | grep -q ' 16\.'
+          # One test account, which plays every login role: the tests of
+          # the binary run in development mode, which tolerates it, and
+          # check that production refuses it (CORE-E014, ADR-0011).
           sudo -u postgres createuser --createdb --createrole "$USER"
           echo "OSTENA_TEST_DB_USER=$USER" >> "$GITHUB_ENV"
       - run: cargo test --locked -p ostena-core -p ostena-cli
+      - name: Production, two system accounts (service and migrations)
+        run: |
+          # As in production (ADR-0011): roles and database under the
+          # PostgreSQL superuser, the schema under the migration account,
+          # the service under its own account, which cannot migrate.
+          for account in ostena_ci ostena_ci_admin; do
+            sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$account"
+          done
+          dir="$(mktemp -d)"
+          chmod 711 "$dir"
+          install -m 0755 target/debug/ostena "$dir/ostena"
+          cat > "$dir/core.toml" <<EOF
+          mode = "production"
+
+          [core]
+          tunnel_listen = "127.0.0.1:7001"
+          enrollment_listen = "127.0.0.1:7002"
+          tls_root_ca = "$dir/root.pem"
+          tls_certificate = "$dir/server.pem"
+          tls_private_key = { credential = "server.key" }
+          issuing_certificate = "$dir/issuing.pem"
+          issuing_private_key = { credential = "issuing.key" }
+          grant_signing_key = { credential = "grant.key" }
+
+          [core.audit]
+          signing_key = { credential = "audit.key" }
+
+          [core.database]
+          name = "ostena_ci_roles"
+          user = "ostena_ci"
+          migration_user = "ostena_ci_admin"
+          EOF
+          chmod 0644 "$dir/core.toml"
+          run() {
+            local account="$1"; shift
+            sudo -u "$account" -- "$dir/ostena" core "$@" --config "$dir/core.toml"
+          }
+          run postgres db init --superuser postgres
+          run ostena_ci_admin migrate
+          run ostena_ci_admin migrate --check
+          # The roles pass the production checks (no CORE-E014).
+          run ostena_ci user list
+          if run ostena_ci migrate; then
+            echo "the service account migrated" >&2
+            exit 1
+          fi
       - name: The offline query cache matches the migrations
         working-directory: crates/ostena-core
         run: |
@@ -432,7 +481,8 @@ jobs:
   # real OpenSSH target in a network namespace, sealed transcript, offline
   # audit verification, then tampering found in a transcript, the export and
   # the database. Local processes only (PostgreSQL of the runner, sudo for
-  # the namespace).
+  # the namespace and the two system accounts of the core, service and
+  # migrations, which the script creates).
   demo-m1:
     needs: [changes, release-sign]
     if: needs.changes.outputs.code == 'true'
@@ -454,7 +504,6 @@ jobs:
         run: |
           sudo systemctl start postgresql.service
           psql --version | grep -q ' 16\.'
-          sudo -u postgres createuser --createdb --createrole "$USER"
           command -v sshd || test -x /usr/sbin/sshd \
             || (sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server)
           ssh -V
