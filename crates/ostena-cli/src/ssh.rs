@@ -591,6 +591,9 @@ fn settings(ssh: &ostena_common::config::AgentSshConfig) -> ServerSettings {
     let size = |v: u32| usize::try_from(v).unwrap_or(usize::MAX);
     ServerSettings {
         max_sessions: size(ssh.max_sessions),
+        max_sessions_per_user: ssh.max_sessions_per_user.map(size),
+        max_sessions_per_target: ssh.max_sessions_per_target.map(size),
+        idle_timeout: ssh.idle_timeout_secs.map(Duration::from_secs),
         max_unauthenticated: size(ssh.max_unauthenticated),
         max_unauthenticated_per_source: size(ssh.max_unauthenticated_per_source),
         login_grace: Duration::from_secs(ssh.login_grace_secs),
@@ -859,6 +862,21 @@ pub(crate) fn show_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_carry_the_session_quotas_and_idle_delay() {
+        let ssh: ostena_common::config::AgentSshConfig = toml::from_str(
+            "listen = [\"127.0.0.1:2222\"]\nmax_sessions = 8\nmax_sessions_per_user = 2\n\
+             idle_timeout_secs = 900\n",
+        )
+        .unwrap();
+        let limits = settings(&ssh).limits();
+        assert_eq!(limits.max_sessions, 8);
+        assert_eq!(limits.max_per_user, Some(2));
+        assert_eq!(limits.max_per_target, None);
+        assert_eq!(limits.idle_timeout, Some(Duration::from_secs(900)));
+        assert_eq!(limits.max_duration, None);
+    }
 
     #[derive(Default, Clone)]
     struct Counter(Arc<(AtomicUsize, AtomicUsize)>);

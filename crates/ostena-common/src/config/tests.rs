@@ -814,6 +814,9 @@ fn ssh_section_parses_with_safe_defaults() {
     let ssh = a.ssh.as_ref().unwrap();
     assert_eq!(ssh.listen, ["0.0.0.0:2222", "[::]:2222"]);
     assert_eq!(ssh.max_sessions, 64);
+    assert_eq!(ssh.max_sessions_per_user, None);
+    assert_eq!(ssh.max_sessions_per_target, None);
+    assert_eq!(ssh.idle_timeout_secs, None);
     assert_eq!(ssh.max_unauthenticated, 16);
     assert_eq!(ssh.max_unauthenticated_per_source, 4);
     assert_eq!(ssh.login_grace_secs, 30);
@@ -860,6 +863,12 @@ fn v015_ssh_addresses_bounds_and_keys() {
         ("login_grace_secs", 121, 120),
         ("target_connect_timeout_secs", 0, 1),
         ("target_connect_timeout_secs", 31, 30),
+        ("max_sessions_per_user", 0, 1),
+        ("max_sessions_per_user", 257, 256),
+        ("max_sessions_per_target", 0, 1),
+        ("max_sessions_per_target", 257, 256),
+        ("idle_timeout_secs", 59, 60),
+        ("idle_timeout_secs", 86_401, 86_400),
     ] {
         let c = agent_ssh(&format!("{field} = {bad}\n"));
         assert_eq!(agent_codes(&c), vec![Code::AgentSsh], "{field} = {bad}");

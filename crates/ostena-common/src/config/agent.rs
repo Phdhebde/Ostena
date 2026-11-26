@@ -122,6 +122,18 @@ pub struct AgentSshConfig {
     /// Authenticated sessions, 1 to 256.
     #[serde(default = "default_ssh_max_sessions")]
     pub max_sessions: u32,
+    /// Sessions of one user at once, 1 to 256 (within `max_sessions`
+    /// anyway); unset: only `max_sessions` (ADR-0018).
+    #[serde(default)]
+    pub max_sessions_per_user: Option<u32>,
+    /// Sessions towards one resource at once, 1 to 256 (within
+    /// `max_sessions` anyway); unset: only `max_sessions` (ADR-0018).
+    #[serde(default)]
+    pub max_sessions_per_target: Option<u32>,
+    /// A session without traffic from the user for this long is cut, 60 to
+    /// 86 400 s; unset: never (ADR-0018).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
     /// Connections not yet authenticated, 1 to 256.
     #[serde(default = "default_ssh_max_unauthenticated")]
     pub max_unauthenticated: u32,
@@ -240,6 +252,22 @@ fn ssh_consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
             ));
         }
     }
+    // Unset optional bounds are not checked (no bound of their own).
+    let optional = [
+        (
+            "max_sessions_per_user",
+            ssh.max_sessions_per_user.map(u64::from),
+            1..=256,
+        ),
+        (
+            "max_sessions_per_target",
+            ssh.max_sessions_per_target.map(u64::from),
+            1..=256,
+        ),
+        ("idle_timeout_secs", ssh.idle_timeout_secs, 60..=86_400),
+    ]
+    .into_iter()
+    .filter_map(|(field, value, range)| value.map(|v| (field, v, range)));
     let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 5] = [
         ("max_sessions", u64::from(ssh.max_sessions), 1..=256),
         (
@@ -259,7 +287,7 @@ fn ssh_consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
             1..=30,
         ),
     ];
-    for (field, value, range) in bounds {
+    for (field, value, range) in bounds.into_iter().chain(optional) {
         if !range.contains(&value) {
             out.push(Violation::new(
                 Code::AgentSsh,
