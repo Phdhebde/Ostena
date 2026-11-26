@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browser;
 pub mod channel;
 pub mod control;
 pub mod enroll;

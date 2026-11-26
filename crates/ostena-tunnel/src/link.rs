@@ -209,9 +209,18 @@ pub struct AgentLink {
     stop: watch::Sender<bool>,
     task: Mutex<Option<JoinHandle<()>>>,
     pushes: Mutex<Option<mpsc::Receiver<CoreMessage>>>,
+    incoming: Mutex<Option<mpsc::Receiver<Incoming>>>,
     connected: watch::Receiver<Option<Connection>>,
     waiting: Arc<Waiting>,
 }
+
+/// A session channel opened by the core: its session, its class and the
+/// channel (browser streams, ADR-0020).
+pub type Incoming = (crate::Uuid, crate::StreamClass, crate::Channel);
+
+/// Channels opened by the core and not taken yet: past this, the accept
+/// loop waits (the core then waits on the stream limit of the tunnel).
+pub const INCOMING_QUEUE: usize = 16;
 
 /// A connection established, as [`AgentLink::subscribe_connected`] tells
 /// it: what a message bound to the tunnel needs (`ssh_host_key`).
@@ -247,6 +256,7 @@ impl AgentLink {
         let status = Arc::new(Mutex::new(initial_status()));
         let (stop, stop_rx) = watch::channel(false);
         let (push_tx, push_rx) = mpsc::channel(64);
+        let (incoming_tx, incoming_rx) = mpsc::channel(INCOMING_QUEUE);
         let current = Current::default();
         let (connected_tx, connected) = watch::channel(None);
         let waiting = Arc::new(Waiting::default());
@@ -256,7 +266,10 @@ impl AgentLink {
             current.clone(),
             connected_tx,
             stop_rx,
-            push_tx,
+            Sinks {
+                pushes: push_tx,
+                incoming: incoming_tx,
+            },
             waiting.clone(),
         ));
         Self {
@@ -265,6 +278,7 @@ impl AgentLink {
             stop,
             task: Mutex::new(Some(task)),
             pushes: Mutex::new(Some(push_rx)),
+            incoming: Mutex::new(Some(incoming_rx)),
             connected,
             waiting,
         }
@@ -360,6 +374,12 @@ impl AgentLink {
     /// answers…), once.
     pub fn take_pushes(&self) -> Option<mpsc::Receiver<CoreMessage>> {
         self.pushes.lock().ok()?.take()
+    }
+
+    /// The session channels the core opens, on every connection, once. A
+    /// channel belongs to the connection that carried it.
+    pub fn take_incoming(&self) -> Option<mpsc::Receiver<Incoming>> {
+        self.incoming.lock().ok()?.take()
     }
 
     /// Stops the link and waits for it.
@@ -490,7 +510,7 @@ async fn run(
     current: Current,
     connected: watch::Sender<Option<Connection>>,
     mut stop: watch::Receiver<bool>,
-    pushes: mpsc::Sender<CoreMessage>,
+    sinks: Sinks,
     waiting: Arc<Waiting>,
 ) {
     let overdue = {
@@ -532,7 +552,7 @@ async fn run(
                     count,
                     certificate_sha256: tls::fingerprint(&certificate),
                 }));
-                let ended = serve(&params, &tunnel, &certificate, &status, &stop, &pushes).await;
+                let ended = serve(&params, &tunnel, &certificate, &status, &stop, &sinks).await;
                 if let Ok(mut c) = current.lock() {
                     *c = None;
                 }
@@ -618,6 +638,35 @@ async fn open(
     Ok((Arc::new(tunnel), certificate))
 }
 
+/// Hands the channels the core opens on `tunnel` to `incoming`, until the
+/// tunnel closes; a channel with a bad header is refused, the tunnel stays.
+async fn accept_channels(tunnel: Arc<AgentTunnel>, incoming: mpsc::Sender<Incoming>) {
+    loop {
+        match tunnel.accept_channel().await {
+            Ok(accepted) => {
+                if incoming.send(accepted).await.is_err() {
+                    return;
+                }
+            }
+            Err(TunnelError::ConnectionLost(_)) => return,
+            Err(e) => {
+                tracing::warn!(event = "agent.channel_refused", code = e.code(), "{e}");
+                if tunnel.is_closed() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Where the link hands what the core sends.
+struct Sinks {
+    /// The control messages.
+    pushes: mpsc::Sender<CoreMessage>,
+    /// The session channels.
+    incoming: mpsc::Sender<Incoming>,
+}
+
 enum Event {
     Message(CoreMessage),
     Closed(TunnelError),
@@ -633,8 +682,10 @@ async fn serve(
     certificate: &CertificateDer<'static>,
     status: &Mutex<LinkStatus>,
     stop: &watch::Receiver<bool>,
-    pushes: &mpsc::Sender<CoreMessage>,
+    sinks: &Sinks,
 ) -> Ended {
+    let pushes = &sinks.pushes;
+    let acceptor = tokio::spawn(accept_channels(tunnel.clone(), sinks.incoming.clone()));
     let (tx, mut events) = mpsc::channel::<Event>(16);
     let mut pending: Option<(SigningKey, SecretBytes)> = None;
     let mut renewed = false;
@@ -733,6 +784,7 @@ async fn serve(
     renewal_timer.abort();
     forwarder.abort();
     stopper.abort();
+    acceptor.abort();
     ended
 }
 
