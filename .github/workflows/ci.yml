@@ -428,7 +428,7 @@ jobs:
           OSTENA_REQUIRE_RDP_TARGET: "1"
       # What the target logged about its sessions and the logons of the
       # test account: why a session ended.
-      - if: always()
+      - if: failure()
         run: tests/rdp/windows-target-events.ps1
         shell: pwsh
 
