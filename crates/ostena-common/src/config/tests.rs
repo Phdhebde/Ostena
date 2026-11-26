@@ -126,7 +126,7 @@ fn codes_are_stable_and_unique() {
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
         "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
-        "CFG-P017",
+        "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1660,4 +1660,132 @@ fn core_login_key_is_a_key_of_its_own() {
         vec![Code::CoreKeyInFile, Code::TotpSha1]
     );
     assert!(waived[0].message.contains("core.login.totp_key"));
+}
+
+// ---------------------------------------------------------------- core.web
+
+const WEB: &str = r#"
+[core.web]
+listen = "0.0.0.0:443"
+origin = "https://bastion.example"
+"#;
+
+#[test]
+fn core_web_defaults_are_safe() {
+    let c = core_with(&format!("{LOGIN}{WEB}"));
+    assert_eq!(core_codes(&c), Vec::new());
+    assert_eq!(production_codes(&c), Vec::new());
+    let web = c.core.unwrap().web.unwrap();
+    assert_eq!(
+        (
+            web.session_max_hours,
+            web.idle_minutes,
+            web.bind_source,
+            web.tls_classic_fallback,
+            web.max_connections,
+            web.connections_per_source
+        ),
+        (8, 15, true, false, 256, 16)
+    );
+    assert!(core_with(LOGIN).core.unwrap().web.is_none());
+    assert_eq!(
+        Config::from_toml_str(&format!("{CORE}{LOGIN}{WEB}unknown = 1\n"))
+            .unwrap_err()
+            .codes(),
+        vec![Code::Parse]
+    );
+}
+
+#[test]
+fn v018_core_web_rules() {
+    let ok = core_with(&format!(
+        "{LOGIN}{WEB}session_max_hours = 1\nidle_minutes = 60\nmax_connections = 4096\n\
+         connections_per_source = 1\n"
+    ));
+    assert_eq!(core_codes(&ok), Vec::new());
+    for extra in [
+        "session_max_hours = 0",
+        "session_max_hours = 9",
+        "idle_minutes = 4",
+        "idle_minutes = 61",
+        "max_connections = 0",
+        "max_connections = 4097",
+        "connections_per_source = 0",
+        "connections_per_source = 257",
+    ] {
+        let c = core_with(&format!("{LOGIN}{WEB}{extra}\n"));
+        assert_eq!(core_codes(&c), vec![Code::CoreWeb], "{extra}");
+    }
+    for listen in ["0.0.0.0:8443", "0.0.0.0:8444", "0.0.0.0:8445"] {
+        let c = core_with(&format!("{LOGIN}{}", WEB.replace("0.0.0.0:443", listen)));
+        assert_eq!(core_codes(&c), vec![Code::CoreWeb], "{listen}");
+    }
+    // The credentials and the lockout are those of [core.login].
+    assert_eq!(core_codes(&core_with(WEB)), vec![Code::CoreWeb]);
+}
+
+#[test]
+fn web_origins() {
+    for ok in [
+        "https://bastion.example",
+        "https://bastion.example:8443",
+        "https://10.0.0.1",
+        "https://[2001:db8::1]",
+        "https://[2001:db8::1]:443",
+        "https://b",
+    ] {
+        assert!(is_web_origin(ok), "{ok}");
+        let c = core_with(&format!(
+            "{LOGIN}{}",
+            WEB.replace("https://bastion.example", ok)
+        ));
+        assert_eq!(core_codes(&c), Vec::new(), "{ok}");
+    }
+    for bad in [
+        "",
+        "bastion.example",
+        "http://bastion.example",
+        "https://",
+        "https://Bastion.example",
+        "https://bastion.example/",
+        "https://bastion.example/portal",
+        "https://bastion.example:",
+        "https://bastion.example:0",
+        "https://bastion.example:08443",
+        "https://bastion.example:65536",
+        "https://user@bastion.example",
+        "https://-x.example",
+        "https://a..b",
+        "https://[2001:DB8::1]",
+        "https://[2001:db8::1",
+        "https://[2001:db8::1]x",
+        "https://bastion.example?x",
+    ] {
+        assert!(!is_web_origin(bad), "{bad}");
+    }
+    let c = core_with(&format!(
+        "{LOGIN}{}",
+        WEB.replace("https://bastion.example", "https://x/")
+    ));
+    assert_eq!(core_codes(&c), vec![Code::CoreWeb]);
+}
+
+#[test]
+fn p017_p018_web_weakenings_are_refused_in_production() {
+    let c = core_with(&format!(
+        "{LOGIN}{WEB}bind_source = false\ntls_classic_fallback = true\n"
+    ));
+    assert_eq!(core_codes(&c), Vec::new());
+    assert_eq!(
+        production_codes(&c),
+        vec![Code::WebSourceNotBound, Code::WebTlsClassic]
+    );
+    // Development: logged, not refused.
+    let dev = parse(&format!(
+        "mode = \"development\"\n{CORE}{LOGIN}{WEB}bind_source = false\n"
+    ));
+    assert_eq!(
+        dev.weakenings().iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::WebSourceNotBound]
+    );
 }
