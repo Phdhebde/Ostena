@@ -100,10 +100,12 @@ impl Rights {
     pub const SSH_PORT_FORWARDING: Self = Self(1 << 7);
     /// SSH agent forwarding.
     pub const SSH_AGENT_FORWARDING: Self = Self(1 << 8);
+    /// SSH X11 forwarding.
+    pub const SSH_X11_FORWARDING: Self = Self(1 << 9);
 
     /// No right.
     pub const NONE: Self = Self(0);
-    const KNOWN: u32 = (1 << 9) - 1;
+    const KNOWN: u32 = (1 << 10) - 1;
 
     /// Parses a bit set; `None` if an unknown bit is set.
     pub const fn from_bits(bits: u32) -> Option<Self> {
@@ -329,7 +331,8 @@ mod tests {
         assert!(r.contains(Rights::FILE_DOWNLOAD));
         assert!(!r.contains(Rights::FILE_UPLOAD));
         assert_eq!(Rights::from_bits(r.bits()), Some(r));
-        assert_eq!(Rights::from_bits(1 << 9), None);
+        assert_eq!(Rights::from_bits(1 << 9), Some(Rights::SSH_X11_FORWARDING));
+        assert_eq!(Rights::from_bits(1 << 10), None);
         assert_eq!(Rights::from_bits(u32::MAX), None);
     }
 
