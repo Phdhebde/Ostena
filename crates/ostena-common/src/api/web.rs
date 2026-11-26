@@ -12,7 +12,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::login::{
-    MAX_PASSWORD, MAX_TOTP, is_username, is_uuid, secret_from_string, secret_len, secret_to_string,
+    MAX_PASSWORD, MAX_TOTP, is_account, is_resource, is_username, is_uuid, secret_from_string,
+    secret_len, secret_to_string,
 };
 use crate::secret::SecretString;
 
@@ -332,6 +333,117 @@ impl RevokeRequest {
     }
 }
 
+/// Length of the text form of a grant (ADR-0004): 184 bytes in base64url
+/// without padding. It travels as the subprotocol `ostena-grant.<grant>`.
+pub const GRANT_TEXT_LEN: usize = 246;
+
+/// The protocols a browser session may ask for. RDP comes with the display
+/// of PR 13 (ADR-0020, § 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessProtocol {
+    /// An SSH terminal.
+    Ssh,
+}
+
+impl AccessProtocol {
+    /// The name stored and sent, e.g. `ssh`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+        }
+    }
+}
+
+/// Browser → core: `POST /api/v1/access`, an access to `account@resource`
+/// for the current browser session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessRequest {
+    /// The resource (`[a-z0-9][a-z0-9.-]{0,62}`).
+    pub resource: String,
+    /// The account on the resource.
+    pub account: String,
+    /// The protocol.
+    pub protocol: AccessProtocol,
+}
+
+impl AccessRequest {
+    /// Parses and checks a request body.
+    ///
+    /// # Errors
+    ///
+    /// [`WireError`].
+    pub fn parse(body: &[u8]) -> Result<Self, WireError> {
+        let request: Self = parse_json(body)?;
+        if !is_resource(&request.resource) {
+            return Err(WireError::Field(
+                "resource",
+                "[a-z0-9][a-z0-9.-], 1 à 63 octets",
+            ));
+        }
+        if !is_account(&request.account) {
+            return Err(WireError::Field(
+                "account",
+                "1 à 256 octets, sans caractère de contrôle ni espace aux extrémités",
+            ));
+        }
+        Ok(request)
+    }
+}
+
+/// Core → browser: the grant of an access, to present once, within its
+/// validity, in the opening of the WebSocket `/api/v1/gateway`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessGrant {
+    /// The grant, text form ([`GRANT_TEXT_LEN`] base64url characters). It
+    /// carries the authorisation, never a secret of the target.
+    pub grant: String,
+    /// The resource.
+    pub resource: String,
+    /// The account on the resource.
+    pub account: String,
+    /// The protocol.
+    pub protocol: AccessProtocol,
+    /// End of validity of the grant, Unix seconds.
+    pub expires_at: u64,
+    /// Longest session it allows, seconds.
+    pub max_session_secs: u32,
+}
+
+impl AccessGrant {
+    /// Parses and checks a response body.
+    ///
+    /// # Errors
+    ///
+    /// [`WireError`].
+    pub fn parse(body: &[u8]) -> Result<Self, WireError> {
+        let grant: Self = parse_json(body)?;
+        if grant.grant.len() != GRANT_TEXT_LEN
+            || !grant
+                .grant
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(WireError::Field(
+                "grant",
+                "246 caractères base64url attendus",
+            ));
+        }
+        if !is_resource(&grant.resource) || !is_account(&grant.account) {
+            return Err(WireError::Field("resource", "ressource ou compte invalide"));
+        }
+        if grant.expires_at == 0 || grant.max_session_secs == 0 {
+            return Err(WireError::Field(
+                "expires_at",
+                "échéance et durée non nulles",
+            ));
+        }
+        Ok(grant)
+    }
+}
+
 /// Core → browser: every refusal. The portal shows the translation of
 /// `code`, never `message`, which is for the logs and the tests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -396,6 +508,14 @@ pub fn fuzz(data: &[u8]) {
     if let Ok(r) = ErrorBody::parse(data) {
         let again = serde_json::to_vec(&r).ok();
         assert_eq!(again.and_then(|b| ErrorBody::parse(&b).ok()), Some(r));
+    }
+    if let Ok(r) = AccessRequest::parse(data) {
+        let again = serde_json::to_vec(&r).ok();
+        assert_eq!(again.and_then(|b| AccessRequest::parse(&b).ok()), Some(r));
+    }
+    if let Ok(r) = AccessGrant::parse(data) {
+        let again = serde_json::to_vec(&r).ok();
+        assert_eq!(again.and_then(|b| AccessGrant::parse(&b).ok()), Some(r));
     }
     if let Ok(r) = SessionRequest::parse(data) {
         let again = serde_json::to_vec(&r).ok();
@@ -475,6 +595,49 @@ mod tests {
         assert!(RevokeRequest::parse(br#"{"reason":"poste perdu"}"#).is_ok());
         assert!(RevokeRequest::parse(br#"{"reason":""}"#).is_err());
         assert!(RevokeRequest::parse(br#"{"reason":"a\nb"}"#).is_err());
+    }
+
+    #[test]
+    fn access_messages_are_strict() {
+        let ok = br#"{"resource":"srv-01","account":"root","protocol":"ssh"}"#;
+        let r = AccessRequest::parse(ok).unwrap();
+        assert_eq!(
+            (r.resource.as_str(), r.account.as_str(), r.protocol),
+            ("srv-01", "root", AccessProtocol::Ssh)
+        );
+        for bad in [
+            &br#"{"resource":"srv-01","account":"root"}"#[..],
+            br#"{"resource":"srv-01","account":"root","protocol":"rdp"}"#,
+            br#"{"resource":"Srv","account":"root","protocol":"ssh"}"#,
+            br#"{"resource":"srv-01","account":" root","protocol":"ssh"}"#,
+            br#"{"resource":"srv-01","account":"root","protocol":"ssh","x":1}"#,
+        ] {
+            assert!(
+                AccessRequest::parse(bad).is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        let grant = AccessGrant {
+            grant: "A".repeat(GRANT_TEXT_LEN),
+            resource: "srv-01".into(),
+            account: "root".into(),
+            protocol: AccessProtocol::Ssh,
+            expires_at: 1_800_000_060,
+            max_session_secs: 3600,
+        };
+        let body = serde_json::to_vec(&grant).unwrap();
+        assert_eq!(AccessGrant::parse(&body).unwrap(), grant);
+        let edits: [fn(&mut AccessGrant); 3] = [
+            |g| g.grant.push('A'),
+            |g| g.grant.replace_range(..1, "+"),
+            |g| g.max_session_secs = 0,
+        ];
+        for edit in edits {
+            let mut bad = grant.clone();
+            edit(&mut bad);
+            assert!(AccessGrant::parse(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
     }
 
     #[test]

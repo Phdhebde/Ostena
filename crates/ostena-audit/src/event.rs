@@ -179,6 +179,11 @@ event_kinds! {
     UserGroupMemberAdded => "user_group.member_added",
     /// A user left a group of users.
     UserGroupMemberRemoved => "user_group.member_removed",
+    /// An access asked by a browser session was granted: a grant issued
+    /// for the browser gateway (ADR-0020).
+    AccessWebGranted => "access.web_granted",
+    /// An access asked by a browser session was refused (code, reason).
+    AccessWebRefused => "access.web_refused",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -595,7 +600,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 66);
+        assert_eq!(names.len(), 68);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())
