@@ -21,3 +21,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0015](0015-transport-https-de-l-api-du-core.md) | Transport HTTPS de l'API du core | Accepté |
 | [0016](0016-transcripts-des-sessions.md) | Transcripts des sessions | Accepté |
 | [0017](0017-signature-des-livrables.md) | Signature des livrables | Accepté |
+| [0019](0019-driver-rdp-et-passthrough-navigateur.md) | Driver RDP et passthrough vers le navigateur | Proposé |
