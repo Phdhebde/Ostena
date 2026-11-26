@@ -18,6 +18,9 @@
 //!
 //! The RDP targets have their own profile, confined to the RDP driver
 //! ([`target`], ADR-0009 « écart RDP »): it is the only use of TLS 1.2.
+//! The LDAPS directories of the identity sources have theirs, TLS 1.3 only
+//! but with classic groups and RSA certificates ([`directory`], ADR-0009
+//! « Annuaires LDAPS »).
 
 use std::fmt;
 use std::sync::Arc;
@@ -665,6 +668,7 @@ pub fn web_server_config(
     Ok(Arc::new(config))
 }
 
+pub mod directory;
 pub mod target;
 
 #[cfg(test)]

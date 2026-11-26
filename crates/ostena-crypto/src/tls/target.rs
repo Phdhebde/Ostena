@@ -112,7 +112,7 @@ static ECDSA_P256_SHA256: TargetAlgorithm = TargetAlgorithm {
     signature: alg_id::ECDSA_SHA256,
 };
 
-static TARGET_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
+pub(super) static TARGET_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
     all: &[
         &ECDSA_P256_SHA256,
         &RSA_PSS_SHA256,
