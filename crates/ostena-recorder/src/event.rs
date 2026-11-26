@@ -37,6 +37,9 @@ pub enum NoteKind {
     /// A request refused for lack of a function of the right: what was
     /// asked (`port-forwarding 10.0.0.5:80`, `transfer scp`…).
     Refused = 2,
+    /// A forwarding opened under the function of the right: what
+    /// (`port-forwarding 10.0.0.5:80`).
+    Forward = 3,
     /// A file opened for reading.
     Read = 16,
     /// A file opened for writing (created, truncated or appended to).
@@ -57,9 +60,10 @@ pub enum NoteKind {
 
 impl NoteKind {
     /// Every kind.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Transfer,
         Self::Refused,
+        Self::Forward,
         Self::Read,
         Self::Write,
         Self::Remove,
@@ -80,6 +84,7 @@ impl NoteKind {
         match self {
             Self::Transfer => "transfer",
             Self::Refused => "refused",
+            Self::Forward => "forward",
             Self::Read => "file-read",
             Self::Write => "file-write",
             Self::Remove => "file-remove",
@@ -94,7 +99,7 @@ impl NoteKind {
     /// Whether its text is a label (printable ASCII and spaces) rather than
     /// paths.
     pub const fn is_label(self) -> bool {
-        matches!(self, Self::Transfer | Self::Refused)
+        matches!(self, Self::Transfer | Self::Refused | Self::Forward)
     }
 
     /// Whether its text holds two paths separated by a NUL.

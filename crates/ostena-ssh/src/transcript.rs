@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use ostena_recorder::{EndReason, Event, Exit, Frame, wire};
+use ostena_recorder::{EndReason, Event, Exit, Frame, NoteKind, wire};
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::error::SshError;
@@ -64,7 +64,13 @@ struct Signal {
     probe: std::sync::Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// A window change not recorded yet: `cols << 32 | rows`, 0 for none.
     resize: AtomicU64,
+    /// Notes kept by [`Transcript::note_later`], not recorded yet.
+    notes: std::sync::Mutex<Vec<(NoteKind, Vec<u8>)>>,
 }
+
+/// Most notes kept at once by [`Transcript::note_later`]: refusals are
+/// rare, a client that sends more is only logged.
+pub const MAX_PENDING_NOTES: usize = 16;
 
 /// The transcript of one session. Cheap to clone: the clones share the
 /// queue and the clock.
@@ -104,6 +110,7 @@ impl Transcript {
                 notify: Notify::new(),
                 probe: std::sync::Mutex::new(Some(tx.clone())),
                 resize: AtomicU64::new(0),
+                notes: std::sync::Mutex::new(Vec::new()),
             }),
             state: Arc::new(Mutex::new(State {
                 tx: Some(tx),
@@ -186,7 +193,76 @@ impl Transcript {
                 command: command.map(<[u8]>::to_vec),
             },
         )
-        .await
+        .await?;
+        self.pending_notes(state).await
+    }
+
+    /// Records the notes kept by [`Transcript::note_later`], once started.
+    async fn pending_notes(&self, state: &mut State) -> Result<(), SshError> {
+        if state.origin.is_none() {
+            return Ok(());
+        }
+        let notes = self
+            .signal
+            .notes
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default();
+        for (kind, text) in notes {
+            self.queue(state, Event::Note { kind, text }).await?;
+        }
+        Ok(())
+    }
+
+    /// Keeps a note, recorded after the start, before the next event: never
+    /// waits, so the SSH handler never waits for the core. `false` if it is
+    /// invalid or [`MAX_PENDING_NOTES`] are already kept (the caller logs
+    /// it).
+    pub fn note_later(&self, kind: NoteKind, text: &[u8]) -> bool {
+        let note = Event::Note {
+            kind,
+            text: text.to_vec(),
+        };
+        if note.check().is_err() {
+            return false;
+        }
+        let Event::Note { text, .. } = note else {
+            return false;
+        };
+        match self.signal.notes.lock() {
+            Ok(mut notes) if notes.len() < MAX_PENDING_NOTES => {
+                notes.push((kind, text));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Records a note now, after the notes kept; before the start, it is
+    /// kept like [`Transcript::note_later`]. Call it before relaying what it
+    /// describes.
+    ///
+    /// # Errors
+    ///
+    /// [`SshError::TranscriptLost`]: do not relay, cut the session;
+    /// [`SshError::Refused`] for an invalid note.
+    pub async fn note(&self, kind: NoteKind, text: &[u8]) -> Result<(), SshError> {
+        let mut state = self.state.lock().await;
+        if state.origin.is_none() {
+            return if self.note_later(kind, text) {
+                Ok(())
+            } else {
+                Err(SshError::Refused("note invalide ou trop de notes"))
+            };
+        }
+        let note = Event::Note {
+            kind,
+            text: text.to_vec(),
+        };
+        note.check()
+            .map_err(|_| SshError::Refused("note invalide"))?;
+        self.pending_notes(&mut state).await?;
+        self.queue(&mut state, note).await
     }
 
     /// Records the window change kept by [`Transcript::resize`], if any.
@@ -241,6 +317,7 @@ impl Transcript {
             self.start_locked(&mut state, None, None).await?;
         }
         self.pending_resize(&mut state).await?;
+        self.pending_notes(&mut state).await?;
         self.queue(&mut state, Event::Output(data.to_vec())).await?;
         state.output = state.output.saturating_add(data.len() as u64);
         Ok(())
@@ -276,6 +353,7 @@ impl Transcript {
             self.start_locked(&mut state, None, None).await?;
         }
         self.pending_resize(&mut state).await?;
+        self.pending_notes(&mut state).await?;
         self.queue(&mut state, Event::Exit(exit)).await?;
         state.exited = true;
         Ok(())
@@ -307,6 +385,7 @@ impl Transcript {
         if state.origin.is_none() {
             self.start_locked(&mut state, None, None).await?;
         }
+        self.pending_notes(&mut state).await?;
         let output_bytes = state.output;
         let sent = self
             .queue(
@@ -380,6 +459,49 @@ mod tests {
             .enable_time()
             .build()
             .unwrap()
+    }
+
+    /// Notes kept before the start are recorded right after it; a note
+    /// recorded now follows them; past the bound, notes are refused.
+    #[test]
+    fn notes_follow_the_start_in_order() {
+        rt().block_on(async {
+            let (t, rx) = Transcript::channel(64);
+            let drained = tokio::spawn(drain(rx));
+            assert!(t.note_later(NoteKind::Refused, b"port-forwarding 10.0.0.5:80"));
+            assert!(!t.note_later(NoteKind::Refused, b"bad\n"), "invalid");
+            t.note(NoteKind::Refused, b"agent-forwarding")
+                .await
+                .unwrap();
+            t.start(None, None).await.unwrap();
+            t.note(NoteKind::Transfer, b"sftp").await.unwrap();
+            t.note(NoteKind::Write, b"/tmp/a").await.unwrap();
+            assert!(t.note(NoteKind::Write, b"").await.is_err());
+            for _ in 0..MAX_PENDING_NOTES {
+                assert!(t.note_later(NoteKind::Refused, b"x11-forwarding"));
+            }
+            assert!(!t.note_later(NoteKind::Refused, b"x11-forwarding"));
+            t.end(EndReason::Closed).await.unwrap();
+            let frames = decode(drained.await.unwrap());
+            let notes: Vec<_> = frames
+                .iter()
+                .filter_map(|f| match &f.event {
+                    Event::Note { kind, text } => Some((*kind, text.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert!(matches!(frames[0].event, Event::Start { .. }));
+            assert_eq!(notes.len(), 4 + MAX_PENDING_NOTES);
+            assert_eq!(
+                notes[..4],
+                [
+                    (NoteKind::Refused, b"port-forwarding 10.0.0.5:80".to_vec()),
+                    (NoteKind::Refused, b"agent-forwarding".to_vec()),
+                    (NoteKind::Transfer, b"sftp".to_vec()),
+                    (NoteKind::Write, b"/tmp/a".to_vec()),
+                ]
+            );
+        });
     }
 
     #[test]

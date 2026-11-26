@@ -169,6 +169,8 @@ impl Authorizer for TunnelAuthorizer {
                     account: session.account,
                     max_session: Duration::from_secs(session.session.max_session_secs.into()),
                     transcript,
+                    // Signed by the core, verified by the gateway.
+                    rights: session.session.grant.claims.rights,
                 })
             }
             Err(e) => Err(Refusal {

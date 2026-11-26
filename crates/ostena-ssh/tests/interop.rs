@@ -344,7 +344,7 @@ impl Native {
             self.dir.0.join("known_hosts").display()
         ))
         .args(["-o", &format!("GlobalKnownHostsFile={null}")])
-        .args(["-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none"])
+        .args(["-o", "IdentitiesOnly=yes"])
         .args(["-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"])
         .arg("-i")
         .arg(&self.user_key);
@@ -354,6 +354,11 @@ impl Native {
                 .arg(format!("CertificateFile={}", path.display())),
             None => cmd.args(["-o", "CertificateFile=none"]),
         };
+        // The first value of an option wins: an agent given in `extra`
+        // replaces none.
+        if !extra.iter().any(|a| a.starts_with("IdentityAgent=")) {
+            cmd.args(["-o", "IdentityAgent=none"]);
+        }
         cmd.args(extra)
             .args(["-p", &self.agent.addr.port().to_string()])
             .arg(format!("{user}@127.0.0.1"))
@@ -602,35 +607,64 @@ fn native_session_refuses_forwarding_agent_and_subsystems() {
     // sftp.
     let out = n.run("root@srv-lab01", Some(&certificate), &["-s"], &["sftp"]);
     assert!(!out.status.success());
-    // Agent forwarding is refused, the session goes on.
+    // Agent forwarding is refused, the session goes on. The client asks
+    // for it only with an agent to forward: an empty one (Unix only, the
+    // Windows agent is a service).
+    let socket = n.dir.0.join("agent.sock");
+    let mut agent = openssh("ssh-agent").filter(|_| cfg!(unix)).map(|bin| {
+        Command::new(bin)
+            .arg("-D")
+            .arg("-a")
+            .arg(&socket)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let identity_agent = format!("IdentityAgent={}", socket.display());
     let out = n.run(
         "root@srv-lab01",
         Some(&certificate),
-        &["-o", "ForwardAgent=yes"],
+        &["-o", &identity_agent, "-o", "ForwardAgent=yes"],
         &["hello"],
     );
+    if let Some(agent) = agent.as_mut() {
+        let _ = agent.kill();
+        let _ = agent.wait();
+    }
     assert!(out.status.success(), "{}", stderr(&out));
+    // X11 is refused, the session goes on (needs a display to be asked).
+    let x11 = std::env::var_os("DISPLAY").is_some();
+    if x11 {
+        let out = n.run("root@srv-lab01", Some(&certificate), &["-X"], &["hello"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    // Each is refused for lack of the function of the right, logged and
+    // noted in the transcript (none of these functions by default).
+    let mut expected = vec!["port-forwarding", "port-forwarding", "transfer"];
+    if agent.is_some() {
+        expected.insert(0, "agent-forwarding");
+    }
+    if x11 {
+        expected.push("x11-forwarding");
+    }
     for _ in 0..100 {
-        if events_on(n.agent.addr, "ssh.channel_refused").len() >= 3 {
+        if events_on(n.agent.addr, "ssh.request_refused").len() >= expected.len() {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    let kinds: Vec<String> = events_on(n.agent.addr, "ssh.channel_refused")
-        .iter()
-        .map(|e| e.field("kind").to_owned())
-        .collect();
-    for expected in ["direct-tcpip", "tcpip-forward", "sous-système sftp"] {
-        assert!(
-            kinds.iter().any(|k| k == expected),
-            "{expected} in {kinds:?}"
-        );
-    }
-    assert!(
-        events_on(n.agent.addr, "ssh.channel_refused")
-            .iter()
-            .all(|e| e.code == "SSH-E017")
-    );
+    let refused = events_on(n.agent.addr, "ssh.request_refused");
+    let mut functions: Vec<&str> = refused.iter().map(|e| e.field("function")).collect();
+    functions.sort_unstable();
+    assert_eq!(functions, expected);
+    assert!(refused.iter().all(|e| e.code == "SSH-E022"));
+    assert!(refused.iter().any(|e| e.field("detail") == "127.0.0.1:22"));
 }
 
 #[test]

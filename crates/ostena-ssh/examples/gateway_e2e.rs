@@ -129,6 +129,7 @@ impl Authorizer for ViaGateway {
                     account: session.account,
                     max_session: Duration::from_secs(session.session.max_session_secs.into()),
                     transcript,
+                    rights: session.session.grant.claims.rights,
                 })
             }
             Err(e) => Err(Refusal {
