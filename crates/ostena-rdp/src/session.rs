@@ -68,6 +68,10 @@ pub struct Counters {
     pub reactivations: u64,
     /// Input frames written.
     pub inputs: u64,
+    /// The last non-zero error information code the target sent
+    /// (`SUPPORT_ERR_INFO_PDU`, [MS-RDPBCGR] 2.2.5.1.1), kept even when
+    /// the end is normal.
+    pub error_info: Option<u32>,
 }
 
 /// Continuous Auto-Detect ([MS-RDPBCGR] 3.2.5.17).
@@ -149,7 +153,6 @@ pub struct Demux {
     autodetect: AutoDetect,
     counters: Counters,
     origin: Instant,
-    last_error: Option<u32>,
     responses: Vec<Vec<u8>>,
 }
 
@@ -220,7 +223,7 @@ impl SessionLoop {
                 }
                 filled = self.transport.fill() => {
                     if let Err(e) = filled {
-                        break match (e, self.demux.last_error) {
+                        break match (e, self.demux.counters.error_info) {
                             (RdpError::Unreachable(_), None) => SessionEnd::Closed,
                             (_, Some(code)) => end_of(code),
                             (e, None) => SessionEnd::Failed(e),
@@ -355,7 +358,6 @@ impl Demux {
             autodetect: AutoDetect::default(),
             counters: Counters::default(),
             origin: Instant::now(),
-            last_error: None,
             responses: Vec::new(),
         }
     }
@@ -408,7 +410,7 @@ impl Demux {
             Err(error) => {
                 return match decode::<X224<McsMessage<'_>>>(frame) {
                     Ok(X224(McsMessage::DisconnectProviderUltimatum(_))) => Ok(Step::End(
-                        self.last_error.map_or(SessionEnd::Closed, end_of),
+                        self.counters.error_info.map_or(SessionEnd::Closed, end_of),
                     )),
                     _ => Err(RdpError::Protocol(format!("trame X.224 : {error}"))),
                 };
@@ -443,7 +445,7 @@ impl Demux {
                     ShareDataPdu::ServerSetErrorInfo(info) => {
                         let code = error_code(&info);
                         if code != 0 {
-                            self.last_error = Some(code);
+                            self.counters.error_info = Some(code);
                         }
                     }
                     ShareDataPdu::ShutdownDenied => return Ok(Step::End(SessionEnd::Closed)),

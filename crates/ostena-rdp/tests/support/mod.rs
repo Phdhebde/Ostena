@@ -86,6 +86,9 @@ pub enum Script {
     AutoDetect,
     /// Error information with a failure code, then disconnection.
     ServerError,
+    /// Error information with a failure code and the TLS close
+    /// notification in one write, without disconnection PDU.
+    ServerErrorThenClose,
     /// Waits for the client to disconnect.
     WaitClient,
 }
@@ -250,6 +253,22 @@ impl Stream {
                 Ok(())
             }
         }
+    }
+
+    /// Writes `data` and the TLS close notification in one TCP write.
+    fn write_and_close(&mut self, data: &[u8]) -> io::Result<()> {
+        self.sent.push(data.to_vec());
+        let Some(tls) = &mut self.tls else {
+            return Err(io::ErrorKind::NotConnected.into());
+        };
+        tls.writer().write_all(data)?;
+        tls.send_close_notify();
+        let mut out = Vec::new();
+        while tls.wants_write() {
+            tls.write_tls(&mut out)?;
+        }
+        self.tcp.write_all(&out)?;
+        self.tcp.shutdown(std::net::Shutdown::Write)
     }
 
     /// Reads one PDU whose size `size` tells.
@@ -646,6 +665,16 @@ fn serve(
         Script::ServerError => {
             send(stream, io, error_info(ProtocolIndependentCode::OutOfMemory))?;
             stream.write_all(&ultimatum()).map_err(|e| err("fin", e))?;
+        }
+        Script::ServerErrorThenClose => {
+            let pdu = X224(McsMessage::SendDataIndication(SendDataIndication {
+                initiator_id: user,
+                channel_id: io,
+                user_data: Cow::Owned(error_info(ProtocolIndependentCode::OutOfMemory)),
+            }));
+            stream
+                .write_and_close(&encode_vec(&pdu).unwrap())
+                .map_err(|e| err("fin", e))?;
         }
     }
     std::thread::sleep(Duration::from_millis(100));

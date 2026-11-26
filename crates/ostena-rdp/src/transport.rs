@@ -26,6 +26,9 @@ pub struct Transport {
     pending: Vec<u8>,
     /// Bytes received from the target since the last [`Transport::take_received`].
     received: u64,
+    /// The target closed TLS after plain bytes still pending: the next
+    /// [`Transport::fill`] reports the end, once those bytes are handled.
+    closed: bool,
 }
 
 impl std::fmt::Debug for Transport {
@@ -50,6 +53,7 @@ impl Transport {
             tls: None,
             pending: Vec::new(),
             received: 0,
+            closed: false,
         }
     }
 
@@ -99,6 +103,9 @@ impl Transport {
     /// [`RdpError::Unreachable`] when the target closed, [`RdpError::Tls`]
     /// on a TLS error.
     pub async fn fill(&mut self) -> Result<(), RdpError> {
+        if self.closed {
+            return Err(RdpError::Unreachable("TLS fermée par la cible".into()));
+        }
         let mut buf = vec![0u8; CHUNK];
         let n = self.tcp.read(&mut buf).await.map_err(|e| io_error(&e))?;
         self.absorb(&buf[..n])
@@ -128,12 +135,23 @@ impl Transport {
                 .map_err(|e| RdpError::Tls(e.to_string()))?;
         }
         let mut chunk = [0u8; CHUNK];
+        let mut plain = 0usize;
         loop {
             match tls.reader().read(&mut chunk) {
+                // The close notification may come in the same read as the
+                // last PDUs (error information, disconnection): they are
+                // kept, and the end reported by the next fill.
+                Ok(0) if plain > 0 => {
+                    self.closed = true;
+                    break;
+                }
                 Ok(0) => {
                     return Err(RdpError::Unreachable("TLS fermée par la cible".into()));
                 }
-                Ok(n) => self.pending.extend_from_slice(&chunk[..n]),
+                Ok(n) => {
+                    plain += n;
+                    self.pending.extend_from_slice(&chunk[..n]);
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(io_error(&e)),
             }
