@@ -312,6 +312,12 @@ jobs:
       - run: bash tests/agent/linux-service.sh target/release/ostena
       # The static musl binary is the Linux release artifact: measure it.
       - run: cargo xtask footprint --target x86_64-unknown-linux-musl
+      # The test core built by footprint, for the package installation tests.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-core-linux
+          path: target/release/examples/test_core
+          retention-days: 7
 
   # All targets in one job, 30 s each: the fuzz build is shared. Longer runs:
   # fuzz-nightly.yml.
@@ -378,15 +384,29 @@ jobs:
       - run: cargo build --release --locked --package ostena-cli
       - run: target/release/ostena.exe --version
       - run: cargo xtask check-release target/release/ostena.exe
+      # Authenticode with a test certificate drawn for this job (ADR-0024),
+      # before the MSI embeds the executable.
+      - if: matrix.os == 'windows-2025'
+        run: packaging/windows/sign-test.ps1 -Name exe -Files target/release/ostena.exe -Certificate target/release/ostena-exe-test.cer
+        shell: pwsh
       - if: matrix.os == 'windows-2025'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ostena-x86_64-pc-windows-msvc
-          path: target/release/ostena.exe
+          path: |
+            target/release/ostena.exe
+            target/release/ostena-exe-test.cer
           retention-days: 7
       - run: tests/agent/windows-service.ps1 -Binary target/release/ostena.exe
         shell: pwsh
       - run: cargo xtask footprint
+      # The test core built by footprint, for the MSI installation tests.
+      - if: matrix.os == 'windows-2025'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-core-windows
+          path: target/release/examples/test_core.exe
+          retention-days: 7
       - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -427,6 +447,168 @@ jobs:
         env:
           OSTENA_REQUIRE_RDP_TARGET: "1"
 
+  # Agent packages (ADR-0024), built offline on Linux: the .deb with dpkg-deb
+  # from the static musl binary (built twice: it must be reproducible), the
+  # MSI with wixl (msitools) around the signed ostena.exe. The MSI is signed
+  # by msi-sign.
+  package:
+    needs: [changes, release-linux, windows]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends wixl msitools
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-unknown-linux-musl
+          path: bin/linux
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-pc-windows-msvc
+          path: bin/windows
+      - name: .deb, built twice and compared
+        run: |
+          chmod +x bin/linux/ostena
+          deb=$(packaging/debian/build-deb.sh bin/linux/ostena out/deb)
+          again=$(packaging/debian/build-deb.sh bin/linux/ostena out/deb-again)
+          cmp "$deb" "$again"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+      - run: packaging/windows/build-msi.sh bin/windows/ostena.exe out/msi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ostena-deb
+          path: out/deb/
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ostena-msi-unsigned
+          path: out/msi/
+          retention-days: 1
+
+  # Authenticode signature of the MSI with a test certificate drawn for this
+  # job (ADR-0024); signtool is part of the Windows SDK of the runner.
+  msi-sign:
+    needs: [changes, package]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-msi-unsigned
+          path: msi
+      - run: packaging/windows/sign-test.ps1 -Name msi -Files (Get-ChildItem msi\*.msi).FullName -Certificate msi\ostena-msi-test.cer
+        shell: pwsh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ostena-msi
+          path: msi/
+          retention-days: 7
+
+  # The MSI installed silently on each Windows Server runner, connected to a
+  # test core (the identity it issues stands for an enrolment): signatures,
+  # service, status, no listening port (dial-back), control pipe refused to
+  # a non-administrator, repair, removal (tests/packaging/windows-msi.ps1).
+  install-windows:
+    needs: [changes, msi-sign, windows]
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-msi
+          path: msi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-pc-windows-msvc
+          path: exe
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-core-windows
+          path: core
+      - name: Silent installation against a test core
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'core'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          # The test core serves until its standard input is closed.
+          $info = [Diagnostics.ProcessStartInfo]::new((Resolve-Path core\test_core.exe).Path)
+          $info.ArgumentList.Add($dir)
+          $info.ArgumentList.Add('2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6')
+          $info.RedirectStandardInput = $true
+          $info.RedirectStandardOutput = $true
+          $info.UseShellExecute = $false
+          $core = [Diagnostics.Process]::Start($info)
+          $line = $core.StandardOutput.ReadLine()
+          if ($line -notmatch '^core (.+)$') { Write-Host "::error::test core: $line"; exit 1 }
+          $address = $Matches[1]
+          Write-Host "test core at $address"
+          try {
+            tests/packaging/windows-msi.ps1 -Msi (Get-ChildItem msi\*.msi).FullName `
+              -CoreAddress $address -RootCa (Join-Path $dir 'root.pem') -IdentityDir $dir `
+              -ExpectConnected -TrustCertificate exe\ostena-exe-test.cer, msi\ostena-msi-test.cer
+            $code = $LASTEXITCODE
+          } finally {
+            $core.StandardInput.Close()
+            $core.WaitForExit(10000) | Out-Null
+          }
+          exit $code
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msi-logs-${{ matrix.os }}
+          path: |
+            C:\ProgramData\Ostena\setup.log
+            C:\ProgramData\Ostena\state\agent.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The .deb in Debian 12 and 13 containers whose PID 1 is systemd, connected
+  # to a test core on the host: postinst, setup, service, status, no
+  # listening port (dial-back), control socket refused to a non-root user,
+  # reinstallation, removal, purge (tests/packaging/debian-install.sh).
+  install-debian:
+    needs: [changes, package, release-linux]
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "debian:13"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-deb
+          path: deb
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-core-linux
+          path: core
+      - env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          chmod +x core/test_core
+          bash tests/packaging/debian-install.sh "$IMAGE" deb/*.deb core/test_core
+
   # SSH latency (CLAUDE.md: at most 3 ms added at p99 by SSH, session set up
   # in less than 5 s): the agent relay and the tunnel, on every run. The
   # summary of the job shows the table; the raw results are an artifact.
@@ -452,12 +634,13 @@ jobs:
           retention-days: 90
 
   # Signed deliverables (ADR-0017), with a TEST key drawn for this run only
-  # and never kept: the Linux and Windows release binaries and the SBOMs in
-  # one manifest, signed and verified by the binary itself, then a modified
+  # and never kept: the Linux and Windows release binaries, the agent
+  # packages (.deb, MSI with the public test certificates of its
+  # Authenticode signatures, ADR-0024) and the SBOMs in one manifest, signed and verified by the binary itself, then a modified
   # copy must be refused. The artifact holds the files, the manifest, its
   # signature and the public test key.
   release-sign:
-    needs: [changes, checks, release-linux, windows]
+    needs: [changes, checks, release-linux, windows, package, msi-sign]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -473,6 +656,14 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sbom-cyclonedx
+          path: signed
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-deb
+          path: signed
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-msi
           path: signed
       - name: Sign with a test key, verify, refuse a modified copy
         run: |
@@ -564,6 +755,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # The MSI on Windows Server 2016 in the lab (ADR-0024, ADR-0025): the gateway
+  # gw2016 of the isolated zone installs the signed package silently and runs
+  # the checks of install-windows, without a core (lab/agent-msi.sh). The lab
+  # takes hours: weekly run and manual runs only, outside ci-ok.
+  lab-agent:
+    needs: [changes, release-sign]
+    if: needs.changes.outputs.code == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/lab.yml
+    with:
+      artifacts: ostena-test-signed
+      command: bash lab/agent-msi.sh "$LAB_ARTIFACTS/ostena-test-signed" gw2016
+
   # The single required check of the branch protection: every job must have
   # succeeded, or been skipped by `changes` for a documentation-only change.
   ci-ok:
@@ -579,6 +782,10 @@ jobs:
       - windows
       - rdp-windows
       - bench-ssh
+      - package
+      - msi-sign
+      - install-windows
+      - install-debian
       - release-sign
       - demo-m1
     runs-on: ubuntu-24.04
