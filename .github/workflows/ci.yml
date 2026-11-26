@@ -426,6 +426,11 @@ jobs:
         shell: pwsh
         env:
           OSTENA_REQUIRE_RDP_TARGET: "1"
+      # What the target logged about its sessions and the logons of the
+      # test account: why a session ended.
+      - if: always()
+        run: tests/rdp/windows-target-events.ps1
+        shell: pwsh
 
   # SSH latency (CLAUDE.md: at most 3 ms added at p99 by SSH, session set up
   # in less than 5 s): the agent relay and the tunnel, on every run. The
