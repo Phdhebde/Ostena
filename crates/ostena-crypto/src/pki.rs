@@ -542,7 +542,7 @@ fn certificate_subject(der: &[u8]) -> Option<Subject> {
 }
 
 /// `(content, rest)` of the element at the start of `input` with `tag`.
-fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+pub(crate) fn der_element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
     let (&first, input) = input.split_first()?;
     if first != tag {
         return None;
