@@ -24,4 +24,5 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0018](0018-gestionnaire-de-sessions-et-trait-driver.md) | Gestionnaire de sessions de l'agent et trait `Driver` | Accepté |
 | [0019](0019-driver-rdp-et-passthrough-navigateur.md) | Driver RDP et passthrough vers le navigateur | Proposé |
 | [0020](0020-portail-web-et-passerelle-navigateur.md) | Portail web et passerelle navigateur | Proposé |
+| [0024](0024-paquets-de-l-agent.md) | Paquets de l'agent | Accepté |
 | [0025](0025-laboratoire-decrit-en-code.md) | Laboratoire décrit en code | Accepté |
