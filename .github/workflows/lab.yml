@@ -1,31 +1,168 @@
 name: Lab
 
+# Windows lab described in code (ADR-0025, docs/exploitation/laboratoire.md):
+# a domain controller, Windows Server 2016 and 2022 members and a gateway
+# machine in an isolated zone, as QEMU/KVM guests of one runner. The base
+# images are installed unattended from the Microsoft evaluation ISOs and
+# kept in the Actions cache only (never as artifacts, never published).
+#
+# Other workflows reuse it with `uses: ./.github/workflows/lab.yml` and a
+# `command` run in the same job once the lab is up, with LAB_JSON naming the
+# entry point (addresses, accounts, certificate fingerprints).
 on:
   push:
     branches: [m2/lab]
   workflow_dispatch:
+    inputs:
+      command:
+        description: Command run once the lab is up (LAB_JSON is set)
+        default: ""
+      rebuild-base:
+        description: Rebuild the base images even if cached
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      command:
+        description: Command run once the lab is up (LAB_JSON is set)
+        type: string
+        default: ""
+      rebuild-base:
+        type: boolean
+        default: false
+  schedule:
+    - cron: "41 0 * * *"
 
 permissions:
   contents: read
 
+concurrency:
+  group: lab-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   lab:
+    # Not in forks: the evaluation images and the night's hours are this
+    # repository's.
+    if: github.repository == 'Phdhebde/Ostena'
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 330
+    env:
+      LAB_BASE_TIMEOUT_MIN: "90"
+      LAB_UP_TIMEOUT_MIN: "150"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: lab/providers/qemu-ci/preflight.sh
-      - run: |
-          lab/providers/qemu-ci/fetch-iso.sh ws2016 "$LAB_WORK/iso" &
-          lab/providers/qemu-ci/fetch-iso.sh ws2022 "$LAB_WORK/iso" &
-          wait -n; wait -n
-      - if: always()
+
+      - name: Prepare the runner (KVM, disk, tools)
         run: |
-          for iso in "$LAB_WORK"/iso/*.iso; do
-            sudo mkdir -p /media/iso && sudo mount -o loop,ro "$iso" /media/iso
-            wiminfo /media/iso/sources/install.wim | grep -E '^(Index|Name|Edition ID|Installation Type)'
-            sudo umount /media/iso
+          echo "LAB_T0=$(date +%s)" >>"$GITHUB_ENV"
+          lab/providers/qemu-ci/preflight.sh
+
+      # The evaluation period is 180 days: base images are rebuilt at least
+      # every quarter, and whenever their inputs change.
+      - id: key
+        name: Cache keys of the base images
+        run: |
+          period="$(date -u +%Y)q$(( ($(date -u +%-m) - 1) / 3 + 1 ))"
+          echo "suffix=${{ hashFiles('lab/images.json', 'lab/guest/base/**', 'lab/providers/qemu-ci/build-base.sh', 'lab/providers/qemu-ci/common.sh') }}-$period" >>"$GITHUB_OUTPUT"
+
+      - id: cache-ws2016
+        if: ${{ !inputs.rebuild-base }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LAB_WORK }}/base/ws2016.qcow2
+          key: lab-base-ws2016-${{ steps.key.outputs.suffix }}
+      - id: cache-ws2022
+        if: ${{ !inputs.rebuild-base }}
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LAB_WORK }}/base/ws2022.qcow2
+          key: lab-base-ws2022-${{ steps.key.outputs.suffix }}
+
+      - id: build
+        name: Build the missing base images (download, install, sysprep)
+        if: steps.cache-ws2016.outputs.cache-hit != 'true' || steps.cache-ws2022.outputs.cache-hit != 'true'
+        env:
+          HIT_WS2016: ${{ steps.cache-ws2016.outputs.cache-hit }}
+          HIT_WS2022: ${{ steps.cache-ws2022.outputs.cache-hit }}
+        run: |
+          start=$(date +%s)
+          pids=()
+          for image in ws2016 ws2022; do
+            hit=HIT_${image^^}
+            [[ "${!hit}" == true ]] && continue
+            ( lab/providers/qemu-ci/fetch-iso.sh "$image" "$LAB_WORK/iso" \
+                && lab/providers/qemu-ci/build-base.sh "$image" \
+                && echo "$image=built" >>"$GITHUB_OUTPUT" ) &
+            pids+=($!)
           done
-          df -h / /mnt
+          status=0
+          for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+          rm -rf "$LAB_WORK/iso"
+          echo "LAB_BASE_BUILD_S=$(( $(date +%s) - start ))" >>"$GITHUB_ENV"
+          exit $status
+
+      # Saved as soon as built, even if the rest of the run fails.
+      - if: always() && steps.build.outputs.ws2016 == 'built'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LAB_WORK }}/base/ws2016.qcow2
+          key: lab-base-ws2016-${{ steps.key.outputs.suffix }}
+      # Saved as soon as built, even if the rest of the run fails.
+      - if: always() && steps.build.outputs.ws2022 == 'built'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LAB_WORK }}/base/ws2022.qcow2
+          key: lab-base-ws2022-${{ steps.key.outputs.suffix }}
+
+      - name: Network (bridges, isolated zone, control service)
+        run: lab/providers/qemu-ci/lab.sh net-up
+      - name: Start the machines
+        run: lab/providers/qemu-ci/lab.sh up
+      - name: Wait for the provisioning (domain, CA, joins)
+        run: lab/providers/qemu-ci/lab.sh wait
+      - name: Smoke checks
+        run: lab/providers/qemu-ci/lab.sh smoke
+
+      - name: Caller's command
+        if: inputs.command != ''
+        env:
+          LAB_COMMAND: ${{ inputs.command }}
+        run: bash -c "$LAB_COMMAND"
+
+      - name: Timings
+        if: always()
+        run: |
+          total=$(( $(date +%s) - LAB_T0 ))
+          {
+            echo "### Lab timings"
+            echo
+            echo "| Phase | Duration |"
+            echo "|---|---|"
+            if [[ -f "$LAB_WORK/state/timings.json" ]]; then
+              python3 -c 'import json,sys
+          for k, v in sorted(json.load(open(sys.argv[1])).items()):
+              print(f"| {k} | {v // 60} min {v % 60} s |")' "$LAB_WORK/state/timings.json"
+            fi
+            [[ -n "${LAB_BASE_BUILD_S:-}" ]] && echo "| base images (download + install, parallel) | $(( LAB_BASE_BUILD_S / 60 )) min $(( LAB_BASE_BUILD_S % 60 )) s |"
+            echo "| whole job until now | $(( total / 60 )) min $(( total % 60 )) s |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Diagnostics only (screenshots, serial logs, progress, timings);
+      # collect refuses to copy anything that holds a secret of the run.
+      - name: Collect diagnostics
+        if: failure()
+        run: lab/providers/qemu-ci/lab.sh collect "$RUNNER_TEMP/lab-diagnostics"
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lab-diagnostics
+          path: ${{ runner.temp }}/lab-diagnostics
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Stop the lab
+        if: always()
+        run: lab/providers/qemu-ci/lab.sh down
