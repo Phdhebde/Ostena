@@ -10,7 +10,7 @@
 - **Révision** : 2026-11-25, HMAC-SHA-256 pour les empreintes à clé de l'audit (ADR-0016)
 - **Révision** : 2026-11-26, écart RDP : cryptographie d'IronRDP et de `sspi` dans `ostena-rdp`, profil TLS 1.2 des cibles Windows, règle NTLM (amendement accepté, décision du responsable du projet, 2026-11-26)
 - **Révision** : 2026-11-26, portail web (ADR-0020) : groupes TLS de l'écouteur `core.web` et écart `X25519MLKEM768`, SHA-1 confiné à `Sec-WebSocket-Accept`, licence OFL-1.1 des polices embarquées (amendement accepté, décision du responsable du projet, 2026-11-26)
-- **Révision** : 2026-11-26, écart des annuaires LDAPS : profil TLS 1.3 à échange classique et certificats RSA (amendement proposé, ADR-0021, décision du responsable du projet attendue)
+- **Révision** : 2026-11-26, écart des annuaires LDAPS : profil TLS 1.3 à échange classique et certificats RSA, TLS 1.2 en option par source (amendement accepté, décision du responsable du projet, 2026-11-26, ADR-0021)
 
 ## Contexte
 
@@ -338,7 +338,7 @@ Variantes refusées :
 - clés de certificat et signatures de la poignée de main : **RSA de 2 048 à 8 192 bits** (PKCS#1 v1.5 avec SHA-256, 384 ou 512 en TLS 1.2, PSS) ou ECDSA P-256 / SHA-256 ;
 - validation : empreinte SHA-256 épinglée (`pinned`, défaut) ou chaîne vers l'autorité du client (`pki`), avant tout envoi d'identifiant (ADR-0019, section 3).
 
-La fonctionnalité `tls12` de rustls est activée **dans `ostena-crypto` seulement**, pour ce seul profil. Toutes les autres configurations (tunnel, API du core) fixent explicitement TLS 1.3 ; un test vérifie qu'un client du tunnel refuse un serveur TLS 1.2.
+La fonctionnalité `tls12` de rustls est activée **dans `ostena-crypto` seulement**, pour ce profil et pour l'option TLS 1.2 des annuaires LDAPS (amendement plus bas). Toutes les autres configurations (tunnel, API du core) fixent explicitement TLS 1.3 ; un test vérifie qu'un client du tunnel refuse un serveur TLS 1.2.
 
 **Règle NTLM.** NTLM n'authentifie pas la cible par son nom : un relais qui obtient une réponse valide recevrait un mot de passe délégué. NTLM n'est donc admis **qu'en Restricted Admin** (aucun secret transmis à la cible), et seulement si `rdp.ntlm_fallback = true`, journalisé à chaque session (`rdp.ntlm_used`). Avec la délégation du mot de passe (`rdp.password_delegation = true`), le repli NTLM est **refusé en production** (`CFG-P003`) ; l'agent le refuse aussi à l'exécution, en contrôlant chaque jeton sortant (ADR-0019).
 
@@ -354,9 +354,9 @@ La fonctionnalité `tls12` de rustls est activée **dans `ostena-crypto` seuleme
 
 **Réexamen** à chaque montée d'IronRDP ou de `sspi`, à la sortie de `picky` 7 stable, et à tout avis RustSec sur ces crates.
 
-#### Annuaires LDAPS : profil TLS des sources d'identités (proposé le 2026-11-26)
+#### Annuaires LDAPS : profil TLS des sources d'identités (amendement du 2026-11-26)
 
-- **Statut** : Proposé, sur la proposition de l'ADR-0021 ; décision du responsable du projet attendue.
+- **Statut** : Accepté, décision du responsable du projet le 2026-11-26, sur la proposition de l'ADR-0021.
 - **Portée** : les connexions du core vers les annuaires LDAPS de `[core.identity]` (`ostena_crypto::tls::directory`), et seulement elles.
 
 **L'écart.** Le profil du tunnel (`SecP256r1MLKEM768` seul) est inapplicable : les annuaires du client (Active Directory, OpenLDAP, FreeIPA) ne proposent pas ML-KEM, et leurs certificats sont émis par la PKI du client, le plus souvent en RSA. Profil figé, non négociable par l'annuaire :
@@ -366,11 +366,17 @@ La fonctionnalité `tls12` de rustls est activée **dans `ostena-crypto` seuleme
 - certificat et signatures : **RSA de 2 048 à 8 192 bits** (PKCS#1 v1.5, PSS) ou ECDSA P-256 / SHA-256, la même liste que pour les cibles RDP ;
 - validation : chaîne vers le seul fichier d'autorités de la source, nom du serveur exigé, aucune autorité système.
 
-**Ce qui n'est pas activé.** TLS 1.2 : Active Directory sur Windows Server 2016 et 2019 ne propose que TLS 1.2 pour LDAPS, et il est refusé (`IDN-E002`). Le permettre demanderait le profil TLS 1.2 des cibles (EMS exigé, suites ECDHE AES-256-GCM), qui existe déjà dans `ostena-crypto`, mais ce serait un écart de plus, à décider.
+**TLS 1.2 en option, par source.** Active Directory sur Windows Server 2016 et 2019 ne propose que TLS 1.2 pour LDAPS. Par défaut, un tel annuaire est refusé (`IDN-E002`). Une source peut l'admettre avec `tls_min_version = "1.2"` (désactivé par défaut) :
+
+- le client propose alors TLS 1.3 puis TLS 1.2 ; un annuaire qui parle TLS 1.3 l'obtient toujours ;
+- en TLS 1.2, seulement `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384` et `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`, *extended master secret* exigé, mêmes groupes et mêmes signatures : ce sont les suites du profil TLS 1.2 des cibles RDP ; ni AES-128, ni ChaCha20, ni échange RSA, ni CBC ;
+- l'option est **admise en production** (écart accepté), mais journalisée : `CFG-P021` au démarrage (`config.waiver`, écrit aussi dans l'audit), et un avertissement `identity.tls12` à chaque connexion qui négocie TLS 1.2.
+
+La fonctionnalité `tls12` de rustls, déjà activée pour les cibles RDP, sert donc aussi à ce profil, et à lui seul en dehors du driver RDP.
 
 **Portée du risque.** Le canal porte le mot de passe du compte de service et ceux des utilisateurs à la connexion (liaison simple). Un échange classique enregistré aujourd'hui pourrait être déchiffré par un ordinateur quantique futur : ces mots de passe seraient alors exposés, s'ils n'ont pas changé entre-temps.
 
-**Conditions de sortie.** Passer au profil du tunnel quand les annuaires proposeront un groupe hybride avec ML-KEM ; le client le propose déjà en premier.
+**Conditions de sortie.** Passer au profil du tunnel quand les annuaires proposeront un groupe hybride avec ML-KEM ; le client le propose déjà en premier. Retirer l'option TLS 1.2 quand les contrôleurs de domaine antérieurs à Windows Server 2022 auront disparu des parcs suivis.
 
 #### Question ouverte : échange de clés SSH hybride post-quantique
 

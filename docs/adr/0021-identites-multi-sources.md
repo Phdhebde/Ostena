@@ -35,12 +35,18 @@ Alternative écartée : `ldap3`. Sa licence (MIT/Apache) conviendrait, mais elle
 
 `ostena_crypto::tls::directory` :
 
-- **TLS 1.3 seulement**, suite `TLS13_AES_256_GCM_SHA384` seulement, ni reprise de session ni 0-RTT ;
+- **TLS 1.3 seulement** par défaut, suite `TLS13_AES_256_GCM_SHA384` seulement, ni reprise de session ni 0-RTT ;
 - groupes : `SecP256r1MLKEM768` d'abord, puis P-256 et P-384 (échange classique quand l'annuaire ne propose pas ML-KEM, ce qui est le cas des annuaires actuels) ;
 - certificat et signatures de la poignée de main : RSA de 2 048 à 8 192 bits (PKCS#1 v1.5, PSS) ou ECDSA P-256, comme le profil des cibles RDP ;
 - validation : chaîne vers le seul fichier d'autorités de la source (`ca_bundle`), nom du serveur exigé, aucune autorité système.
 
-C'est un écart au profil du tunnel, consigné dans l'ADR-0009 (« Annuaires LDAPS ») et soumis à la décision du responsable du projet. **TLS 1.2 n'est pas activé** : un annuaire qui ne propose que TLS 1.2 (Active Directory sur Windows Server 2016 ou 2019) est refusé (`IDN-E002`, « TLS 1.3 non proposé par le serveur »). L'activer serait un écart de plus, à décider explicitement.
+C'est un écart au profil du tunnel, consigné dans l'ADR-0009 (« Annuaires LDAPS ») et accepté par le responsable du projet le 2026-11-26.
+
+**TLS 1.2, option par source.** Par défaut, un annuaire qui ne propose que TLS 1.2 (Active Directory sur Windows Server 2016 ou 2019) est refusé (`IDN-E002`, « TLS 1.3 non proposé par le serveur »). `tls_min_version = "1.2"` l'admet pour une source, et pour elle seule :
+
+- TLS 1.3 reste proposé en premier et retenu quand l'annuaire le parle ;
+- en TLS 1.2 : suites ECDHE AES-256-GCM seulement (`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`), *extended master secret* exigé, mêmes groupes, signatures et validation qu'en TLS 1.3 : le profil TLS 1.2 des cibles RDP ;
+- écart accepté, admis en production : `CFG-P021` journalisé et écrit dans l'audit à chaque démarrage, avertissement `identity.tls12` (source, serveur) à chaque connexion qui négocie TLS 1.2.
 
 ### Sources et noms
 
@@ -55,6 +61,7 @@ name = "corp"
 kind = "active-directory"      # ou "openldap", "freeipa"
 servers = ["ldaps://dc01.corp.example", "ldaps://dc02.corp.example:636"]
 ca_bundle = "/etc/ostena/corp-ca.pem"
+# tls_min_version = "1.2"     # TLS 1.2 admis (écart accepté, CFG-P021) ; défaut "1.3"
 bind_dn = "CN=svc-ostena,OU=Services,DC=corp,DC=example"
 bind_password = { credential = "corp-ldap.password" }
 user_base = "OU=Utilisateurs,DC=corp,DC=example"
@@ -68,6 +75,7 @@ groups = [{ directory = "CN=Admins-Bastion,OU=Groupes,DC=corp,DC=example", group
 - **Comptes de secours** : les comptes locaux restent joignables par `local/nom` quand un annuaire est indisponible, ou quand `default_source` désigne un annuaire.
 - **Bascule** : les serveurs d'une source sont essayés dans l'ordre, en commençant par le dernier qui a répondu (`identity.server_failover`). Un compte de service refusé arrête tout de suite (`IDN-E003`) : le même compte sert sur tous les serveurs, et insister le verrouillerait.
 - **Secret du compte de service** : lu d'un *credential* systemd ou d'un fichier lisible du seul service (`CFG-P020` sinon), gardé dans un `SecretString`, jamais journalisé.
+- **Adresses de métadonnées** : le nom d'un serveur est résolu par le core, et une adresse de métadonnées cloud du plancher de l'ADR-0005 (`169.254.169.254`, `fd00:ec2::/64`, etc.) est refusée avant toute connexion (`IDN-E002`) ; le serveur suivant est essayé.
 
 ### Connexion d'un utilisateur d'annuaire
 
@@ -130,7 +138,7 @@ Champs nouveaux : `identity_source`, `user_group`, `directory_dn`, `server`, `us
 | Code | Sens |
 |---|---|
 | `IDN-E001` | aucun serveur de la source ne répond (connexion, délai, ou TLS refusé par tous) |
-| `IDN-E002` | TLS refusé par un serveur : autorité, nom, TLS 1.2 seulement, suite ou groupe hors profil |
+| `IDN-E002` | serveur refusé : autorité, nom, TLS 1.2 seulement (sans l'option), suite ou groupe hors profil, adresse de métadonnées cloud |
 | `IDN-E003` | compte de service refusé |
 | `IDN-E004` | recherche en échec |
 | `IDN-E005` | source inutilisable : fichier d'autorités, filtre, adresse |
@@ -138,10 +146,13 @@ Champs nouveaux : `identity_source`, `user_group`, `directory_dn`, `server`, `us
 | `CORE-E015` | source d'identités inutilisable (porte le code `IDN-…`) |
 | `CFG-V020` | section `[core.identity]` invalide (ADR-0003) |
 | `CFG-P020` | mot de passe d'une source lisible au-delà du service (ADR-0003) |
+| `CFG-P021` | TLS 1.2 admis vers les annuaires d'une source, écart accepté, journalisé à chaque démarrage (ADR-0003, ADR-0009) |
+
+Journal seul (pas d'audit) : `identity.tls12`, avertissement à chaque connexion d'une source qui négocie TLS 1.2 ; `identity.server_failover`, bascule vers un autre serveur.
 
 ### Tests
 
-- Serveur LDAP de test servi en TLS 1.3 par une PKI de test : deux annuaires à la fois, même identifiant dans deux sources, groupes imbriqués des deux sortes, bascule, LDAP en clair refusé sans qu'aucune liaison parte, autorité étrangère, autre nom, TLS 1.2 refusés, compte de service refusé.
+- Serveur LDAP de test servi en TLS 1.3 par une PKI de test : deux annuaires à la fois, même identifiant dans deux sources, groupes imbriqués des deux sortes, bascule, LDAP en clair refusé sans qu'aucune liaison parte, autorité étrangère, autre nom, TLS 1.2 refusés, TLS 1.2 admis avec l'option, compte de service refusé.
 - Sur PostgreSQL : création, connexion d'un utilisateur d'annuaire avec TOTP, désactivation coupée en moins de 60 s, suppression, sortie des groupes, désactivation par un administrateur jamais levée, mot de passe changé.
 - De bout en bout, chaque nuit, contre l'AD du laboratoire (ADR-0025, `identities-lab.yml`) : lecture en TLS 1.3, liaison, compte désactivé vu en moins de 60 s, refus du port 389 et d'une autre autorité.
 
@@ -149,8 +160,8 @@ Champs nouveaux : `identity_source`, `user_group`, `directory_dn`, `server`, `us
 
 - Le bastion se branche sur plusieurs annuaires sans fusionner leurs comptes. Les comptes locaux restent le recours quand les annuaires tombent.
 - La coupure en moins de 60 s coûte une recherche par source toutes les 20 s, limitée aux utilisateurs connectés, plus une passe complète tous les quarts d'heure.
-- **Écart TLS** : échange de clés classique et certificats RSA vers les annuaires, à accepter (ADR-0009). Les annuaires TLS 1.2 seulement sont refusés tant qu'un écart de plus n'est pas décidé.
-- **Pas de contrôle de périmètre** (ADR-0005) sur les serveurs d'annuaire : ce sont des adresses de la configuration, pas d'une cible ni d'un grant, et la connexion vient du core. À reconsidérer si une source pouvait être désignée par un utilisateur.
+- **Écart TLS**, accepté (ADR-0009) : échange de clés classique et certificats RSA vers les annuaires, et TLS 1.2 (ECDHE, AES-256-GCM, EMS) pour les seules sources qui l'admettent. Une source TLS 1.2 se voit dans les journaux à chaque démarrage et à chaque connexion.
+- **Pas de contrôle de périmètre complet** (ADR-0005) sur les serveurs d'annuaire : ce sont des adresses de la configuration, pas d'une cible ni d'un grant, et la connexion vient du core. Seules les adresses de métadonnées cloud du plancher sont refusées. À reconsidérer si une source pouvait être désignée par un utilisateur.
 - Un client LDAP maison est à maintenir. Il est petit, sans dépendance et fuzzé, mais il ne parle que le sous-ensemble utile : pas de SASL (Kerberos, GSSAPI), pas d'écriture dans l'annuaire, pas de référence suivie.
 - Le TOTP reste administré dans le core, utilisateur par utilisateur. Un second facteur venu de la source (attribut, OIDC) fera l'objet d'un autre ADR.
 - Les groupes du core existent avant la décision d'accès qui les lira (PR 10).
