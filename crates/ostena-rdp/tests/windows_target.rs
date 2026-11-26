@@ -1,6 +1,8 @@
 //! The driver against a real Windows target: RDP enabled on the loopback
 //! of the Windows CI runner by `tests/rdp/windows-target.ps1` (NLA, Restricted
-//! Admin allowed, a local administrator with a random password).
+//! Admin allowed, one local administrator per mode with a random password:
+//! the target reconnects a connection to the disconnected session of the
+//! same account, so each test opens its own session).
 //!
 //! Skipped without the `OSTENA_RDP_TARGET_*` variables; mandatory with
 //! `OSTENA_REQUIRE_RDP_TARGET`. The measured phases are printed, and
@@ -37,12 +39,37 @@ use support::loopback;
 const SETUP_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
+struct Account {
+    user: String,
+    password: String,
+}
+
+#[derive(Clone)]
 struct Lab {
     port: u16,
     name: String,
-    user: String,
-    password: String,
+    /// The account of the delegation tests.
+    delegation: Account,
+    /// The account of the Restricted Admin tests.
+    restricted_admin: Account,
     sha256: String,
+}
+
+impl Lab {
+    fn account(&self, mode: RdpMode) -> &Account {
+        if mode == RdpMode::Delegation {
+            &self.delegation
+        } else {
+            &self.restricted_admin
+        }
+    }
+}
+
+fn account(prefix: &str) -> Option<Account> {
+    Some(Account {
+        user: var(&format!("{prefix}_USER"))?,
+        password: var(&format!("{prefix}_PASSWORD"))?,
+    })
 }
 
 fn var(name: &str) -> Option<String> {
@@ -54,8 +81,8 @@ fn lab() -> Option<Lab> {
         Some(Lab {
             port: var("OSTENA_RDP_TARGET_PORT").map_or(Some(3389), |p| p.parse().ok())?,
             name: var("OSTENA_RDP_TARGET_NAME")?,
-            user: var("OSTENA_RDP_TARGET_USER")?,
-            password: var("OSTENA_RDP_TARGET_PASSWORD")?,
+            delegation: account("OSTENA_RDP_TARGET_DELEGATION")?,
+            restricted_admin: account("OSTENA_RDP_TARGET_RA")?,
             sha256: var("OSTENA_RDP_TARGET_SHA256")?.to_ascii_lowercase(),
         })
     })();
@@ -73,11 +100,11 @@ struct Secrets(Lab);
 
 impl SecretSource for Secrets {
     fn password(&self, account: &str) -> Result<SecretString, RdpError> {
-        if account == self.0.user {
-            Ok(SecretString::from(self.0.password.clone()))
-        } else {
-            Err(RdpError::Secret("compte inconnu".into()))
-        }
+        [&self.0.delegation, &self.0.restricted_admin]
+            .into_iter()
+            .find(|a| a.user == account)
+            .map(|a| SecretString::from(a.password.clone()))
+            .ok_or_else(|| RdpError::Secret("compte inconnu".into()))
     }
 }
 
@@ -99,7 +126,7 @@ fn driver(lab: &Lab, production: bool, password_delegation: bool) -> RdpDriver {
 fn params(lab: &Lab, mode: RdpMode, sha256: &str) -> TargetParams {
     TargetParams {
         session: RdpSessionParams {
-            account: lab.user.clone(),
+            account: lab.account(mode).user.clone(),
             target_name: Some(lab.name.clone()),
             certificate_sha256: Some(sha256.to_owned()),
             mode,
@@ -108,7 +135,7 @@ fn params(lab: &Lab, mode: RdpMode, sha256: &str) -> TargetParams {
             profile: None,
             license: None,
         },
-        label: format!("{}@windows", lab.user),
+        label: format!("{}@windows", lab.account(mode).user),
     }
 }
 
