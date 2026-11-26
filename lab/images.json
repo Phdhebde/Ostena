@@ -1,0 +1,19 @@
+{
+  "comment": "Official Microsoft evaluation ISOs (180 days), downloaded from the fwlink of the Microsoft Evaluation Center. The SHA-256 is checked before any use. The image installed is the Server Core one whose edition matches 'edition' (looked up by name in install.wim, see lab/providers/qemu-ci/build-base.sh).",
+  "images": {
+    "ws2016": {
+      "label": "Windows Server 2016 (14393) evaluation, en-US",
+      "url": "https://go.microsoft.com/fwlink/p/?LinkID=2195174&clcid=0x409&culture=en-us&country=US",
+      "file": "ws2016-eval-en-us.iso",
+      "sha256": "1ce702a578a3cb1ac3d14873980838590f06d5b7101c5daaccbac9d73f1fb50f",
+      "edition": "Standard"
+    },
+    "ws2022": {
+      "label": "Windows Server 2022 (20348) evaluation, en-US",
+      "url": "https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US",
+      "file": "ws2022-eval-en-us.iso",
+      "sha256": "3e4fa6d8507b554856fc9ca6079cc402df11a8b79344871669f0251535255325",
+      "edition": "Standard"
+    }
+  }
+}
