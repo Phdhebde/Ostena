@@ -18,7 +18,17 @@ targets = [
 version = 2
 yanked = "deny"
 # Every ignored advisory needs an id, a reason and an owner.
-ignore = []
+ignore = [
+    # Marvin attack (timing side channel on RSA private-key decryption and
+    # signature) in rsa 0.10.0-rc.18, pulled in unconditionally by picky,
+    # sspi and winscard (pinned by ADR-0019), no fixed version. The agent
+    # performs no RSA private-key operation (licences encrypted with the
+    # target public key, public-key verification only, no PKINIT or smart
+    # card); guarded by the test no_rsa_private_key_in_ostena_rdp.
+    # Maintainer decision approved by Max on 2026-11-26, review by 2027-03-31
+    # (ADR-0019 section 9).
+    { id = "RUSTSEC-2023-0071", reason = "no RSA private-key operation in the agent (ADR-0019 section 9); review by 2027-03-31" },
+]
 
 [licenses]
 version = 2
