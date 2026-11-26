@@ -143,6 +143,15 @@ pub fn classify_io(error: &std::io::Error) -> Option<HandshakeFailure> {
         .map(classify)
 }
 
+/// The TLS alert the peer sent, carried by an I/O error of a TLS stream
+/// (tokio-rustls), if any: over TCP it is all a refusal by the peer says.
+pub fn received_alert(error: &std::io::Error) -> Option<u8> {
+    match error.get_ref()?.downcast_ref::<rustls::Error>()? {
+        rustls::Error::AlertReceived(alert) => Some(u8::from(*alert)),
+        _ => None,
+    }
+}
+
 /// Classifies a handshake error, seen from either side.
 pub fn classify(error: &rustls::Error) -> HandshakeFailure {
     use rustls::Error as E;
@@ -161,7 +170,11 @@ pub fn classify(error: &rustls::Error) -> HandshakeFailure {
         )
         | E::AlertReceived(AlertDescription::ProtocolVersion) => HandshakeFailure::ProtocolVersion,
         E::InvalidCertificate(e) => match e {
-            CertificateError::UnknownIssuer => HandshakeFailure::UnknownIssuer,
+            // An issuer with the name of the pinned CA but another key:
+            // not vouched for by the pinned CA either.
+            CertificateError::UnknownIssuer | CertificateError::BadSignature => {
+                HandshakeFailure::UnknownIssuer
+            }
             CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
                 HandshakeFailure::Expired
             }
