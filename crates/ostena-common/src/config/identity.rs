@@ -80,6 +80,22 @@ pub enum DirectoryKind {
     Freeipa,
 }
 
+/// `tls_min_version` of a source: the lowest TLS version offered to its
+/// directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum DirectoryTlsVersion {
+    /// TLS 1.3 only (default).
+    #[default]
+    #[serde(rename = "1.3")]
+    Tls13,
+    /// TLS 1.3 or TLS 1.2 (ECDHE, AES-256-GCM, extended master secret):
+    /// accepted deviation for the domain controllers before Windows
+    /// Server 2022 (ADR-0009), `CFG-P021`, logged at every start and at
+    /// every connection in TLS 1.2, admitted in production.
+    #[serde(rename = "1.2")]
+    Tls12,
+}
+
 /// `[[core.identity.ldap]]`: one LDAPS directory.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +110,9 @@ pub struct LdapSourceConfig {
     /// The CA bundle (PEM) that issues the certificates of the servers:
     /// the only trust anchors of this source.
     pub ca_bundle: PathBuf,
+    /// Lowest TLS version offered: `"1.3"` (default) or `"1.2"`.
+    #[serde(default)]
+    pub tls_min_version: DirectoryTlsVersion,
     /// DN of the read-only service account.
     pub bind_dn: String,
     /// Its password: a systemd credential, or a file readable by the

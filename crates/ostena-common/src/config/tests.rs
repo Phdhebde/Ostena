@@ -126,7 +126,7 @@ fn codes_are_stable_and_unique() {
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
         "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
-        "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019", "CFG-V020", "CFG-P020",
+        "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019", "CFG-V020", "CFG-P020", "CFG-P021",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1829,7 +1829,7 @@ fn identity_sources_are_read_with_safe_defaults() {
     let c = core_with(IDENTITY);
     assert_eq!(core_codes(&c), Vec::new());
     assert_eq!(production_codes(&c), Vec::new());
-    let identity = c.core.unwrap().identity.unwrap();
+    let identity = c.core.clone().unwrap().identity.unwrap();
     assert_eq!(identity.check_interval_secs, 20);
     assert_eq!(identity.sync_interval_secs, 900);
     let corp = &identity.ldap[0];
@@ -1840,6 +1840,43 @@ fn identity_sources_are_read_with_safe_defaults() {
         (5, 10)
     );
     assert_eq!(identity.ldap[1].kind, DirectoryKind::Openldap);
+    // TLS 1.3 only by default: nothing tolerated.
+    assert_eq!(corp.tls_min_version, DirectoryTlsVersion::Tls13);
+    assert_eq!(c.tolerated(), Vec::new());
+}
+
+/// TLS 1.2 towards a source: an accepted deviation, tolerated in
+/// production and logged at every start, never refused.
+#[test]
+fn directory_tls12_is_an_accepted_deviation() {
+    let text = IDENTITY.replace(
+        "ca_bundle = \"/etc/ostena/lab-ca.pem\"",
+        "ca_bundle = \"/etc/ostena/lab-ca.pem\"\ntls_min_version = \"1.2\"",
+    );
+    let c = core_with(&text);
+    assert_eq!(core_codes(&c), Vec::new());
+    assert_eq!(production_codes(&c), Vec::new());
+    let waived = c.tolerated();
+    assert_eq!(
+        waived.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::DirectoryTls12]
+    );
+    assert!(waived[0].message.contains("« lab »"));
+    assert!(waived[0].message.contains("ADR-0009"));
+    let identity = c.core.unwrap().identity.unwrap();
+    assert_eq!(identity.ldap[0].tls_min_version, DirectoryTlsVersion::Tls13);
+    assert_eq!(identity.ldap[1].tls_min_version, DirectoryTlsVersion::Tls12);
+    // Neither TLS 1.1 nor a bare number.
+    for bad in ["\"1.1\"", "\"1.0\"", "1.2"] {
+        let text = IDENTITY.replace(
+            "ca_bundle = \"/etc/ostena/lab-ca.pem\"",
+            &format!("ca_bundle = \"/etc/ostena/lab-ca.pem\"\ntls_min_version = {bad}"),
+        );
+        assert!(
+            Config::from_toml_str(&format!("{CORE}{text}")).is_err(),
+            "{bad}"
+        );
+    }
 }
 
 /// Plain LDAP (and so StartTLS) is refused in every mode, not only in

@@ -846,8 +846,9 @@ pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) 
 }
 
 /// Weakenings tolerated in production and logged at every start:
-/// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1, accepted
-/// deviation of ADR-0009) without end.
+/// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) and
+/// `CFG-P021` (TLS 1.2 towards a directory), accepted deviations of
+/// ADR-0009, without end.
 pub(crate) fn tolerated(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
     if now < KEY_FILE_WAIVER_END {
         key_files(core, out);
@@ -863,6 +864,20 @@ pub(crate) fn tolerated(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
              HMAC-SHA-1, écart accepté (ADR-0009) pour les applications d'authentification ; \
              « sha256 » le supprime.",
         ));
+    }
+    for source in core.identity.iter().flat_map(|i| &i.ldap) {
+        if source.tls_min_version == super::identity::DirectoryTlsVersion::Tls12 {
+            out.push(Violation::new(
+                Code::DirectoryTls12,
+                format!(
+                    "core.identity.ldap « {} » : tls_min_version = « 1.2 » : TLS 1.2 admis vers \
+                     les annuaires de cette source (ECDHE, AES-256-GCM, extended master \
+                     secret), écart accepté (ADR-0009) ; chaque connexion en TLS 1.2 est \
+                     journalisée.",
+                    source.name
+                ),
+            ));
+        }
     }
 }
 

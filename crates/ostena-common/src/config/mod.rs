@@ -34,7 +34,8 @@ pub use agent::{
     SshPaths, TunnelTransport,
 };
 pub use identity::{
-    CoreIdentityConfig, DirectoryKind, GroupRule, LOCAL_SOURCE, LdapSourceConfig, LdapsServer,
+    CoreIdentityConfig, DirectoryKind, DirectoryTlsVersion, GroupRule, LOCAL_SOURCE,
+    LdapSourceConfig, LdapsServer,
 };
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{
@@ -296,7 +297,8 @@ impl Config {
     }
 
     /// Weakenings tolerated in production, logged at every start:
-    /// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) always.
+    /// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) and
+    /// `CFG-P021` (TLS 1.2 towards a directory) always.
     pub fn tolerated(&self) -> Vec<Violation> {
         self.tolerated_at(unix_now())
     }
