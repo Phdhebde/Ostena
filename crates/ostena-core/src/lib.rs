@@ -1,7 +1,7 @@
 //! The core (ADR-0011): agent registry and enrolment tokens in PostgreSQL,
 //! tunnel and enrolment listeners, audit chain (ADR-0012), minimal
 //! inventory and native SSH authorisation (ADR-0014), HTTPS login API
-//! (ADR-0015).
+//! (ADR-0015), identity sources (ADR-0021).
 
 #![forbid(unsafe_code)]
 
@@ -15,6 +15,7 @@ pub mod db;
 mod error;
 pub mod functions;
 pub mod grant_keys;
+pub mod identity;
 pub mod inventory;
 pub mod login;
 pub mod pushes;

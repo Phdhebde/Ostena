@@ -69,6 +69,11 @@ pub enum CoreError {
          voir docs/exploitation/core-installation.md"
     )]
     RolesWeak(String),
+    /// An identity source cannot be read: no server answers, its TLS or
+    /// its service account is refused, a search fails (ADR-0021). The
+    /// message starts with the `IDN-` code of the cause.
+    #[error("[CORE-E015] source d'identités inutilisable : {0}")]
+    Directory(String),
 }
 
 impl CoreError {
@@ -89,6 +94,7 @@ impl CoreError {
             Self::Invalid(_) => "CORE-E012",
             Self::Roles(_) => "CORE-E013",
             Self::RolesWeak(_) => "CORE-E014",
+            Self::Directory(_) => "CORE-E015",
         }
     }
 }
@@ -120,6 +126,7 @@ mod tests {
             CoreError::Invalid("x".into()),
             CoreError::Roles("x".into()),
             CoreError::RolesWeak("x".into()),
+            CoreError::Directory("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("CORE-E{:03}", i + 1);

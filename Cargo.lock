@@ -2049,6 +2049,7 @@ dependencies = [
  "ostena-core",
  "ostena-crypto",
  "ostena-grant",
+ "ostena-ldap",
  "ostena-platform",
  "ostena-recorder",
  "ostena-scope",
