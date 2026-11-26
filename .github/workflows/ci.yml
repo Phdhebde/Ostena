@@ -392,6 +392,38 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # The RDP driver against a real Windows target (ADR-0019): RDP enabled on
+  # the loopback of the runner (NLA, Restricted Admin allowed, a local
+  # administrator with a random password). Production mode: Restricted
+  # Admin with NTLM; development mode: the password delegated; the refusals
+  # of REG-SEC-01 and REG-SEC-02. One session at a time; the measured
+  # phases go to the summary of the job.
+  rdp-windows:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@2201cc584a476d1b508be977bbe4b7d1c7a52e9c # v2.9.3
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - run: tests/rdp/windows-target.ps1
+        shell: pwsh
+      - run: |
+          $env:OSTENA_RDP_TARGET_SUMMARY = $env:GITHUB_STEP_SUMMARY
+          cargo test --locked -p ostena-rdp --test windows_target -- --nocapture --test-threads=1
+        shell: pwsh
+        env:
+          OSTENA_REQUIRE_RDP_TARGET: "1"
+
   # SSH latency (CLAUDE.md: at most 3 ms added at p99 by SSH, session set up
   # in less than 5 s): the agent relay and the tunnel, on every run. The
   # summary of the job shows the table; the raw results are an artifact.
@@ -542,6 +574,7 @@ jobs:
       - release-linux
       - fuzz-smoke
       - windows
+      - rdp-windows
       - bench-ssh
       - release-sign
       - demo-m1

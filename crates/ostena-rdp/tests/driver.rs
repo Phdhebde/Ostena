@@ -16,7 +16,7 @@ use ostena_rdp::driver::{
 };
 use ostena_rdp::profile::to_hex;
 use ostena_session::{Driver, DriverConnection};
-use support::{Options, PASSWORD, Script, Target, USER};
+use support::{Options, PASSWORD, Script, Target, USER, loopback};
 
 struct Secrets;
 
@@ -28,31 +28,6 @@ impl SecretSource for Secrets {
             Err(RdpError::Secret("compte inconnu".into()))
         }
     }
-}
-
-async fn loopback(port: u16) -> ostena_scope::PinnedTarget {
-    use ostena_common::config::Mode;
-    use ostena_common::config::scope::{AllowRuleSpec, FloorExceptionSpec, PolicySpec};
-    let spec = PolicySpec {
-        gateway_group: "rdp-tests".into(),
-        allow: vec![AllowRuleSpec {
-            label: None,
-            networks: vec!["127.0.0.0/8".into()],
-            ports: vec![port.to_string()],
-        }],
-        floor_exceptions: vec![FloorExceptionSpec {
-            network: "127.0.0.0/8".into(),
-            reason: "tests: cible sur la boucle locale".into(),
-        }],
-        ..PolicySpec::default()
-    };
-    let policy = ostena_scope::CompiledPolicy::compile(&spec, Mode::Development).unwrap();
-    let scope = ostena_scope::Scope::new(
-        Arc::new(policy),
-        ostena_scope::SharedLocalAddresses::new(ostena_scope::LocalAddresses::from_addrs([])),
-        ostena_scope::SystemResolver::new(Duration::from_secs(5), 4),
-    );
-    scope.pin("127.0.0.1", port).await.unwrap()
 }
 
 fn driver(production: bool, ntlm_fallback: bool) -> RdpDriver {
