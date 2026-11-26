@@ -10,6 +10,7 @@ members = [
     "crates/ostena-recorder",
     "crates/ostena-scope",
     "crates/ostena-frame",
+    "crates/ostena-session",
     "crates/ostena-platform",
     "crates/ostena-tunnel",
     "crates/ostena-ssh",
@@ -38,6 +39,7 @@ ostena-grant = { path = "crates/ostena-grant" }
 ostena-platform = { path = "crates/ostena-platform" }
 ostena-recorder = { path = "crates/ostena-recorder" }
 ostena-scope = { path = "crates/ostena-scope" }
+ostena-session = { path = "crates/ostena-session" }
 ostena-ssh = { path = "crates/ostena-ssh" }
 ostena-tunnel = { path = "crates/ostena-tunnel" }
 

@@ -1,0 +1,24 @@
+[package]
+name = "ostena-session"
+description = "Session manager of the agent: atomic quotas, unique session identifiers, idle and maximum lengths, cuts, observers; the Driver trait of the protocols (ADR-0018)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+# No database, no API: the manager lives in the agent (ADR-0018).
+[dependencies]
+# PinnedTarget: a driver dials nothing else (anti-SSRF by type, ADR-0005).
+ostena-scope.workspace = true
+thiserror.workspace = true
+# Cut signal (watch) and deadlines (time): features already enabled by the
+# workspace.
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
