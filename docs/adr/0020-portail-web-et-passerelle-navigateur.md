@@ -1,7 +1,8 @@
 # ADR-0020 : Portail web et passerelle navigateur
 
-- **Statut** : Proposé. Trois points demandent un arbitrage du responsable du projet avant la PR 8 (groupes TLS des navigateurs, SHA-1 de la poignée de main WebSocket, licence OFL des polices) ; ils sont rassemblés à la fin, sous « Points à arbitrer ».
+- **Statut** : Accepté pour les sections 2 (serveur web du core, hors WebSocket) et 3 (session navigateur), livrées par la PR 8a, et pour les trois arbitrages rendus par le responsable du projet le 2026-11-26 (amendement de l'ADR-0009). Proposé pour le reste (chaîne de build, passerelle, internationalisation, tests de bout en bout) : chaque partie passe à « Accepté » avec sa PR.
 - **Date** : 2026-11-26
+- **Révision** : 2026-11-26, PR 8a : arbitrages consignés, détails de mise en œuvre (« Mise en œuvre de la PR 8a »)
 
 ## Contexte
 
@@ -88,7 +89,7 @@ Application Svelte représentative (connexion, catalogue, i18n, thèmes, termina
 - limite des tentatives de connexion et verrouillage partagés avec l'écouteur de `ostena login` : le même compteur par source, le même compteur par compte ;
 - jamais de compression des réponses de l'API (attaques de type BREACH). Seuls les fichiers statiques sont servis précompressés.
 
-Le certificat est celui du core, signé par la racine Ostena, que l'administrateur distribue aux postes (GPO). Le client peut aussi fournir un certificat de sa propre PKI pour le nom du portail (`core.web.certificate`). Les groupes TLS proposés aux navigateurs sont à arbitrer (voir plus bas).
+Le certificat est celui du core, signé par la racine Ostena, que l'administrateur distribue aux postes (GPO). Le client peut aussi fournir un certificat de sa propre PKI pour le nom du portail (`core.web.certificate`). Ce second certificat viendra après la PR 8a ; elle sert le certificat du core. Les groupes TLS sont `SecP256r1MLKEM768` puis `X25519MLKEM768`, le repli classique seulement par une option refusée en production (ADR-0009, amendement du 2026-11-26).
 
 **OpenAPI écrite à la main.** `crates/ostena-core/api/openapi.json` (OpenAPI 3.1) est le contrat de l'API, relu en revue comme un document. Il n'est pas généré par des macros (utoipa) : la génération ajoute des macros procédurales et leurs dépendances, et décrit le code tel qu'il est plutôt que le contrat voulu.
 - Pour que le document reste fidèle au code, des tests (PR 8) vérifient que :
@@ -105,7 +106,7 @@ Le certificat est celui du core, signé par la racine Ostena, que l'administrate
 
 Le test énumère la table elle-même : une route ajoutée sans test reste couverte. Les routes `Public` sont une liste fermée, vérifiée par le test : la racine du portail et ses fichiers, `POST /api/v1/session` (connexion), `GET /api/v1/health` (`204`, sans corps) et `POST /api/v1/csp-report` (8 Kio au plus, débit limité).
 
-**WebSocket à nous.** Un crate `ostena-ws` (RFC 6455, côté serveur) : poignée de main sur la requête hyper (`upgrade`), trames masquées exigées du client, extensions jamais négociées (pas de `permessage-deflate`), messages texte refusés, message de 32 Kio au plus. Le crate est sans dépendance, `#![forbid(unsafe_code)]`, avec des tests de propriétés et une cible de fuzz `ws_frame`. Le RD Gateway (`ostena-tsgu`, transport WebSocket) le réutilisera. La poignée de main calcule `Sec-WebSocket-Accept` par SHA-1 (RFC 6455, § 4.2.2), voir « Points à arbitrer ».
+**WebSocket à nous.** Un crate `ostena-ws` (RFC 6455, côté serveur) : poignée de main sur la requête hyper (`upgrade`), trames masquées exigées du client, extensions jamais négociées (pas de `permessage-deflate`), messages texte refusés, message de 32 Kio au plus. Le crate est sans dépendance, `#![forbid(unsafe_code)]`, avec des tests de propriétés et une cible de fuzz `ws_frame`. Le RD Gateway (`ostena-tsgu`, transport WebSocket) le réutilisera. La poignée de main calcule `Sec-WebSocket-Accept` par SHA-1 (RFC 6455, § 4.2.2), par le seul module `ostena-crypto::websocket` (ADR-0009, amendement du 2026-11-26).
 
 ### 3. Session navigateur
 
@@ -287,8 +288,8 @@ La PR 8 est trop grosse pour une seule revue : elle est scindée.
 | PR | Contenu |
 |---|---|
 | **8a** `m2/web-gateway-a` | Écouteur `core.web`, table de routes, session navigateur (mot de passe et TOTP, cookie, liaison, inactivité, ré-authentification), CSRF, en-têtes et CSP, `openapi.json` et ses tests, test d'énumération des routes, codes `WEB-E…`, événements, réglages et leurs refus en production. |
-| **8b** `m2/web-gateway-b` | Crate `ostena-ws` et sa cible de fuzz, `POST /api/v1/access`, WebSocket `/api/v1/gateway` authentifiée par le grant, relais core ↔ tunnel ↔ agent avec contre-pression, codes `GTW-E…`. Testé de bout en bout par un client WebSocket en Rust. Après l'arbitrage sur SHA-1. |
-| **8c** `m2/web-gateway-c` | `portal/` minimal (page de connexion), `cargo xtask portal`, vendorisation npm, contrôles du lockfile et des licences, embarquement par `build.rs`, `ostena core portal-manifest`, budget, double construction en CI, `ostena-web-client` (wasm-bindgen autour d'`ostena-frame`), premier E2E Playwright : connexion, zéro requête externe, zéro violation de CSP, axe. Après l'arbitrage sur les groupes TLS et les polices. |
+| **8b** `m2/web-gateway-b` | Crate `ostena-ws` et sa cible de fuzz, `POST /api/v1/access`, WebSocket `/api/v1/gateway` authentifiée par le grant, relais core ↔ tunnel ↔ agent avec contre-pression, codes `GTW-E…`. Testé de bout en bout par un client WebSocket en Rust. |
+| **8c** `m2/web-gateway-c` | `portal/` minimal (page de connexion), `cargo xtask portal`, vendorisation npm, contrôles du lockfile et des licences, embarquement par `build.rs`, `ostena core portal-manifest`, budget, double construction en CI, `ostena-web-client` (wasm-bindgen autour d'`ostena-frame`), premier E2E Playwright : connexion, zéro requête externe, zéro violation de CSP, axe. |
 | **12** `m2/web-ssh` | Trames v2 d'`ostena-frame` (révision de l'ADR-0006), xterm.js et sa cale CSP, driver SSH de l'agent alimenté par le tunnel, même transcript, E2E du terminal. |
 | **16** `m2/portal-v0` | Catalogue, lancement en deux clics, sessions et rejeu, administration minimale de l'inventaire, i18n complète, thèmes, raccourci de sortie du clavier, axe et tests au clavier sur tous les parcours, test des contrastes. |
 
@@ -320,25 +321,55 @@ Les codes sont réservés ici ; leur texte exact est fixé par la PR qui les int
 - refus : `web.origin_refused` et `web.csrf_refused`, journalisés avec un débit limité ;
 - passerelle : `gateway.opened` (accordant, jti, agent), `gateway.refused`, `gateway.closed` (cause, octets dans chaque sens).
 
+### Mise en œuvre de la PR 8a
+
+**Routes.** La table compte dix routes :
+
+| Méthode et chemin | Accès | Particularités |
+|---|---|---|
+| `GET /` | public | `503` `WEB-E008` tant que le portail n'est pas embarqué (PR 8c) |
+| `GET /api/v1/health` | public | `204`, sans corps |
+| `POST /api/v1/csp-report` | public | 8 Kio au plus, sans contrôle CSRF (le navigateur l'envoie de lui-même, sans les en-têtes d'une requête du portail ; la route n'a aucun effet), journalisé avec un débit limité |
+| `POST /api/v1/session` | public | connexion ; `Origin` vérifiée ; limite des tentatives partagée |
+| `GET /api/v1/session` | session | la session courante (utilisateur, rôles, échéances) |
+| `DELETE /api/v1/session` | session | déconnexion, `Clear-Site-Data` |
+| `POST /api/v1/session/reauthenticate` | session | mot de passe et TOTP de l'utilisateur de la session ; nouvelle valeur du cookie |
+| `GET /api/v1/openapi.json` | session | le document embarqué |
+| `GET /api/v1/login-sessions` | rôle `admin` | sessions de connexion actives, des deux canaux |
+| `DELETE /api/v1/login-sessions/{id}` | rôle `admin`, authentification récente | révocation, idempotente ; `404` `WEB-E005` pour une session inconnue |
+
+**Rôles.** La table `user_role` porte les rôles du portail ; seul `admin` existe. `ostena core user role-grant <nom> admin` et `role-revoke` les administrent, avec `user.role_granted` (accordant) et `user.role_revoked` (protecteur) dans la chaîne d'audit.
+
+**Stockage.** La migration 0007, réversible, ajoute à `login_session` la colonne `channel` (`cli` ou `web`) ; le certificat n'est obligatoire que pour `cli`. La table `web_session` garde le SHA-256 du cookie, la source, l'heure de la dernière authentification et celle de la dernière activité. Le rôle du service (`ostena_app`) y reçoit `SELECT`, `INSERT` et `UPDATE` sur `web_session`, `SELECT`, `INSERT` et `DELETE` sur `user_role` (ADR-0011). Le retour à la migration 6 supprime ces deux tables et les sessions de connexion de type `web`, qui n'ont pas de certificat et n'existent pas dans le schéma 6 ; les sessions d'`ostena login` restent.
+
+**Décision sur une session.** Elle est une fonction pure (`web::session::decide`), dans cet ordre : révoquée ou compte inactif, échéance absolue, changement de source, inactivité.
+- L'échéance absolue répond `401` sans événement : la fin de la session de connexion est déjà portée par son échéance.
+- L'inactivité et le changement de source révoquent la session et écrivent `web_session.expired` ou `web_session.source_changed`, acteur `core`.
+- L'activité n'est enregistrée qu'à partir de 10 s après la précédente : l'échéance d'inactivité peut être atteinte jusqu'à 10 s plus tôt que l'inactivité réelle, jamais plus tard. Une session inactive n'est révoquée qu'à sa requête suivante ; un balayage périodique viendra avec la passerelle (PR 8b), pour couper aussi les sessions de passerelle.
+
+**Écouteur.** Plafond global de connexions (`core.web.max_connections`, 256) et par source (`core.web.connections_per_source`, 16), connexions persistantes bornées à 300 s. L'origine (`core.web.origin`) est une URL `https://` sans chemin. Les groupes TLS actifs sont journalisés au démarrage (`web.tls_groups`). Codes de configuration : `CFG-V019` (section `[core.web]` invalide), `CFG-P018` (`bind_source = false`) et `CFG-P019` (`tls_classic_fallback = true`), ces deux derniers refusés en production.
+
+**En-têtes.** Ceux du tableau plus haut, plus `Reporting-Endpoints: csp="/api/v1/csp-report"` pour la directive `report-to csp`. `Permissions-Policy` refuse aussi `publickey-credentials-create` et `publickey-credentials-get` : la PR 15 (WebAuthn) les ouvrira à `self`.
+
+**Tests.** Le test d'énumération et les tests de la CSRF tournent sur une mémoire de sessions en processus, qui implémente le même trait que PostgreSQL (`WebBackend`) : la décision sur la session est celle de l'écouteur, quelle que soit la mémoire. Des tests contre PostgreSQL couvrent le chemin réel (connexion, ré-authentification, inactivité, changement de source, révocation par un administrateur, désactivation du compte).
+
+**Coût mesuré** (`cargo bench -p ostena-core --bench web_request`, 2026-11-26, machine de développement, mémoire en processus) : un aller-retour `GET /api/v1/session` sur une connexion TLS persistante coûte 86 µs au p50 et 136 µs au p99, contre 77 µs et 127 µs pour la route publique `GET /api/v1/health`. L'authentification elle-même (cookie, recherche, décision, contrôles) ajoute donc environ 10 µs. La lecture dans PostgreSQL (une requête indexée par le SHA-256 du cookie) n'est pas comptée.
+
 ## Conséquences
 
 - **Node** entre dans la chaîne de build, jamais dans le produit. La construction hors ligne demande `vendor/npm/` et la version épinglée de Node, à transférer comme la toolchain Rust.
 - **Binaires précompilés** : deux outils de build sont des binaires natifs précompilés (`rolldown`, `lightningcss`), épinglés par leur intégrité mais non reconstruits depuis les sources. C'est un risque de chaîne d'approvisionnement accepté et consigné, à revoir pour la CSPN (empaqueteur en WebAssembly, ou reconstruction).
 - **Taille du binaire** : le core embarque le portail en version brute et brotli, environ 0,6 Mio aujourd'hui. `xtask footprint` le mesure. Cet ajout volontaire est consigné, et n'est pas une régression.
-- **Écart à CLAUDE.md** : axum n'est pas adopté. La ligne « axum REST + OpenAPI » de CLAUDE.md devra devenir « hyper, routeur à table statique + OpenAPI », si cet ADR est accepté.
+- **Écart à CLAUDE.md** : axum n'est pas adopté. La ligne « axum REST + OpenAPI » de CLAUDE.md est devenue « hyper, routeur à table statique + OpenAPI » (PR 8a).
 - **Nouveau crate** : `ostena-ws` (protocole, sans dépendance, fuzzé).
 - **Framing** : `ostena-frame` passe en version 2 pour le terminal. L'en-tête ne change pas ; la v1 reste négociable.
 - **Cale CSP** : xterm.js dépend d'une cale CSP tant que l'amont n'utilise pas les feuilles de style construites. Une montée de version de xterm.js doit repasser le test E2E de la CSP.
 - **Liaison à la source** : elle peut couper la session d'un poste en double pile ou en mobilité. C'est voulu ; le guide d'exploitation l'explique.
 
-## Points à arbitrer
+## Arbitrages (2026-11-26)
 
-1. **Groupes TLS des navigateurs** (question laissée ouverte par l'ADR-0015). Les navigateurs ne proposent pas `SecP256r1MLKEM768`, le seul groupe de l'ADR-0009. Proposition, pour l'écouteur `core.web` seulement :
-   - `SecP256r1MLKEM768`, préféré par le serveur, puis `X25519MLKEM768`, admis comme écart consigné dans l'ADR-0009. L'hybride reste au moins aussi fort que ML-KEM-768, et X25519 respecte `RègleCourbeElliptiqueGFp`, même s'il n'est plus cité par [PG-083] v3.00 ;
-   - un échange classique `secp256r1` seulement par une option, `core.web.tls_classic_fallback`, journalisée et refusée en mode production (navigateurs sans hybride).
+Le responsable du projet a retenu les trois propositions ; elles sont consignées dans l'amendement du 2026-11-26 de l'ADR-0009.
 
-   L'écouteur de `ostena login` et le tunnel restent inchangés. À décider par un amendement de l'ADR-0009 avant la PR 8c.
-2. **SHA-1 dans la poignée de main WebSocket.** RFC 6455 impose `Sec-WebSocket-Accept = base64(SHA-1(clé ‖ GUID))`. Ce n'est pas un usage de sécurité : la valeur est publique et prouve seulement que le serveur a compris la demande. Proposition : un amendement de l'ADR-0009 qui l'admet, exposé par `ostena-crypto` dans le seul module `websocket` (`SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs), sur le modèle du confinement du TOTP. Le crate `sha1` reste refusé. Nécessaire avant la PR 8b, et aussi au RD Gateway.
-3. **Licence des polices.** Inter et JetBrains Mono, choisies par la charte, sont sous SIL OFL-1.1, absente de la liste de CLAUDE.md, qui vise les dépendances de code. Proposition : admettre OFL-1.1 pour les seules polices embarquées, avec leur licence livrée dans le paquet et dans la SBOM.
-
-Si ces propositions sont retenues, cet ADR passe à « Accepté » avec elles. Sinon, les sections concernées sont révisées avant leur PR.
+1. **Groupes TLS des navigateurs.** Sur l'écouteur `core.web` seulement : `SecP256r1MLKEM768`, puis `X25519MLKEM768`, admis comme écart. Le repli classique `secp256r1` n'existe que par `core.web.tls_classic_fallback`, journalisé et refusé en production (`CFG-P019`). rustls suit l'ordre du client : la garantie est que tout échange accepté est hybride, pas que `SecP256r1MLKEM768` soit choisi. L'écouteur de `ostena login` et le tunnel restent inchangés.
+2. **SHA-1 dans la poignée de main WebSocket.** Admis pour `Sec-WebSocket-Accept` seulement, dans le module `ostena-crypto::websocket` (`SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs), qui arrivera avec la PR 8b. Le crate `sha1` reste refusé.
+3. **Licence des polices.** OFL-1.1 est admise pour les seules polices embarquées, avec leur licence livrée dans le paquet et dans la SBOM (CLAUDE.md).
