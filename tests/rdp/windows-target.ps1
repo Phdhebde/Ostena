@@ -1,7 +1,8 @@
 # Prepares a Windows CI runner as an RDP target for the tests of the RDP
 # driver (crates/ostena-rdp/tests/windows_target.rs, ADR-0019): RDP on,
 # NLA required, Restricted Admin allowed, a local administrator with a
-# random password and its profile already created. Writes the
+# random password and its profile already created, disconnected sessions
+# ended at once (never reconnected by the next test). Writes the
 # OSTENA_RDP_TARGET_* variables to $env:GITHUB_ENV, the password masked in
 # the logs.
 #
@@ -70,6 +71,25 @@ Set-ItemProperty -Path $Tcp -Name UserAuthentication -Value 1 -Type DWord
 # 2: TLS (SSL), the only security layer the agent accepts.
 Set-ItemProperty -Path $Tcp -Name SecurityLayer -Value 2 -Type DWord
 Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name DisableRestrictedAdmin -Value 0 -Type DWord
+
+Write-Host '=== RDP: end disconnected sessions'
+# A session the agent closes is only disconnected by default: the next
+# connection of the same account, whatever its mode, is reconnected to it
+# (observed: a Restricted Admin connection attached to the session opened
+# with the delegated password, then reset by the target). Each test opens
+# its own session: a disconnected or broken session ends after 1 s. Set as
+# local policy, which wins over the listener settings, and on the listener.
+$Ending = @{ fResetBroken = 1; MaxDisconnectionTime = 1000 }
+if (-not (Test-Path $Policy)) { New-Item -Path $Policy -Force | Out-Null }
+foreach ($Key in @($Policy, $Tcp)) {
+    foreach ($Name in $Ending.Keys) {
+        Set-ItemProperty -Path $Key -Name $Name -Value $Ending[$Name] -Type DWord
+        $Applied = (Get-ItemProperty -Path $Key -Name $Name).$Name
+        if ($Applied -ne $Ending[$Name]) { Fail "$Key\$Name is $Applied, expected $($Ending[$Name])" }
+        Write-Host "$Key\$Name = $Applied"
+    }
+}
+
 Set-Service -Name TermService -StartupType Manual
 Restart-Service -Name TermService -Force
 
