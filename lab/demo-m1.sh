@@ -219,8 +219,8 @@ cbin="$core_dir/ostena"
 
 # --- 1. PKI ----------------------------------------------------------------
 step "Cérémonie de la racine et clés du core (ostena ca)"
-mkdir -p "$work/ceremony" "$work/credentials" "$work/agent" "$work/transcripts"
-chmod 700 "$work/credentials" "$work/transcripts"
+mkdir -p "$work/ceremony" "$work/credentials" "$work/agent"
+chmod 700 "$work/credentials"
 (
   cd "$work/ceremony"
   ostena ca root init --name "Ostena demo" --out media1 --out media2 > root-init.txt
@@ -454,7 +454,8 @@ step "Transcript écrit et scellé"
 wait_log "$work/core.log" transcript.sealed
 # Les transcripts appartiennent au compte du service : copie lisible.
 fetch_transcripts() {
-  $SUDO cp -r "$core_dir/transcripts" "$1"
+  mkdir -p "$1"
+  $SUDO cp -r "$core_dir/transcripts/." "$1"
   $SUDO chown -R "$(id -u):$(id -g)" "$1"
 }
 fetch_transcripts "$work/transcripts"
