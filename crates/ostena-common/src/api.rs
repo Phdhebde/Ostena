@@ -2,3 +2,4 @@
 //! parsers, no I/O: fuzzed alone.
 
 pub mod login;
+pub mod web;

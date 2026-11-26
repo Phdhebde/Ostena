@@ -88,19 +88,24 @@ fn is_base64url(s: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn secret_from_string<'de, D: Deserializer<'de>>(d: D) -> Result<SecretString, D::Error> {
+pub(super) fn secret_from_string<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<SecretString, D::Error> {
     let text = String::deserialize(d)?;
     Ok(SecretString::from(text))
 }
 
-fn secret_to_string<S: Serializer>(value: &SecretString, s: S) -> Result<S::Ok, S::Error> {
+pub(super) fn secret_to_string<S: Serializer>(
+    value: &SecretString,
+    s: S,
+) -> Result<S::Ok, S::Error> {
     // SECRET-EXPOSURE: written into the request body, sent over TLS once.
     #[expect(clippy::disallowed_methods)]
     let text = value.expose_secret();
     s.serialize_str(text)
 }
 
-fn secret_len(value: &SecretString) -> usize {
+pub(super) fn secret_len(value: &SecretString) -> usize {
     // SECRET-EXPOSURE: only the length is read.
     #[expect(clippy::disallowed_methods)]
     let len = value.expose_secret().len();

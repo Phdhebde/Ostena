@@ -121,6 +121,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "web_messages"
+path = "fuzz_targets/web_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "recorder_decode"
 path = "fuzz_targets/recorder_decode.rs"
 test = false
