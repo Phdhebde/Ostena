@@ -14,7 +14,9 @@
 //! - [`hkdf`] — HKDF-SHA-256;
 //! - [`hmac`] — HMAC-SHA-256 under a 256-bit key;
 //! - [`sha256`] — digests;
-//! - [`release`] — signed release manifests (ADR-0017).
+//! - [`release`] — signed release manifests (ADR-0017);
+//! - [`websocket`] — the `Sec-WebSocket-Accept` value, the only SHA-1 besides
+//!   the TOTP (ADR-0009, amendment of 2026-11-26).
 
 #![forbid(unsafe_code)]
 
@@ -30,6 +32,7 @@ pub mod sealed;
 pub mod sha256;
 pub mod tls;
 pub mod totp;
+pub mod websocket;
 
 /// Errors raised by this crate. Deliberately coarse: callers must not be able
 /// to tell apart the reasons of a cryptographic failure.
