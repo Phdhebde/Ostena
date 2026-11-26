@@ -135,6 +135,17 @@ pub enum Answer {
 pub struct SessionLoop {
     transport: Transport,
     result: ConnectionResult,
+    demux: Demux,
+}
+
+/// The demultiplexer of the slow-path frames of a session: what the loop
+/// does with each frame, without I/O (also the entry point of the
+/// `rdp_session` fuzz target).
+#[derive(Debug)]
+pub struct Demux {
+    io_channel: u16,
+    message_channel: Option<u16>,
+    user_channel: u16,
     autodetect: AutoDetect,
     counters: Counters,
     origin: Instant,
@@ -145,7 +156,7 @@ pub struct SessionLoop {
 impl std::fmt::Debug for SessionLoop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionLoop")
-            .field("counters", &self.counters)
+            .field("counters", &self.demux.counters)
             .finish_non_exhaustive()
     }
 }
@@ -160,21 +171,16 @@ enum Step {
 impl SessionLoop {
     /// A loop over an established connection.
     pub fn new(transport: Transport, result: ConnectionResult) -> Self {
+        let demux = Demux::new(
+            result.io_channel_id,
+            result.message_channel_id,
+            result.user_channel_id,
+        );
         Self {
             transport,
             result,
-            autodetect: AutoDetect::default(),
-            counters: Counters::default(),
-            origin: Instant::now(),
-            last_error: None,
-            responses: Vec::new(),
+            demux,
         }
-    }
-
-    fn now(&self) -> MonotonicInstant {
-        MonotonicInstant::from_millis(
-            u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
-        )
     }
 
     /// Runs until the target ends the session, `stop` turns true, or an
@@ -206,7 +212,7 @@ impl SessionLoop {
                         if let Err(e) = self.transport.write_all(&frame).await {
                             break SessionEnd::Failed(e);
                         }
-                        self.counters.inputs += 1;
+                        self.demux.counters.inputs += 1;
                         if let Some(a) = &activity {
                             a.touch();
                         }
@@ -214,7 +220,7 @@ impl SessionLoop {
                 }
                 filled = self.transport.fill() => {
                     if let Err(e) = filled {
-                        break match (e, self.last_error) {
+                        break match (e, self.demux.last_error) {
                             (RdpError::Unreachable(_), None) => SessionEnd::Closed,
                             (_, Some(code)) => end_of(code),
                             (e, None) => SessionEnd::Failed(e),
@@ -228,7 +234,7 @@ impl SessionLoop {
         } else {
             self.transport.close().await;
         }
-        (end, self.counters)
+        (end, self.demux.counters)
     }
 
     /// Sends the MCS disconnection and closes the transport.
@@ -245,12 +251,12 @@ impl SessionLoop {
     /// Handles every complete frame pending.
     async fn drain(&mut self) -> Result<Option<SessionEnd>, RdpError> {
         while let Some(frame) = self.next_frame()? {
-            match self.process(&frame)? {
+            match self.demux.process(&frame)? {
                 Step::Continue => {}
                 Step::End(end) => return Ok(Some(end)),
                 Step::Reactivate => self.reactivate().await?,
             }
-            for response in std::mem::take(&mut self.responses) {
+            for response in std::mem::take(&mut self.demux.responses) {
                 self.transport.write_all(&response).await?;
             }
         }
@@ -276,13 +282,123 @@ impl SessionLoop {
                 return Ok(None);
             }
             let frame = self.transport.consume(info.length);
-            self.counters.frames += 1;
-            self.autodetect.record(frame.len());
+            self.demux.counters.frames += 1;
+            self.demux.autodetect.record(frame.len());
             if info.action == Action::X224 {
                 return Ok(Some(frame));
             }
-            self.counters.fast_path += 1;
+            self.demux.counters.fast_path += 1;
         }
+    }
+
+    /// Reads the next PDU matching `hint` (reactivation).
+    async fn read_hinted(&mut self, hint: &dyn ironrdp_pdu::PduHint) -> Result<Vec<u8>, RdpError> {
+        loop {
+            match hint
+                .find_size(self.transport.pending())
+                .map_err(|e| RdpError::Protocol(format!("trame : {e}")))?
+            {
+                Some((_, 0)) => return Err(RdpError::Protocol("trame de taille nulle".into())),
+                Some((_, n)) if n > MAX_PDU => {
+                    return Err(RdpError::Protocol("trame hors bornes".into()));
+                }
+                Some((matched, n)) if self.transport.pending().len() >= n => {
+                    let pdu = self.transport.consume(n);
+                    if matched {
+                        return Ok(pdu);
+                    }
+                }
+                _ => self.transport.fill().await?,
+            }
+        }
+    }
+
+    /// Drives a deactivation-reactivation sequence to its end.
+    async fn reactivate(&mut self) -> Result<(), RdpError> {
+        let mut sequence = self.result.activation_factory.create();
+        let mut out = WriteBuf::new();
+        for _ in 0..64 {
+            if let ConnectionActivationState::Finalized {
+                desktop_size,
+                share_id,
+                ..
+            } = sequence.connection_activation_state()
+            {
+                self.result.desktop_size = desktop_size;
+                self.result.share_id = share_id;
+                self.demux.counters.reactivations += 1;
+                return Ok(());
+            }
+            out.clear();
+            let written = if let Some(hint) = sequence.next_pdu_hint() {
+                let pdu = self.read_hinted(hint).await?;
+                sequence.step(&pdu, Some(self.demux.now()), &mut out)
+            } else {
+                sequence.step_no_input(&mut out)
+            }
+            .map_err(|e| RdpError::Protocol(format!("réactivation : {}", e.report())))?;
+            if written.size().is_some() {
+                self.transport.write_all(out.filled()).await?;
+            }
+        }
+        Err(RdpError::Protocol("réactivation sans fin".into()))
+    }
+}
+
+impl Demux {
+    /// A demultiplexer for the channels of a connection.
+    pub fn new(io_channel: u16, message_channel: Option<u16>, user_channel: u16) -> Self {
+        Self {
+            io_channel,
+            message_channel,
+            user_channel,
+            autodetect: AutoDetect::default(),
+            counters: Counters::default(),
+            origin: Instant::now(),
+            last_error: None,
+            responses: Vec::new(),
+        }
+    }
+
+    fn now(&self) -> MonotonicInstant {
+        MonotonicInstant::from_millis(
+            u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Feeds arbitrary bytes as frames from the target, without I/O:
+    /// complete frames are handled, answers are dropped, a reactivation or
+    /// an end stops the feed. For the fuzz target and the tests.
+    ///
+    /// # Errors
+    ///
+    /// The [`RdpError`] the loop would end the session with.
+    pub fn feed(&mut self, mut bytes: &[u8]) -> Result<Option<SessionEnd>, RdpError> {
+        while let Some(info) =
+            find_size(bytes).map_err(|e| RdpError::Protocol(format!("trame : {e}")))?
+        {
+            if info.length == 0 || info.length > MAX_PDU || info.length > bytes.len() {
+                return Ok(None);
+            }
+            let (frame, rest) = bytes.split_at(info.length);
+            bytes = rest;
+            self.counters.frames += 1;
+            if info.action != Action::X224 {
+                self.counters.fast_path += 1;
+                continue;
+            }
+            match self.process(frame)? {
+                Step::Continue => self.responses.clear(),
+                Step::End(end) => return Ok(Some(end)),
+                Step::Reactivate => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// What was counted.
+    pub fn counters(&self) -> Counters {
+        self.counters
     }
 
     /// Handles one slow-path frame; answers go to `self.responses`.
@@ -298,9 +414,9 @@ impl SessionLoop {
                 };
             }
         };
-        if data.channel_id == self.result.io_channel_id {
+        if data.channel_id == self.io_channel {
             self.process_io(data)
-        } else if Some(data.channel_id) == self.result.message_channel_id {
+        } else if Some(data.channel_id) == self.message_channel {
             self.process_message(data)?;
             Ok(Step::Continue)
         } else {
@@ -367,12 +483,12 @@ impl SessionLoop {
             Answer::Consumed => self.counters.autodetect_served += 1,
             Answer::Respond(response) => {
                 self.counters.autodetect_served += 1;
-                let Some(channel) = self.result.message_channel_id else {
+                let Some(channel) = self.message_channel else {
                     return Ok(());
                 };
                 let mut out = WriteBuf::new();
                 ironrdp_pdu::mcs::encode_send_data_request(
-                    self.result.user_channel_id,
+                    self.user_channel,
                     channel,
                     &AutoDetectRspPdu::new(response),
                     &mut out,
@@ -382,59 +498,6 @@ impl SessionLoop {
             }
         }
         Ok(())
-    }
-
-    /// Reads the next PDU matching `hint` (reactivation).
-    async fn read_hinted(&mut self, hint: &dyn ironrdp_pdu::PduHint) -> Result<Vec<u8>, RdpError> {
-        loop {
-            match hint
-                .find_size(self.transport.pending())
-                .map_err(|e| RdpError::Protocol(format!("trame : {e}")))?
-            {
-                Some((_, 0)) => return Err(RdpError::Protocol("trame de taille nulle".into())),
-                Some((_, n)) if n > MAX_PDU => {
-                    return Err(RdpError::Protocol("trame hors bornes".into()));
-                }
-                Some((matched, n)) if self.transport.pending().len() >= n => {
-                    let pdu = self.transport.consume(n);
-                    if matched {
-                        return Ok(pdu);
-                    }
-                }
-                _ => self.transport.fill().await?,
-            }
-        }
-    }
-
-    /// Drives a deactivation-reactivation sequence to its end.
-    async fn reactivate(&mut self) -> Result<(), RdpError> {
-        let mut sequence = self.result.activation_factory.create();
-        let mut out = WriteBuf::new();
-        for _ in 0..64 {
-            if let ConnectionActivationState::Finalized {
-                desktop_size,
-                share_id,
-                ..
-            } = sequence.connection_activation_state()
-            {
-                self.result.desktop_size = desktop_size;
-                self.result.share_id = share_id;
-                self.counters.reactivations += 1;
-                return Ok(());
-            }
-            out.clear();
-            let written = if let Some(hint) = sequence.next_pdu_hint() {
-                let pdu = self.read_hinted(hint).await?;
-                sequence.step(&pdu, Some(self.now()), &mut out)
-            } else {
-                sequence.step_no_input(&mut out)
-            }
-            .map_err(|e| RdpError::Protocol(format!("réactivation : {}", e.report())))?;
-            if written.size().is_some() {
-                self.transport.write_all(out.filled()).await?;
-            }
-        }
-        Err(RdpError::Protocol("réactivation sans fin".into()))
     }
 }
 
