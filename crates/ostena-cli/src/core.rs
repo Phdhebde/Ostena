@@ -53,14 +53,29 @@ struct Loaded {
 /// The validated configuration and its `[core]` section; weakenings and
 /// waivers are logged.
 fn load(path: &Path) -> Result<Loaded, String> {
-    let loaded = config::load_with(path, ostena_platform::permission_checker())
-        .map_err(|e| e.to_string())?;
+    loaded(config::load_with(
+        path,
+        ostena_platform::permission_checker(),
+    ))
+}
+
+/// [`load`] for `db init` and `migrate`, run under other accounts than the
+/// service: its keys and transcripts, private to it, are not checked.
+fn load_for_database(path: &Path) -> Result<Loaded, String> {
+    loaded(config::load_for_database(
+        path,
+        ostena_platform::permission_checker(),
+    ))
+}
+
+fn loaded(result: Result<config::LoadedConfig, config::ConfigError>) -> Result<Loaded, String> {
+    let loaded = result.map_err(|e| e.to_string())?;
     loaded.log_weakenings();
     let core = loaded
         .config
         .core
         .clone()
-        .ok_or_else(|| format!("section [core] absente de {}", path.display()))?;
+        .ok_or_else(|| format!("section [core] absente de {}", loaded.path.display()))?;
     let waivers = loaded
         .weakenings
         .iter()
@@ -131,7 +146,7 @@ async fn serve(loaded: Loaded) -> Result<(), CoreError> {
     // administration account, does.
     schema::require_up_to_date(&pool).await?;
     roles::check_service(&pool).await?;
-    warn_weaknesses(&pool, &core.database).await?;
+    enforce_roles(&pool, &core.database, config.mode).await?;
     let store = PgStore::new(pool, Arc::new(AgentCache::default()));
     let info = StartInfo { waivers };
     let running = RunningCore::start(&core, store, &keys, &info).await?;
@@ -142,22 +157,20 @@ async fn serve(loaded: Loaded) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// Logs what weakens the separation of the roles (`core.database_role_weak`):
-/// the login role of the service could take the owner role, or is also the
-/// migration role.
-async fn warn_weaknesses(pool: &db::Pool, database: &DatabaseConfig) -> Result<(), CoreError> {
+/// Logs what weakens the separation of the roles (`core.database_role_weak`)
+/// and refuses it in production (`CORE-E014`): the login role of the
+/// service is a superuser, could take the owner role or create roles, or is
+/// also the migration role.
+async fn enforce_roles(
+    pool: &db::Pool,
+    database: &DatabaseConfig,
+    mode: config::Mode,
+) -> Result<(), CoreError> {
     let logins = Logins {
         service: &database.user,
         migration: &database.migration_user,
     };
-    for reason in roles::weaknesses(pool, logins).await? {
-        tracing::warn!(
-            event = "core.database_role_weak",
-            reason = %reason,
-            "séparation des rôles de la base affaiblie"
-        );
-    }
-    Ok(())
+    roles::enforce(pool, logins, mode).await
 }
 
 /// Runs an administration task against the database of `path`, on a small
@@ -170,6 +183,7 @@ pub(crate) fn admin<T>(
     let rt = runtime(1)?;
     rt.block_on(async {
         let pool = db::connect(&loaded.core.database, loaded.config.mode, Role::App).await?;
+        enforce_roles(&pool, &loaded.core.database, loaded.config.mode).await?;
         schema::require_up_to_date(&pool).await?;
         task(pool).await
     })
@@ -185,6 +199,7 @@ pub(crate) fn admin_core<T>(
     let rt = runtime(1)?;
     rt.block_on(async {
         let pool = db::connect(&loaded.core.database, loaded.config.mode, Role::App).await?;
+        enforce_roles(&pool, &loaded.core.database, loaded.config.mode).await?;
         schema::require_up_to_date(&pool).await?;
         task(pool, loaded.core).await
     })
@@ -196,7 +211,7 @@ pub(crate) fn admin_core<T>(
 /// (`core.migrated`, `core.migration_reverted`).
 pub(crate) fn migrate(path: &Path, check: bool, revert_to: Option<i64>) -> ExitCode {
     init_admin_logging(path);
-    let outcome = load(path).and_then(|loaded| {
+    let outcome = load_for_database(path).and_then(|loaded| {
         runtime(1)?
             .block_on(async {
                 let pool =
@@ -248,7 +263,7 @@ pub(crate) fn migrate(path: &Path, check: bool, revert_to: Option<i64>) -> ExitC
 /// installation left to the service account, as `superuser`.
 pub(crate) fn db_init(path: &Path, superuser: &str) -> ExitCode {
     init_admin_logging(path);
-    let outcome = load(path).and_then(|loaded| {
+    let outcome = load_for_database(path).and_then(|loaded| {
         runtime(1)?
             .block_on(async {
                 let database = &loaded.core.database;
@@ -256,6 +271,15 @@ pub(crate) fn db_init(path: &Path, superuser: &str) -> ExitCode {
                     service: &database.user,
                     migration: &database.migration_user,
                 };
+                if loaded.config.mode == config::Mode::Production
+                    && database.user == database.migration_user
+                {
+                    return Err(CoreError::RolesWeak(format!(
+                        "{} sert au service et aux migrations : core.database.user et \
+                         migration_user doivent désigner deux comptes distincts",
+                        database.user
+                    )));
+                }
                 let cluster = DatabaseConfig {
                     name: "postgres".into(),
                     user: superuser.into(),
@@ -274,12 +298,12 @@ pub(crate) fn db_init(path: &Path, superuser: &str) -> ExitCode {
                 changes.extend(roles::adopt_m1_objects(&pool, &database.user).await?);
                 let weak = roles::weaknesses(&pool, logins).await?;
                 pool.close().await;
-                Ok::<_, CoreError>((changes, weak))
+                Ok::<_, CoreError>((changes, weak, loaded.config.mode))
             })
             .map_err(|e| e.to_string())
     });
     match outcome {
-        Ok((changes, weak)) => {
+        Ok((changes, weak, mode)) => {
             let mut stdout = io::stdout().lock();
             if changes.is_empty() {
                 let _ = writeln!(stdout, "rôles et base déjà en place : rien à faire");
@@ -291,6 +315,11 @@ pub(crate) fn db_init(path: &Path, superuser: &str) -> ExitCode {
             for reason in &weak {
                 tracing::warn!(event = "core.database_role_weak", reason = %reason);
                 let _ = writeln!(io::stderr(), "attention : {reason}");
+            }
+            drop(stdout);
+            if mode == config::Mode::Production && !weak.is_empty() {
+                // The core would refuse to start on these roles.
+                return fail(&CoreError::RolesWeak(weak.join(" ; ")).to_string());
             }
             ExitCode::SUCCESS
         }

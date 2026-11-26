@@ -60,6 +60,15 @@ pub enum CoreError {
          init` (docs/exploitation/core-installation.md)"
     )]
     Roles(String),
+    /// In production, the login roles weaken the separation: the service
+    /// role is a superuser, may take the owner role or create roles, or is
+    /// also the migration role (ADR-0011). Tolerated and logged in
+    /// development only.
+    #[error(
+        "[CORE-E014] séparation des rôles de la base affaiblie, refusée en production : {0} ; \
+         voir docs/exploitation/core-installation.md"
+    )]
+    RolesWeak(String),
 }
 
 impl CoreError {
@@ -79,6 +88,7 @@ impl CoreError {
             Self::AuditChain(_) => "CORE-E011",
             Self::Invalid(_) => "CORE-E012",
             Self::Roles(_) => "CORE-E013",
+            Self::RolesWeak(_) => "CORE-E014",
         }
     }
 }
@@ -109,6 +119,7 @@ mod tests {
             CoreError::AuditChain("x".into()),
             CoreError::Invalid("x".into()),
             CoreError::Roles("x".into()),
+            CoreError::RolesWeak("x".into()),
         ];
         for (i, e) in samples.iter().enumerate() {
             let code = format!("CORE-E{:03}", i + 1);

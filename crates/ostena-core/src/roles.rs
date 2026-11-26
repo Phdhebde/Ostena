@@ -14,7 +14,7 @@
 //! [`OWNER_ROLE`], and hands over to it what an M1 installation left owned
 //! by the service account. Every step is idempotent.
 
-use ostena_common::config::{APP_ROLE, OWNER_ROLE};
+use ostena_common::config::{APP_ROLE, Mode, OWNER_ROLE};
 use sqlx::PgPool;
 
 use crate::error::CoreError;
@@ -256,6 +256,30 @@ pub async fn weaknesses(pool: &PgPool, logins: Logins<'_>) -> Result<Vec<String>
         ));
     }
     Ok(out)
+}
+
+/// Logs each weakness of [`weaknesses`] (`core.database_role_weak`) and,
+/// in production, refuses them: the separation of the roles is only worth
+/// what the login roles allow. Development tolerates them (a single test
+/// account plays every role).
+///
+/// # Errors
+///
+/// [`CoreError::RolesWeak`] in production, [`CoreError::Database`].
+pub async fn enforce(pool: &PgPool, logins: Logins<'_>, mode: Mode) -> Result<(), CoreError> {
+    let weak = weaknesses(pool, logins).await?;
+    for reason in &weak {
+        tracing::warn!(
+            event = "core.database_role_weak",
+            reason = %reason,
+            refused = mode == Mode::Production,
+            "séparation des rôles de la base affaiblie"
+        );
+    }
+    if mode == Mode::Production && !weak.is_empty() {
+        return Err(CoreError::RolesWeak(weak.join(" ; ")));
+    }
+    Ok(())
 }
 
 /// Checks, before the service starts, that the schema is held as the

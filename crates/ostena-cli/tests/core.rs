@@ -160,9 +160,32 @@ fn command(args: &[&str], config: &Path) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// Runs `args` with `config` and its credentials, and checks that it fails
+/// with `code`, on standard output (the log) or standard error.
+fn refused(lab: &Lab, args: &[&str], config: &Path, code: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ostena"))
+        .args(args)
+        .arg("--config")
+        .arg(config)
+        .env("CREDENTIALS_DIRECTORY", lab.dir.join("credentials"))
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{args:?} : {text}");
+    assert!(text.contains(code), "{args:?} : {code} attendu : {text}");
+}
+
 struct Lab {
     dir: PathBuf,
     core_config: PathBuf,
+    /// The same configuration in production mode, when the database is
+    /// reached as in production (socket, peer): the single test account
+    /// plays both login roles, which production refuses (`CORE-E014`).
+    production_config: Option<PathBuf>,
     agent_config: PathBuf,
     login_port: u16,
 }
@@ -271,15 +294,12 @@ fn lab(db: &TestDb) -> Lab {
                 .unwrap_or_default()
         ),
     };
-    let mode = match db.mode {
-        Mode::Production => "production",
-        Mode::Development => "development",
-    };
+    // One test account plays the service and the migrations: development
+    // mode, which tolerates it (ADR-0011); production is checked to refuse
+    // it.
     let core_config = dir.join("core.toml");
-    std::fs::write(
-        &core_config,
-        format!(
-            "mode = \"{mode}\"\n\n[core]\ntunnel_listen = \"127.0.0.1:{tunnel}\"\n\
+    let text = format!(
+        "[core]\ntunnel_listen = \"127.0.0.1:{tunnel}\"\n\
              enrollment_listen = \"127.0.0.1:{enrollment}\"\ntls_root_ca = \"{}\"\n\
              tls_certificate = \"{}\"\ntls_private_key = {{ credential = \"server.key\" }}\n\
              issuing_certificate = \"{}\"\nissuing_private_key = {{ credential = \"issuing.key\" }}\n\
@@ -294,17 +314,21 @@ fn lab(db: &TestDb) -> Lab {
              heartbeat_secs = 60\n\n\
              [core.database]\nport = {}\nname = \"{}\"\nuser = \"{}\"\nmigration_user = \"{}\"\n\
              {connection}",
-            p("root.pem"),
-            p("server.pem"),
-            p("issuing.pem"),
-            p("transcripts"),
-            database.port,
-            database.name,
-            database.user,
-            database.migration_user,
-        ),
-    )
-    .unwrap();
+        p("root.pem"),
+        p("server.pem"),
+        p("issuing.pem"),
+        p("transcripts"),
+        database.port,
+        database.name,
+        database.user,
+        database.migration_user,
+    );
+    std::fs::write(&core_config, format!("mode = \"development\"\n\n{text}")).unwrap();
+    let production_config = (db.mode == Mode::Production).then(|| {
+        let path = dir.join("core-production.toml");
+        std::fs::write(&path, format!("mode = \"production\"\n\n{text}")).unwrap();
+        path
+    });
     let agent_config = dir.join("agent/ostena.toml");
     std::fs::write(
         &agent_config,
@@ -324,6 +348,7 @@ fn lab(db: &TestDb) -> Lab {
     Lab {
         dir,
         core_config,
+        production_config,
         agent_config,
         login_port,
     }
@@ -338,19 +363,18 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     };
     let lab = lab(&db);
     // The core never migrates (ADR-0011): refused until `core migrate`.
-    let refused = Command::new(env!("CARGO_BIN_EXE_ostena"))
-        .args(["core", "run", "--config"])
-        .arg(&lab.core_config)
-        .env("CREDENTIALS_DIRECTORY", lab.dir.join("credentials"))
-        .output()
-        .unwrap();
-    assert!(!refused.status.success());
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&refused.stdout),
-        String::from_utf8_lossy(&refused.stderr)
-    );
-    assert!(text.contains("CORE-E005"), "{text}");
+    refused(&lab, &["core", "run"], &lab.core_config, "CORE-E005");
+    // One account for the service and the migrations: refused in
+    // production, before anything is created (ADR-0011).
+    if let Some(production) = &lab.production_config {
+        let superuser = db.config.user.as_str();
+        refused(
+            &lab,
+            &["core", "db", "init", "--superuser", superuser],
+            production,
+            "CORE-E014",
+        );
+    }
     // TestDb set up the roles and the database as `core db init` does:
     // nothing left to do.
     let init = command(
@@ -363,6 +387,12 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     let again = command(&["core", "migrate"], &lab.core_config);
     assert!(!again.contains("appliquées"), "{again}");
     command(&["core", "migrate", "--check"], &lab.core_config);
+    // Migrated, the service and the administration commands still refuse
+    // these roles in production; development tolerates them, logged.
+    if let Some(production) = &lab.production_config {
+        refused(&lab, &["core", "run"], production, "CORE-E014");
+        refused(&lab, &["core", "user", "list"], production, "CORE-E014");
+    }
     let mut core = Process::spawn(&["core", "run"], &lab.core_config);
     core.wait_for("core.started");
 

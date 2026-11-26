@@ -7,7 +7,7 @@
 mod common;
 
 use common::{TestDb, block_on};
-use ostena_common::config::DatabaseConfig;
+use ostena_common::config::{DatabaseConfig, Mode};
 use ostena_core::db::{self, APP_ROLE, OWNER_ROLE, Role};
 use ostena_core::roles::{self, Logins};
 use ostena_core::{audit, schema};
@@ -178,6 +178,70 @@ fn the_service_role_has_exactly_the_listed_privileges() {
         assert_eq!(e.code(), "CORE-E013");
         assert!(e.to_string().contains("audit_head DELETE"), "{e}");
         owner.close().await;
+        db.drop_database().await;
+    });
+}
+
+#[test]
+fn production_refuses_weak_login_roles() {
+    block_on(async {
+        let Some(db) = migrated("production_refuses_weak_login_roles").await else {
+            return;
+        };
+        let login = db.login_pool().await;
+        let user = db.config.user.clone();
+        // The test account plays both login roles: refused in production,
+        // tolerated (and logged) in development.
+        let single = Logins {
+            service: &user,
+            migration: &user,
+        };
+        let e = roles::enforce(&login, single, Mode::Production)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "CORE-E014");
+        assert!(
+            e.to_string().contains("sert au service et aux migrations"),
+            "{e}"
+        );
+        roles::enforce(&login, single, Mode::Development)
+            .await
+            .unwrap();
+
+        // A service account of its own, member of ostena_app only, not a
+        // superuser: accepted in production.
+        let suffix: [u8; 4] = ostena_crypto::rand::array().unwrap();
+        let service = suffix
+            .iter()
+            .fold(String::from("ostena_test_svc_"), |mut s, b| {
+                use std::fmt::Write as _;
+                let _ = write!(s, "{b:02x}");
+                s
+            });
+        let logins = Logins {
+            service: &service,
+            migration: &user,
+        };
+        roles::init_cluster(&login, logins).await.unwrap();
+        roles::enforce(&login, logins, Mode::Production)
+            .await
+            .unwrap();
+        // Made a member of the owner role: refused again.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "GRANT {OWNER_ROLE} TO {service}"
+        )))
+        .execute(&login)
+        .await
+        .unwrap();
+        let e = roles::enforce(&login, logins, Mode::Production)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains(OWNER_ROLE), "{e}");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP ROLE {service}")))
+            .execute(&login)
+            .await
+            .unwrap();
+        login.close().await;
         db.drop_database().await;
     });
 }
