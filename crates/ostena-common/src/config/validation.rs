@@ -100,11 +100,17 @@ pub enum Code {
     /// Agent: sessions never cut for inactivity
     /// (`agent.sessions.idle_timeout_secs = 0`).
     IdleTimeoutDisabled,
+    /// Core: invalid `[core.web]` (bound, address, origin).
+    CoreWeb,
+    /// Core: a browser session is not bound to its source.
+    WebSourceNotBound,
+    /// Core: the web listener accepts a classical key exchange.
+    WebTlsClassic,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 39] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -141,6 +147,9 @@ impl Code {
         Self::TranscriptsExposed,
         Self::AgentSessions,
         Self::IdleTimeoutDisabled,
+        Self::CoreWeb,
+        Self::WebSourceNotBound,
+        Self::WebTlsClassic,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -182,6 +191,9 @@ impl Code {
             Self::TranscriptsExposed => "CFG-P016",
             Self::AgentSessions => "CFG-V018",
             Self::IdleTimeoutDisabled => "CFG-P017",
+            Self::CoreWeb => "CFG-V019",
+            Self::WebSourceNotBound => "CFG-P018",
+            Self::WebTlsClassic => "CFG-P019",
         }
     }
 
@@ -205,6 +217,8 @@ impl Code {
                 | Self::TotpSha1
                 | Self::TranscriptsExposed
                 | Self::IdleTimeoutDisabled
+                | Self::WebSourceNotBound
+                | Self::WebTlsClassic
         )
     }
 }

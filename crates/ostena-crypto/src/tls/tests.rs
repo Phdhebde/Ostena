@@ -638,3 +638,102 @@ fn classify_io_finds_the_tls_error() {
     let plain = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
     assert_eq!(classify_io(&plain), None);
 }
+
+#[test]
+fn web_provider_offers_the_hybrid_groups_and_the_fixed_suite() {
+    let names = |p: &CryptoProvider| p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>();
+    let hybrid = web_provider(WebGroups::Hybrid);
+    assert_eq!(
+        names(&hybrid),
+        [NamedGroup::secp256r1MLKEM768, NamedGroup::X25519MLKEM768]
+    );
+    assert_eq!(hybrid.cipher_suites.len(), 1);
+    assert_eq!(
+        hybrid.cipher_suites[0].suite(),
+        CipherSuite::TLS13_AES_256_GCM_SHA384
+    );
+    assert_eq!(hybrid.signature_verification_algorithms.all.len(), 1);
+    assert_eq!(
+        names(&web_provider(WebGroups::HybridThenClassic)),
+        [
+            NamedGroup::secp256r1MLKEM768,
+            NamedGroup::X25519MLKEM768,
+            NamedGroup::secp256r1
+        ]
+    );
+    assert_eq!(WebGroups::Hybrid.names().len(), 2);
+    assert_eq!(WebGroups::HybridThenClassic.names().len(), 3);
+}
+
+#[test]
+fn web_listener_accepts_browsers_with_a_hybrid_group_only() {
+    use testing::{Offer, browser_client_config};
+    let f = fixture();
+    let root = f.pki.root_anchor();
+    let hybrid = web_server_config(&f.server, WebGroups::Hybrid).unwrap();
+    let classic = web_server_config(&f.server, WebGroups::HybridThenClassic).unwrap();
+
+    // A browser offering X25519MLKEM768: accepted, hybrid, http/1.1.
+    let o = handshake(
+        browser_client_config(Offer::X25519MlKem768, &root).unwrap(),
+        hybrid.clone(),
+        "core.test",
+    );
+    assert!(o.client.is_ok() && o.server.is_ok(), "{:?}", o.server);
+    assert_eq!(
+        o.server_conn
+            .negotiated_key_exchange_group()
+            .unwrap()
+            .name(),
+        NamedGroup::X25519MLKEM768
+    );
+    assert_eq!(o.server_conn.alpn_protocol(), Some(&b"http/1.1"[..]));
+    assert_eq!(
+        o.server_conn.negotiated_cipher_suite().unwrap().suite(),
+        CipherSuite::TLS13_AES_256_GCM_SHA384
+    );
+    // The fixed hybrid of the tunnel is accepted too.
+    let o = handshake(
+        client_config(&root, None, &[b"http/1.1"]).unwrap(),
+        hybrid.clone(),
+        "core.test",
+    );
+    assert!(o.server.is_ok(), "{:?}", o.server);
+    assert_eq!(
+        o.server_conn
+            .negotiated_key_exchange_group()
+            .unwrap()
+            .name(),
+        NamedGroup::secp256r1MLKEM768
+    );
+
+    // Classical only: refused, unless the fallback is on (development).
+    let o = handshake(
+        browser_client_config(Offer::Secp256r1, &root).unwrap(),
+        hybrid.clone(),
+        "core.test",
+    );
+    assert_eq!(failure(&o.server), HandshakeFailure::NoCommonGroup);
+    let o = handshake(
+        browser_client_config(Offer::Secp256r1, &root).unwrap(),
+        classic.clone(),
+        "core.test",
+    );
+    assert!(o.server.is_ok(), "{:?}", o.server);
+    // X25519 alone is never accepted.
+    for server in [hybrid.clone(), classic] {
+        let o = handshake(
+            browser_client_config(Offer::X25519, &root).unwrap(),
+            server,
+            "core.test",
+        );
+        assert_eq!(failure(&o.server), HandshakeFailure::NoCommonGroup);
+    }
+    // AES-128 suites only: refused.
+    let o = handshake(
+        browser_client_config(Offer::Aes128Suite, &root).unwrap(),
+        hybrid,
+        "core.test",
+    );
+    assert_eq!(failure(&o.server), HandshakeFailure::NoCommonCipherSuite);
+}

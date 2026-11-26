@@ -9,6 +9,7 @@
 - **Révision** : 2026-11-25, identités locales : mots de passe, TOTP et écart HMAC-SHA-1 (amendement accepté, décision du responsable du projet, 2026-11-25)
 - **Révision** : 2026-11-25, HMAC-SHA-256 pour les empreintes à clé de l'audit (ADR-0016)
 - **Révision** : 2026-11-26, écart RDP : cryptographie d'IronRDP et de `sspi` dans `ostena-rdp`, profil TLS 1.2 des cibles Windows, règle NTLM (amendement accepté, décision du responsable du projet, 2026-11-26)
+- **Révision** : 2026-11-26, portail web (ADR-0020) : groupes TLS de l'écouteur `core.web` et écart `X25519MLKEM768`, SHA-1 confiné à `Sec-WebSocket-Accept`, licence OFL-1.1 des polices embarquées (amendement accepté, décision du responsable du projet, 2026-11-26)
 
 ## Contexte
 
@@ -52,6 +53,12 @@ L'encadré « Attention » du § 2.2.3 rappelle qu'ECDSA n'est pas fortement ré
 - suite `TLS_AES_256_GCM_SHA384` seule ;
 - groupe d'échange de clés `SecP256r1MLKEM768` seul : une poignée de main qui ne le négocie pas échoue, avec un code `TUN` dédié ;
 - certificats ECDSA P-256 / SHA-256 pour la CA du core et pour les agents. P-256 garde ouverte une clé d'agent non exportable dans un TPM 2.0 (qui ne gère pas Ed25519) et la CA dans un HSM.
+
+**Écouteur du portail** (`core.web`, ADR-0020 ; amendement du 2026-11-26) :
+- TLS 1.3 seul, suite `TLS_AES_256_GCM_SHA384` seule, certificat ECDSA P-256 / SHA-256 du core, pas de certificat client, ALPN `http/1.1`, ni ticket de session ni données précoces ;
+- groupes `SecP256r1MLKEM768` puis `X25519MLKEM768`, ce dernier admis comme écart (plus bas, « Écarts ») parce qu'aucun navigateur ne propose aujourd'hui le premier ;
+- l'échange classique `secp256r1` n'est accepté qu'avec `core.web.tls_classic_fallback = true` (navigateur sans hybride) : affaiblissement journalisé à chaque démarrage, **refusé en mode production** (`CFG-P019`) ;
+- l'écouteur de `ostena login` et le tunnel gardent `SecP256r1MLKEM768` seul : l'écart ne vaut que pour les navigateurs.
 
 **Aléa et dérivation** :
 - aléa du système d'exploitation via `aws-lc-rs` ;
@@ -141,9 +148,35 @@ Un mot de passe est un secret de faible entropie, attaquable hors ligne si le co
 - Le code n'est pas une signature : il vaut 30 s, n'est utilisable qu'une fois (anti-rejeu), avec le mot de passe, et sous la limitation des tentatives et le verrouillage. Deviner un code de 6 chiffres reste la meilleure attaque, quelle que soit la fonction.
 - Le secret est tiré au hasard (160 bits), jamais dérivé d'un mot de passe.
 
-**Confinement.** HMAC-SHA-1 n'est exposé par `ostena-crypto` que dans le module `totp`, par la constante `HMAC_SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs. Aucun autre usage de SHA-1 n'est permis. Le choix de SHA-256 vaut pour les nouveaux enrôlements ; un administrateur peut l'imposer (`totp_algorithm = "sha256"`). Tant que SHA-1 reste la valeur, chaque démarrage du core le signale comme affaiblissement accepté (`CFG-P015`, avertissement `config.waiver` et enregistrement d'audit), sans le refuser en production.
+**Confinement.** HMAC-SHA-1 n'est exposé par `ostena-crypto` que dans le module `totp`, par la constante `HMAC_SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs. Aucun autre usage de SHA-1 n'est permis, hormis la valeur `Sec-WebSocket-Accept` (amendement du 2026-11-26, plus bas). Le choix de SHA-256 vaut pour les nouveaux enrôlements ; un administrateur peut l'imposer (`totp_algorithm = "sha256"`). Tant que SHA-1 reste la valeur, chaque démarrage du core le signale comme affaiblissement accepté (`CFG-P015`, avertissement `config.waiver` et enregistrement d'audit), sans le refuser en production.
 
 **Conditions de sortie.** Passage à SHA-256 par défaut quand les applications d'authentification utilisées par les clients le prennent en charge, ou remplacement du TOTP par FIDO2/WebAuthn (après M1).
+
+#### Portail : `X25519MLKEM768` pour les navigateurs (décidé le 2026-11-26)
+
+**L'écart.** Le seul groupe de ce document est `SecP256r1MLKEM768`. Les navigateurs répandus ne proposent que `X25519MLKEM768` comme hybride post-quantique, et X25519 n'est plus cité parmi les mécanismes conformes de [PG-083] v3.00 (tableau plus haut). Sur l'écouteur `core.web` seulement, `X25519MLKEM768` est admis après `SecP256r1MLKEM768`.
+
+**Pourquoi le risque est faible.**
+- L'échange reste hybride : la clé de session dérive des deux secrets, et elle reste au moins aussi forte que ML-KEM-768 seul, que [PG-083] juge conforme en hybride (§ 2.2.2).
+- X25519 respecte `RègleCourbeElliptiqueGFp` (sous-groupe premier de 253 bits) et reste recommandé par [PA-079] (R18).
+- L'alternative réaliste n'est pas `SecP256r1MLKEM768`, mais un échange classique sans protection contre l'attaque rétroactive, que `RecoSécuLongTerme` demande d'éviter.
+
+**Ordre des groupes.** rustls retient le premier groupe de la liste du client que le serveur accepte : le serveur ne peut pas imposer sa préférence. L'ordre `SecP256r1MLKEM768` puis `X25519MLKEM768` ne sert donc que d'intention ; la garantie est que, sans l'option de repli, **tout échange accepté est hybride**. Le core journalise les groupes actifs au démarrage (`web.tls_groups`).
+
+**Repli classique.** `secp256r1` seul n'est accepté qu'avec `core.web.tls_classic_fallback = true`, journalisé, refusé en production (`CFG-P019`).
+
+**Conditions de sortie.** Retrait de `X25519MLKEM768` quand les navigateurs utilisés par les clients proposent `SecP256r1MLKEM768`.
+
+#### WebSocket : SHA-1 de `Sec-WebSocket-Accept` (décidé le 2026-11-26)
+
+**L'écart.** RFC 6455 (§ 4.2.2) impose `Sec-WebSocket-Accept = base64(SHA-1(clé ‖ GUID))` dans la réponse à la poignée de main. SHA-1 n'est pas une fonction de hachage conforme ([PG-083] § 2.1.4, [PA-079] R3).
+
+**Pourquoi ce n'est pas un usage de sécurité.** La clé du client et le GUID sont publics, et la valeur aussi : elle prouve seulement que le serveur a compris une demande WebSocket, contre les caches et les intermédiaires mal configurés. Ni l'authentification (cookie, grant) ni l'intégrité (TLS) n'en dépendent.
+
+**Confinement.**
+- SHA-1 est exposé par `ostena-crypto` dans le seul module `websocket`, par la constante `SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs, sur le modèle du TOTP. Le module ne rend que la valeur de `Sec-WebSocket-Accept` ; il n'offre pas de hachage SHA-1 générique.
+- Le crate `sha1` reste refusé par `deny.toml`.
+- Le module arrive avec la passerelle navigateur (PR 8b) ; le RD Gateway (`ostena-tsgu`, transport WebSocket) le réutilisera.
 
 #### SSH : la cryptographie de russh dans `ostena-ssh` (décidé le 2026-11-13)
 
@@ -324,9 +357,14 @@ La fonctionnalité `tls12` de rustls est activée **dans `ostena-crypto` seuleme
 
 russh 0.65.1 ne propose qu'un hybride X25519 + ML-KEM-768 (`mlkem768x25519-sha256`), hors liste. Une variante P-256 + ML-KEM-768 est décrite par un brouillon de l'IETF (`mlkem768nistp256-sha256`). Sa prise en charge par russh et par OpenSSH reste à vérifier. En attendant, l'échange SSH reste classique (ECDH P-256), comme l'authentification du tunnel (voir le risque accepté plus haut).
 
+### Licence des polices embarquées (amendement du 2026-11-26)
+
+Inter et JetBrains Mono, choisies par la charte du portail (ADR-0020), sont sous SIL OFL-1.1, absente de la liste de licences de CLAUDE.md, qui vise les dépendances de code. **OFL-1.1 est admise pour les seules polices embarquées dans le portail.** Leur licence est livrée dans le paquet et déclarée dans la SBOM. Aucune crate ni aucun paquet npm sous OFL-1.1 n'est admis par cette exception.
+
 ## Conséquences
 
 - **`ostena-crypto`** n'expose plus Ed25519. Les algorithmes ne sont ni négociables ni configurables : `grant.signature_algorithm` n'accepte que `ecdsa-p256-sha256` en production (`CFG-P004`).
 - **Identités locales** : `ostena-crypto` expose PBKDF2-HMAC-SHA256 pour les mots de passe, le TOTP (HMAC-SHA-1 par défaut, écart ci-dessus) et AES-256-GCM pour les secrets au repos.
+- **Portail** : l'écouteur `core.web` est le seul à admettre `X25519MLKEM768`, et SHA-1 n'existe dans `ostena-crypto` que pour le TOTP et `Sec-WebSocket-Accept`.
 - **Interopérabilité** : les deux extrémités du tunnel sont à nous. N'accepter qu'un groupe et qu'une suite ne coûte rien en interopérabilité, et supprime toute rétrogradation.
 - **Veille des guides** : toute nouvelle version de [PG-083] ou de [PA-079] impose de revoir ce tableau. Les identifiants de règles cités permettent de vérifier rapidement ce qui a changé.

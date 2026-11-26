@@ -74,6 +74,10 @@ pub struct CoreConfig {
     /// started.
     #[serde(default)]
     pub login: Option<CoreLoginConfig>,
+    /// The web portal and its REST API (ADR-0020): absent, the web listener
+    /// is not started.
+    #[serde(default)]
+    pub web: Option<CoreWebConfig>,
 }
 
 /// `[core.ssh]`: the SSH certificate authorities of the core (ADR-0014).
@@ -193,6 +197,112 @@ pub struct CoreLoginConfig {
     /// Port of the agents' SSH servers.
     #[serde(default = "default_login_ssh_port")]
     pub ssh_port: u16,
+}
+
+/// Default idle time before a browser session ends, in minutes.
+pub const DEFAULT_WEB_IDLE_MINUTES: u32 = 15;
+/// Default simultaneous connections to the web listener.
+pub const DEFAULT_WEB_MAX_CONNECTIONS: u32 = 256;
+/// Default simultaneous connections to the web listener from one source.
+pub const DEFAULT_WEB_CONNECTIONS_PER_SOURCE: u32 = 16;
+
+const fn default_web_idle_minutes() -> u32 {
+    DEFAULT_WEB_IDLE_MINUTES
+}
+
+const fn default_web_max_connections() -> u32 {
+    DEFAULT_WEB_MAX_CONNECTIONS
+}
+
+const fn default_web_connections_per_source() -> u32 {
+    DEFAULT_WEB_CONNECTIONS_PER_SOURCE
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+/// `[core.web]`: the web portal and its REST API (ADR-0020). It shares the
+/// credentials, the lockout and the attempt limiter of `[core.login]`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreWebConfig {
+    /// Address of the web listener (HTTPS over TCP), e.g. `0.0.0.0:443`.
+    pub listen: SocketAddr,
+    /// The exact origin of the portal, as the browsers send it in `Origin`:
+    /// `https://<host>` or `https://<host>:<port>`, lower case, no path.
+    pub origin: String,
+    /// Longest browser session, 1 to 8 hours.
+    #[serde(default = "default_session_max_hours")]
+    pub session_max_hours: u32,
+    /// Inactivity before a browser session ends, 5 to 60 minutes.
+    #[serde(default = "default_web_idle_minutes")]
+    pub idle_minutes: u32,
+    /// A session is bound to the source that opened it (IPv4 address or
+    /// IPv6 /64); `false` is a weakening refused in production (`CFG-P018`).
+    #[serde(default = "default_true")]
+    pub bind_source: bool,
+    /// Also accept the classical `secp256r1` group, for browsers without a
+    /// hybrid group: a weakening refused in production (`CFG-P019`).
+    #[serde(default)]
+    pub tls_classic_fallback: bool,
+    /// Simultaneous connections, 1 to 4096.
+    #[serde(default = "default_web_max_connections")]
+    pub max_connections: u32,
+    /// Simultaneous connections from one source, 1 to 256.
+    #[serde(default = "default_web_connections_per_source")]
+    pub connections_per_source: u32,
+}
+
+/// Whether `origin` is `https://<host>[:<port>]`: a lower-case DNS name or
+/// IPv4 address (or a bracketed IPv6 address), an optional port from 1 to
+/// 65535, nothing else.
+pub fn is_web_origin(origin: &str) -> bool {
+    let Some(rest) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    let (host_ok, port) = if let Some(v6) = rest.strip_prefix('[') {
+        let Some((addr, after)) = v6.split_once(']') else {
+            return false;
+        };
+        let port = match after {
+            "" => None,
+            _ => match after.strip_prefix(':') {
+                Some(p) => Some(p),
+                None => return false,
+            },
+        };
+        let ok = addr.parse::<std::net::Ipv6Addr>().is_ok() && addr == addr.to_ascii_lowercase();
+        (ok, port)
+    } else {
+        let (host, port) = match rest.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (rest, None),
+        };
+        (is_dns_host(host), port)
+    };
+    let port_ok = port.is_none_or(|p| {
+        !p.starts_with('0')
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u16>().is_ok_and(|n| n > 0)
+    });
+    host_ok && port_ok
+}
+
+/// A lower-case DNS name or IPv4 address: labels of letters, digits and
+/// `-`, 1 to 63 bytes each, 253 in all.
+fn is_dns_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 /// Default interval between two heads while the chain moves, seconds.
@@ -497,6 +607,63 @@ fn login_rules(core: &CoreConfig, login: &CoreLoginConfig, out: &mut Vec<Violati
     }
 }
 
+fn web_violation(out: &mut Vec<Violation>, message: String) {
+    out.push(Violation::new(Code::CoreWeb, message));
+}
+
+/// Rules of `[core.web]` (`CFG-V019`).
+fn web_rules(core: &CoreConfig, web: &CoreWebConfig, out: &mut Vec<Violation>) {
+    match &core.login {
+        None => web_violation(
+            out,
+            "[core.web] exige [core.login] : la connexion au portail utilise les mêmes \
+             identifiants, le même verrouillage et la même clé des secrets TOTP."
+                .into(),
+        ),
+        Some(login) if login.listen == web.listen => web_violation(
+            out,
+            "core.web.listen doit différer de core.login.listen.".into(),
+        ),
+        Some(_) => {}
+    }
+    if web.listen == core.tunnel_listen || web.listen == core.enrollment_listen() {
+        web_violation(
+            out,
+            "core.web.listen doit différer de core.tunnel_listen et de \
+             core.enrollment_listen."
+                .into(),
+        );
+    }
+    if !is_web_origin(&web.origin) {
+        web_violation(
+            out,
+            format!(
+                "core.web.origin = « {} » : origine exacte attendue, https://<hôte> ou \
+                 https://<hôte>:<port>, en minuscules, sans chemin ni barre finale.",
+                web.origin.escape_debug()
+            ),
+        );
+    }
+    for (field, value, min, max) in [
+        ("core.web.session_max_hours", web.session_max_hours, 1, 8),
+        ("core.web.idle_minutes", web.idle_minutes, 5, 60),
+        ("core.web.max_connections", web.max_connections, 1, 4096),
+        (
+            "core.web.connections_per_source",
+            web.connections_per_source,
+            1,
+            256,
+        ),
+    ] {
+        if !(min..=max).contains(&value) {
+            web_violation(
+                out,
+                format!("{field} = {value} : attendu de {min} à {max}."),
+            );
+        }
+    }
+}
+
 /// The private keys of the core: their sources (`CFG-V008`, `CFG-V014`), one use each
 /// (`CFG-V016`), and the SSH section bounds (`CFG-V012`).
 fn key_rules(core: &CoreConfig, out: &mut Vec<Violation>) {
@@ -570,6 +737,9 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
     if let Some(login) = &core.login {
         login_rules(core, login, out);
     }
+    if let Some(web) = &core.web {
+        web_rules(core, web, out);
+    }
     let db = &core.database;
     path_rule(out, "core.database.socket_dir", &db.socket_dir);
     for (field, value) in [
@@ -636,7 +806,7 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
 }
 
 /// Production refusals of the core section that do not need the file
-/// system: `CFG-P014`, and `CFG-P012` once the waiver has ended (`now`, Unix
+/// system: `CFG-P014`, `CFG-P018`, `CFG-P019`, and `CFG-P012` once the waiver has ended (`now`, Unix
 /// seconds).
 pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
     if core.database.tcp.is_some() {
@@ -648,6 +818,23 @@ pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) 
     }
     if now >= KEY_FILE_WAIVER_END {
         key_files(core, out);
+    }
+    if let Some(web) = &core.web {
+        if !web.bind_source {
+            out.push(Violation::new(
+                Code::WebSourceNotBound,
+                "core.web.bind_source = false : une session du portail n'est plus liée à la \
+                 source qui l'a ouverte ; un cookie volé servirait depuis un autre poste.",
+            ));
+        }
+        if web.tls_classic_fallback {
+            out.push(Violation::new(
+                Code::WebTlsClassic,
+                "core.web.tls_classic_fallback = true : un navigateur sans groupe hybride \
+                 négocie un échange de clés classique (secp256r1), sans protection \
+                 post-quantique (ADR-0009).",
+            ));
+        }
     }
 }
 

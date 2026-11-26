@@ -5,6 +5,7 @@
 - **Révisé** : 2026-11-11 — section `[agent]` (`CFG-V006` à `V010`, `CFG-P007` à `P010`) et `CFG-P006` sous Windows
 - **Révisé** : 2026-11-25 — `CFG-P016`, droits du répertoire des transcripts (ADR-0016)
 - **Révisé** : 2026-11-26 — `CFG-V013` couvre `core.database.migration_user` et les rôles de groupe du schéma (ADR-0011, rôles séparés)
+- **Révisé** : 2026-11-26 — `CFG-V019`, `CFG-P018` et `CFG-P019`, section `[core.web]` du portail (ADR-0020)
 
 ## Contexte
 
@@ -71,6 +72,9 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 
 | `CFG-V018` | cohérence | section `[agent.sessions]` (ADR-0018) : valeur hors bornes (`max_sessions` 1 à 1 024, `max_sessions_per_user` et `max_sessions_per_target` 1 à 256, `idle_timeout_secs` 0 ou 60 à 86 400) |
 | `CFG-P017` | production | `agent.sessions.idle_timeout_secs = 0` : sessions jamais coupées pour inactivité (ADR-0018) |
+| `CFG-V019` | cohérence | section `[core.web]` (ADR-0020) : section `[core.login]` absente, adresse égale à celle de `ostena login`, du tunnel ou de l'enrôlement, `origin` qui n'est pas une origine exacte `https://<hôte>[:<port>]` en minuscules, valeur hors bornes (`session_max_hours` 1 à 8, `idle_minutes` 5 à 60, `max_connections` 1 à 4096, `connections_per_source` 1 à 256) |
+| `CFG-P018` | production | `core.web.bind_source = false` : la session du portail n'est plus liée à sa source (ADR-0020) |
+| `CFG-P019` | production | `core.web.tls_classic_fallback = true` : échange de clés classique `secp256r1` admis sur l'écouteur du portail (ADR-0009, amendement du 2026-11-26) |
 
 `CFG-P013` (credential non lié au TPM 2.0, ADR-0008) est réservé : il n'est pas encore contrôlé, ce qui sera fait avec la lecture des credentials chiffrés après M1.
 
