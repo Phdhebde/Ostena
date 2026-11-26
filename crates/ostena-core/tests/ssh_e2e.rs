@@ -175,13 +175,32 @@ fn agent(
     cert_pem: &str,
     key_pem: &[u8],
 ) -> (Gateway, Arc<AgentLink>) {
+    agent_via(
+        dir,
+        &format!("127.0.0.1:{port}"),
+        ostena_tunnel::TransportMode::Auto,
+        keys,
+        cert_pem,
+        key_pem,
+    )
+}
+
+/// The same, dialling `core_address` with `transport`.
+fn agent_via(
+    dir: &Path,
+    core_address: &str,
+    transport: ostena_tunnel::TransportMode,
+    keys: &Keys,
+    cert_pem: &str,
+    key_pem: &[u8],
+) -> (Gateway, Arc<AgentLink>) {
     let certificate = dir.join("agent.crt");
     let private_key = dir.join("agent.key");
     std::fs::write(&certificate, cert_pem).unwrap();
     private_file::create(&private_key, key_pem, Reader::CurrentProcess).unwrap();
     let group = Uuid::parse(GROUP).unwrap();
     let link = Arc::new(AgentLink::spawn(LinkParams {
-        core_address: format!("127.0.0.1:{port}"),
+        core_address: core_address.to_owned(),
         certificate,
         private_key,
         root: tls::TrustAnchor::from_der(keys.root.certificate().clone()),
@@ -190,7 +209,7 @@ fn agent(
             gateway_group: group,
             config_fingerprint: format!("sha256:{}", "0".repeat(64)),
         },
-        transport: ostena_tunnel::TransportMode::Auto,
+        transport,
         limits: Limits::default(),
         backoff: Backoff {
             base: Duration::from_millis(100),
@@ -748,6 +767,289 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
         };
         assert!(limited && answered >= 40, "{answered}");
 
+        core.stop().await;
+        drop(gateway);
+        link.stop().await;
+        pool.close().await;
+        db.drop_database().await;
+    });
+}
+
+/// A UDP relay between the agent and the core that can drop every packet,
+/// as a network cut does: neither end sees a close, each finds the
+/// connection lost after its idle delay.
+struct Cut {
+    addr: std::net::SocketAddr,
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Cut {
+    async fn start(core: std::net::SocketAddr) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        back.connect(core).await.unwrap();
+        let blocked = Arc::new(AtomicBool::new(false));
+        let client = Arc::new(Mutex::new(None::<std::net::SocketAddr>));
+        tokio::spawn({
+            let (front, back, blocked, client) =
+                (front.clone(), back.clone(), blocked.clone(), client.clone());
+            async move {
+                let mut buf = vec![0u8; 65_536];
+                while let Ok((n, from)) = front.recv_from(&mut buf).await {
+                    if blocked.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    *client.lock().unwrap() = Some(from);
+                    let _ = back.send(&buf[..n]).await;
+                }
+            }
+        });
+        tokio::spawn({
+            let (front, blocked) = (front.clone(), blocked.clone());
+            async move {
+                let mut buf = vec![0u8; 65_536];
+                while let Ok(n) = back.recv(&mut buf).await {
+                    let to = *client.lock().unwrap();
+                    if blocked.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if let Some(to) = to {
+                        let _ = front.send_to(&buf[..n], to).await;
+                    }
+                }
+            }
+        });
+        Self {
+            addr: front.local_addr().unwrap(),
+            blocked,
+        }
+    }
+
+    fn set(&self, blocked: bool) {
+        self.blocked
+            .store(blocked, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Runs the transcript of a session with a grace, as the agent SSH server
+/// does (ADR-0016).
+fn record_with_grace(
+    link: &Arc<AgentLink>,
+    session: Uuid,
+    stream: ostena_tunnel::Channel,
+    grace: Duration,
+) -> (
+    Transcript,
+    tokio::task::JoinHandle<Result<(), ostena_tunnel::TunnelError>>,
+) {
+    use ostena_tunnel::recording::{Options, QUEUE, Resume, run};
+    let (transcript, rx) = Transcript::channel(QUEUE);
+    let options = Options {
+        resume: Some(Resume {
+            link: link.clone(),
+            session,
+            grace,
+        }),
+        ..Options::default()
+    };
+    (transcript, tokio::spawn(run(rx, stream, options)))
+}
+
+/// Criterion L2 of the tunnel (ADR-0008, ADR-0016): a 30 s network cut
+/// between the agent and the core. The link comes back on its own; a
+/// session whose grace is longer than the cut is kept, what it showed
+/// during the cut reaches the core once the transcript is resumed, and the
+/// transcript is sealed complete. A session whose grace is shorter is cut,
+/// and its transcript is sealed incomplete: nothing is lost silently.
+#[test]
+fn a_network_cut_shorter_than_the_grace_keeps_the_ssh_sessions() {
+    block_on(async {
+        let Some(db) = TestDb::create("a_network_cut_shorter_than_the_grace_keeps_ssh").await
+        else {
+            return;
+        };
+        db.migrate().await;
+        let pool = db.pool().await;
+        let dir =
+            Dir(std::env::temp_dir().join(format!("ostena-core-ssh-grace-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let pki = TestPki::new("Ostena grace").unwrap();
+        let group = Uuid::parse(GROUP).unwrap();
+        let agent_id = Uuid::random().unwrap();
+        let (agent_key, agent_pkcs8) = SigningKey::generate().unwrap();
+        let agent_cert = pki
+            .issuing
+            .issue_agent(
+                &agent_key.verifying_key(),
+                GROUP,
+                &agent_id.to_string(),
+                valid(),
+            )
+            .unwrap();
+        let fingerprint = tls::fingerprint(&agent_cert);
+        let keys = keys(pki, &dir.0.join("transcripts"));
+        let store = PgStore::new(pool.clone(), Arc::new(AgentCache::default()));
+        ostena_core::audit::ensure_genesis(&pool).await.unwrap();
+        store.register(fingerprint, group, agent_id).await.unwrap();
+        inventory::create_group(&pool, Some(group), "lab", &["bastion.lab".into()])
+            .await
+            .unwrap();
+        inventory::set_group_policy(&pool, "lab", &allow_lab())
+            .await
+            .unwrap();
+        let user = inventory::add_user(&pool, "alice", "Alice").await.unwrap();
+        let target = SigningKey::generate().unwrap().0.verifying_key();
+        inventory::add_resource(&pool, "srv-lab01", "10.20.0.5", 22, "lab", &target)
+            .await
+            .unwrap();
+        inventory::add_account(&pool, "srv-lab01", "root")
+            .await
+            .unwrap();
+        inventory::grant_right(&pool, "alice", "srv-lab01", "root", now() + 86_400, 1800)
+            .await
+            .unwrap();
+
+        let port = free_port();
+        let config = config(port);
+        let core = RunningCore::start(
+            &config,
+            PgStore::new(pool.clone(), Arc::new(AgentCache::default())),
+            &keys,
+            &StartInfo::default(),
+        )
+        .await
+        .unwrap();
+        let cut = Cut::start(core.tunnel_addr()).await;
+        // SECRET-EXPOSURE: test only, the key file `agent enroll` would write.
+        #[expect(clippy::disallowed_methods)]
+        let key_pem = pem_private_key(&agent_pkcs8).expose_secret().to_vec();
+        let (gateway, link) = agent_via(
+            &dir.0,
+            &cut.addr.to_string(),
+            ostena_tunnel::TransportMode::Quic,
+            &keys,
+            &pem_certificate(&agent_cert),
+            &key_pem,
+        );
+        until("politique et clés", || {
+            let v = gateway.state().versions();
+            v.policy.is_some() && v.keyset.is_some() && v.ssh_trust.is_some()
+        })
+        .await;
+
+        // Two live sessions: one with a grace of 60 s, one of 3 s.
+        let cert = [0xe1; 32];
+        let login_session = open_login(&pool, user, cert).await;
+        let access = SshAccess {
+            subject: user,
+            login_session,
+            certificate_sha256: cert,
+            account: "root".into(),
+            resource: "srv-lab01".into(),
+            client_address: "192.0.2.7:50022".parse().unwrap(),
+        };
+        let replay = MemoryReplayStore::default();
+        let kept = gateway
+            .open_ssh_session(&access, now(), &replay)
+            .await
+            .unwrap();
+        let kept_id = kept.session.session_id;
+        let (kept_transcript, kept_pumped) =
+            record_with_grace(&link, kept_id, kept.recording, Duration::from_secs(60));
+        let short = gateway
+            .open_ssh_session(&access, now(), &replay)
+            .await
+            .unwrap();
+        let short_id = short.session.session_id;
+        let (short_transcript, short_pumped) =
+            record_with_grace(&link, short_id, short.recording, Duration::from_secs(3));
+        kept_transcript.start(None, None).await.unwrap();
+        kept_transcript.output(b"before the cut\n").await.unwrap();
+        short_transcript.start(None, None).await.unwrap();
+        short_transcript.output(b"short grace\n").await.unwrap();
+        until("transcripts en cours", || {
+            let t = keys.transcripts.as_ref().unwrap();
+            t.path(kept_id).exists() && t.path(short_id).exists()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The cut: 30 s, the session keeps showing output meanwhile.
+        cut.set(true);
+        let started = tokio::time::Instant::now();
+        let mut shown = vec![b"before the cut\n".to_vec()];
+        let mut i = 0;
+        while started.elapsed() < Duration::from_secs(30) {
+            let output = format!("during the cut {i}\n").into_bytes();
+            kept_transcript.output(&output).await.unwrap();
+            shown.push(output);
+            i += 1;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // The short grace is over: that session is cut.
+        tokio::time::timeout(Duration::from_millis(10), short_transcript.closed())
+            .await
+            .expect("session with a 3 s grace cut during a 30 s cut");
+        let error = short_pumped.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("grâce"), "{error}");
+        cut.set(false);
+
+        // The link comes back by itself, the transcript is resumed.
+        until("lien rétabli", || link.status().connections >= 2).await;
+        let output = b"after the cut\n".to_vec();
+        kept_transcript.output(&output).await.unwrap();
+        shown.push(output);
+        kept_transcript.end(EndReason::Closed).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), kept_transcript.closed())
+                .await
+                .is_err(),
+            "session with a 60 s grace kept"
+        );
+        drop(kept_transcript);
+        tokio::time::timeout(Duration::from_secs(30), kept_pumped)
+            .await
+            .expect("transcript resumed and acknowledged")
+            .unwrap()
+            .unwrap();
+        assert_eq!(until_sealed(&pool, kept_id).await, "sealed");
+        let text = String::from_utf8(
+            std::fs::read(keys.transcripts.as_ref().unwrap().path(kept_id)).unwrap(),
+        )
+        .unwrap();
+        let mut at = 0;
+        for line in &shown {
+            let escaped = String::from_utf8(line.clone())
+                .unwrap()
+                .replace('\n', "\\n");
+            let found = text[at..]
+                .find(&escaped)
+                .unwrap_or_else(|| panic!("{escaped} absent ou déplacé"));
+            at += found + escaped.len();
+        }
+
+        // The cut session: sealed incomplete once the core's wait is over
+        // (grace announced plus margin), never left unsealed.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if transcript_state(&pool, short_id).await.as_deref() == Some("incomplete") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "transcript coupé non scellé incomplet"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let seal_code: Option<String> =
+            sqlx::query_scalar("SELECT code FROM session_transcript WHERE session_id = $1::uuid")
+                .bind(short_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seal_code.as_deref(), Some("REC-E005"));
         core.stop().await;
         drop(gateway);
         link.stop().await;
