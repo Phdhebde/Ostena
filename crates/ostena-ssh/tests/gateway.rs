@@ -270,7 +270,12 @@ fn the_transcript_reaches_the_core_and_its_loss_is_seen() {
         transcript.end(EndReason::Closed).await.unwrap();
         drop(transcript);
         pumped.await.unwrap().unwrap();
-        let (bytes, finished) = core.recording(id).unwrap();
+        // The pump returns on the transport acknowledgement of the end: the
+        // core received everything, and reads it to its end soon after.
+        let (bytes, finished) = core
+            .finished_recording(id, Duration::from_secs(5))
+            .await
+            .expect("transcript read to its end by the core");
         assert!(finished);
         let mut decoder = Decoder::new(RecLimits::default());
         decoder.feed(&bytes);
