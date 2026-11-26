@@ -52,6 +52,13 @@ pub enum SshError {
     /// (revocations lost).
     #[error("[SSH-E021] transcript non transmissible au core, session coupée : {0}")]
     TranscriptLost(String),
+    /// A request that needs a function the right does not have (transfer,
+    /// port forwarding, agent, X11).
+    #[error("[SSH-E022] fonction absente du droit : {0}")]
+    FunctionMissing(&'static str),
+    /// A transfer stream the agent cannot follow: the session is cut.
+    #[error("[SSH-E023] flux de transfert illisible, session coupée : {0}")]
+    TransferUnreadable(String),
 }
 
 impl SshError {
@@ -69,6 +76,8 @@ impl SshError {
             Self::Identity(_) => "SSH-E018",
             Self::Limit(_) => "SSH-E019",
             Self::TranscriptLost(_) => "SSH-E021",
+            Self::FunctionMissing(_) => "SSH-E022",
+            Self::TransferUnreadable(_) => "SSH-E023",
         }
     }
 }

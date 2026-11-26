@@ -46,7 +46,9 @@ use std::time::Duration;
 
 use ostena_audit::{Event, EventKind, Outcome, field};
 use ostena_crypto::hmac::HmacKey;
-use ostena_recorder::{CastWriter, Decoder, EndReason, Frame, Limits, RecorderError, Sealed};
+use ostena_recorder::{
+    CastWriter, Decoder, EndReason, Frame, Limits, NoteKind, RecorderError, Sealed,
+};
 use ostena_tunnel::recording::{self, Preamble, RESET_STALLED, STOP_REPLACED, send_offset};
 use ostena_tunnel::{Channel, StreamError, Uuid};
 use sqlx::PgPool;
@@ -482,6 +484,63 @@ struct Received {
     reason: Option<EndReason>,
     command: Option<Command>,
     output_bytes: u64,
+    /// Notes audited: transfers, refused requests.
+    audited_notes: usize,
+}
+
+/// Most notes of one transcript recorded in the audit chain: the agent
+/// sends few (one transfer per session, a bounded number of refusals), a
+/// stream that sends more does not flood the chain; they all stay in the
+/// sealed transcript.
+const MAX_AUDITED_NOTES: usize = 32;
+
+/// The audit record of a note of the transcript of `session`: a transfer
+/// (`access.ssh_transfer`), a refused request
+/// (`access.ssh_request_refused`) or a forwarding relayed
+/// (`access.ssh_forward`); none for a file operation, which stays
+/// in the transcript, nor past [`MAX_AUDITED_NOTES`].
+fn note_event(
+    agent: Uuid,
+    session: Uuid,
+    kind: NoteKind,
+    text: &[u8],
+    out: &mut Received,
+) -> Option<Event> {
+    let (event_kind, outcome, name) = match kind {
+        NoteKind::Transfer => (
+            EventKind::AccessSshTransfer,
+            Outcome::Success,
+            field::TRANSFER,
+        ),
+        NoteKind::Refused => (
+            EventKind::AccessSshRequestRefused,
+            Outcome::Refused,
+            field::REQUEST,
+        ),
+        NoteKind::Forward => (
+            EventKind::AccessSshForward,
+            Outcome::Success,
+            field::REQUEST,
+        ),
+        _ => return None,
+    };
+    if out.audited_notes >= MAX_AUDITED_NOTES {
+        return None;
+    }
+    out.audited_notes += 1;
+    // Printable ASCII, checked by the decoder.
+    let text = String::from_utf8_lossy(text);
+    tracing::info!(
+        event = event_kind.name(),
+        agent = %agent,
+        session = %session,
+        detail = %text,
+    );
+    Some(
+        agent_event(event_kind, outcome, agent)
+            .uuid(field::ACCESS_SESSION, session.to_bytes())
+            .text(name, truncate(&text)),
+    )
 }
 
 /// Keeps the hash of the command in the row as soon as it is known, so
@@ -586,6 +645,11 @@ async fn note(
                 "commande d'une session SSH, empreinte à clé consignée"
             );
         }
+        ostena_recorder::Event::Note { kind, text } => {
+            if let Some(event) = note_event(agent, session, *kind, text, out) {
+                recorder.emit(event);
+            }
+        }
         ostena_recorder::Event::End { reason, .. } => out.reason = Some(*reason),
         _ => {}
     }
@@ -615,6 +679,7 @@ async fn read_stream(
         reason: None,
         command: None,
         output_bytes: 0,
+        audited_notes: 0,
     };
     'stream: loop {
         let read = tokio::select! {

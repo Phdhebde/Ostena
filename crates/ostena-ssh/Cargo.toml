@@ -42,10 +42,21 @@ russh = ["dep:russh", "dep:ssh-key", "dep:ostena-scope", "dep:ostena-session", "
 # test core: never in a release binary (dev-dependency only).
 ostena-tunnel = { workspace = true, features = ["testing"] }
 proptest.workspace = true
+# The transfer tests run the real sftp-server, scp and rsync behind a test
+# target (dev-dependency only: the agent spawns no process).
+tokio = { workspace = true, features = ["process"] }
 tracing-subscriber.workspace = true
 
 [[test]]
 name = "interop"
+required-features = ["russh"]
+
+[[test]]
+name = "algorithms"
+required-features = ["russh"]
+
+[[test]]
+name = "transfers"
 required-features = ["russh"]
 
 [[test]]

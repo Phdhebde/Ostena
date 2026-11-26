@@ -552,6 +552,230 @@ impl russh::server::Handler for EchoTarget {
     }
 }
 
+/// The `sftp-server` of OpenSSH on this machine, if any.
+pub fn sftp_server() -> Option<PathBuf> {
+    [
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+        "/usr/lib/ssh/sftp-server",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|p| p.exists())
+}
+
+/// A target that runs what it is asked, as a minimal sshd would, in `dir`:
+/// a command through `sh -c`, the `sftp` subsystem through `sftp-server`;
+/// `direct-tcpip` connects to the address asked. Accepts the one `allowed`
+/// key. Unix only (tests of the transfers).
+pub struct ExecTarget {
+    pub allowed: PublicKey,
+    pub dir: PathBuf,
+    /// Standard input of the process of each channel (per connection).
+    stdins: Arc<Mutex<Stdins>>,
+}
+
+/// The input of the process of each channel: `None` closes it.
+type Stdins =
+    std::collections::HashMap<ChannelId, tokio::sync::mpsc::UnboundedSender<Option<Vec<u8>>>>;
+
+impl ExecTarget {
+    pub fn new(allowed: PublicKey, dir: PathBuf) -> Self {
+        Self {
+            allowed,
+            dir,
+            stdins: Arc::default(),
+        }
+    }
+
+    /// Runs `program` for `channel`: its input from the channel, its output
+    /// and errors to it, then its exit status.
+    fn spawn(
+        &self,
+        program: &Path,
+        args: &[&str],
+        channel: ChannelId,
+        handle: russh::server::Handle,
+    ) -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .current_dir(&self.dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<Vec<u8>>>();
+        self.stdins.lock().unwrap().insert(channel, tx);
+        tokio::spawn(async move {
+            while let Some(Some(data)) = rx.recv().await {
+                if stdin.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+            drop(stdin);
+        });
+        let errors = handle.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            while let Ok(n) = stderr.read(&mut buf).await {
+                if n == 0
+                    || errors
+                        .extended_data(channel, 1, buf[..n].to_vec())
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 32 * 1024];
+            while let Ok(n) = stdout.read(&mut buf).await {
+                if n == 0 || handle.data(channel, buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+            let status = child
+                .wait()
+                .await
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(255);
+            let _ = handle
+                .exit_status_request(channel, u32::try_from(status).unwrap_or(255))
+                .await;
+            let _ = handle.eof(channel).await;
+            let _ = handle.close(channel).await;
+        });
+        Ok(())
+    }
+}
+
+impl Clone for ExecTarget {
+    /// A handler per connection, with its own channels.
+    fn clone(&self) -> Self {
+        Self::new(self.allowed.clone(), self.dir.clone())
+    }
+}
+
+impl russh::server::Handler for ExecTarget {
+    type Error = russh::Error;
+
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        key: VerifiedPublicKey<'_>,
+    ) -> Result<Auth, Self::Error> {
+        if key.public_key.key_data() == self.allowed.key_data() {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::reject())
+        }
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        _channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        reply.accept().await;
+        Ok(())
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Ok(port) = u16::try_from(port_to_connect) else {
+            drop(reply);
+            return Ok(());
+        };
+        let Ok(tcp) = TcpStream::connect((host_to_connect, port)).await else {
+            drop(reply);
+            return Ok(());
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            let mut stream = channel.into_stream();
+            let mut tcp = tcp;
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+        });
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        match sftp_server().filter(|_| name == "sftp") {
+            Some(server) if self.spawn(&server, &[], channel, session.handle()).is_ok() => {
+                session.channel_success(channel)
+            }
+            _ => session.channel_failure(channel),
+        }
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(data).into_owned();
+        if self
+            .spawn(
+                Path::new("/bin/sh"),
+                &["-c", &command],
+                channel,
+                session.handle(),
+            )
+            .is_ok()
+        {
+            session.channel_success(channel)
+        } else {
+            session.channel_failure(channel)
+        }
+    }
+
+    async fn data(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(tx) = self.stdins.lock().unwrap().get(&channel) {
+            let _ = tx.send(Some(data.to_vec()));
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if let Some(tx) = self.stdins.lock().unwrap().remove(&channel) {
+            let _ = tx.send(None);
+        }
+        Ok(())
+    }
+}
+
 /// Serves `handler` behind the pre-check on 127.0.0.1.
 pub async fn serve_handler<H>(host_key: PrivateKey, handler: H, label: &str) -> std::net::SocketAddr
 where
@@ -629,6 +853,9 @@ pub struct TestAuthorizer {
     /// Never reads the transcript queue, as a core that no longer reads:
     /// a frame waits this long for room, then the transcript is lost.
     pub stall_transcript: Mutex<Option<Duration>>,
+    /// The functions of the right (rights bits of the grant); none by
+    /// default.
+    pub rights: Mutex<ostena_grant::Rights>,
 }
 
 impl TestAuthorizer {
@@ -685,6 +912,7 @@ impl ostena_ssh::server::Authorizer for TestAuthorizer {
                 account: request.account,
                 max_session,
                 transcript: ostena_ssh::transcript::Transcript::with_timeout(tx, wait),
+                rights: *self.rights.lock().unwrap(),
             });
         }
         let (transcript, mut rx) = ostena_ssh::transcript::Transcript::channel(8);
@@ -716,6 +944,7 @@ impl ostena_ssh::server::Authorizer for TestAuthorizer {
             account: request.account,
             max_session,
             transcript,
+            rights: *self.rights.lock().unwrap(),
         })
     }
 

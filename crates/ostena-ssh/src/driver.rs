@@ -209,6 +209,28 @@ impl TargetSession {
             .map_err(|e| SshError::TargetUnreachable(format!("canal refusé par la cible : {e}")))
     }
 
+    /// Opens a `direct-tcpip` channel on the target, to `host:port` as the
+    /// target reaches it (local forwarding, `-W`, `ProxyJump`). The target
+    /// decides too: the `restrict` option of the agent key forbids it
+    /// unless `port-forwarding` is added there.
+    ///
+    /// # Errors
+    ///
+    /// [`SshError::Refused`] if the target refuses or the connection is
+    /// gone.
+    pub async fn open_direct_tcpip(
+        &self,
+        host: &str,
+        port: u32,
+        originator: &str,
+        originator_port: u32,
+    ) -> Result<Channel<client::Msg>, SshError> {
+        self.handle
+            .channel_open_direct_tcpip(host, port, originator, originator_port)
+            .await
+            .map_err(|_| SshError::Refused("redirection refusée par la cible"))
+    }
+
     /// Closes the connection.
     pub async fn close(&self) {
         let _ = self

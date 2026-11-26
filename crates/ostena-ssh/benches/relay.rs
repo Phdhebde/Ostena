@@ -156,6 +156,7 @@ impl Authorizer for Bench {
             account: request.account,
             max_session: Duration::from_secs(3600),
             transcript,
+            rights: ostena_grant::Rights::NONE,
         })
     }
 

@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use ostena_recorder::{EndReason, Event, Frame, encode};
+use ostena_recorder::{EndReason, Event, Frame, NoteKind, encode};
 
 fn corpus_dir(target: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../fuzz/corpus/{target}"))
@@ -108,9 +108,43 @@ fn seeds() -> Vec<(&'static str, Vec<u8>)> {
             },
         },
     ]);
+    let transfer = stream(&[
+        Frame {
+            at_us: 0,
+            event: Event::Start {
+                cols: 0,
+                rows: 0,
+                started_ms: 2,
+                term: String::new(),
+                command: None,
+            },
+        },
+        Frame {
+            at_us: 1,
+            event: Event::Note {
+                kind: NoteKind::Transfer,
+                text: b"sftp".to_vec(),
+            },
+        },
+        Frame {
+            at_us: 2,
+            event: Event::Note {
+                kind: NoteKind::Rename,
+                text: b"/tmp/a\0/tmp/\xe2\x82".to_vec(),
+            },
+        },
+        Frame {
+            at_us: 3,
+            event: Event::End {
+                reason: EndReason::Closed,
+                output_bytes: 0,
+            },
+        },
+    ]);
     vec![
         ("seed-shell.bin", shell.clone()),
         ("seed-exec.bin", exec),
+        ("seed-transfer.bin", transfer),
         ("seed-truncated.bin", shell[..shell.len() - 3].to_vec()),
         ("seed-empty.bin", Vec::new()),
     ]
@@ -137,7 +171,7 @@ fn write_seed_corpus() {
 /// the writer.
 #[test]
 fn complete_seeds_decode_to_the_end() {
-    for (name, data) in seeds().into_iter().take(2) {
+    for (name, data) in seeds().into_iter().take(3) {
         let mut d = ostena_recorder::Decoder::new(ostena_recorder::Limits::default());
         d.feed(&data);
         while d.next_frame().unwrap().is_some() {}

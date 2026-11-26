@@ -107,6 +107,37 @@ fn bidirectional_format_characters_are_escaped() {
     );
 }
 
+/// A note is a marker; paths are decoded and escaped like outputs.
+#[test]
+fn notes_are_markers() {
+    let note = |at, kind, text: &[u8]| {
+        frame(
+            at,
+            Event::Note {
+                kind,
+                text: text.to_vec(),
+            },
+        )
+    };
+    let (sealed, text) = write(&[
+        start("", None),
+        note(1, NoteKind::Transfer, b"sftp"),
+        note(2, NoteKind::Write, b"/tmp/a\x1b[31m\xff"),
+        note(3, NoteKind::Rename, b"/tmp/a\0/tmp/b"),
+        end(3),
+    ]);
+    let lines: Vec<&str> = text.lines().skip(1).collect();
+    assert_eq!(
+        lines,
+        [
+            "[0.000001,\"m\",\"transfer sftp\"]",
+            "[0.000002,\"m\",\"file-write /tmp/a\\u001b[31m\u{fffd}\"]",
+            "[0.000003,\"m\",\"file-rename /tmp/a -> /tmp/b\"]",
+        ]
+    );
+    assert_eq!((sealed.events, sealed.invalid_utf8), (3, 1));
+}
+
 /// The exit status or signal of the target is a marker.
 #[test]
 fn the_exit_is_a_marker() {

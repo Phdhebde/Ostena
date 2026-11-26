@@ -221,8 +221,9 @@ fn reverting_the_portal_removes_only_the_browser_sessions() {
         else {
             return;
         };
-        db.migrate().await;
         let owner = db.owner_pool().await;
+        // Up to the portal only: the later migrations are not under test.
+        MIGRATOR.run_to(7, &owner).await.unwrap();
         for sql in [
             "INSERT INTO app_user (id, name, display_name)
              VALUES ('11111111-1111-1111-1111-111111111111', 'alice', 'Alice')",

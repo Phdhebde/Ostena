@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use ostena_common::api::web::Role;
 use ostena_common::config::scope::PolicySpec;
+use ostena_core::functions::Functions;
 use ostena_core::{access, credential, inventory, login};
 use ostena_tunnel::Uuid;
 
@@ -262,7 +263,8 @@ pub(crate) fn account_add(path: &Path, resource: &str, account: &str) -> ExitCod
 }
 
 /// `ostena core right grant`: SSH, for `days` (1 to 366), sessions of at
-/// most `max_session_mins`; prints the right identifier.
+/// most `max_session_mins`, with the functions of `allow` (none by
+/// default); prints the right identifier.
 pub(crate) fn right_grant(
     path: &Path,
     user: &str,
@@ -270,15 +272,20 @@ pub(crate) fn right_grant(
     account: &str,
     days: u64,
     max_session_mins: u32,
+    allow: &[String],
 ) -> ExitCode {
     init_admin_logging(path);
     if !(1..=366).contains(&days) {
         return fail("--days : 1 à 366 jours (la fin d'un droit est obligatoire)");
     }
+    let functions = match Functions::parse(allow) {
+        Ok(functions) => functions,
+        Err(e) => return fail(&format!("--allow : {e}")),
+    };
     let until = now() + days * DAY;
     let max = max_session_mins.saturating_mul(60);
     done(admin(path, async move |pool| {
-        inventory::grant_right(&pool, user, resource, account, until, max)
+        inventory::grant_right(&pool, user, resource, account, until, max, functions)
             .await
             .map(|id| id.to_string())
     }))
@@ -290,12 +297,12 @@ pub(crate) fn right_list(path: &Path) -> ExitCode {
     done(
         admin(path, async |pool| inventory::list_rights(&pool).await).map(|rights| {
             let mut out = String::from(
-                "droit\tutilisateur\tcompte\tprotocole\tfin\tsession max (s)\trévoqué",
+                "droit\tutilisateur\tcompte\tprotocole\tfin\tsession max (s)\tfonctions\trévoqué",
             );
             for r in rights {
                 let _ = write!(
                     out,
-                    "\n{}\t{}\t{}@{}\t{}\t{}\t{}\t{}",
+                    "\n{}\t{}\t{}@{}\t{}\t{}\t{}\t{}\t{}",
                     r.id,
                     r.user,
                     r.account,
@@ -303,6 +310,7 @@ pub(crate) fn right_list(path: &Path) -> ExitCode {
                     r.protocol,
                     r.valid_until,
                     r.max_session_secs,
+                    r.functions.label(),
                     if r.revoked { "oui" } else { "non" }
                 );
             }
@@ -349,12 +357,13 @@ pub(crate) fn access_check(path: &Path, user: &str, resource: &str, account: &st
         Ok(Ok(allowed)) => {
             let _ = writeln!(
                 io::stdout(),
-                "autorisé\tdroit {}\tgroupe {}\tcible {}:{}\tsession max {} s",
+                "autorisé\tdroit {}\tgroupe {}\tcible {}:{}\tsession max {} s\tfonctions {}",
                 allowed.right,
                 allowed.group,
                 allowed.host,
                 allowed.port,
-                allowed.max_session_secs
+                allowed.max_session_secs,
+                allowed.functions.label()
             );
             ExitCode::SUCCESS
         }

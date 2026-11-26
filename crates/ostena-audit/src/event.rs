@@ -151,6 +151,17 @@ event_kinds! {
     UserRoleGranted => "user.role_granted",
     /// A role was taken from a user.
     UserRoleRevoked => "user.role_revoked",
+    /// A file transfer (sftp, scp, rsync) started in an SSH session, under
+    /// the transfer function of the right (ADR-0010): the file names are in
+    /// the transcript.
+    AccessSshTransfer => "access.ssh_transfer",
+    /// A request of an SSH session refused by the agent for lack of a
+    /// function of the right (transfer, forwarding, agent, X11), as recorded
+    /// in the transcript (ADR-0010).
+    AccessSshRequestRefused => "access.ssh_request_refused",
+    /// A port forwarding channel (`direct-tcpip`: `-L`, `-W`, `ProxyJump`)
+    /// relayed under the port forwarding function of the right (ADR-0010).
+    AccessSshForward => "access.ssh_forward",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -289,6 +300,15 @@ pub mod field {
     pub const ROLE: &str = "role";
     /// The source a browser session is bound to (IPv4 address or IPv6 /64).
     pub const SOURCE: &str = "source";
+    /// Functions of a right beyond the session, comma separated
+    /// (`transfer`, `port-forwarding`, `agent-forwarding`, `x11-forwarding`).
+    pub const FUNCTIONS: &str = "functions";
+    /// Rights bits of a grant (ADR-0004).
+    pub const RIGHTS: &str = "rights";
+    /// Transfer protocol (`sftp`, `scp`, `rsync`).
+    pub const TRANSFER: &str = "transfer";
+    /// A refused request, as the agent names it.
+    pub const REQUEST: &str = "request";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -357,6 +377,10 @@ pub mod field {
         CHANNEL,
         ROLE,
         SOURCE,
+        FUNCTIONS,
+        RIGHTS,
+        TRANSFER,
+        REQUEST,
     ];
 }
 
@@ -526,7 +550,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 55);
+        assert_eq!(names.len(), 58);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

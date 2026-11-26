@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT ar.id::text AS \"id!\", u.name AS \"user!\", r.name AS \"resource!\",\n                  a.name AS \"account!\", ar.protocol, ar.valid_until, ar.max_session_secs,\n                  ar.revoked_at IS NOT NULL AS \"revoked!\"\n           FROM access_right ar JOIN app_user u ON u.id = ar.user_id\n           JOIN target_account a ON a.id = ar.account_id JOIN resource r ON r.id = a.resource_id\n           ORDER BY ar.created_at DESC, ar.id",
+  "query": "SELECT ar.id::text AS \"id!\", u.name AS \"user!\", r.name AS \"resource!\",\n                  a.name AS \"account!\", ar.protocol, ar.valid_until, ar.max_session_secs,\n                  ar.functions, ar.revoked_at IS NOT NULL AS \"revoked!\"\n           FROM access_right ar JOIN app_user u ON u.id = ar.user_id\n           JOIN target_account a ON a.id = ar.account_id JOIN resource r ON r.id = a.resource_id\n           ORDER BY ar.created_at DESC, ar.id",
   "describe": {
     "columns": [
       {
@@ -77,6 +77,17 @@
       },
       {
         "ordinal": 7,
+        "name": "functions",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "functions"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "revoked!",
         "type_info": "Bool",
         "origin": "Expression"
@@ -93,8 +104,9 @@
       false,
       false,
       false,
+      false,
       null
     ]
   },
-  "hash": "3ea456484aade0472b68a30b06e552388cb239a2763811b78b7d14cb7b7d0481"
+  "hash": "4dcc207f8e9381f9a8d93b14ff8b67f387fc8673dec2d9396301d6fa24f4e15b"
 }

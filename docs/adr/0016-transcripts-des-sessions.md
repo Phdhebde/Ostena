@@ -3,6 +3,7 @@
 - **Statut** : Accepté, implémenté (jalon M1, PR 8) : format du flux, écrivain asciicast, primitives cryptographiques, capture par l'agent, réception, stockage et scellement par le core, vérification hors ligne.
 - **Date** : 2026-11-25
 - **Révision** : 2026-11-26, jalon M2 (PR 2c) : grâce de reconnexion. Accusés applicatifs du core, tampon borné sur l'agent, reprise du flux sur la nouvelle connexion, scellement différé ; l'échec fermé est gardé au-delà de la grâce ou du tampon.
+- **Révision** : 2026-11-26, trame de note (type 6) : transferts, opérations sur les fichiers, redirections et demandes refusées, en marqueurs dans l'asciicast (jalon M2, PR 4a)
 - **Révision** : 2026-11-25, relecture de sécurité : session coupée quand le core ne lit plus, écriture hors des workers async, limite des refus de flux, `AUD-E019`, `AUD-E020`, `AUD-W007`, `AUD-W008`, `CFG-P016`, empreinte de la commande dans le sceau avec l'identifiant de sa clé, fin de commande enregistrée, caractères bidirectionnels échappés, borne de ce qui peut être montré sans être enregistré
 
 ## Contexte
@@ -40,12 +41,14 @@ L'agent capture les événements et les envoie au fil de la session, sur un flux
 
 | Taille | Champ |
 |---|---|
-| 1 | type : 1 début, 2 sortie, 3 taille, 4 fin, 5 fin de commande |
+| 1 | type : 1 début, 2 sortie, 3 taille, 4 fin, 5 fin de commande, 6 note |
 | 8 | temps, en microsecondes depuis le début |
 | 4 | longueur de la charge |
 | n | charge |
 
-Charges : début `cols u16 ‖ lignes u16 ‖ début en ms Unix u64 ‖ longueur du type de terminal u8 ‖ type ‖ commande présente u8 (0 ou 1) ‖ commande` (jusqu'à la fin de la charge) ; sortie : les octets ; taille `cols u16 ‖ lignes u16` ; fin `raison u8 ‖ octets de sortie u64` ; fin de commande `1 ‖ code u32` (`exit-status`) ou `2 ‖ core u8 (0 ou 1) ‖ nom du signal` (`exit-signal`, 1 à 32 caractères ASCII imprimables, `KILL` et non `SIGKILL`).
+Charges : début `cols u16 ‖ lignes u16 ‖ début en ms Unix u64 ‖ longueur du type de terminal u8 ‖ type ‖ commande présente u8 (0 ou 1) ‖ commande` (jusqu'à la fin de la charge) ; sortie : les octets ; taille `cols u16 ‖ lignes u16` ; fin `raison u8 ‖ octets de sortie u64` ; fin de commande `1 ‖ code u32` (`exit-status`) ou `2 ‖ core u8 (0 ou 1) ‖ nom du signal` (`exit-signal`, 1 à 32 caractères ASCII imprimables, `KILL` et non `SIGKILL`) ; note `sorte u8 ‖ texte`.
+
+**Notes** (jalon M2, PR 4a, ADR-0010) : ce que l'agent observe hors des sorties. Sortes : 1 transfert (protocole), 2 refus (fonction et détail), 3 redirection (fonction et destination), texte ASCII imprimable de 256 octets au plus ; 16 lecture, 17 écriture, 18 suppression, 19 renommage, 20 création de dossier, 21 suppression de dossier, 22 changement d'attributs, 23 lien, texte : un chemin (deux, séparés par un octet nul, pour le renommage et le lien), 4 096 octets au plus chacun, sans octet nul ailleurs. Une sorte inconnue est refusée. Une note vient après le début et avant la fin. L'écrivain asciicast en fait un marqueur `[t, "m", "file-rename /a -> /b"]` (nom de la sorte : `transfer`, `refused`, `forward`, `file-read`, `file-write`, `file-remove`, `file-rename`, `file-mkdir`, `file-rmdir`, `file-setstat`, `file-link`), échappé comme le reste.
 
 **Sens retour : accusés du core.** Le core répond sur le même flux par des entiers de 8 octets big-endian : le nombre cumulé d'octets de transcript (comptés après le préambule, d'un flux à l'autre) qu'il a écrits dans le fichier, c'est-à-dire remis au noyau ; le dernier accusé suit la synchronisation finale sur le disque. Sur un flux de reprise, le premier entier est l'offset de reprise : les octets que le core a reçus, trame partielle comprise (il garde l'état de son décodeur). Un accusé qui recule ou qui dépasse ce que l'agent a envoyé est une violation : la session est coupée.
 

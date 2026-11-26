@@ -411,13 +411,23 @@ impl TestCore {
         )
         .map_err(|e| TunnelError::Config(e.to_string()))?;
         // QUIC takes a free UDP port, TCP the same port number: retry on the
-        // rare collision with a TCP port already taken.
+        // rare collision with a TCP port already taken. Windows hands out the
+        // UDP ports in order and may reserve whole TCP ranges among them
+        // (`os error 10013`): after three tries, a random port below its
+        // dynamic range.
         let mut bound = CoreListener::bind((Ipv4Addr::LOCALHOST, 0).into(), tls.clone(), limits);
-        for _ in 0..10 {
+        for attempt in 0..20 {
             if bound.is_ok() {
                 break;
             }
-            bound = CoreListener::bind((Ipv4Addr::LOCALHOST, 0).into(), tls.clone(), limits);
+            let port = if attempt < 2 {
+                0
+            } else {
+                let [a, b] = ostena_crypto::rand::array::<2>()
+                    .map_err(|e| TunnelError::Io(e.to_string()))?;
+                20_000 + u16::from_be_bytes([a, b]) % 25_000
+            };
+            bound = CoreListener::bind((Ipv4Addr::LOCALHOST, port).into(), tls.clone(), limits);
         }
         let listener = Arc::new(bound?);
         let addr = listener.local_addr()?;

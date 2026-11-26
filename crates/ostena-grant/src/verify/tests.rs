@@ -347,7 +347,7 @@ fn arb_claims() -> impl Strategy<Value = Claims> {
         any::<[u8; 16]>(),
         any::<[u8; 16]>(),
         proptest::sample::select(Protocol::ALL.to_vec()),
-        0u32..(1 << 9),
+        0u32..(1 << 10),
         1u32..=12 * 3600,
     )
         .prop_map(|(s, r, protocol, rights, max_session_secs)| Claims {

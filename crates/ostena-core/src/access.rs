@@ -32,6 +32,7 @@ use sqlx::PgPool;
 
 use crate::audit::{self, Appended, Tx};
 use crate::error::CoreError;
+use crate::functions::{Function, Functions};
 use crate::grant_keys::GrantAuthority;
 use crate::store::{i64_of, truncate, uuid};
 
@@ -93,6 +94,7 @@ pub fn label(code: &str) -> &'static str {
         HOST_KEY_MISSING => "clé d'hôte de la cible non épinglée",
         NO_HOST_NAME => "aucun nom d'hôte SSH pour le groupe",
         RATE_LIMITED => "trop de demandes de cet agent",
+        FUNCTIONS_REDUCED => "fonctions du droit réduites depuis le grant",
         _ => "accès refusé",
     }
 }
@@ -115,6 +117,9 @@ pub const SSH_DISABLED: &str = "ACC-E007";
 pub const GRANT_UNKNOWN: &str = "ACC-E008";
 /// `ACC-E009`: too many requests from the agent ([`crate::rate`]).
 pub const RATE_LIMITED: &str = "ACC-E009";
+/// `ACC-E010`: no valid right keeps every function the grant carries (a
+/// right revoked or replaced by one with fewer functions since the grant).
+pub const FUNCTIONS_REDUCED: &str = "ACC-E010";
 /// `INV-E001`: resource unknown (or disabled).
 pub const RESOURCE_UNKNOWN: &str = "INV-E001";
 /// `INV-E002`: resource of another gateway group.
@@ -163,6 +168,8 @@ pub struct Allowed {
     /// Longest session the right allows now: its maximum, and no later
     /// than its end.
     pub max_session_secs: u32,
+    /// Functions of the right beyond the terminal and the commands.
+    pub functions: Functions,
 }
 
 fn secs_until(end: i64, now: u64) -> u64 {
@@ -206,13 +213,16 @@ impl UserLock {
 
 /// The resource, the account and a valid right of `user` (already locked
 /// and checked), read with `FOR SHARE` in `tx`. `group` is the group of the
-/// asking agent (`None`: any, for the dry run).
+/// asking agent (`None`: any, for the dry run). Among several valid rights,
+/// one that has every function of `wanted` comes first, then the one that
+/// lasts longest.
 async fn allowed(
     tx: &mut Tx<'_>,
     user: Uuid,
     resource: &str,
     account: &str,
     group: Option<Uuid>,
+    wanted: Functions,
     now: u64,
 ) -> Result<Allowed, Refusal> {
     let Some(r) = sqlx::query!(
@@ -269,15 +279,17 @@ async fn allowed(
             ),
         ));
     };
-    // The right that lasts longest, if several.
+    // One with the functions wanted, then the one that lasts longest.
     let Some(right) = sqlx::query!(
-        r#"SELECT id::text AS "id!", valid_until, max_session_secs FROM access_right
+        r#"SELECT id::text AS "id!", valid_until, max_session_secs, functions FROM access_right
            WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid AND protocol = 'ssh'
              AND revoked_at IS NULL AND valid_from <= $3 AND valid_until > $3
-           ORDER BY valid_until DESC, max_session_secs DESC LIMIT 1 FOR SHARE"#,
+           ORDER BY functions @> $4 DESC, valid_until DESC, max_session_secs DESC
+           LIMIT 1 FOR SHARE"#,
         user.to_string(),
         account_id,
         i64_of(now),
+        &wanted.names(),
     )
     .fetch_optional(&mut **tx)
     .await?
@@ -303,6 +315,7 @@ async fn allowed(
         port: u16::try_from(r.port).unwrap_or(0),
         target_p256_public,
         max_session_secs: u32::try_from(max).unwrap_or(u32::MAX),
+        functions: Functions::from_stored(&right.functions),
     })
 }
 
@@ -382,7 +395,7 @@ pub async fn check(
     })?;
     let user = uuid(&user)?;
     let found = match UserLock::take(&mut tx, user).await?.active() {
-        Ok(()) => allowed(&mut tx, user, resource, account, None, now).await,
+        Ok(()) => allowed(&mut tx, user, resource, account, None, Functions::NONE, now).await,
         Err(refusal) => Err(refusal),
     };
     tx.rollback().await?;
@@ -460,6 +473,7 @@ pub async fn ssh_grant(
         &request.resource,
         &request.account,
         Some(group),
+        Functions::NONE,
         now,
     )
     .await?;
@@ -473,7 +487,7 @@ pub async fn ssh_grant(
         resource: ResourceId::from_bytes(allowed.resource.to_bytes()),
         audience: GatewayGroupId::from_bytes(group.to_bytes()),
         protocol: Protocol::Ssh,
-        rights: Rights::NONE,
+        rights: allowed.functions.rights(),
         max_session_secs,
         binding: Binding::of(request.login_session.to_bytes(), &request.account),
     };
@@ -484,9 +498,9 @@ pub async fn ssh_grant(
     sqlx::query!(
         "INSERT INTO access_grant (jti, login_session_id, right_id, agent_id, gateway_group,
                                    resource_id, account, protocol, max_session_secs,
-                                   issued_at, expires_at)
+                                   issued_at, expires_at, rights)
          VALUES ($1, $2::text::uuid, $3::text::uuid, $4::text::uuid, $5::text::uuid,
-                 $6::text::uuid, $7, 'ssh', $8, $9, $10)",
+                 $6::text::uuid, $7, 'ssh', $8, $9, $10, $11)",
         &content.jti.to_bytes()[..],
         request.login_session.to_string(),
         allowed.right.to_string(),
@@ -497,6 +511,7 @@ pub async fn ssh_grant(
         i32::try_from(max_session_secs).unwrap_or(i32::MAX),
         i64_of(content.issued_at),
         i64_of(content.expires_at),
+        i32::try_from(claims.rights.bits()).unwrap_or(0),
     )
     .execute(&mut *tx)
     .await?;
@@ -511,7 +526,9 @@ pub async fn ssh_grant(
     .uuid(field::RESOURCE_ID, allowed.resource.to_bytes())
     .uuid(field::GROUP_ID, group.to_bytes())
     .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
-    .u64(field::EXPIRES_AT, content.expires_at);
+    .u64(field::EXPIRES_AT, content.expires_at)
+    .text(field::FUNCTIONS, allowed.functions.label())
+    .u64(field::RIGHTS, u64::from(claims.rights.bits()));
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()
@@ -575,6 +592,49 @@ fn verify(
     SignedGrant::from_text(grant)
         .and_then(|signed| verifier.check(signed.as_bytes(), now))
         .map_err(|e| Refusal::new(e.code(), e.to_string()))
+}
+
+/// A grant of the registry must not be consumed yet (`GRT-E010`) and must
+/// be for SSH.
+fn unused_ssh_grant(consumed: bool, protocol: &str, checked: &Grant) -> Result<(), Refusal> {
+    if consumed {
+        return Err(Refusal::new(
+            "GRT-E010",
+            format!("grant {} déjà consommé", checked.jti),
+        ));
+    }
+    if protocol != "ssh" {
+        return Err(Refusal::new(
+            GRANT_UNKNOWN,
+            format!("grant {} d'un protocole non servi", checked.jti),
+        ));
+    }
+    Ok(())
+}
+
+/// The right retained at the opening must keep every function of the grant,
+/// which the agent enforces (`ACC-E010`).
+fn keeps_functions(allowed: Allowed, checked: &Grant) -> Result<Allowed, Refusal> {
+    if allowed.functions.rights().contains(checked.claims.rights) {
+        return Ok(allowed);
+    }
+    Err(Refusal::new(
+        FUNCTIONS_REDUCED,
+        format!(
+            "aucun droit valide ne garde les fonctions du grant {} ({}) ; droit retenu : {}",
+            checked.jti,
+            functions_of(checked.claims.rights).label(),
+            allowed.functions.label()
+        ),
+    ))
+}
+
+/// The functions whose rights `rights` carries in full.
+fn functions_of(rights: Rights) -> Functions {
+    Function::ALL
+        .into_iter()
+        .filter(|f| rights.contains(f.rights()))
+        .fold(Functions::NONE, Functions::with)
 }
 
 /// The longest session allowed: the smallest of `limits` and of
@@ -647,18 +707,7 @@ pub async fn open_session(
             format!("grant {} non émis par le core pour ce groupe", checked.jti),
         ));
     };
-    if row.consumed {
-        return Err(Refusal::new(
-            "GRT-E010",
-            format!("grant {} déjà consommé", checked.jti),
-        ));
-    }
-    if row.protocol != "ssh" {
-        return Err(Refusal::new(
-            GRANT_UNKNOWN,
-            format!("grant {} d'un protocole non servi", checked.jti),
-        ));
-    }
+    unused_ssh_grant(row.consumed, &row.protocol, &checked)?;
     let subject = Uuid::from_bytes(checked.claims.subject.to_bytes());
     let login = uuid(&row.login)?;
     // Lock order (ADR-0014): the grant, the user, then the login session.
@@ -671,18 +720,19 @@ pub async fn open_session(
     )
     .fetch_one(&mut *tx)
     .await?;
+    // Any valid right of the user on the account will do, the one of the grant
+    // may have been replaced since (a longer one); none: `ACC-E006`.
     let allowed = allowed(
         &mut tx,
         subject,
         &resource_name,
         &row.account,
         Some(group),
+        functions_of(checked.claims.rights),
         now,
     )
-    .await?;
-    // Any valid right of the user on the account will do: the one of the
-    // grant may have been replaced by another since (a longer one, for
-    // example); without any, `allowed` refuses (`ACC-E006`).
+    .await
+    .and_then(|allowed| keeps_functions(allowed, &checked))?;
     let session = consume(&mut tx, jti, agent, now).await?;
     // Computed again now: no longer than the grant (its row and its
     // claims), than the right used (its maximum and its end), nor than the
@@ -714,7 +764,11 @@ pub async fn open_session(
     .text(field::ACCOUNT, truncate(&row.account))
     .text(field::HOST, truncate(&allowed.host))
     .u64(field::PORT, u64::from(allowed.port))
-    .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs));
+    .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
+    .text(
+        field::FUNCTIONS,
+        functions_of(checked.claims.rights).label(),
+    );
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()
@@ -801,6 +855,7 @@ mod tests {
             SSH_DISABLED,
             GRANT_UNKNOWN,
             RATE_LIMITED,
+            FUNCTIONS_REDUCED,
             RESOURCE_UNKNOWN,
             OTHER_GROUP,
             ACCOUNT_UNKNOWN,

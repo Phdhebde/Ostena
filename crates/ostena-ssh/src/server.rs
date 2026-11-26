@@ -25,11 +25,23 @@
 //!
 //! **Channel.** One session channel; terminal (if the certificate allows
 //! it, bounded), shell, command (32 KiB at most), window changes, signals
-//! and `LANG`/`LC_*` are relayed. Subsystems (sftp), port forwarding in
-//! both directions, agent and X11 forwarding are refused
-//! (`ssh.channel_refused`, `SSH-E017`). A command is logged by its length
-//! only: secrets can appear in a command line; its text goes to the
-//! transcript, and the core keeps a keyed hash of it (ADR-0016).
+//! and `LANG`/`LC_*` are relayed. A command is logged by its length only:
+//! secrets can appear in a command line; its text goes to the transcript,
+//! and the core keeps a keyed hash of it (ADR-0016).
+//!
+//! **Functions of the right** (the rights bits of the grant, ADR-0010).
+//! Without the transfer function, the `sftp` subsystem and the transfer
+//! commands ([`transfer::classify`]) are refused; with it, the transfer is
+//! noted in the transcript (`ssh.transfer_started`), the file operations of
+//! an SFTP stream too, before they reach the target, but not the file
+//! contents. Without the port forwarding function, `direct-tcpip` (`-L`,
+//! `-W`, `ProxyJump`) is refused; with it, the channel is relayed to the
+//! target, which opens the connection, and noted. Remote forwarding, agent
+//! and X11 forwarding are refused without their function, and not relayed
+//! yet with it. Every refusal for lack of a function is logged
+//! (`ssh.request_refused`, `SSH-E022`) and noted in the transcript; other
+//! subsystems and Unix socket forwarding are refused (`ssh.channel_refused`,
+//! `SSH-E017`).
 //!
 //! **Transcript** (ADR-0016). Every authorised access comes with its
 //! [`Transcript`]: the start (terminal, command), the outputs of the target
@@ -40,11 +52,13 @@
 //! Events: `ssh.connection_limited`, `ssh.connection_refused`,
 //! `ssh.auth_refused`, `ssh.access_refused`, `ssh.session_opened`,
 //! `ssh.exec`, `ssh.session_expired`, `ssh.session_idle`,
-//! `ssh.session_revoked`, `ssh.session_closed`, `ssh.channel_refused`, `ssh.transcript_lost`.
+//! `ssh.session_revoked`, `ssh.session_closed`, `ssh.channel_refused`,
+//! `ssh.transcript_lost`, `ssh.request_refused`, `ssh.transfer_started`,
+//! `ssh.forward_opened`, `ssh.transfer_unreadable`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -69,7 +83,9 @@ use crate::login::parse_login;
 use crate::precheck::Role;
 use crate::precheck::stream::Prechecked;
 use crate::transcript::{Terminal, Transcript};
-use ostena_recorder::{EndReason, Exit};
+use crate::transfer::{self, Protocol as TransferProtocol, SftpObserver};
+use ostena_grant::Rights;
+use ostena_recorder::{EndReason, Exit, NoteKind};
 
 /// Longest command accepted.
 pub const MAX_COMMAND: usize = 32 * 1024;
@@ -89,6 +105,11 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const TRANSCRIPT_LOST: &str = "transcript perdu";
 /// Reason of a session cut at its idle delay.
 const IDLE: &str = "inactive";
+/// Forwarded channels open at once on one connection.
+const MAX_FORWARDS: usize = 8;
+/// Longest text of a note built from what the client asked.
+const MAX_LABEL: usize = 200;
+
 /// How long the end of a transcript may take: a start and an end frame,
 /// each waiting at most [`crate::transcript::SEND_TIMEOUT`], and the lock.
 const END_TIMEOUT: Duration = Duration::from_secs(40);
@@ -241,6 +262,9 @@ pub struct Authorized {
     pub max_session: Duration,
     /// Its transcript, towards the core: no access without one.
     pub transcript: Transcript,
+    /// The functions of the right, as the rights bits of the verified
+    /// grant: transfers, forwarding (ADR-0010).
+    pub rights: Rights,
 }
 
 /// Why an access is refused: the underlying stable code and a message.
@@ -489,6 +513,8 @@ struct Conn {
     certificate_checked: AtomicBool,
     to_target: Arc<AtomicU64>,
     from_target: Arc<AtomicU64>,
+    /// Forwarded channels open.
+    forwards: Arc<AtomicUsize>,
 }
 
 struct Relay {
@@ -496,6 +522,32 @@ struct Relay {
     target: Arc<ChannelWriteHalf<client::Msg>>,
     replies: mpsc::Receiver<bool>,
     allow_pty: bool,
+    /// Outputs of the target recorded (not in a transfer: they are file
+    /// contents or protocol).
+    record_data: Arc<AtomicBool>,
+    /// The SFTP observer of a transfer, fed by the relay to the target.
+    observer: Arc<Mutex<Option<SftpObserver>>>,
+}
+
+/// A note text from what the client asked: printable ASCII and spaces,
+/// anything else `?`, at most [`MAX_LABEL`] bytes.
+fn label(text: &str) -> Vec<u8> {
+    text.bytes()
+        .take(MAX_LABEL)
+        .map(|b| {
+            if b.is_ascii_graphic() || b == b' ' {
+                b
+            } else {
+                b'?'
+            }
+        })
+        .collect()
+}
+
+/// Whether `rights` has the transfer function: both ways (the agent does
+/// not enforce a direction).
+fn allows_transfer(rights: Rights) -> bool {
+    rights.contains(Rights::FILE_UPLOAD.with(Rights::FILE_DOWNLOAD))
 }
 
 struct Handler<A> {
@@ -574,6 +626,161 @@ impl<A: Authorizer> Handler<A> {
             resource = %request.resource,
             "{error}"
         );
+    }
+
+    /// The functions of the right of the authorised access (none before).
+    fn rights(&self) -> Rights {
+        self.access
+            .as_ref()
+            .map_or(Rights::NONE, |(_, authorized)| authorized.rights)
+    }
+
+    /// Refuses a request for lack of `function`: logged
+    /// (`ssh.request_refused`, `SSH-E022`) and noted in the transcript.
+    fn refuse_request(&self, function: &'static str, detail: &str) {
+        let error = SshError::FunctionMissing(function);
+        let text = label(&format!("{function} {detail}"));
+        let noted = self
+            .transcript()
+            .is_some_and(|t| t.note_later(NoteKind::Refused, &text));
+        tracing::warn!(
+            event = "ssh.request_refused",
+            code = error.code(),
+            session = %format_uuid(&self.session_id),
+            peer = %self.peer,
+            listener = %self.listener,
+            function,
+            detail = sanitize(detail),
+            noted,
+            "{error}"
+        );
+    }
+
+    /// Starts the transcript of a transfer (`command` for an `exec`), notes
+    /// it, and stops recording the outputs of the target; `false` if the
+    /// transcript cannot be started.
+    async fn start_transfer(&self, command: Option<&[u8]>, protocol: TransferProtocol) -> bool {
+        if !self.start_transcript(command).await {
+            return false;
+        }
+        let Some(transcript) = self.transcript() else {
+            return false;
+        };
+        if let Err(e) = transcript
+            .note(NoteKind::Transfer, protocol.name().as_bytes())
+            .await
+        {
+            tracing::warn!(
+                event = "ssh.transcript_lost",
+                code = e.code(),
+                session = %format_uuid(&self.session_id),
+                peer = %self.peer,
+                listener = %self.listener,
+                "{e}"
+            );
+            return false;
+        }
+        if let Some(relay) = &self.relay {
+            relay.record_data.store(false, Ordering::SeqCst);
+            if protocol == TransferProtocol::Sftp
+                && let Ok(mut observer) = relay.observer.lock()
+            {
+                *observer = Some(SftpObserver::new());
+            }
+        }
+        tracing::info!(
+            event = "ssh.transfer_started",
+            session = %format_uuid(&self.session_id),
+            peer = %self.peer,
+            listener = %self.listener,
+            protocol = protocol.name(),
+            "transfert de fichiers (noms dans le transcript)"
+        );
+        true
+    }
+
+    /// The connection to the target: the one being made since the
+    /// authorisation, or the one already made.
+    async fn target_session(&mut self) -> Result<Arc<TargetSession>, SshError> {
+        if let Some(target) = self.conn.target.lock().ok().and_then(|t| t.clone()) {
+            return Ok(target);
+        }
+        let target = match self.target.take() {
+            Some(join) => join
+                .await
+                .unwrap_or_else(|e| Err(SshError::TargetUnreachable(e.to_string())))?,
+            None => return Err(SshError::Refused("aucune autorisation")),
+        };
+        let target = Arc::new(target);
+        if let Ok(mut slot) = self.conn.target.lock() {
+            *slot = Some(target.clone());
+        }
+        Ok(target)
+    }
+
+    /// Relays a `direct-tcpip` channel to the target, under the port
+    /// forwarding function; noted, its bytes counted with the session.
+    async fn forward(
+        &mut self,
+        channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
+        host: &str,
+        port: u32,
+        originator: (&str, u32),
+    ) {
+        let what = format!("{}:{port}", sanitize(host));
+        if !self.rights().contains(Rights::SSH_PORT_FORWARDING) {
+            self.refuse_request("port-forwarding", &what);
+            drop(reply);
+            return;
+        }
+        if self.conn.forwards.fetch_add(1, Ordering::SeqCst) >= MAX_FORWARDS {
+            self.conn.forwards.fetch_sub(1, Ordering::SeqCst);
+            limited(self.peer, self.listener, "redirections ouvertes");
+            drop(reply);
+            return;
+        }
+        let opened = match self.target_session().await {
+            Ok(target) => {
+                target
+                    .open_direct_tcpip(host, port, originator.0, originator.1)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let target_channel = match opened {
+            Ok(c) => c,
+            Err(e) => {
+                self.conn.forwards.fetch_sub(1, Ordering::SeqCst);
+                self.channel_refused(&format!("direct-tcpip {what} : {e}"));
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
+                return;
+            }
+        };
+        if let Some(transcript) = self.transcript() {
+            transcript.note_later(
+                NoteKind::Forward,
+                &label(&format!("port-forwarding {what}")),
+            );
+        }
+        reply.accept().await;
+        tracing::info!(
+            event = "ssh.forward_opened",
+            session = %format_uuid(&self.session_id),
+            peer = %self.peer,
+            listener = %self.listener,
+            destination = %what,
+            "redirection de port relayée à la cible"
+        );
+        let (user_read, user_write) = channel.split();
+        let (target_read, target_write) = target_channel.split();
+        let forwards = self.conn.forwards.clone();
+        let to = tokio::spawn(pipe(user_read, target_write, self.conn.to_target.clone()));
+        let from = tokio::spawn(pipe(target_read, user_write, self.conn.from_target.clone()));
+        tokio::spawn(async move {
+            let _ = tokio::join!(to, from);
+            forwards.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     /// The certificate checked a second time, the user name, then the
@@ -740,20 +947,8 @@ impl<A: Authorizer> Handler<A> {
         reply: ChannelOpenHandle,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
-        let target = match self.target.take() {
-            Some(join) => join
-                .await
-                .unwrap_or_else(|e| Err(SshError::TargetUnreachable(e.to_string()))),
-            None => Err(SshError::Refused("aucune autorisation")),
-        };
-        let opened = match target {
-            Ok(target) => {
-                let target = Arc::new(target);
-                if let Ok(mut slot) = self.conn.target.lock() {
-                    *slot = Some(target.clone());
-                }
-                target.open_session().await
-            }
+        let opened = match self.target_session().await {
+            Ok(target) => target.open_session().await,
             Err(e) => Err(e),
         };
         let Ok(target_channel) = opened else {
@@ -781,11 +976,18 @@ impl<A: Authorizer> Handler<A> {
         let Some(activity) = self.activity.clone() else {
             return Ok(());
         };
+        let record_data = Arc::new(AtomicBool::new(true));
+        let observer = Arc::new(Mutex::new(None));
         tokio::spawn(user_to_target(
             user_read,
             target_write.clone(),
             self.conn.to_target.clone(),
             activity,
+            Observed {
+                observer: observer.clone(),
+                transcript: transcript.clone(),
+                session: self.session_id,
+            },
         ));
         tokio::spawn(target_to_user(
             target_read,
@@ -795,12 +997,15 @@ impl<A: Authorizer> Handler<A> {
             replies_tx,
             self.conn.from_target.clone(),
             transcript,
+            record_data.clone(),
         ));
         self.relay = Some(Relay {
             id,
             target: target_write,
             replies,
             allow_pty,
+            record_data,
+            observer,
         });
         if let Some((request, authorized)) = self.access.as_ref() {
             tracing::info!(
@@ -820,18 +1025,70 @@ impl<A: Authorizer> Handler<A> {
     }
 }
 
+/// What the relay to the target observes in a transfer.
+struct Observed {
+    observer: Arc<Mutex<Option<SftpObserver>>>,
+    transcript: Transcript,
+    session: [u8; 16],
+}
+
+impl Observed {
+    /// Notes the file operations `data` completes, before it is relayed;
+    /// `false` if the stream cannot be followed or the transcript is lost:
+    /// the relay stops (and the session ends).
+    async fn note(&self, data: &[u8]) -> bool {
+        let mut seen = Vec::new();
+        let fed = match self.observer.lock() {
+            Ok(mut observer) => match observer.as_mut() {
+                Some(observer) => observer.feed(data, &mut seen),
+                None => return true,
+            },
+            Err(_) => return false,
+        };
+        if let Err(e) = fed {
+            let error = SshError::TransferUnreadable(e.to_string());
+            tracing::warn!(
+                event = "ssh.transfer_unreadable",
+                code = error.code(),
+                session = %format_uuid(&self.session),
+                "{error}"
+            );
+            return false;
+        }
+        for operation in seen {
+            if let Err(e) = self.transcript.note(operation.kind, &operation.text).await {
+                tracing::warn!(
+                    event = "ssh.transcript_lost",
+                    code = e.code(),
+                    session = %format_uuid(&self.session),
+                    "{e}"
+                );
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// From the user to the target: data, end of data, close. Keystrokes are
-/// not recorded (ADR-0016); they are the traffic of the idle delay.
+/// not recorded (ADR-0016); they are the traffic of the idle delay. The file
+/// operations of an SFTP transfer are
+/// noted before they are relayed.
 async fn user_to_target(
     mut user: russh::ChannelReadHalf,
     target: Arc<ChannelWriteHalf<client::Msg>>,
     count: Arc<AtomicU64>,
     activity: Activity,
+    observed: Observed,
 ) {
     while let Some(message) = user.wait().await {
         let sent = match message {
             ChannelMsg::Data { data } => {
                 activity.touch();
+                if !observed.note(&data).await {
+                    let _ = target.close().await;
+                    break;
+                }
                 count.fetch_add(data.len() as u64, Ordering::Relaxed);
                 target.data_bytes(data).await
             }
@@ -847,6 +1104,29 @@ async fn user_to_target(
             break;
         }
     }
+}
+
+/// One way of a forwarded channel: data, end of data, close; counted, not
+/// recorded.
+async fn pipe<S>(mut from: russh::ChannelReadHalf, to: ChannelWriteHalf<S>, count: Arc<AtomicU64>)
+where
+    S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static,
+{
+    while let Some(message) = from.wait().await {
+        let sent = match message {
+            ChannelMsg::Data { data } => {
+                count.fetch_add(data.len() as u64, Ordering::Relaxed);
+                to.data_bytes(data).await
+            }
+            ChannelMsg::Eof => to.eof().await,
+            ChannelMsg::Close => break,
+            _ => Ok(()),
+        };
+        if sent.is_err() {
+            break;
+        }
+    }
+    let _ = to.close().await;
 }
 
 /// The name of a signal as SSH carries it (`KILL`, not `SIGKILL`).
@@ -881,11 +1161,14 @@ async fn target_to_user(
     replies: mpsc::Sender<bool>,
     count: Arc<AtomicU64>,
     transcript: Transcript,
+    record_data: Arc<AtomicBool>,
 ) {
     while let Some(message) = target.wait().await {
         let sent = match message {
             ChannelMsg::Data { data } => {
-                if transcript.output(&data).await.is_err() {
+                // In a transfer, the standard output is file contents or
+                // protocol: noted, not recorded.
+                if record_data.load(Ordering::SeqCst) && transcript.output(&data).await.is_err() {
                     break;
                 }
                 count.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1007,16 +1290,26 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
 
     async fn channel_open_direct_tcpip(
         &mut self,
-        _channel: Channel<Msg>,
-        _host_to_connect: &str,
-        _port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.channel_refused("direct-tcpip");
-        drop(reply);
+        if !*self.authenticated.borrow() {
+            drop(reply);
+            return Ok(());
+        }
+        self.forward(
+            channel,
+            reply,
+            host_to_connect,
+            port_to_connect,
+            (originator_address, originator_port),
+        )
+        .await;
         Ok(())
     }
 
@@ -1117,7 +1410,23 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
             self.channel_refused("commande de plus de 32 Kio");
             return session.channel_failure(channel);
         }
-        if !self.start_transcript(Some(data)).await {
+        let started = match transfer::classify(data) {
+            transfer::Command::Transfer(protocol) if allows_transfer(self.rights()) => {
+                self.start_transfer(Some(data), protocol).await
+            }
+            transfer::Command::Transfer(protocol) => {
+                self.refuse_request("transfer", protocol.name());
+                return session.channel_failure(channel);
+            }
+            transfer::Command::Mentions(tool) if !allows_transfer(self.rights()) => {
+                self.refuse_request("transfer", tool);
+                return session.channel_failure(channel);
+            }
+            transfer::Command::Mentions(_) | transfer::Command::Ordinary => {
+                self.start_transcript(Some(data)).await
+            }
+        };
+        if !started {
             return session.channel_failure(channel);
         }
         tracing::info!(
@@ -1201,8 +1510,24 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.channel_refused(&format!("sous-système {name}"));
-        session.channel_failure(channel)
+        if name != "sftp" {
+            self.channel_refused(&format!("sous-système {name}"));
+            return session.channel_failure(channel);
+        }
+        if !allows_transfer(self.rights()) {
+            self.refuse_request("transfer", "sftp");
+            return session.channel_failure(channel);
+        }
+        let Some(target) = self.relay(channel) else {
+            return session.channel_failure(channel);
+        };
+        if !self.start_transfer(None, TransferProtocol::Sftp).await {
+            return session.channel_failure(channel);
+        }
+        if target.request_subsystem(true, "sftp").await.is_err() {
+            return session.channel_failure(channel);
+        }
+        self.answer(channel, session).await
     }
 
     async fn x11_request(
@@ -1214,7 +1539,11 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
         _x11_screen_number: u32,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.channel_refused("x11");
+        if self.rights().contains(Rights::SSH_X11_FORWARDING) {
+            self.channel_refused("x11 (pas encore relayé)");
+        } else {
+            self.refuse_request("x11-forwarding", "");
+        }
         session.channel_failure(channel)
     }
 
@@ -1223,17 +1552,28 @@ impl<A: Authorizer> russh::server::Handler for Handler<A> {
         _channel: ChannelId,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        self.channel_refused("agent");
+        if self.rights().contains(Rights::SSH_AGENT_FORWARDING) {
+            self.channel_refused("agent (pas encore relayé)");
+        } else {
+            self.refuse_request("agent-forwarding", "");
+        }
         Ok(false)
     }
 
     async fn tcpip_forward(
         &mut self,
-        _address: &str,
-        _port: &mut u32,
+        address: &str,
+        port: &mut u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
-        self.channel_refused("tcpip-forward");
+        if self.rights().contains(Rights::SSH_PORT_FORWARDING) {
+            self.channel_refused("tcpip-forward (pas encore relayé)");
+        } else {
+            self.refuse_request(
+                "port-forwarding",
+                &format!("-R {}:{port}", sanitize(address)),
+            );
+        }
         Ok(false)
     }
 

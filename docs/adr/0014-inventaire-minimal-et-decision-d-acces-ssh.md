@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté. Implémenté dans le lot M1, PR 5b.
 - **Date** : 2026-11-25
+- **Révision** : 2026-11-26, fonctions d'un droit SSH (`--allow`, migration `0008_ssh_functions`, réversible), portées par le grant, `ACC-E010` (jalon M2, PR 4a)
 
 ## Contexte
 
@@ -48,7 +49,7 @@ Le but du jalon M1 est un inventaire **minimal**, administré en ligne de comman
 | `resource add <nom> --host <hôte> [--port 22] --group <groupe> --host-key <ssh_host_ecdsa_key.pub>` | ajoute une ressource ; la clé d'hôte est lue dans le fichier public de la cible |
 | `resource list` | ressources, adresse, groupe, clé épinglée, comptes |
 | `account add --resource <ressource> <compte>` | ajoute un compte |
-| `right grant --user --resource --account --days <1–366> [--max-session-mins 60]` | accorde un droit SSH ; `--days` est obligatoire |
+| `right grant --user --resource --account --days <1–366> [--max-session-mins 60] [--allow <fonction>]…` | accorde un droit SSH ; `--days` est obligatoire ; `--allow` ajoute une fonction (`transfer`, `port-forwarding`, `agent-forwarding`, `x11-forwarding`), aucune par défaut |
 | `right list`, `right revoke <uuid>` | liste, révocation |
 | `login revoke <uuid> --reason <texte>` | révoque une session de connexion |
 | `access check --user --resource --account` | **essai à blanc** de la décision, sans session de connexion ; rien n'est écrit, pas même dans la chaîne d'audit ; code de sortie 1 en cas de refus |
@@ -87,6 +88,14 @@ Les refus ne sont pas audités un par un, ce qui inonderait la chaîne : une lig
 
 **Essai à blanc** (`access check`) : mêmes contrôles, depuis la base, sans signature ni écriture. Il reste hors de la chaîne d'audit : il ne change aucun droit.
 
+### Fonctions d'un droit (jalon M2, PR 4a)
+
+Un droit porte la liste de ses **fonctions** au-delà du terminal et des commandes (`access_right.functions`, migration `0008_ssh_functions`, réversible, contrainte sur les quatre noms connus) : `transfer`, `port-forwarding`, `agent-forwarding`, `x11-forwarding` (ADR-0010). Aucune par défaut. `right.granted` les consigne (`functions`), `right list` et `access check` les affichent.
+
+- **À la demande de grant**, le core retient le droit comme avant (le plus long, puis la plus longue session) et signe ses fonctions dans les droits du grant (ADR-0004). Les fonctions de plusieurs droits valides sur le même compte ne s'additionnent pas : accorder une fonction, c'est accorder un droit qui la porte, ou révoquer et accorder de nouveau. Le registre des grants garde ces bits (`access_grant.rights`), et `access.ssh_granted` les consigne (`functions`, `rights`).
+- **À l'ouverture de la session**, le droit retenu de nouveau doit **garder toutes les fonctions du grant** : un droit révoqué ou remplacé par un droit plus pauvre depuis l'émission donne `ACC-E010`. Un droit plus riche ne les étend pas : l'agent n'applique que ce que le grant signe. `access.session_opened` consigne les fonctions.
+- Chaque transfert, chaque redirection relayée et chaque demande refusée par l'agent sont notés dans le transcript et consignés par le core (`access.ssh_transfer`, `access.ssh_forward`, `access.ssh_request_refused`, au mieux, 32 au plus par transcript ; les suivants restent dans le transcript scellé). Les opérations sur les fichiers restent dans le transcript.
+
 ### Codes
 
 | Code | Refus |
@@ -100,6 +109,7 @@ Les refus ne sont pas audités un par un, ce qui inonderait la chaîne : une lig
 | `ACC-E007` | accès SSH non configuré sur le core (`[core.ssh]`) |
 | `ACC-E008` | grant inconnu du core |
 | `ACC-E009` | trop de demandes de l'agent (limite par agent) |
+| `ACC-E010` | aucun droit valide ne garde les fonctions signées dans le grant |
 | `INV-E001` | ressource inconnue |
 | `INV-E002` | ressource d'un autre groupe de passerelles |
 | `INV-E003` | compte inconnu sur la ressource |

@@ -46,3 +46,39 @@ pub fn login(data: &[u8]) {
         assert_eq!(format!("{}@{}", login.account, login.resource), user);
     }
 }
+
+/// The SFTP observer and the command classifier on arbitrary bytes, the
+/// stream cut where its first byte says: never panics, the operations do
+/// not depend on the cut, and each is a valid transcript note.
+///
+/// # Panics
+///
+/// If the cut changes what is observed, or a note is invalid: a bug.
+pub fn sftp(data: &[u8]) {
+    use crate::transfer::{SftpObserver, classify};
+    let _ = classify(data);
+    let Some((&cut, stream)) = data.split_first() else {
+        return;
+    };
+    let observe = |chunk: usize| {
+        let mut observer = SftpObserver::new();
+        let mut out = Vec::new();
+        let result = stream
+            .chunks(chunk.max(1))
+            .try_for_each(|part| observer.feed(part, &mut out));
+        (result.is_ok(), out)
+    };
+    let whole = observe(stream.len());
+    assert_eq!(
+        whole,
+        observe(usize::from(cut)),
+        "observation depends on the cut"
+    );
+    for o in whole.1 {
+        let note = ostena_recorder::Event::Note {
+            kind: o.kind,
+            text: o.text,
+        };
+        assert!(note.check().is_ok(), "invalid note");
+    }
+}

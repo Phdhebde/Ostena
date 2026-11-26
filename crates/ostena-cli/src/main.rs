@@ -432,31 +432,41 @@ enum CoreAccountCommand {
     },
 }
 
+/// `ostena core right grant`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, clap::Args)]
+struct RightGrant {
+    /// Configuration file.
+    #[arg(long, default_value = CORE_CONFIG)]
+    config: PathBuf,
+    /// Login name.
+    #[arg(long)]
+    user: String,
+    /// Resource name.
+    #[arg(long)]
+    resource: String,
+    /// Account on the resource.
+    #[arg(long)]
+    account: String,
+    /// Validity in days, 1 to 366 (required).
+    #[arg(long)]
+    days: u64,
+    /// Longest session in minutes, 1 to 720.
+    #[arg(long, default_value_t = 60)]
+    max_session_mins: u32,
+    /// A function beyond the terminal and the commands, none by default:
+    /// transfer (sftp, scp, rsync), port-forwarding (`-L`, `-R`, `-W`,
+    /// `ProxyJump`), agent-forwarding, x11-forwarding. Repeatable.
+    #[arg(long = "allow", value_name = "FUNCTION")]
+    allow: Vec<String>,
+}
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Subcommand)]
 enum CoreRightCommand {
     /// Grant a user SSH access to an account, for a number of days;
     /// prints the right identifier.
-    Grant {
-        /// Configuration file.
-        #[arg(long, default_value = CORE_CONFIG)]
-        config: PathBuf,
-        /// Login name.
-        #[arg(long)]
-        user: String,
-        /// Resource name.
-        #[arg(long)]
-        resource: String,
-        /// Account on the resource.
-        #[arg(long)]
-        account: String,
-        /// Validity in days, 1 to 366 (required).
-        #[arg(long)]
-        days: u64,
-        /// Longest session in minutes, 1 to 720.
-        #[arg(long, default_value_t = 60)]
-        max_session_mins: u32,
-    },
+    Grant(RightGrant),
     /// List the rights.
     List {
         /// Configuration file.
@@ -1142,14 +1152,15 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
                 },
         } => inv::account_add(&config, &resource, &name),
         CoreCommand::Right { command } => match command {
-            CoreRightCommand::Grant {
-                config,
-                user,
-                resource,
-                account,
-                days,
-                max_session_mins,
-            } => inv::right_grant(&config, &user, &resource, &account, days, max_session_mins),
+            CoreRightCommand::Grant(grant) => inv::right_grant(
+                &grant.config,
+                &grant.user,
+                &grant.resource,
+                &grant.account,
+                grant.days,
+                grant.max_session_mins,
+                &grant.allow,
+            ),
             CoreRightCommand::List { config } => inv::right_list(&config),
             CoreRightCommand::Revoke { config, right } => inv::right_revoke(&config, &right),
         },

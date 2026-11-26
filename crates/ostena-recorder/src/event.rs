@@ -1,7 +1,7 @@
 //! The recorded events and their bounds.
 //!
-//! A transcript is one [`Event::Start`], then outputs and window changes,
-//! at most one [`Event::Exit`], then one [`Event::End`]. Each event carries its time in microseconds
+//! A transcript is one [`Event::Start`], then outputs, window changes and
+//! notes, at most one [`Event::Exit`], then one [`Event::End`]. Each event carries its time in microseconds
 //! since the start of the session, from the monotonic clock of the agent.
 //! Keystrokes are not recorded (ADR-0016).
 
@@ -20,6 +20,93 @@ pub const MAX_CELLS: u16 = 10_000;
 /// Longest exit signal name, in bytes (printable ASCII, as in SSH: `KILL`,
 /// not `SIGKILL`).
 pub const MAX_SIGNAL: usize = 32;
+/// Longest path in a note, in bytes.
+pub const MAX_PATH: usize = 4096;
+/// Longest note text, in bytes: two paths and their separator.
+pub const MAX_NOTE: usize = 2 * MAX_PATH + 1;
+/// Longest text of a transfer or refusal note (printable ASCII and spaces).
+pub const MAX_NOTE_LABEL: usize = 256;
+
+/// What a note says (ADR-0010): a transfer started, a request refused, or
+/// a file operation observed in a transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum NoteKind {
+    /// A file transfer started: its protocol (`sftp`, `scp`, `rsync`).
+    Transfer = 1,
+    /// A request refused for lack of a function of the right: what was
+    /// asked (`port-forwarding 10.0.0.5:80`, `transfer scp`…).
+    Refused = 2,
+    /// A forwarding opened under the function of the right: what
+    /// (`port-forwarding 10.0.0.5:80`).
+    Forward = 3,
+    /// A file opened for reading.
+    Read = 16,
+    /// A file opened for writing (created, truncated or appended to).
+    Write = 17,
+    /// A file removed.
+    Remove = 18,
+    /// A file renamed: `old ‖ NUL ‖ new`.
+    Rename = 19,
+    /// A directory created.
+    Mkdir = 20,
+    /// A directory removed.
+    Rmdir = 21,
+    /// Attributes changed (mode, owner, times).
+    Setstat = 22,
+    /// A link created: `link ‖ NUL ‖ target`.
+    Link = 23,
+}
+
+impl NoteKind {
+    /// Every kind.
+    pub const ALL: [Self; 11] = [
+        Self::Transfer,
+        Self::Refused,
+        Self::Forward,
+        Self::Read,
+        Self::Write,
+        Self::Remove,
+        Self::Rename,
+        Self::Mkdir,
+        Self::Rmdir,
+        Self::Setstat,
+        Self::Link,
+    ];
+
+    /// The kind of a byte, if known.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| *k as u8 == v)
+    }
+
+    /// Its name, as in the transcript markers.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Transfer => "transfer",
+            Self::Refused => "refused",
+            Self::Forward => "forward",
+            Self::Read => "file-read",
+            Self::Write => "file-write",
+            Self::Remove => "file-remove",
+            Self::Rename => "file-rename",
+            Self::Mkdir => "file-mkdir",
+            Self::Rmdir => "file-rmdir",
+            Self::Setstat => "file-setstat",
+            Self::Link => "file-link",
+        }
+    }
+
+    /// Whether its text is a label (printable ASCII and spaces) rather than
+    /// paths.
+    pub const fn is_label(self) -> bool {
+        matches!(self, Self::Transfer | Self::Refused | Self::Forward)
+    }
+
+    /// Whether its text holds two paths separated by a NUL.
+    pub const fn has_two_paths(self) -> bool {
+        matches!(self, Self::Rename | Self::Link)
+    }
+}
 
 /// How the shell or the command ended, as the target said.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +195,13 @@ pub enum Event {
     },
     /// The shell or the command ended (`exit-status` or `exit-signal`).
     Exit(Exit),
+    /// Something the agent observed or refused (ADR-0010).
+    Note {
+        /// What.
+        kind: NoteKind,
+        /// Its text: a label, a path, or two paths separated by a NUL.
+        text: Vec<u8>,
+    },
     /// The session ended.
     End {
         /// Why.
@@ -181,6 +275,23 @@ impl Event {
                 }
                 Ok(())
             }
+            Self::Note { kind, text } => {
+                let valid = if kind.is_label() {
+                    !text.is_empty()
+                        && text.len() <= MAX_NOTE_LABEL
+                        && text.iter().all(|b| b.is_ascii_graphic() || *b == b' ')
+                } else {
+                    let count = if kind.has_two_paths() { 2 } else { 1 };
+                    text.split(|b| *b == 0).count() == count
+                        && text
+                            .split(|b| *b == 0)
+                            .all(|p| !p.is_empty() && p.len() <= MAX_PATH)
+                };
+                if !valid {
+                    return Err(RecorderError::Malformed("note invalide"));
+                }
+                Ok(())
+            }
             Self::Exit(Exit::Status(_)) | Self::End { .. } => Ok(()),
         }
     }
@@ -243,6 +354,41 @@ mod tests {
         assert!(Event::Output(vec![0; MAX_OUTPUT + 1]).check().is_err());
         assert!(Event::Resize { cols: 1, rows: 1 }.check().is_ok());
         assert!(Event::Resize { cols: 0, rows: 1 }.check().is_err());
+    }
+
+    #[test]
+    fn notes_are_bounded() {
+        let note = |kind, text: &[u8]| Event::Note {
+            kind,
+            text: text.to_vec(),
+        };
+        assert!(note(NoteKind::Transfer, b"sftp").check().is_ok());
+        assert!(
+            note(NoteKind::Refused, b"port-forwarding 10.0.0.5:80")
+                .check()
+                .is_ok()
+        );
+        assert!(note(NoteKind::Read, b"/etc/hosts").check().is_ok());
+        assert!(note(NoteKind::Write, "/tmp/é".as_bytes()).check().is_ok());
+        assert!(note(NoteKind::Rename, b"/a\0/b").check().is_ok());
+        assert!(note(NoteKind::Read, &[b'a'; MAX_PATH]).check().is_ok());
+        for bad in [
+            note(NoteKind::Transfer, b""),
+            note(NoteKind::Transfer, b"sftp\n"),
+            note(NoteKind::Refused, &[b'a'; MAX_NOTE_LABEL + 1]),
+            note(NoteKind::Read, b""),
+            note(NoteKind::Read, b"/a\0/b"),
+            note(NoteKind::Read, &[b'a'; MAX_PATH + 1]),
+            note(NoteKind::Rename, b"/a"),
+            note(NoteKind::Rename, b"/a\0"),
+            note(NoteKind::Link, b"/a\0/b\0/c"),
+        ] {
+            assert!(bad.check().is_err(), "{bad:?}");
+        }
+        for k in NoteKind::ALL {
+            assert_eq!(NoteKind::from_u8(k as u8), Some(k));
+        }
+        assert_eq!(NoteKind::from_u8(0), None);
     }
 
     #[test]
