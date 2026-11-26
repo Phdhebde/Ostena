@@ -311,6 +311,50 @@
           }
         }
       }
+    },
+    "/api/v1/access": {
+      "post": {
+        "operationId": "requestAccess",
+        "summary": "Demande un accès à un compte d'une ressource, pour la passerelle navigateur.",
+        "description": "Le core décide comme pour SSH (ADR-0014) : utilisateur actif, session de connexion valide, ressource, compte et droit valide, lus et verrouillés dans une transaction. Il choisit un agent connecté du groupe de la ressource et émet un grant v2 (audience : le groupe ; TTL : 60 s ; liaison : la session de connexion et le compte), enregistré par son jti avec l'enregistrement accordant access.web_granted. Le grant porte l'autorisation, jamais un secret de la cible ; il se présente une seule fois, à l'ouverture de la WebSocket /api/v1/gateway. Seul SSH est servi tant que l'affichage RDP n'est pas livré (PR 13).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accès accordé.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessGrant"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadBody"
+          },
+          "401": {
+            "$ref": "#/components/responses/NoSession"
+          },
+          "403": {
+            "$ref": "#/components/responses/AccessRefused"
+          },
+          "429": {
+            "$ref": "#/components/responses/AccessRateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/NoAgent"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -421,6 +465,36 @@
       },
       "NoPortal": {
         "description": "WEB-E008 : portail absent de ce binaire.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "AccessRefused": {
+        "description": "Accès refusé, avec le code de la décision : ACC-E003 (session révoquée), ACC-E005 (utilisateur désactivé), ACC-E006 (aucun droit valide), INV-E001 (ressource inconnue), INV-E003 (compte inconnu), INV-E004 (clé d'hôte de la cible non épinglée) ; WEB-E002, WEB-E003 : voir CrossSite. Le message est un libellé générique ; la cause est dans la chaîne d'audit (access.web_refused).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NoAgent": {
+        "description": "GTW-E003 : aucun agent du groupe de la ressource n'est connecté au core ; ou une erreur du core (CORE-E…).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "AccessRateLimited": {
+        "description": "ACC-E009 : trop de demandes d'accès pour cette session (10 d'un coup, puis une toutes les 6 s).",
         "content": {
           "application/json": {
             "schema": {
@@ -725,6 +799,99 @@
           {
             "code": "AUTH-E001",
             "message": "identifiants invalides ou compte indisponible"
+          }
+        ]
+      },
+      "AccessProtocol": {
+        "type": "string",
+        "enum": [
+          "ssh"
+        ],
+        "description": "Protocole demandé ; RDP viendra avec l'affichage de la PR 13.",
+        "examples": [
+          "ssh"
+        ]
+      },
+      "AccessRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "resource",
+          "account",
+          "protocol"
+        ],
+        "properties": {
+          "resource": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]{0,62}$",
+            "description": "Nom de la ressource dans l'inventaire."
+          },
+          "account": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Compte sur la ressource, sans caractère de contrôle ni espace aux extrémités."
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/AccessProtocol"
+          }
+        },
+        "examples": [
+          {
+            "resource": "srv-web-01",
+            "account": "root",
+            "protocol": "ssh"
+          }
+        ]
+      },
+      "AccessGrant": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grant",
+          "resource",
+          "account",
+          "protocol",
+          "expires_at",
+          "max_session_secs"
+        ],
+        "properties": {
+          "grant": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{246}$",
+            "description": "Le grant, forme texte (ADR-0004), à présenter dans le sous-protocole ostena-grant.<grant>, jamais dans l'URL."
+          },
+          "resource": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9.-]{0,62}$"
+          },
+          "account": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/AccessProtocol"
+          },
+          "expires_at": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Fin de validité du grant, secondes Unix (émission + 60 s)."
+          },
+          "max_session_secs": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Durée de session la plus longue permise : le droit, sa fin et la session de connexion."
+          }
+        },
+        "examples": [
+          {
+            "grant": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "resource": "srv-web-01",
+            "account": "root",
+            "protocol": "ssh",
+            "expires_at": 1800000060,
+            "max_session_secs": 3600
           }
         ]
       }
