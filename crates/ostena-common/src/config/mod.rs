@@ -27,7 +27,10 @@ pub use self::core::{
     CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, DatabaseConfig, DatabaseTcp,
     KeySource, TotpAlgorithmSetting,
 };
-pub use agent::{AgentConfig, AgentSshConfig, InfrastructureEndpoint, SshPaths};
+pub use agent::{
+    AgentConfig, AgentSessionsConfig, AgentSshConfig, InfrastructureEndpoint, SessionBounds,
+    SshPaths,
+};
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{
     Code, GRANT_SIGNATURE_ALGORITHM, KNOWN_SIGNATURE_ALGORITHMS, Violation, Violations,

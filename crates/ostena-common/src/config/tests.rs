@@ -125,7 +125,8 @@ fn codes_are_stable_and_unique() {
         "CFG-P001", "CFG-P002", "CFG-P003", "CFG-P004", "CFG-P005", "CFG-P006", "CFG-V006",
         "CFG-V007", "CFG-V008", "CFG-V009", "CFG-V010", "CFG-P007", "CFG-P008", "CFG-P009",
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
-        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016",
+        "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
+        "CFG-P017",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -800,6 +801,67 @@ fn p007_core_ca_required_in_production() {
     assert_eq!(production_codes(&c), vec![Code::CoreCaMissing]);
 }
 
+#[test]
+fn sessions_section_has_safe_defaults_and_bounds() {
+    let c = parse(AGENT);
+    let a = c.agent.as_ref().unwrap();
+    assert_eq!(a.sessions, AgentSessionsConfig::default());
+    assert_eq!(a.session_bounds().max_sessions_per_user, 8);
+    assert!(c.validate_for_production().is_ok());
+
+    // The obsolete SSH key is the agent bound unless the section sets one.
+    let c = parse(&format!("{AGENT}{SSH}max_sessions = 12\n"));
+    assert_eq!(c.agent.unwrap().session_bounds().max_sessions, 12);
+    let c = parse(&format!(
+        "{AGENT}\n[agent.sessions]\nmax_sessions = 100\n{SSH}max_sessions = 12\n"
+    ));
+    assert_eq!(c.agent.unwrap().session_bounds().max_sessions, 100);
+
+    for (field, bad, good) in [
+        ("max_sessions", 0, 1024),
+        ("max_sessions", 1025, 1),
+        ("max_sessions_per_user", 0, 1),
+        ("max_sessions_per_user", 257, 256),
+        ("max_sessions_per_target", 0, 1),
+        ("max_sessions_per_target", 257, 256),
+        ("idle_timeout_secs", 59, 60),
+        ("idle_timeout_secs", 86_401, 86_400),
+    ] {
+        let c = parse(&format!("{AGENT}\n[agent.sessions]\n{field} = {bad}\n"));
+        assert_eq!(
+            agent_codes(&c),
+            vec![Code::AgentSessions],
+            "{field} = {bad}"
+        );
+        let c = parse(&format!("{AGENT}\n[agent.sessions]\n{field} = {good}\n"));
+        assert!(c.validate().is_ok(), "{field} = {good}");
+    }
+    let text = format!("{AGENT}\n[agent.sessions]\nunknown = 1\n");
+    assert_eq!(
+        Config::from_toml_str(&text).unwrap_err().codes(),
+        vec![Code::Parse]
+    );
+    // The per-protocol keys of M2 moved to the common section.
+    let text = format!("{AGENT}{SSH}idle_timeout_secs = 900\n");
+    assert_eq!(
+        Config::from_toml_str(&text).unwrap_err().codes(),
+        vec![Code::Parse]
+    );
+}
+
+#[test]
+fn p017_idle_timeout_disabled() {
+    let c = parse(&format!(
+        "{AGENT}\n[agent.sessions]\nidle_timeout_secs = 0\n"
+    ));
+    assert!(c.validate().is_ok());
+    assert_eq!(
+        c.agent.as_ref().unwrap().session_bounds().idle_timeout_secs,
+        None
+    );
+    assert_eq!(production_codes(&c), vec![Code::IdleTimeoutDisabled]);
+}
+
 const SSH: &str = "\n[agent.ssh]\nlisten = [\"0.0.0.0:2222\", \"[::]:2222\"]\n";
 
 fn agent_ssh(extra: &str) -> Config {
@@ -813,10 +875,16 @@ fn ssh_section_parses_with_safe_defaults() {
     let a = c.agent.as_ref().unwrap();
     let ssh = a.ssh.as_ref().unwrap();
     assert_eq!(ssh.listen, ["0.0.0.0:2222", "[::]:2222"]);
-    assert_eq!(ssh.max_sessions, 64);
-    assert_eq!(ssh.max_sessions_per_user, None);
-    assert_eq!(ssh.max_sessions_per_target, None);
-    assert_eq!(ssh.idle_timeout_secs, None);
+    assert_eq!(ssh.max_sessions, None);
+    assert_eq!(
+        a.session_bounds(),
+        SessionBounds {
+            max_sessions: 64,
+            max_sessions_per_user: 8,
+            max_sessions_per_target: 8,
+            idle_timeout_secs: Some(900),
+        }
+    );
     assert_eq!(ssh.max_unauthenticated, 16);
     assert_eq!(ssh.max_unauthenticated_per_source, 4);
     assert_eq!(ssh.login_grace_secs, 30);
@@ -863,12 +931,6 @@ fn v015_ssh_addresses_bounds_and_keys() {
         ("login_grace_secs", 121, 120),
         ("target_connect_timeout_secs", 0, 1),
         ("target_connect_timeout_secs", 31, 30),
-        ("max_sessions_per_user", 0, 1),
-        ("max_sessions_per_user", 257, 256),
-        ("max_sessions_per_target", 0, 1),
-        ("max_sessions_per_target", 257, 256),
-        ("idle_timeout_secs", 59, 60),
-        ("idle_timeout_secs", 86_401, 86_400),
     ] {
         let c = agent_ssh(&format!("{field} = {bad}\n"));
         assert_eq!(agent_codes(&c), vec![Code::AgentSsh], "{field} = {bad}");

@@ -63,10 +63,76 @@ pub struct AgentConfig {
     /// Native SSH server of the agent (ADR-0010); absent: no SSH server.
     #[serde(default)]
     pub ssh: Option<AgentSshConfig>,
+    /// Quotas and delays of the sessions, every protocol (ADR-0018).
+    #[serde(default)]
+    pub sessions: AgentSessionsConfig,
 }
 
-/// Default bound of the authenticated SSH sessions.
-pub const DEFAULT_SSH_MAX_SESSIONS: u32 = 64;
+/// Default bound of the sessions of an agent, every protocol.
+pub const DEFAULT_MAX_SESSIONS: u32 = 64;
+/// Default bound of the sessions of one user at once (ADR-0018).
+pub const DEFAULT_MAX_SESSIONS_PER_USER: u32 = 8;
+/// Default bound of the sessions towards one resource at once (ADR-0018).
+pub const DEFAULT_MAX_SESSIONS_PER_TARGET: u32 = 8;
+/// Default idle delay of a session, in seconds (ADR-0018).
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
+
+const fn default_max_sessions_per_user() -> u32 {
+    DEFAULT_MAX_SESSIONS_PER_USER
+}
+const fn default_max_sessions_per_target() -> u32 {
+    DEFAULT_MAX_SESSIONS_PER_TARGET
+}
+const fn default_idle_timeout() -> u64 {
+    DEFAULT_IDLE_TIMEOUT_SECS
+}
+
+/// `[agent.sessions]`: the quotas and delays of the session manager of the
+/// agent, common to every protocol (SSH, RDP, web; ADR-0018).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSessionsConfig {
+    /// Sessions of the agent at once, every protocol, 1 to 1 024; default
+    /// `agent.ssh.max_sessions` if set (jalon M1), else 64.
+    #[serde(default)]
+    pub max_sessions: Option<u32>,
+    /// Sessions of one user at once, 1 to 256.
+    #[serde(default = "default_max_sessions_per_user")]
+    pub max_sessions_per_user: u32,
+    /// Sessions towards one resource at once, 1 to 256.
+    #[serde(default = "default_max_sessions_per_target")]
+    pub max_sessions_per_target: u32,
+    /// A session without activity of the user for this long is cut, 60 to
+    /// 86 400 s; 0: never (`CFG-P017` in production).
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for AgentSessionsConfig {
+    fn default() -> Self {
+        Self {
+            max_sessions: None,
+            max_sessions_per_user: DEFAULT_MAX_SESSIONS_PER_USER,
+            max_sessions_per_target: DEFAULT_MAX_SESSIONS_PER_TARGET,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+        }
+    }
+}
+
+/// The bounds of the session manager, defaults applied (the agent builds
+/// its `ostena_session::Limits` from them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionBounds {
+    /// Sessions of the agent at once.
+    pub max_sessions: u32,
+    /// Sessions of one user at once.
+    pub max_sessions_per_user: u32,
+    /// Sessions towards one resource at once.
+    pub max_sessions_per_target: u32,
+    /// Idle delay; `None`: never (development only).
+    pub idle_timeout_secs: Option<u64>,
+}
+
 /// Default bound of the SSH connections not yet authenticated.
 pub const DEFAULT_SSH_MAX_UNAUTHENTICATED: u32 = 16;
 /// Default bound of the SSH connections not yet authenticated from one
@@ -84,9 +150,6 @@ pub const DEFAULT_SSH_TARGET_KEY: &str = "ssh_target_key";
 /// See [`DEFAULT_SSH_HOST_KEY`].
 pub const DEFAULT_SSH_HOST_CERTIFICATE: &str = "ssh_host_certificate";
 
-const fn default_ssh_max_sessions() -> u32 {
-    DEFAULT_SSH_MAX_SESSIONS
-}
 const fn default_ssh_max_unauthenticated() -> u32 {
     DEFAULT_SSH_MAX_UNAUTHENTICATED
 }
@@ -119,21 +182,10 @@ pub struct AgentSshConfig {
     /// `ssh_host_certificate` in the state directory.
     #[serde(default)]
     pub host_certificate: Option<PathBuf>,
-    /// Authenticated sessions, 1 to 256.
-    #[serde(default = "default_ssh_max_sessions")]
-    pub max_sessions: u32,
-    /// Sessions of one user at once, 1 to 256 (within `max_sessions`
-    /// anyway); unset: only `max_sessions` (ADR-0018).
+    /// Obsolete (jalon M1): the bound of the agent sessions when
+    /// `[agent.sessions] max_sessions` is not set, 1 to 256.
     #[serde(default)]
-    pub max_sessions_per_user: Option<u32>,
-    /// Sessions towards one resource at once, 1 to 256 (within
-    /// `max_sessions` anyway); unset: only `max_sessions` (ADR-0018).
-    #[serde(default)]
-    pub max_sessions_per_target: Option<u32>,
-    /// A session without traffic from the user for this long is cut, 60 to
-    /// 86 400 s; unset: never (ADR-0018).
-    #[serde(default)]
-    pub idle_timeout_secs: Option<u64>,
+    pub max_sessions: Option<u32>,
     /// Connections not yet authenticated, 1 to 256.
     #[serde(default = "default_ssh_max_unauthenticated")]
     pub max_unauthenticated: u32,
@@ -209,6 +261,21 @@ impl AgentConfig {
         std::fs::read(&self.tls_private_key).map(SecretBytes::from)
     }
 
+    /// The bounds of the session manager, defaults applied.
+    pub fn session_bounds(&self) -> SessionBounds {
+        let sessions = &self.sessions;
+        SessionBounds {
+            max_sessions: sessions
+                .max_sessions
+                .or_else(|| self.ssh.as_ref().and_then(|s| s.max_sessions))
+                .unwrap_or(DEFAULT_MAX_SESSIONS),
+            max_sessions_per_user: sessions.max_sessions_per_user,
+            max_sessions_per_target: sessions.max_sessions_per_target,
+            idle_timeout_secs: (sessions.idle_timeout_secs != 0)
+                .then_some(sessions.idle_timeout_secs),
+        }
+    }
+
     /// The state directory: the directory of the replay journal.
     pub fn state_dir(&self) -> &Path {
         self.replay_journal
@@ -252,24 +319,10 @@ fn ssh_consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
             ));
         }
     }
-    // Unset optional bounds are not checked (no bound of their own).
-    let optional = [
-        (
-            "max_sessions_per_user",
-            ssh.max_sessions_per_user.map(u64::from),
-            1..=256,
-        ),
-        (
-            "max_sessions_per_target",
-            ssh.max_sessions_per_target.map(u64::from),
-            1..=256,
-        ),
-        ("idle_timeout_secs", ssh.idle_timeout_secs, 60..=86_400),
-    ]
-    .into_iter()
-    .filter_map(|(field, value, range)| value.map(|v| (field, v, range)));
-    let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 5] = [
-        ("max_sessions", u64::from(ssh.max_sessions), 1..=256),
+    let optional = ssh
+        .max_sessions
+        .map(|v| ("max_sessions", u64::from(v), 1..=256));
+    let bounds: [(&str, u64, std::ops::RangeInclusive<u64>); 4] = [
         (
             "max_unauthenticated",
             u64::from(ssh.max_unauthenticated),
@@ -313,6 +366,50 @@ fn ssh_consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
             Code::AgentSsh,
             "agent.ssh.host_key et agent.ssh.target_key désignent le même fichier : la clé \
              d'hôte de l'agent ne doit jamais servir à se connecter aux cibles.",
+        ));
+    }
+}
+
+/// Rules of `[agent.sessions]` (`CFG-V018`).
+fn sessions_consistency(sessions: &AgentSessionsConfig, out: &mut Vec<Violation>) {
+    let bounds = [
+        (
+            "max_sessions",
+            sessions.max_sessions.map(u64::from),
+            1..=1024,
+        ),
+        (
+            "max_sessions_per_user",
+            Some(u64::from(sessions.max_sessions_per_user)),
+            1..=256,
+        ),
+        (
+            "max_sessions_per_target",
+            Some(u64::from(sessions.max_sessions_per_target)),
+            1..=256,
+        ),
+    ];
+    for (field, value, range) in bounds {
+        if let Some(value) = value
+            && !range.contains(&value)
+        {
+            out.push(Violation::new(
+                Code::AgentSessions,
+                format!(
+                    "agent.sessions.{field} = {value} : attendu de {} à {}.",
+                    range.start(),
+                    range.end()
+                ),
+            ));
+        }
+    }
+    let idle = sessions.idle_timeout_secs;
+    if idle != 0 && !(60..=86_400).contains(&idle) {
+        out.push(Violation::new(
+            Code::AgentSessions,
+            format!(
+                "agent.sessions.idle_timeout_secs = {idle} : attendu 0 (jamais) ou de 60 à 86 400."
+            ),
         ));
     }
 }
@@ -447,6 +544,7 @@ pub(crate) fn consistency(agent: &AgentConfig, out: &mut Vec<Violation>) {
         ));
     }
     ssh_consistency(agent, out);
+    sessions_consistency(&agent.sessions, out);
     for (i, endpoint) in agent.infrastructure.iter().enumerate() {
         if endpoint.addresses.is_empty() {
             out.push(Violation::new(
@@ -473,6 +571,13 @@ pub(crate) fn weakenings(agent: &AgentConfig, out: &mut Vec<Violation>) {
             Code::CoreCaMissing,
             "agent.tls_core_ca absent : le certificat du core doit être validé par une CA dédiée, \
              jamais par les racines du système.",
+        ));
+    }
+    if agent.sessions.idle_timeout_secs == 0 {
+        out.push(Violation::new(
+            Code::IdleTimeoutDisabled,
+            "agent.sessions.idle_timeout_secs = 0 : une session laissée ouverte sans activité \
+             n'est jamais coupée ; choisissez un délai de 60 à 86 400 s en production.",
         ));
     }
 }
