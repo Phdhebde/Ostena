@@ -220,7 +220,7 @@ async fn wrong_fingerprint_is_refused_at_tls() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, RdpError::Tls(_)),
+        matches!(error, RdpError::Certificate(_)),
         "{} : {error}",
         error.code()
     );
