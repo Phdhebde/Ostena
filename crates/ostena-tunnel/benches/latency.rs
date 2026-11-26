@@ -1,7 +1,8 @@
 //! Latency added by the tunnel on 127.0.0.1: 64-byte round trips on an
-//! interactive channel to the test core (echo), against the same round trips
-//! on a plain TCP loopback. Prints p50 and p99; indicative target: < 1 ms
-//! added at p99. Not a gate (ADR-0005).
+//! interactive channel to the test core (echo), over QUIC and over the TLS
+//! 1.3 on TCP fallback, against the same round trips on a plain TCP
+//! loopback. Prints p50 and p99; indicative target: < 1 ms added at p99.
+//! Not a gate (ADR-0005).
 //!
 //! `cargo bench -p ostena-tunnel`; with `OSTENA_BENCH_OUT`, the results are
 //! also appended there as JSON Lines (`cargo xtask bench-ssh`).
@@ -15,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use ostena_tunnel::testing::{Behaviour, TestCore, valid};
-use ostena_tunnel::{Limits, StreamClass, Uuid, connect};
+use ostena_tunnel::{Limits, StreamClass, Transport, Uuid, connect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -32,12 +33,13 @@ fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
 }
 
-async fn tunnel_round_trips() -> Vec<Duration> {
+async fn tunnel_round_trips(transport: Transport) -> Vec<Duration> {
     let limits = Limits::default();
     let core = TestCore::start(limits, Behaviour::default()).expect("test core");
     let group = Uuid::from_bytes([1; 16]);
     let id = core.agent_identity(group, valid(), true).expect("identity");
-    let config = core.agent_config(&id, group, limits).expect("config");
+    let mut config = core.agent_config(&id, group, limits).expect("config");
+    config.transport = transport;
     let (tunnel, _) = connect(&config).await.expect("tunnel");
     let mut ch = tunnel
         .open_channel(Uuid::random().expect("random"), StreamClass::Interactive)
@@ -113,29 +115,35 @@ fn main() {
         .enable_all()
         .build()
         .expect("runtime");
-    let mut tunnel = rt.block_on(tunnel_round_trips());
     let mut tcp = rt.block_on(tcp_round_trips());
-    tunnel.sort_unstable();
     tcp.sort_unstable();
-    for (name, p) in [("p50", 500), ("p99", 990)] {
-        let t = percentile(&tunnel, p);
-        let base = percentile(&tcp, p);
+    for (transport, case) in [
+        (Transport::Quic, "round_trip_64"),
+        (Transport::Tcp, "round_trip_64_tcp"),
+    ] {
+        let mut tunnel = rt.block_on(tunnel_round_trips(transport));
+        tunnel.sort_unstable();
+        let name = transport.as_str().to_uppercase();
+        for (label, p) in [("p50", 500), ("p99", 990)] {
+            let t = percentile(&tunnel, p);
+            let base = percentile(&tcp, p);
+            println!(
+                "{name} round trip {label}: tunnel {:.0} µs, TCP loopback {:.0} µs, added {:.0} µs",
+                micros(t),
+                micros(base),
+                micros(t.saturating_sub(base))
+            );
+        }
+        let added_p99 = percentile(&tunnel, 990).saturating_sub(percentile(&tcp, 990));
         println!(
-            "round trip {name}: tunnel {:.0} µs, TCP loopback {:.0} µs, added {:.0} µs",
-            micros(t),
-            micros(base),
-            micros(t.saturating_sub(base))
+            "{name} added latency p99: {:.3} ms (indicative target < 1 ms)",
+            added_p99.as_secs_f64() * 1e3
+        );
+        record(
+            case,
+            tunnel.len(),
+            [percentile(&tcp, 500), percentile(&tcp, 990)],
+            [percentile(&tunnel, 500), percentile(&tunnel, 990)],
         );
     }
-    let added_p99 = percentile(&tunnel, 990).saturating_sub(percentile(&tcp, 990));
-    println!(
-        "added latency p99: {:.3} ms (indicative target < 1 ms)",
-        added_p99.as_secs_f64() * 1e3
-    );
-    record(
-        "round_trip_64",
-        tunnel.len(),
-        [percentile(&tcp, 500), percentile(&tcp, 990)],
-        [percentile(&tunnel, 500), percentile(&tunnel, 990)],
-    );
 }

@@ -51,7 +51,9 @@ fn objective(result: &BenchResult) -> Option<(&'static str, u64, bool)> {
     match (result.bench.as_str(), result.case.as_str()) {
         ("ssh-relay", "round_trip_64") => Some(("ajout p99 ≤ 3 ms", 3_000, true)),
         ("ssh-relay", "session_setup") => Some(("établissement p99 < 5 s", 5_000_000, false)),
-        ("tunnel", "round_trip_64") => Some(("ajout p99 < 1 ms (indicatif)", 1_000, true)),
+        ("tunnel", "round_trip_64" | "round_trip_64_tcp") => {
+            Some(("ajout p99 < 1 ms (indicatif)", 1_000, true))
+        }
         _ => None,
     }
 }
@@ -61,6 +63,9 @@ fn label(result: &BenchResult) -> String {
         ("ssh-relay", "round_trip_64") => "SSH via l'agent, aller-retour 64 octets".to_owned(),
         ("ssh-relay", "session_setup") => "SSH via l'agent, établissement de session".to_owned(),
         ("tunnel", "round_trip_64") => "Tunnel agent-core, aller-retour 64 octets".to_owned(),
+        ("tunnel", "round_trip_64_tcp") => {
+            "Tunnel agent-core en repli TCP, aller-retour 64 octets".to_owned()
+        }
         (bench, case) => format!("{bench} {case}"),
     }
 }
