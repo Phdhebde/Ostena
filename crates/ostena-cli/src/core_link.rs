@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ostena_common::config::{AgentConfig, Mode};
+use ostena_common::config::{AgentConfig, Mode, TunnelTransport};
 use ostena_crypto::tls::TrustAnchor;
 use ostena_platform::private_file::{self, Reader};
 use ostena_scope::infrastructure::{self, Unresolved};
 use ostena_scope::{InfrastructureSpec, LocalAddresses, SharedLocalAddresses, SystemResolver};
 use ostena_tunnel::gateway::{Gateway, GatewayParams, GatewayState};
 use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, SystemClock};
-use ostena_tunnel::{Hello, Limits, Uuid};
+use ostena_tunnel::{Hello, Limits, TransportMode, Uuid};
 
 /// How often the component names are resolved again.
 const INFRASTRUCTURE_REFRESH: Duration = Duration::from_mins(5);
@@ -137,6 +137,11 @@ pub(crate) fn start(agent: &AgentConfig, config_fingerprint: &str) -> Result<Age
             agent_version: ostena_common::VERSION.to_owned(),
             gateway_group,
             config_fingerprint: config_fingerprint.to_owned(),
+        },
+        transport: match agent.transport {
+            TunnelTransport::Auto => TransportMode::Auto,
+            TunnelTransport::Quic => TransportMode::Quic,
+            TunnelTransport::Tcp => TransportMode::Tcp,
         },
         limits: Limits::default(),
         backoff: Backoff::default(),

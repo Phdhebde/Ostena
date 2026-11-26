@@ -28,6 +28,11 @@ pub struct AgentConfig {
     pub gateway_group: String,
     /// Core address, `host:port`.
     pub core_address: String,
+    /// Transport of the tunnel to the core (ADR-0008): `auto` (default,
+    /// QUIC, and TLS 1.3 over TCP on the same port if QUIC does not answer
+    /// within 1 s), `quic` or `tcp`.
+    #[serde(default)]
+    pub transport: TunnelTransport,
     /// Core enrolment address, `host:port`; default: the host of
     /// `core_address` on port 8444 (ADR-0008).
     #[serde(default)]
@@ -131,6 +136,20 @@ pub struct SessionBounds {
     pub max_sessions_per_target: u32,
     /// Idle delay; `None`: never (development only).
     pub idle_timeout_secs: Option<u64>,
+}
+
+/// Transport of the tunnel to the core (ADR-0008). TCP is a performance
+/// downgrade, not a security one: TLS and its algorithms are the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelTransport {
+    /// QUIC first, TLS 1.3 over TCP in parallel after 1 s without answer.
+    #[default]
+    Auto,
+    /// QUIC only.
+    Quic,
+    /// TLS 1.3 over TCP only (UDP blocked on the path).
+    Tcp,
 }
 
 /// Default bound of the SSH connections not yet authenticated.

@@ -38,6 +38,7 @@ use crate::error::TunnelError;
 use crate::ids::Uuid;
 use crate::limits::Limits;
 use crate::link::{Clock, SystemClock};
+use crate::transport::ChannelRecv;
 use crate::tunnel::{check_protocol, peer_certificate, read_frame, within};
 
 /// Application protocol of the enrolment listener.
@@ -415,7 +416,8 @@ async fn exchange(conn: &Connection, params: &EnrollParams<'_>) -> Result<Enroll
         .ok_or(TunnelError::NoClientCertificate)?;
     let lost = |e: quinn::WriteError| TunnelError::ConnectionLost(e.to_string());
     // The core opens the stream and sends the challenge.
-    let (mut send, mut recv) = conn.accept_bi().await.map_err(TunnelError::from)?;
+    let (mut send, recv) = conn.accept_bi().await.map_err(TunnelError::from)?;
+    let mut recv = ChannelRecv::Quic(recv);
     let challenge = decode_server(&read_frame(&mut recv, MAX_ENROLL_MESSAGE).await?)?;
     let EnrollServer::Challenge { nonce, .. } = challenge else {
         return Err(invalid("défi attendu"));
@@ -940,7 +942,8 @@ impl EnrollmentService {
     /// than a well-formed request is refused (`TUN-E010`).
     async fn serve(&self, conn: &Connection) -> Result<Outcome, TunnelError> {
         let lost = |e: quinn::WriteError| TunnelError::ConnectionLost(e.to_string());
-        let (mut send, mut recv) = conn.open_bi().await.map_err(TunnelError::from)?;
+        let (mut send, recv) = conn.open_bi().await.map_err(TunnelError::from)?;
+        let mut recv = ChannelRecv::Quic(recv);
         let nonce =
             ostena_crypto::rand::array::<32>().map_err(|e| TunnelError::Io(e.to_string()))?;
         let challenge = EnrollServer::Challenge {
@@ -1081,6 +1084,7 @@ pub mod testing {
         QuicClientConfig, SocketAddr, TrustAnchor, TunnelError, VarInt, decode_server, read_frame,
         tls, within,
     };
+    use crate::transport::ChannelRecv;
 
     /// Connects to an enrolment listener offering `alpn`, waits for the
     /// challenge and sends `payload` as the request frame; returns the core
@@ -1109,7 +1113,8 @@ pub mod testing {
                 .map_err(|e| TunnelError::Config(e.to_string()))?
                 .await
                 .map_err(TunnelError::from)?;
-            let (mut send, mut recv) = conn.accept_bi().await.map_err(TunnelError::from)?;
+            let (mut send, recv) = conn.accept_bi().await.map_err(TunnelError::from)?;
+            let mut recv = ChannelRecv::Quic(recv);
             decode_server(&read_frame(&mut recv, MAX_ENROLL_MESSAGE).await?)?;
             let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
             let mut frame = len.to_be_bytes().to_vec();

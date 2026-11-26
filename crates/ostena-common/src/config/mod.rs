@@ -30,7 +30,7 @@ pub use self::core::{
 };
 pub use agent::{
     AgentConfig, AgentSessionsConfig, AgentSshConfig, InfrastructureEndpoint, SessionBounds,
-    SshPaths,
+    SshPaths, TunnelTransport,
 };
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{

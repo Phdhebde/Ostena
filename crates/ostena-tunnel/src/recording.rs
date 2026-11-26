@@ -7,11 +7,11 @@
 //! connection. If the core stops the stream (malformed, limit, storage
 //! failure) or the connection is lost, the pump drops the queue, and the
 //! server, which watches it, cuts the session. Nothing is buffered beyond
-//! the queue and the QUIC window, nothing is written to the agent's disk.
+//! the queue and the stream window (QUIC or TCP multiplexer), nothing is
+//! written to the agent's disk.
 
 use std::time::Duration;
 
-use quinn::VarInt;
 use tokio::sync::mpsc;
 
 use crate::error::TunnelError;
@@ -84,7 +84,7 @@ pub async fn pump_with(
                 let written =
                     tokio::time::timeout(write_timeout, channel.send.write_all(&frame)).await;
                 let Ok(written) = written else {
-                    let _ = channel.send.reset(VarInt::from_u32(RESET_STALLED));
+                    let _ = channel.send.reset(RESET_STALLED);
                     return Err(lost("le core ne lit plus le transcript".into()));
                 };
                 written.map_err(|e| lost(e.to_string()))?;
@@ -104,6 +104,6 @@ pub async fn pump_with(
 /// Stops a transcript stream received by the core, with
 /// [`STOP_REFUSED`]: the agent cuts the session.
 pub fn refuse(channel: &mut Channel) {
-    let _ = channel.recv.stop(VarInt::from_u32(STOP_REFUSED));
+    let _ = channel.recv.stop(STOP_REFUSED);
     let _ = channel.send.finish();
 }

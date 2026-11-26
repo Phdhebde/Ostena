@@ -25,7 +25,8 @@ use crate::control::{AgentMessage, CoreMessage};
 use crate::error::TunnelError;
 use crate::limits::Limits;
 use crate::renewal;
-use crate::tunnel::{ALPN, AgentConfig, AgentTunnel, Hello, connect};
+use crate::transport::{Transport, TransportMode};
+use crate::tunnel::{ALPN, AgentConfig, AgentTunnel, Hello, connect_with};
 
 /// Reconnection delays: full jitter (a random delay between zero and the
 /// exponential bound), so that agents cut off together do not come back
@@ -183,6 +184,8 @@ pub struct LinkParams {
     pub root: TrustAnchor,
     /// Hello content.
     pub hello: Hello,
+    /// Transport to dial: `auto` (QUIC, then TCP), `quic` or `tcp`.
+    pub transport: TransportMode,
     /// Bounds.
     pub limits: Limits,
     /// Reconnection delays.
@@ -469,11 +472,15 @@ async fn run(
                 set(&status, |s| {
                     s.state = LinkState::Connected {
                         since: params.clock.now(),
-                        transport: "quic",
+                        transport: tunnel.transport().as_str(),
                     };
                     s.connections += 1;
                 });
-                tracing::info!(event = "agent.core_connected", core = %params.core_address);
+                tracing::info!(
+                    event = "agent.core_connected",
+                    core = %params.core_address,
+                    transport = tunnel.transport().as_str()
+                );
                 if let Ok(mut c) = current.lock() {
                     *c = Some(tunnel.clone());
                 }
@@ -542,11 +549,12 @@ async fn open(
         server_name,
         tls: tls::client_config(&params.root, Some(&identity), &[ALPN])
             .map_err(|e| TunnelError::Config(e.to_string()))?,
+        transport: Transport::Quic,
         limits: params.limits,
         hello: params.hello.clone(),
     };
     drop(identity);
-    let (tunnel, _) = connect(&config).await?;
+    let (tunnel, _) = connect_with(&config, params.transport).await?;
     Ok((Arc::new(tunnel), certificate))
 }
 

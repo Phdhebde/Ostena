@@ -1,10 +1,11 @@
 # ADR-0008 : Tunnel entre l'agent et le core, et enrôlement
 
-- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (lot L2, PR 3b). La reconnexion et le repli TCP viendront dans les PR suivantes. Les messages de l'accès SSH natif sont implémentés côté agent et dans le core de test (jalon M1, PR 4) ; leur traitement par le core viendra à la PR 5 du jalon M1.
+- **Statut** : Accepté en partie. Le transport, TLS, le multiplexage, les bornes, le heartbeat, les messages de contrôle et la PKI à deux niveaux sont décidés et implémentés (PR 1, 2 et 3a du lot L2, partie 2). La protection au repos de la clé de la CA est décidée et sera implémentée avec le core. L'enrôlement, le renouvellement et la révocation sont implémentés (lot L2, PR 3b). La reconnexion (backoff borné avec gigue complète, état dans `ostena agent status`) est implémentée (lot L2). Le repli TLS 1.3 sur TCP, avec son multiplexeur et le mode `auto`, est implémenté (jalon M2, PR 2a et 2b). La grâce qui garde les sessions SSH pendant une coupure courte viendra à la PR 2c. Les messages de l'accès SSH natif sont implémentés côté agent et dans le core de test (jalon M1, PR 4) ; leur traitement par le core viendra à la PR 5 du jalon M1.
 - **Date** : 2026-11-11
 - **Révision** : 2026-11-15, messages de l'accès SSH natif et `TUN-E030` (jalon M1, PR 4)
 - **Révision** : 2026-11-25, autorités d'hôtes dans `ssh_trust`, liaison du grant exigée par l'agent (jalon M1, PR 5a)
 - **Révision** : 2026-11-25, classe de flux `enregistrement` pour les transcripts, quatre flux par session (jalon M1, PR 8, ADR-0016)
+- **Révision** : 2026-11-26, repli TLS 1.3 sur TCP : multiplexeur, écoute TCP du core, mode `auto` et `tunnel.fallback` (jalon M2, PR 2a et 2b)
 
 ## Contexte
 
@@ -23,11 +24,39 @@ Il doit résister aux coupures et rester borné en mémoire. Les algorithmes son
 - des priorités d'envoi par flux ;
 - un contrôle de flux natif.
 
-**Le repli** (lot L2, PR 5) passe par TLS 1.3 sur TCP avec un **multiplexeur maison minimal**, et non par HTTP/2 :
+**Le repli** (jalon M2, PR 2a et 2b) passe par TLS 1.3 sur TCP avec un **multiplexeur maison minimal** (`ostena_tunnel::mux`), et non par HTTP/2 :
 - le mTLS va de bout en bout, donc HTTP/2 n'apporte rien pour traverser un pare-feu ou un proxy ;
 - son ordonnanceur interne empêcherait la priorité stricte des entrées.
 
-En mode `auto`, l'agent tente QUIC et lance TCP en parallèle s'il n'a pas de réponse en 1 s. Le repli est journalisé (`tunnel.fallback`). C'est une rétrogradation de performance, pas de sécurité : TLS et les algorithmes sont les mêmes.
+**Choix du transport** (`[agent] transport`) :
+- `auto` (par défaut) : l'agent tente QUIC et lance TCP en parallèle s'il n'a pas de réponse en 1 s (`FALLBACK_AFTER`), ou aussitôt si QUIC échoue sur le chemin (connexion perdue, erreur locale, poignée de main interrompue). Le premier tunnel établi gagne, l'autre tentative est abandonnée. Un refus du pair (certificat, groupe, suite, ALPN) n'est pas retenté sur TCP : il y serait le même ;
+- `quic` ou `tcp` : un seul transport ;
+- le repli est journalisé (`tunnel.fallback`, avertissement) à chaque connexion qui l'utilise : QUIC est retenté à chaque reconnexion ;
+- `ostena agent status` affiche le transport en cours (« connecté (TCP) »).
+
+C'est une rétrogradation de performance, pas de sécurité : la configuration TLS est la même (`ostena-crypto::tls`, `SecP256r1MLKEM768` seul, `TLS_AES_256_GCM_SHA384` seule), l'ALPN aussi (`ostena-tunnel/1`). Le core écoute en TCP **sur le même port** que QUIC (8443 par défaut) : l'agent n'a qu'une adresse du core. Le core mène au plus 32 poignées de main TCP à la fois ; au-delà, les connexions attendent.
+
+**Le multiplexeur** reprend le modèle de QUIC, en plus simple :
+- **trames** : un en-tête de 8 octets (type, drapeaux nuls, longueur sur 16 bits, flux sur 32 bits), puis 16 Kio de données au plus. Douze types : `SETTINGS`, `OPEN`, `DATA`, `FIN`, `RESET`, `STOP`, `CREDIT`, `FIN_ACK`, `MAX_STREAMS`, `PING`, `PONG`, `CLOSE` ;
+- **mêmes flux** : le flux de contrôle d'abord, ouvert par l'agent, puis jusqu'à quatre flux par session avec leur en-tête de 18 octets. L'agent ouvre les flux impairs, le core les pairs, chacun le suivant de son côté ;
+- **priorités strictes** : l'écrivain sert toujours la priorité la plus haute qui a quelque chose à envoyer (mêmes valeurs qu'en QUIC), à tour de rôle entre égaux, une trame de 16 Kio au plus à la fois. Une frappe attend donc au plus une trame de transfert, plus le lot en cours d'écriture (32 Kio) ;
+- **contrôle de flux de bout en bout** : fenêtres par flux et par connexion, celles de `Limits` (256 Kio et 8 Mio). Un écrivain ne met en file que le crédit accordé par le pair, qui ne le renouvelle (`CREDIT`) qu'une fois les octets lus par l'application. Les tampons restent donc bornés comme en QUIC, et la contre-pression remonte jusqu'à la fenêtre TCP de la cible ;
+- **limite de flux** : chaque côté annonce dans `SETTINGS` le nombre de flux que le pair peut ouvrir (`Limits::max_streams`), puis le relève (`MAX_STREAMS`) à chaque flux fermé des deux côtés. Un flux de plus attend ;
+- **bornes et vivacité** : `PING` toutes les 5 s (`keep_alive`), connexion déclarée perdue après 15 s sans trame (`TUN-E013`), en plus du heartbeat applicatif ;
+- **fermeture** : `CLOSE` porte le code et le message de l'erreur (200 octets au plus), comme la trame de fermeture de QUIC : l'agent reçoit le code du core (`TUN-E005` à la révocation, par exemple) ;
+- **arrêt et réinitialisation** : `STOP` et `RESET` portent un code applicatif, `FIN_ACK` dit que le pair a reçu toutes les données et la fin (l'équivalent de l'accusé QUIC qu'attend le flux d'enregistrement, ADR-0016).
+
+**Toute trame reçue est une entrée non fiable.** Le décodeur vérifie l'en-tête (type connu, drapeaux nuls, longueur permise pour le type, flux nul ou non selon le type) avant d'attendre la charge : une longueur forgée ne fait jamais tamponner plus d'une trame. L'état refuse ensuite toute violation (`TUN-E010`, la connexion est fermée avec ce code) : première trame autre que `SETTINGS`, paramètres hors des bornes de `Limits`, ouverture hors séquence ou au-delà de la limite, données sur un flux jamais ouvert ou après sa fin, dépassement d'une fenêtre, crédit nul, limite de flux en baisse, `FIN_ACK` d'une fin non envoyée. Une autre version donne `TUN-E011`. Des trames tardives pour un flux déjà oublié sont ignorées (leurs données rendent leur crédit à la connexion). Cible `cargo-fuzz` : `tunnel_mux_decode` (décodeur et état, avec un corpus rejoué par les tests).
+
+**Codes sur TCP.** En QUIC, la raison d'un refus TLS voyage dans la trame de fermeture ; sur TCP, seule l'alerte TLS arrive au pair. Les codes restent les mêmes des deux côtés, sauf trois cas :
+
+| Refus | Côté qui le détecte | Ce que voit l'autre côté sur TCP |
+|---|---|---|
+| groupe `SecP256r1MLKEM768` absent (`TUN-E001`) | core | `TUN-E002` (alerte `handshake_failure`) |
+| registre du core illisible (`TUN-E029`) | core | `TUN-E016` (alerte `bad_certificate`) |
+| certificat du core non émis par la racine (`TUN-E017`) | agent | `TUN-E016` |
+
+Le côté qui détecte le refus journalise toujours le code exact.
 
 **QUIC Initial.** QUIC protège ses paquets *Initial* avec AES-128-GCM et des clés dérivées d'un sel public et de l'identifiant de connexion (RFC 9001 § 5.2).
 - Cela ne cache rien à un observateur : ces paquets ne portent que le début de la poignée de main.
@@ -79,12 +108,12 @@ Le flux d'enregistrement passe avant l'affichage et le transfert : une sortie n'
 - **Détection de coupure** :
   - keep-alive QUIC toutes les 5 s, délai d'inactivité de 15 s (`TUN-E013`) ;
   - **heartbeat applicatif** sur le flux de contrôle : Ping toutes les 10 s au plus (l'intervalle est annoncé par le core dans `HelloAck`), et pair déclaré muet sans Pong pendant 30 s (`TUN-E012`). Il détecte un core dont QUIC répond mais dont l'application est bloquée.
-- **Reconnexion** (`ostena_tunnel::link::AgentLink`, démarré avec l'agent) :
+- **Reconnexion** (`ostena_tunnel::link::AgentLink`, démarré avec l'agent, quel que soit le transport) :
   - backoff exponentiel de 1 s à 60 s, avec une **gigue complète** : un délai tiré au hasard entre zéro et la borne, pour que des agents coupés ensemble ne reviennent pas ensemble ;
   - la séquence repart de zéro après une connexion restée stable 60 s ;
   - l'adresse du core est résolue à chaque tentative ;
   - la clé et le certificat sont **relus à chaque connexion**, si bien qu'un certificat renouvelé sert dès la suivante ;
-  - l'état est partagé avec le plan de contrôle : `ostena agent status` affiche « connecté (QUIC) depuis N s, RTT … » ou « non connecté, nouvelle tentative dans N s (code : cause) », et l'échéance du certificat.
+  - l'état est partagé avec le plan de contrôle : `ostena agent status` affiche « connecté (QUIC) depuis N s, RTT … » (ou « (TCP) » ; sur TCP, le RTT est mesuré par les `PING` du multiplexeur) ou « non connecté, nouvelle tentative dans N s (code : cause) », et l'échéance du certificat.
 - **Démarrage** : les noms des composants Ostena sont résolus **avant** le lien. En production, un nom introuvable refuse le démarrage (`CFG-P010`). Les noms sont résolus de nouveau toutes les 5 minutes ; un échec garde les adresses précédentes, et l'union garde les anciennes adresses une période de plus. Sans `tls_core_ca` (développement), le lien n'est pas démarré et `status` le dit.
 - **État de l'agent** : la clé, le certificat et le journal anti-rejeu sont sur disque. La politique et le jeu de clés sont repoussés par le core à chaque connexion. Les sessions en cours sont fermées à la coupure (v1).
 
@@ -362,12 +391,14 @@ En développement, les trois sont journalisées et acceptées.
 | `TUN-E029` | registre des agents (ou magasin des jetons) du core illisible : refus plutôt que copie périmée (ADR-0011) |
 | `TUN-E030` | confiance SSH poussée par le core refusée (version inférieure à celle appliquée, ou même version avec un autre contenu) |
 
-Événements : `tunnel.connected`, `tunnel.refused`, `tunnel.message_refused` ; côté agent : `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`, `agent.identity_rotated`, `agent.renewal_impossible`, `tunnel.renewal_overdue` (avertissement, répété chaque heure).
+Événements : `tunnel.connected` (avec le transport), `tunnel.refused`, `tunnel.message_refused`, `tunnel.accept_failed` (écoute TCP du core) ; côté agent : `tunnel.fallback` (avertissement : repli sur TCP, et pourquoi), `agent.core_connected`, `agent.core_disconnected` (code, délai avant la tentative suivante), `agent.core_link_disabled`, `agent.renewal_requested`, `agent.certificate_renewed`, `agent.renewal_failed`, `agent.infrastructure_refreshed`, `agent.infrastructure_unresolved`, `agent.identity_rotated`, `agent.renewal_impossible`, `tunnel.renewal_overdue` (avertissement, répété chaque heure).
 
 ## Conséquences
 
 - **Latence ajoutée** mesurée par `cargo bench -p ostena-tunnel` (aller-retour de 64 octets sur un canal interactif, comparé à TCP en boucle locale) : **22 µs au p99 sous Windows 11** et **140 µs au p99 sous Linux dans un conteneur Docker** (machine virtuelle WSL2, plus bruitée), pour un objectif indicatif de 1 ms. Le banc est affiché en CI sans seuil bloquant (ADR-0005).
+- **Latence du repli TCP**, même banc (cas `round_trip_64_tcp`), le 2026-11-26 sous Linux (machine partagée à 4 cœurs, boucle locale) : **81 µs ajoutés au p99** (20 µs au p50), contre **21 µs** (14 µs au p50) pour QUIC sur la même machine. Le repli reste très en deçà de l'objectif de 1 ms ; l'écart vient surtout de la tâche d'écriture et du chiffrement TLS par lot. Sur un réseau avec pertes, TCP ajoute en plus le blocage en tête de ligne entre flux, que le banc en boucle locale ne mesure pas.
 - **Le core de test** est derrière la fonctionnalité `testing`. `cargo xtask check-release` échoue si elle est activée dans le binaire de release ou si le binaire contient son marqueur ; les jobs de build le vérifient.
+- **Repli TCP** : `tokio-rustls` (déjà lié au core et à l'agent pour l'API de connexion, ADR-0015) est autorisé dans `ostena-tunnel` ; il ne fait que porter la configuration d'`ostena-crypto::tls`. Aucune nouvelle crate. Le pare-feu du core doit ouvrir le port 8443 en TCP en plus d'UDP.
 - **Nouvelle dépendance** : `quinn`, avec `quinn-proto`, `quinn-udp`, `socket2` et `rand` (identifiants de connexion, rien de cryptographique). `deny.toml` réserve `quinn` à `ostena-tunnel`.
 - **Cible wasm32 retirée de `cargo deny`** : `quinn-proto` dépend de `ring` sous wasm32. `ostena-frame`, seule crate wasm, n'a aucune dépendance. Il faudra remettre cette cible, ciblée, avec `ostena-web-client`.
 - **Windows Server 2016** : la pile UDP ancienne n'est pas couverte en CI. L'essai S5 vérifie le tunnel QUIC et le repli TCP (fiche d'installation, lot L2, PR 6).

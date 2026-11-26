@@ -39,6 +39,7 @@ use crate::ids::Uuid;
 use crate::limits::Limits;
 use crate::link::{Clock, SystemClock};
 use crate::renewal;
+use crate::transport::Transport;
 use crate::tunnel::{ALPN, AgentConfig, Channel, CoreListener, CoreTunnel, Hello};
 
 /// Text present in any binary that links the test core.
@@ -99,6 +100,10 @@ impl Registry {
 
 /// How the test core behaves.
 #[derive(Debug, Clone, Copy, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent knobs of the test core"
+)]
 pub struct Behaviour {
     /// Stop answering heartbeats once connected (QUIC stays up).
     pub mute: bool,
@@ -108,6 +113,9 @@ pub struct Behaviour {
     /// Accept transcript streams but never read them, as a core that no
     /// longer reads.
     pub stall_recordings: bool,
+    /// Drop QUIC connection attempts unanswered, as a firewall that blocks
+    /// UDP: only the TCP fallback gets through.
+    pub udp_blocked: bool,
 }
 
 /// What the test inventory answers for a granted resource.
@@ -398,11 +406,16 @@ impl TestCore {
             &[ALPN],
         )
         .map_err(|e| TunnelError::Config(e.to_string()))?;
-        let listener = Arc::new(CoreListener::bind(
-            (Ipv4Addr::LOCALHOST, 0).into(),
-            tls.clone(),
-            limits,
-        )?);
+        // QUIC takes a free UDP port, TCP the same port number: retry on the
+        // rare collision with a TCP port already taken.
+        let mut bound = CoreListener::bind((Ipv4Addr::LOCALHOST, 0).into(), tls.clone(), limits);
+        for _ in 0..10 {
+            if bound.is_ok() {
+                break;
+            }
+            bound = CoreListener::bind((Ipv4Addr::LOCALHOST, 0).into(), tls.clone(), limits);
+        }
+        let listener = Arc::new(bound?);
         let addr = listener.local_addr()?;
         let issuer = Arc::new(
             IssuingAuthority::from_parts(
@@ -547,6 +560,7 @@ impl TestCore {
             server_name: "localhost".into(),
             tls: tls::client_config(&self.trust_anchor(), Some(identity), &[ALPN])
                 .map_err(|e| TunnelError::Config(e.to_string()))?,
+            transport: Transport::Quic,
             limits,
             hello: Hello {
                 agent_version: "test".into(),
@@ -607,6 +621,9 @@ impl TestCore {
     }
 
     fn listen(&self, listener: Arc<CoreListener>) {
+        if self.behaviour.udp_blocked {
+            listener.drop_quic_for_tests();
+        }
         let task = tokio::spawn(serve(
             listener.clone(),
             self.registry.clone(),

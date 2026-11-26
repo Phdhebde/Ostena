@@ -226,8 +226,9 @@ fn bench_ssh() -> Result<()> {
         .lines()
         .map(|l| bench::parse_line(l).ok_or_else(|| format!("unreadable bench line: {l}")))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    if results.len() != 3 {
-        return Err(format!("expected 3 bench results, got {}", results.len()).into());
+    // relay (round trip, session setup), tunnel over QUIC and over TCP.
+    if results.len() != 4 {
+        return Err(format!("expected 4 bench results, got {}", results.len()).into());
     }
     let commit = std::env::var("GITHUB_SHA").ok();
     let summary = bench::markdown(&results, commit.as_deref());
