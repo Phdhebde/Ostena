@@ -171,4 +171,23 @@ mod tests {
             "{text}"
         );
     }
+
+    #[test]
+    fn summary_shows_the_tcp_fallback() {
+        let tcp = BenchResult {
+            bench: "tunnel".into(),
+            case: "round_trip_64_tcp".into(),
+            through_p99_us: 176,
+            ..parse_line(LINE).unwrap()
+        };
+        let text = markdown(&[tcp], None);
+        assert!(
+            text.contains("| Tunnel agent-core en repli TCP, aller-retour 64 octets | 3000 |"),
+            "{text}"
+        );
+        assert!(
+            text.contains("| 0.120 / 0.081 | ajout p99 < 1 ms (indicatif) | atteint |"),
+            "{text}"
+        );
+    }
 }
