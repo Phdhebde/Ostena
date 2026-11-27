@@ -179,6 +179,19 @@ event_kinds! {
     UserGroupMemberAdded => "user_group.member_added",
     /// A user left a group of users.
     UserGroupMemberRemoved => "user_group.member_removed",
+    /// An access asked by a browser session was granted: a grant issued
+    /// for the browser gateway (ADR-0020).
+    AccessWebGranted => "access.web_granted",
+    /// An access asked by a browser session was refused (code, reason).
+    AccessWebRefused => "access.web_refused",
+    /// A grant presented by its browser session opened the WebSocket of the
+    /// gateway (ADR-0020): granting, with the marking of the grant.
+    GatewayOpened => "gateway.opened",
+    /// A WebSocket of the gateway refused after its session was
+    /// authenticated (grant, agent).
+    GatewayRefused => "gateway.refused",
+    /// A WebSocket of the gateway ended (reason, bytes in each direction).
+    GatewayClosed => "gateway.closed",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -598,7 +611,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 66);
+        assert_eq!(names.len(), 71);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

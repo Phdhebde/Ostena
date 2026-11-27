@@ -75,6 +75,10 @@ pub enum Handler {
     ListLoginSessions,
     /// Revokes a login session.
     RevokeLoginSession,
+    /// Decides an access and issues a grant for the browser gateway.
+    Access,
+    /// The WebSocket of the browser gateway.
+    Gateway,
 }
 
 /// One route.
@@ -170,6 +174,18 @@ pub static ROUTES: &[Route] = &[
             Handler::RevokeLoginSession,
         )
     },
+    route(
+        Verb::Post,
+        "/api/v1/access",
+        Access::Session,
+        Handler::Access,
+    ),
+    route(
+        Verb::Get,
+        "/api/v1/gateway",
+        Access::Session,
+        Handler::Gateway,
+    ),
 ];
 
 /// The typed parameters of a matched path.

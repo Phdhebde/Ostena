@@ -426,3 +426,161 @@ fn policy_of_another_group_is_refused() {
     );
     assert_eq!(state.versions().policy, None);
 }
+
+/// Echoes the browser stream: what the core sends comes back, counted as
+/// sent to and received from the target.
+struct Echo;
+
+impl ostena_tunnel::browser::BrowserDriver for Echo {
+    fn serves(&self, protocol: Protocol) -> bool {
+        protocol == Protocol::Ssh
+    }
+
+    async fn run(
+        &self,
+        _: ostena_tunnel::gateway::Session,
+        mut channel: ostena_tunnel::Channel,
+    ) -> ostena_tunnel::browser::Ended {
+        let mut buf = vec![0u8; 4096];
+        let mut bytes = 0u64;
+        while let Ok(Some(n)) = channel.recv.read(&mut buf).await {
+            bytes += n as u64;
+            if channel.send.write_all(&buf[..n]).await.is_err() {
+                break;
+            }
+        }
+        let _ = channel.send.finish();
+        ostena_tunnel::browser::Ended {
+            reason: "fin du flux navigateur".into(),
+            bytes_to_target: bytes,
+            bytes_from_target: bytes,
+        }
+    }
+}
+
+/// Serves the browser streams the core opens towards `gateway` with
+/// `driver`, each with the replay store `store`.
+fn serve_browsers<D: ostena_tunnel::browser::BrowserDriver>(
+    gateway: &Arc<Gateway>,
+    driver: D,
+    store: Arc<MemoryReplayStore>,
+) {
+    let mut incoming = gateway.link().take_incoming().unwrap();
+    let gateway = gateway.clone();
+    let driver = Arc::new(driver);
+    tokio::spawn(async move {
+        while let Some((_, class, channel)) = incoming.recv().await {
+            assert_eq!(class, ostena_tunnel::StreamClass::Interactive);
+            let (gateway, driver, store) = (gateway.clone(), driver.clone(), store.clone());
+            tokio::spawn(async move {
+                ostena_tunnel::browser::serve(&gateway, channel, &*store, &*driver, now()).await;
+            });
+        }
+    });
+}
+
+#[test]
+fn a_browser_stream_opens_a_session_and_relays() {
+    use ostena_tunnel::browser::Answer;
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("browser");
+        let gateway = Arc::new(agent(&core, &dir, "a", "a.version", allow(&["10.0.0.0/8"])).await);
+        push_all(&core, &gateway, allow(&["10.0.0.0/8"])).await;
+        let store = Arc::new(MemoryReplayStore::new());
+        serve_browsers(&gateway, Echo, store.clone());
+
+        let grant = core
+            .issue_grant(group(), Protocol::Ssh, "10.20.0.5", 22)
+            .unwrap();
+        let (answer, mut channel) = core.open_browser(&grant).await.unwrap();
+        let Answer::Opened { session } = answer else {
+            panic!("{answer:?}");
+        };
+        // Frames go through in both directions, in order.
+        let sent: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        channel.send.write_all(&sent).await.unwrap();
+        let mut back = vec![0u8; sent.len()];
+        channel.recv.read_exact(&mut back).await.unwrap();
+        assert_eq!(back, sent);
+        // Round trips on the stream alone (core → agent → core), the part
+        // of the tunnel in the gateway latency.
+        let mut rtts = Vec::with_capacity(500);
+        let mut small = [0u8; 24];
+        for i in 0..500u32 {
+            let started = std::time::Instant::now();
+            let sent = [(i % 251) as u8; 24];
+            channel.send.write_all(&sent).await.unwrap();
+            channel.recv.read_exact(&mut small).await.unwrap();
+            rtts.push(started.elapsed());
+            assert_eq!(small, sent);
+        }
+        rtts.sort();
+        eprintln!(
+            "browser_stream.rtt: 500 allers-retours core → agent → core, p50 {} µs, p99 {} µs",
+            rtts[250].as_micros(),
+            rtts[495].as_micros()
+        );
+        // The core finishes its half: the session ends and is reported.
+        channel.send.finish().unwrap();
+        let mut rest = [0u8; 1];
+        assert!(matches!(channel.recv.read(&mut rest).await, Ok(None)));
+        let reported = until(&gateway, |_| {
+            core.sessions_closed()
+                .iter()
+                .any(|(s, r)| *s == session.to_string() && r == "fin du flux navigateur")
+        })
+        .await;
+        assert!(reported, "{:?}", core.sessions_closed());
+
+        // The same grant again: refused by the store, with its code.
+        let (answer, _) = core.open_browser(&grant).await.unwrap();
+        assert_eq!(
+            answer,
+            Answer::Refused {
+                code: "GRT-E010".into()
+            }
+        );
+        // A protocol the agent does not serve: GTW-E006.
+        let grant = core
+            .issue_grant(group(), Protocol::Rdp, "10.20.0.6", 3389)
+            .unwrap();
+        let (answer, _) = core.open_browser(&grant).await.unwrap();
+        assert_eq!(
+            answer,
+            Answer::Refused {
+                code: "GTW-E006".into()
+            }
+        );
+    });
+}
+
+#[test]
+fn an_agent_without_browser_driver_refuses_and_burns_the_grant() {
+    use ostena_tunnel::browser::{Answer, NoDriver};
+    run(async {
+        let core = TestCore::start(Limits::default(), Behaviour::default()).unwrap();
+        let dir = dir("nodriver");
+        let gateway = Arc::new(agent(&core, &dir, "a", "a.version", allow(&["10.0.0.0/8"])).await);
+        push_all(&core, &gateway, allow(&["10.0.0.0/8"])).await;
+        let store = Arc::new(MemoryReplayStore::new());
+        serve_browsers(&gateway, NoDriver, store.clone());
+        let grant = core
+            .issue_grant(group(), Protocol::Ssh, "10.20.0.5", 22)
+            .unwrap();
+        let (answer, _) = core.open_browser(&grant).await.unwrap();
+        assert_eq!(
+            answer,
+            Answer::Refused {
+                code: "GTW-E006".into()
+            }
+        );
+        // Consumed by the agent, never sent to the core.
+        let again = gateway
+            .open_session(&grant, now(), &*store)
+            .await
+            .unwrap_err();
+        assert_eq!(again.code(), "GRT-E010");
+        assert_eq!(core.sessions_closed(), Vec::new());
+    });
+}

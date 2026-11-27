@@ -1443,6 +1443,7 @@ dependencies = [
  "ostena-scope",
  "ostena-ssh",
  "ostena-tunnel",
+ "ostena-ws",
 ]
 
 [[package]]
@@ -1545,6 +1546,10 @@ dependencies = [
  "tokio-rustls",
  "tracing",
 ]
+
+[[package]]
+name = "ostena-ws"
+version = "0.0.0"
 
 [[package]]
 name = "p256"

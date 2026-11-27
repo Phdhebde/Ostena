@@ -9,8 +9,8 @@
 use std::collections::BTreeSet;
 
 use ostena_common::api::web::{
-    Channel, ErrorBody, LoginSessionItem, LoginSessionList, ReauthenticateRequest, RevokeRequest,
-    Role, SessionInfo, SessionRequest,
+    AccessGrant, AccessProtocol, AccessRequest, Channel, ErrorBody, LoginSessionItem,
+    LoginSessionList, ReauthenticateRequest, RevokeRequest, Role, SessionInfo, SessionRequest,
 };
 use ostena_core::web::OPENAPI;
 use ostena_core::web::routes::{Access, ROUTES};
@@ -119,6 +119,11 @@ fn round_trip(name: &str, example: &Value) -> Value {
         }
         "RevokeRequest" => serde_json::to_value(RevokeRequest::parse(&bytes).unwrap()).unwrap(),
         "Error" => serde_json::to_value(ErrorBody::parse(&bytes).unwrap()).unwrap(),
+        "AccessRequest" => serde_json::to_value(AccessRequest::parse(&bytes).unwrap()).unwrap(),
+        "AccessGrant" => serde_json::to_value(AccessGrant::parse(&bytes).unwrap()).unwrap(),
+        "AccessProtocol" => {
+            serde_json::to_value(serde_json::from_slice::<AccessProtocol>(&bytes).unwrap()).unwrap()
+        }
         "Role" => serde_json::to_value(serde_json::from_slice::<Role>(&bytes).unwrap()).unwrap(),
         "Channel" => {
             serde_json::to_value(serde_json::from_slice::<Channel>(&bytes).unwrap()).unwrap()

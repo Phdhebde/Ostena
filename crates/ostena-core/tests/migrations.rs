@@ -320,9 +320,10 @@ fn reverting_identity_sources_keeps_directory_users_disabled() {
             .await
             .is_err()
         );
-        // Migration 9 goes: the directory user stays, disabled, as a local
-        // account; the local account is untouched.
-        assert_eq!(schema::revert(&owner, 8).await.unwrap(), [9]);
+        // Migration 9 goes (after the later ones): the directory user stays,
+        // disabled, as a local account; the local account is untouched.
+        let reverted = schema::revert(&owner, 8).await.unwrap();
+        assert_eq!(reverted.last(), Some(&9), "{reverted:?}");
         let users: Vec<(String, String)> =
             sqlx::query_as("SELECT name, state FROM app_user ORDER BY name")
                 .fetch_all(&owner)

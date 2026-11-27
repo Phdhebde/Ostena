@@ -45,7 +45,8 @@ use crate::identity::Directories;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
 use crate::transcripts::{self, Transcripts};
-use crate::web::pg::PgWebBackend;
+use crate::web::gateway::Relays;
+use crate::web::pg::{Agents, PgWebBackend, WebAccess};
 use crate::web::{WebListener, WebSettings};
 use crate::{login, pushes, rate};
 use ostena_crypto::hmac::HmacKey;
@@ -378,16 +379,45 @@ impl Tunnels {
     }
 }
 
+/// The connected agents by gateway group, for the web listener.
+struct Directory {
+    tunnels: Arc<Tunnels>,
+    cache: Arc<AgentCache>,
+}
+
+impl Agents for Directory {
+    fn pick(&self, group: Uuid) -> Option<Uuid> {
+        self.tunnels
+            .live()
+            .into_iter()
+            .filter_map(|(fp, tunnel)| {
+                let entry = self.cache.active(&fp)?;
+                (entry.group == group).then(|| (tunnel.open_channels(), entry.agent))
+            })
+            .min()
+            .map(|(_, agent)| agent)
+    }
+
+    fn tunnel(&self, agent: Uuid) -> Option<Arc<CoreTunnel>> {
+        self.tunnels
+            .live()
+            .into_iter()
+            .find_map(|(fp, tunnel)| (self.cache.active(&fp)?.agent == agent).then_some(tunnel))
+    }
+}
+
 struct Shared {
     store: PgStore,
     cache: Arc<AgentCache>,
     issuer: Arc<IssuingAuthority>,
     enrollment: EnrollmentService,
-    tunnels: Tunnels,
+    tunnels: Arc<Tunnels>,
+    /// The gateway sessions of the portal (ADR-0020).
+    relays: Arc<Relays>,
     certificate_lifetime: u64,
     limits: Limits,
     recorder: Arc<Recorder>,
-    grants: GrantAuthority,
+    grants: Arc<GrantAuthority>,
     ssh: Option<Arc<SshAuthorities>>,
     transcripts: Option<Arc<Transcripts>>,
     /// Asks for a replay of what lost notices would have applied.
@@ -473,10 +503,11 @@ fn identity_of(
 async fn start_login(
     config: &CoreConfig,
     keys: &Keys,
-    store: &PgStore,
+    shared: &Arc<Shared>,
     recorder: &Arc<Recorder>,
     identity: Option<Arc<crate::identity::Identity>>,
 ) -> Result<(Option<LoginListener>, Option<WebListener>), CoreError> {
+    let store = &shared.store;
     let Some(settings) = &config.login else {
         return Ok((None, None));
     };
@@ -517,7 +548,7 @@ async fn start_login(
         web.listen,
         tls,
         WebSettings::from_config(web),
-        Arc::new(PgWebBackend::new(authenticator)),
+        Arc::new(PgWebBackend::new(authenticator).with_access(web_access(shared))),
         attempts,
     )
     .await?;
@@ -547,6 +578,19 @@ impl std::fmt::Debug for RunningCore {
         f.debug_struct("RunningCore")
             .field("tunnel_addr", &self.tunnel_addr)
             .finish_non_exhaustive()
+    }
+}
+
+/// What the access decisions of the portal need: the grant key and the
+/// connected agents.
+fn web_access(shared: &Shared) -> WebAccess {
+    WebAccess {
+        grants: shared.grants.clone(),
+        agents: Arc::new(Directory {
+            tunnels: shared.tunnels.clone(),
+            cache: shared.cache.clone(),
+        }),
+        relays: shared.relays.clone(),
     }
 }
 
@@ -610,11 +654,12 @@ impl RunningCore {
             cache,
             issuer: keys.issuing.clone(),
             enrollment,
-            tunnels: Tunnels::default(),
+            tunnels: Arc::default(),
+            relays: Arc::default(),
             certificate_lifetime,
             limits,
             recorder: recorder.clone(),
-            grants,
+            grants: Arc::new(grants),
             ssh: keys.ssh.clone(),
             transcripts: keys.transcripts.clone(),
             resync: tokio::sync::Notify::new(),
@@ -632,8 +677,7 @@ impl RunningCore {
         )
         .await?;
         let identity = identity_of(keys, &shared.store, &recorder);
-        let (login, web) =
-            start_login(config, keys, &shared.store, &recorder, identity.clone()).await?;
+        let (login, web) = start_login(config, keys, &shared, &recorder, identity.clone()).await?;
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
         let notices = listen(shared.store.pool()).await?;
@@ -1580,6 +1624,11 @@ fn connected(shared: &Shared) -> Vec<(Uuid, Uuid, Arc<CoreTunnel>)> {
 /// Tells the connected agents that received a grant for `session` that it
 /// is revoked; those not connected are told when they connect.
 async fn apply_login_revocation(shared: Arc<Shared>, session: Uuid) {
+    // The gateway sessions of the portal end at once (ADR-0020).
+    let cut = shared.relays.cut(session);
+    if cut > 0 {
+        tracing::warn!(event = "gateway.cut", login_session = %session, sessions = cut);
+    }
     let agents = match login::agents_to_notify(shared.store.pool(), session).await {
         Ok(agents) => agents,
         Err(e) => {
