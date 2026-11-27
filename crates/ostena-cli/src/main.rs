@@ -240,6 +240,12 @@ enum CoreCommand {
         #[command(subcommand)]
         command: CoreAccessCommand,
     },
+    /// The portal embedded in this binary: checks every embedded file
+    /// against its SHA-256, then prints the digest of the manifest
+    /// (`SHA256SUMS`) and the manifest itself, to compare with a rebuild of
+    /// the portal from the sources (ADR-0020). Exit code 1 without a
+    /// portal or if a file differs.
+    PortalManifest,
 }
 
 #[cfg(target_os = "linux")]
@@ -1186,6 +1192,7 @@ fn run_core(command: CoreCommand) -> ExitCode {
                 core::audit_acknowledge_break(&config, seq)
             }
         },
+        CoreCommand::PortalManifest => core::portal_manifest(),
         command => run_core_inventory(command),
     }
 }
@@ -1265,7 +1272,8 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
         | CoreCommand::Migrate { .. }
         | CoreCommand::Db { .. }
         | CoreCommand::Agent { .. }
-        | CoreCommand::Audit { .. } => ExitCode::FAILURE,
+        | CoreCommand::Audit { .. }
+        | CoreCommand::PortalManifest => ExitCode::FAILURE,
     }
 }
 
