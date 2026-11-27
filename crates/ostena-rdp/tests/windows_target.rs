@@ -1,7 +1,15 @@
 //! The driver against a real Windows target: RDP enabled on the loopback
 //! of the Windows CI runner by `tests/rdp/windows-target.ps1` (NLA, Restricted
-//! Admin allowed, one local administrator with a random password, used by
-//! every mode: the agent logs its sessions off, ADR-0026).
+//! Admin allowed, SMB signing required, one local administrator with a
+//! random password, used by every mode: the agent logs its sessions off,
+//! ADR-0026).
+//!
+//! The target is known by a DNS name the script maps to 127.0.0.1 (hosts
+//! file): it is pinned by that name through the scope control, and the
+//! management channel of the sessions goes through the same check as in
+//! production. The runner belongs to no domain: Kerberos is impossible
+//! there, so the production mode is refused on the channel (`RDP-E022`)
+//! and the sessions are opened in development mode, NTLM admitted.
 //!
 //! Skipped without the `OSTENA_RDP_TARGET_*` variables; mandatory with
 //! `OSTENA_REQUIRE_RDP_TARGET`. The measured phases are printed, and
@@ -34,7 +42,7 @@ use ostena_rdp::driver::{
 };
 use ostena_rdp::target_sessions::{self, SessionState, TargetSession, ViewRequest, belongs_to};
 use ostena_session::{Driver, DriverConnection};
-use support::loopback;
+use support::scope;
 
 /// Session set up in less than 5 s (CLAUDE.md).
 const SETUP_BUDGET: Duration = Duration::from_secs(5);
@@ -111,7 +119,16 @@ fn driver_with(
             disconnected_sessions: sessions,
         }),
         Arc::new(Secrets(lab.clone())),
+        Arc::new(scope(&[lab.port])),
     )
+}
+
+/// The target pinned by its name, through the scope control.
+async fn pinned(lab: &Lab) -> ostena_scope::PinnedTarget {
+    scope(&[lab.port])
+        .pin(&lab.name, lab.port)
+        .await
+        .unwrap_or_else(|e| panic!("{} : {e}", e.code()))
 }
 
 fn driver(lab: &Lab, production: bool, password_delegation: bool) -> RdpDriver {
@@ -140,11 +157,12 @@ fn params(lab: &Lab, mode: RdpMode, sha256: &str) -> TargetParams {
 }
 
 /// The sessions of the account on the target, seen by the WTS API as the
-/// agent sees them (pinned address, credentials of the account).
+/// agent sees them (name of the target, credentials of the account).
 async fn account_sessions(lab: &Lab) -> Vec<TargetSession> {
     let request = ViewRequest {
         address: std::net::IpAddr::from([127, 0, 0, 1]),
-        target_name: Some(lab.name.clone()),
+        server: lab.name.clone(),
+        kerberos_required: false,
         account: lab.user.clone(),
         password: SecretString::from(lab.password.clone()),
     };
@@ -161,7 +179,7 @@ async fn account_sessions(lab: &Lab) -> Vec<TargetSession> {
         },
     )
     .await
-    .unwrap_or_else(|e| panic!("{} : {e}", e.code()))
+    .map_or_else(|e| panic!("{} : {e}", e.code()), |(sessions, _)| sessions)
 }
 
 /// Waits until the sessions of the account satisfy `done`, for 10 s at most.
@@ -216,7 +234,7 @@ async fn connect_and_hold_with(
     mode: RdpMode,
     title: &str,
 ) -> (ostena_rdp::driver::RdpConnection, Vec<TargetSession>) {
-    let pinned = loopback(lab.port).await;
+    let pinned = pinned(lab).await;
     let started = Instant::now();
     let connection = driver
         .connect(
@@ -267,17 +285,70 @@ async fn connect_and_hold(lab: &Lab, production: bool, mode: RdpMode, title: &st
     wait_sessions(lab, "session fermée à la fin", <[TargetSession]>::is_empty).await;
 }
 
-/// Production: Restricted Admin with NTLM, no password delegated.
+/// Development: Restricted Admin with NTLM, no password delegated.
 #[tokio::test]
-async fn production_restricted_admin_with_ntlm() {
+async fn development_restricted_admin_with_ntlm() {
     let Some(lab) = lab() else { return };
     connect_and_hold(
         &lab,
-        true,
+        false,
         RdpMode::RestrictedAdmin,
-        "Production : Restricted Admin + NTLM",
+        "Développement : Restricted Admin + NTLM",
     )
     .await;
+}
+
+/// ADR-0026 against the real target: the runner belongs to no domain, no
+/// Kerberos ticket can be had for `cifs/<name>`, and production refuses
+/// NTLM on the management channel, before any RDP connection.
+#[tokio::test]
+async fn production_refuses_ntlm_on_the_session_channel() {
+    let Some(lab) = lab() else { return };
+    let pinned = pinned(&lab).await;
+    let error = driver(&lab, true, false)
+        .connect(
+            &pinned,
+            params(&lab, RdpMode::RestrictedAdmin, &lab.sha256),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "RDP-E022", "{error}");
+    assert!(error.to_string().contains("AGT-E014"), "{error}");
+    assert_eq!(account_sessions(&lab).await, Vec::new());
+}
+
+/// ADR-0026 against the real target: the name of the channel must resolve,
+/// through the scope control, to the pinned address. A name mapped to
+/// another address, and a name that does not resolve, are refused.
+#[tokio::test]
+async fn the_session_channel_needs_the_name_of_the_pinned_address() {
+    let Some(lab) = lab() else { return };
+    let pinned = pinned(&lab).await;
+    for name in ["other.ostena.test", "absent.ostena.test"] {
+        let mut p = params(&lab, RdpMode::RestrictedAdmin, &lab.sha256);
+        p.session.target_name = Some(name.into());
+        let error = driver(&lab, false, false)
+            .connect(&pinned, p, Duration::from_secs(30))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "RDP-E021", "{name} : {error}");
+    }
+    assert_eq!(account_sessions(&lab).await, Vec::new());
+}
+
+/// ADR-0026 against the real target: the SMB signing probe reads that the
+/// target requires it (set by the script).
+#[tokio::test]
+async fn the_target_requires_smb_signing() {
+    let Some(_lab) = lab() else { return };
+    let required = target_sessions::smb_signing(
+        target_sessions::platform_control(),
+        std::net::IpAddr::from([127, 0, 0, 1]),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{} : {e}", e.code()));
+    assert!(required);
 }
 
 /// Development: the password delegated with NTLM (refused in production).
@@ -298,7 +369,7 @@ async fn development_password_delegation() {
 #[tokio::test]
 async fn production_refuses_delegation_with_ntlm() {
     let Some(lab) = lab() else { return };
-    let pinned = loopback(lab.port).await;
+    let pinned = pinned(&lab).await;
     let error = driver(&lab, true, true)
         .connect(
             &pinned,
@@ -315,9 +386,9 @@ async fn production_refuses_delegation_with_ntlm() {
 #[tokio::test]
 async fn wrong_fingerprint_is_refused_at_tls() {
     let Some(lab) = lab() else { return };
-    let pinned = loopback(lab.port).await;
+    let pinned = pinned(&lab).await;
     let wrong = "00".repeat(32);
-    let error = driver(&lab, true, false)
+    let error = driver(&lab, false, false)
         .connect(
             &pinned,
             params(&lab, RdpMode::RestrictedAdmin, &wrong),
@@ -353,7 +424,7 @@ async fn same_account_delegation_then_restricted_admin_gets_a_new_session() {
 
     let (second, during) = connect_and_hold_with(
         &lab,
-        driver(&lab, true, false),
+        driver(&lab, false, false),
         RdpMode::RestrictedAdmin,
         "Même compte (2/2) : Restricted Admin",
     )
@@ -399,7 +470,7 @@ async fn disconnected_session_is_logged_off_before_the_next_connection() {
 
     let (next, during) = connect_and_hold_with(
         &lab,
-        driver(&lab, true, false),
+        driver(&lab, false, false),
         RdpMode::RestrictedAdmin,
         "Connexion suivante : session déconnectée fermée avant",
     )

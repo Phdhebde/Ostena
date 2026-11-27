@@ -21,6 +21,12 @@
 //! holds one); at the end, the session the target opened is logged off
 //! instead of being left disconnected. `[rdp] disconnected_sessions =
 //! "keep"` skips both, logged at every session and refused in production.
+//!
+//! Their management channel (RPC over SMB) is opened by the DNS name of
+//! the target, checked through the scope control ([`TargetNames`]) to
+//! resolve to the pinned address; Kerberos is required on it unless the
+//! development mode and `ntlm_fallback` admit NTLM, and the target must
+//! require SMB signing (refused in production otherwise).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +50,8 @@ use crate::error::RdpError;
 use crate::profile::{StoredLicense, TargetProfile, client_identity, from_hex};
 use crate::session::{Counters, SessionEnd, SessionLoop};
 use crate::target_sessions::{
-    self, DISCONNECT_WAIT, LoggedOff, SessionControl, ViewRequest, after_session, before_session,
+    self, DISCONNECT_WAIT, LoggedOff, SessionControl, TargetNames, ViewRequest, after_session,
+    before_session,
 };
 
 /// Bounds of the desktop size requested.
@@ -255,6 +262,7 @@ impl std::fmt::Debug for TargetParams {
 pub struct RdpDriver {
     policy: Arc<RdpPolicy>,
     secrets: Arc<dyn SecretSource>,
+    names: Arc<dyn TargetNames>,
     control: Arc<dyn SessionControl>,
 }
 
@@ -267,13 +275,20 @@ impl std::fmt::Debug for RdpDriver {
 }
 
 impl RdpDriver {
-    /// A driver applying `policy`, reading secrets from `secrets`, driving
-    /// the Windows sessions of the targets with the mechanism of this
-    /// platform ([`target_sessions::platform_control`]).
-    pub fn new(policy: Arc<RdpPolicy>, secrets: Arc<dyn SecretSource>) -> Self {
+    /// A driver applying `policy`, reading secrets from `secrets`,
+    /// resolving the names of the targets through the scope control
+    /// (`names`, the `Scope` of the gateway group), driving the Windows
+    /// sessions of the targets with the mechanism of this platform
+    /// ([`target_sessions::platform_control`]).
+    pub fn new(
+        policy: Arc<RdpPolicy>,
+        secrets: Arc<dyn SecretSource>,
+        names: Arc<dyn TargetNames>,
+    ) -> Self {
         Self {
             policy,
             secrets,
+            names,
             control: target_sessions::platform_control(),
         }
     }
@@ -321,8 +336,15 @@ impl RdpDriver {
                 Ok(Some(Cleanup {
                     control: self.control.clone(),
                     secrets: self.secrets.clone(),
+                    names: self.names.clone(),
                     address,
-                    target_name: session.target_name.clone(),
+                    name: session
+                        .target_name
+                        .clone()
+                        .or_else(|| target.name().map(ToString::to_string)),
+                    server: None,
+                    production: self.policy.production,
+                    kerberos_required: self.policy.production || !self.policy.ntlm_fallback,
                     account: session.account.clone(),
                     label: label.to_owned(),
                 }))
@@ -402,23 +424,72 @@ impl RdpDriver {
 struct Cleanup {
     control: Arc<dyn SessionControl>,
     secrets: Arc<dyn SecretSource>,
+    names: Arc<dyn TargetNames>,
     address: std::net::IpAddr,
-    target_name: Option<String>,
+    /// DNS name of the target, from the inventory or the pinning.
+    name: Option<String>,
+    /// The name, once checked by [`Cleanup::prepare`].
+    server: Option<String>,
+    production: bool,
+    kerberos_required: bool,
     account: String,
     label: String,
 }
 
 impl Cleanup {
+    /// Checks the management channel before its first use: the name of
+    /// the target resolves to the pinned address through the scope
+    /// control, and the target requires SMB signing.
+    ///
+    /// # Errors
+    ///
+    /// [`RdpError::SessionChannel`], [`RdpError::SmbSigning`] (production),
+    /// [`RdpError::SessionCleanup`] when the target does not answer on SMB.
+    async fn prepare(&mut self) -> Result<(), RdpError> {
+        let server =
+            target_sessions::verify_name(self.names.as_ref(), self.name.as_deref(), self.address)
+                .await?;
+        if !target_sessions::smb_signing(self.control.clone(), self.address).await? {
+            if self.production {
+                return Err(RdpError::SmbSigning);
+            }
+            tracing::warn!(
+                event = "rdp.smb_signing_not_required",
+                target = self.label,
+                server = %server,
+                "la cible n'exige pas la signature SMB : canal de gestion des sessions exposé à \
+                 un relais (refusé en production)"
+            );
+        }
+        self.server = Some(server);
+        Ok(())
+    }
+
     fn request(&self) -> Result<ViewRequest, RdpError> {
+        let server = self
+            .server
+            .clone()
+            .ok_or_else(|| RdpError::SessionChannel("nom de la cible non vérifié".into()))?;
         Ok(ViewRequest {
             address: self.address,
-            target_name: self.target_name.clone(),
+            server,
+            kerberos_required: self.kerberos_required,
             account: self.account.clone(),
             password: self.secrets.password(&self.account)?,
         })
     }
 
-    fn logged(&self, done: &[LoggedOff], moment: &'static str) {
+    fn logged(&self, done: &[LoggedOff], kerberos: bool, moment: &'static str) {
+        if !kerberos {
+            tracing::warn!(
+                event = "rdp.session_channel_ntlm",
+                target = self.label,
+                server = self.server.as_deref().unwrap_or_default(),
+                moment,
+                "canal de gestion des sessions sans ticket Kerberos : NTLM admis \
+                 (développement, ntlm_fallback)"
+            );
+        }
         for s in done {
             tracing::info!(
                 event = "rdp.session_logged_off",
@@ -431,14 +502,16 @@ impl Cleanup {
         }
     }
 
-    /// Before a session: logs off the sessions of the account left on the
-    /// target, or refuses.
-    async fn before(&self) -> Result<Vec<LoggedOff>, RdpError> {
-        let done = target_sessions::run(self.control.clone(), self.request()?, |view, account| {
-            before_session(view, account)
-        })
-        .await?;
-        self.logged(&done, "before");
+    /// Before a session: checks the channel, then logs off the sessions of
+    /// the account left on the target, or refuses.
+    async fn before(&mut self) -> Result<Vec<LoggedOff>, RdpError> {
+        self.prepare().await?;
+        let (done, kerberos) =
+            target_sessions::run(self.control.clone(), self.request()?, |view, account| {
+                before_session(view, account)
+            })
+            .await?;
+        self.logged(&done, kerberos, "before");
         Ok(done)
     }
 
@@ -452,14 +525,14 @@ impl Cleanup {
                 after_session(view, account, id, DISCONNECT_WAIT, &std::thread::sleep)
             },
         );
-        let done = tokio::time::timeout(LOGOFF_DELAY, work)
+        let (done, kerberos) = tokio::time::timeout(LOGOFF_DELAY, work)
             .await
             .unwrap_or_else(|_| {
                 Err(RdpError::SessionCleanup(
                     "délai de fermeture de la session dépassé".into(),
                 ))
             })?;
-        self.logged(&done, "end");
+        self.logged(&done, kerberos, "end");
         Ok(done)
     }
 }
@@ -516,12 +589,12 @@ impl Driver for RdpDriver {
                     return Err(e);
                 }
             };
-            let before = cleanup.clone();
             // A panic in a dependency stays in this task (RDP-E099).
             let task = tokio::spawn(async move {
                 tokio::time::timeout(timeout, async move {
                     let started = Instant::now();
-                    let logged_off = match &before {
+                    let mut cleanup = cleanup;
+                    let logged_off = match &mut cleanup {
                         Some(c) => c.before().await?,
                         None => Vec::new(),
                     };
@@ -531,12 +604,12 @@ impl Driver for RdpDriver {
                         round_trips: 0,
                     };
                     let mut established = connect_any(&target, planned).await?;
-                    if before.is_some() {
+                    if cleanup.is_some() {
                         established.report.phases.insert(0, sessions);
                         established.report.sessions_logged_off =
                             logged_off.iter().map(|s| s.id).collect();
                     }
-                    Ok(established)
+                    Ok((established, cleanup))
                 })
                 .await
             });
@@ -546,7 +619,7 @@ impl Driver for RdpDriver {
                 Err(_) => Err(RdpError::Internal),
             };
             match outcome {
-                Ok(established) => Ok(RdpConnection::start(established, label, cleanup)),
+                Ok((established, cleanup)) => Ok(RdpConnection::start(established, label, cleanup)),
                 Err(e) => {
                     log_failure(&label, &e);
                     Err(e)

@@ -715,20 +715,23 @@ fn serve(
     Ok(())
 }
 
-/// The scope of the tests: the loopback allowed on `port`, pinned.
+/// The scope of the tests: the loopback allowed on `ports` (and on the
+/// SMB port of the session management, ADR-0026), resolved by the system.
 ///
 /// # Panics
 ///
-/// If the policy does not compile or the address is refused.
-pub async fn loopback(port: u16) -> ostena_scope::PinnedTarget {
+/// If the policy does not compile.
+pub fn scope(ports: &[u16]) -> ostena_scope::Scope<ostena_scope::SystemResolver> {
     use ostena_common::config::Mode;
     use ostena_common::config::scope::{AllowRuleSpec, FloorExceptionSpec, PolicySpec};
+    let mut allowed: Vec<String> = ports.iter().map(ToString::to_string).collect();
+    allowed.push(ostena_rdp::smb::PORT.to_string());
     let spec = PolicySpec {
         gateway_group: "rdp-tests".into(),
         allow: vec![AllowRuleSpec {
             label: None,
             networks: vec!["127.0.0.0/8".into()],
-            ports: vec![port.to_string()],
+            ports: allowed,
         }],
         floor_exceptions: vec![FloorExceptionSpec {
             network: "127.0.0.0/8".into(),
@@ -737,10 +740,18 @@ pub async fn loopback(port: u16) -> ostena_scope::PinnedTarget {
         ..PolicySpec::default()
     };
     let policy = ostena_scope::CompiledPolicy::compile(&spec, Mode::Development).unwrap();
-    let scope = ostena_scope::Scope::new(
+    ostena_scope::Scope::new(
         Arc::new(policy),
         ostena_scope::SharedLocalAddresses::new(ostena_scope::LocalAddresses::from_addrs([])),
         ostena_scope::SystemResolver::new(Duration::from_secs(5), 4),
-    );
-    scope.pin("127.0.0.1", port).await.unwrap()
+    )
+}
+
+/// The loopback allowed on `port`, pinned by its address.
+///
+/// # Panics
+///
+/// If the address is refused.
+pub async fn loopback(port: u16) -> ostena_scope::PinnedTarget {
+    scope(&[port]).pin("127.0.0.1", port).await.unwrap()
 }

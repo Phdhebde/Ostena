@@ -67,6 +67,24 @@ pub enum RdpError {
     /// on the target, or the option that keeps them is refused (ADR-0026).
     #[error("[RDP-E019] fermeture des sessions du compte sur la cible impossible : {0}")]
     SessionCleanup(String),
+    /// The channel that manages the sessions of the target is refused: no
+    /// DNS name, or a name that does not resolve, through the scope
+    /// control, to the pinned address (ADR-0026).
+    #[error("[RDP-E021] canal de gestion des sessions de la cible refusé : {0}")]
+    SessionChannel(String),
+    /// Kerberos is impossible on the channel that manages the sessions,
+    /// and NTLM is not admitted there (production, or `ntlm_fallback`
+    /// off; ADR-0026).
+    #[error(
+        "[RDP-E022] Kerberos impossible sur le canal de gestion des sessions, NTLM refusé : {0}"
+    )]
+    SessionChannelNtlm(String),
+    /// The target does not require SMB signing, which carries the channel
+    /// that manages the sessions: refused in production (ADR-0026).
+    #[error(
+        "[RDP-E023] la cible n'exige pas la signature SMB : canal de gestion des sessions refusé"
+    )]
+    SmbSigning,
     /// A dependency panicked; the session is cut, the agent goes on.
     #[error("[RDP-E099] erreur interne du driver RDP : session coupée")]
     Internal,
@@ -95,6 +113,9 @@ impl RdpError {
             Self::Params(_) => "RDP-E017",
             Self::SessionInUse(_) => "RDP-E018",
             Self::SessionCleanup(_) => "RDP-E019",
+            Self::SessionChannel(_) => "RDP-E021",
+            Self::SessionChannelNtlm(_) => "RDP-E022",
+            Self::SmbSigning => "RDP-E023",
             Self::Internal => "RDP-E099",
         }
     }
@@ -120,6 +141,9 @@ impl RdpError {
             Self::Params(_) => "rdp.params_refused",
             Self::SessionInUse(_) => "rdp.session_in_use",
             Self::SessionCleanup(_) => "rdp.session_cleanup_failed",
+            Self::SessionChannel(_) => "rdp.session_channel_refused",
+            Self::SessionChannelNtlm(_) => "rdp.session_channel_ntlm_refused",
+            Self::SmbSigning => "rdp.smb_signing_refused",
             Self::Internal => "rdp.internal_error",
         }
     }
@@ -151,6 +175,9 @@ mod tests {
             RdpError::Params("x".into()),
             RdpError::SessionInUse(2),
             RdpError::SessionCleanup("x".into()),
+            RdpError::SessionChannel("x".into()),
+            RdpError::SessionChannelNtlm("x".into()),
+            RdpError::SmbSigning,
             RdpError::Internal,
         ];
         let mut codes = std::collections::HashSet::new();

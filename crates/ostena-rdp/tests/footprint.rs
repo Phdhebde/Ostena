@@ -116,6 +116,7 @@ async fn memory_per_session() {
             disconnected_sessions: DisconnectedSessions::Keep,
         }),
         Arc::new(Secrets),
+        Arc::new(support::scope(&[])),
     );
     let connect = |port: u16, fp: String| {
         let driver = driver.clone();
