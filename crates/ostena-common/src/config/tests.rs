@@ -128,7 +128,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
         "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
         "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019", "CFG-V020", "CFG-P020", "CFG-P021",
-        "CFG-P024", "CFG-V021",
+        "CFG-P022", "CFG-P024", "CFG-V021",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -241,6 +241,19 @@ fn p003_ntlm_with_password_delegation() {
     );
     let ntlm_only = parse("[rdp]\nntlm_fallback = true");
     assert!(ntlm_only.validate_for_production().is_ok());
+}
+
+#[test]
+fn p022_disconnected_sessions_kept() {
+    let config = parse("[rdp]\ndisconnected_sessions = \"keep\"");
+    assert!(config.validate().is_ok());
+    assert_eq!(production_codes(&config), vec![Code::RdpSessionsKept]);
+    let logoff = parse("[rdp]\ndisconnected_sessions = \"logoff\"");
+    assert!(logoff.validate_for_production().is_ok());
+    assert_eq!(
+        parse("").rdp.disconnected_sessions,
+        DisconnectedSessions::Logoff
+    );
 }
 
 #[test]
@@ -526,12 +539,13 @@ fn config() -> impl Strategy<Value = Config> {
         proptest::option::of(path()),
         any::<bool>(),
         any::<bool>(),
+        any::<bool>(),
         algorithm(),
         proptest::collection::vec(output(), 0..4),
         proptest::collection::vec(output(), 0..4),
     )
         .prop_map(
-            |(mode, hk, cv, bundle, delegation, ntlm, algorithm, logging, audit)| Config {
+            |(mode, hk, cv, bundle, delegation, ntlm, keep, algorithm, logging, audit)| Config {
                 mode,
                 ssh: SshConfig {
                     host_key_verification: hk,
@@ -541,6 +555,11 @@ fn config() -> impl Strategy<Value = Config> {
                     pki_ca_bundle: bundle,
                     password_delegation: delegation,
                     ntlm_fallback: ntlm,
+                    disconnected_sessions: if keep {
+                        DisconnectedSessions::Keep
+                    } else {
+                        DisconnectedSessions::Logoff
+                    },
                 },
                 grant: GrantConfig {
                     signature_algorithm: algorithm,
@@ -582,6 +601,14 @@ proptest! {
         prop_assert_eq!(
             has(&c, Code::NtlmWithPasswordDelegation),
             c.rdp.password_delegation && c.rdp.ntlm_fallback
+        );
+    }
+
+    #[test]
+    fn prop_p022_iff_sessions_kept(c in config()) {
+        prop_assert_eq!(
+            has(&c, Code::RdpSessionsKept),
+            c.rdp.disconnected_sessions == DisconnectedSessions::Keep
         );
     }
 

@@ -27,3 +27,4 @@ Chaque choix structurant fait l'objet d'un ADR court, au format décrit dans [AD
 | [0021](0021-identites-multi-sources.md) | Identités multi-sources | Proposé |
 | [0024](0024-paquets-de-l-agent.md) | Paquets de l'agent | Accepté |
 | [0025](0025-laboratoire-decrit-en-code.md) | Laboratoire décrit en code | Accepté |
+| [0026](0026-fermeture-des-sessions-windows-des-cibles.md) | Fermeture des sessions Windows des cibles RDP | Proposé |

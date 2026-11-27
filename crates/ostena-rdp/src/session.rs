@@ -29,6 +29,7 @@ use ironrdp_pdu::rdp::headers::{
     BasicSecurityHeader, BasicSecurityHeaderFlags, IoChannelPdu, ShareDataPdu,
 };
 use ironrdp_pdu::rdp::server_error_info::ServerSetErrorInfoPdu;
+use ironrdp_pdu::rdp::session_info::InfoData;
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{Action, find_size};
 use ostena_session::Activity;
@@ -72,6 +73,11 @@ pub struct Counters {
     /// (`SUPPORT_ERR_INFO_PDU`, [MS-RDPBCGR] 2.2.5.1.1), kept even when
     /// the end is normal.
     pub error_info: Option<u32>,
+    /// The identifier of the Windows session the target logged the account
+    /// on, from its logon notification (Save Session Info PDU,
+    /// [MS-RDPBCGR] 2.2.10.1): the session the agent logs off at the end
+    /// (ADR-0026).
+    pub logon_session: Option<u32>,
 }
 
 /// Continuous Auto-Detect ([MS-RDPBCGR] 3.2.5.17).
@@ -224,7 +230,14 @@ impl SessionLoop {
                 filled = self.transport.fill() => {
                     if let Err(e) = filled {
                         break match (e, self.demux.counters.error_info) {
-                            (RdpError::Unreachable(_), None) => SessionEnd::Closed,
+                            (RdpError::Unreachable(reason), None) => {
+                                tracing::debug!(
+                                    event = "rdp.session_closed",
+                                    %reason,
+                                    "connexion RDP fermée"
+                                );
+                                SessionEnd::Closed
+                            }
                             (_, Some(code)) => end_of(code),
                             (e, None) => SessionEnd::Failed(e),
                         };
@@ -448,6 +461,11 @@ impl Demux {
                             self.counters.error_info = Some(code);
                         }
                     }
+                    ShareDataPdu::SaveSessionInfo(info) => {
+                        if let Some(id) = logon_session(&info.info_data) {
+                            self.counters.logon_session = Some(id);
+                        }
+                    }
                     ShareDataPdu::ShutdownDenied => return Ok(Step::End(SessionEnd::Closed)),
                     _ => {}
                 },
@@ -528,6 +546,16 @@ fn share_control_parts(bytes: &[u8]) -> Result<Vec<&[u8]>, RdpError> {
     Ok(parts)
 }
 
+/// The session identifier of a logon notification ([MS-RDPBCGR]
+/// 2.2.10.1.1.1 and 2.2.10.1.1.2).
+fn logon_session(info: &InfoData) -> Option<u32> {
+    match info {
+        InfoData::LogonInfoV1(v1) => Some(v1.logon_info.session_id),
+        InfoData::LogonInfoV2(v2) => Some(v2.logon_info.session_id),
+        InfoData::PlainNotify | InfoData::LogonExtended(_) => None,
+    }
+}
+
 /// The raw code of an error information PDU.
 fn error_code(info: &ServerSetErrorInfoPdu) -> u32 {
     encode_vec(info)
@@ -545,5 +573,81 @@ fn end_of(code: u32) -> SessionEnd {
         SessionEnd::Closed
     } else {
         SessionEnd::Failed(RdpError::ServerError(code))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use ironrdp_pdu::mcs::SendDataIndication;
+    use ironrdp_pdu::rdp::client_info::CompressionType;
+    use ironrdp_pdu::rdp::headers::{
+        CompressionFlags, ShareControlHeader, ShareControlPdu, ShareDataHeader, StreamPriority,
+    };
+    use ironrdp_pdu::rdp::session_info::{
+        InfoType, LogonInfo, LogonInfoVersion1, LogonInfoVersion2, SaveSessionInfoPdu,
+    };
+
+    use super::*;
+
+    const IO: u16 = 1003;
+    const USER: u16 = 1007;
+
+    fn frame(info: SaveSessionInfoPdu) -> Vec<u8> {
+        let share = encode_vec(&ShareControlHeader {
+            share_control_pdu: ShareControlPdu::Data(ShareDataHeader {
+                share_data_pdu: ShareDataPdu::SaveSessionInfo(info),
+                stream_priority: StreamPriority::Undefined,
+                compression_flags: CompressionFlags::empty(),
+                compression_type: CompressionType::K8,
+            }),
+            pdu_source: USER,
+            share_id: 0,
+        })
+        .unwrap();
+        encode_vec(&X224(McsMessage::SendDataIndication(SendDataIndication {
+            initiator_id: USER,
+            channel_id: IO,
+            user_data: Cow::Owned(share),
+        })))
+        .unwrap()
+    }
+
+    fn logon(session_id: u32) -> LogonInfo {
+        LogonInfo {
+            session_id,
+            user_name: "admin".into(),
+            domain_name: "SRV".into(),
+        }
+    }
+
+    /// The logon notification names the session to log off at the end.
+    #[test]
+    fn logon_notification_gives_the_session_id() {
+        let mut demux = Demux::new(IO, None, USER);
+        let v2 = frame(SaveSessionInfoPdu {
+            info_type: InfoType::LogonLong,
+            info_data: InfoData::LogonInfoV2(LogonInfoVersion2 {
+                logon_info: logon(7),
+            }),
+        });
+        assert_eq!(demux.feed(&v2).unwrap(), None);
+        assert_eq!(demux.counters().logon_session, Some(7));
+        let v1 = frame(SaveSessionInfoPdu {
+            info_type: InfoType::Logon,
+            info_data: InfoData::LogonInfoV1(LogonInfoVersion1 {
+                logon_info: logon(9),
+            }),
+        });
+        demux.feed(&v1).unwrap();
+        assert_eq!(demux.counters().logon_session, Some(9));
+        // A plain notification keeps what is known.
+        let plain = frame(SaveSessionInfoPdu {
+            info_type: InfoType::PlainNotify,
+            info_data: InfoData::PlainNotify,
+        });
+        demux.feed(&plain).unwrap();
+        assert_eq!(demux.counters().logon_session, Some(9));
     }
 }

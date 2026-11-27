@@ -106,6 +106,24 @@ pub struct RdpConfig {
     pub password_delegation: bool,
     /// Falling back to NTLM is allowed when Kerberos fails.
     pub ntlm_fallback: bool,
+    /// What the agent does with the Windows sessions of the target account
+    /// (ADR-0026): `logoff` (default), or `keep` (`CFG-P022` in production).
+    pub disconnected_sessions: DisconnectedSessions,
+}
+
+/// The Windows sessions of the target account, before and after an RDP
+/// session (ADR-0026).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DisconnectedSessions {
+    /// The agent logs its session off at the end, and logs off the
+    /// disconnected sessions of the account before a new session, or
+    /// refuses the session when it cannot.
+    #[default]
+    Logoff,
+    /// Sessions are left disconnected, and a new connection may attach to
+    /// one (`CFG-P022` in production).
+    Keep,
 }
 
 /// Target RDP certificate validation.

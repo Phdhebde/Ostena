@@ -1,8 +1,9 @@
 # Prepares a Windows CI runner as an RDP target for the tests of the RDP
 # driver (crates/ostena-rdp/tests/windows_target.rs, ADR-0019): RDP on,
-# NLA required, Restricted Admin allowed, a local administrator per mode
-# of the tests (delegation, Restricted Admin) with a random password and
-# its profile already created. Writes the
+# NLA required, Restricted Admin allowed, remote session management (WTS
+# API) allowed, one local administrator for every mode of the tests
+# (delegation, Restricted Admin: the agent logs its sessions off, ADR-0026)
+# with a random password and its profile already created. Writes the
 # OSTENA_RDP_TARGET_* variables to $env:GITHUB_ENV, the password masked in
 # the logs.
 #
@@ -21,56 +22,47 @@ function Fail([string] $Message) {
     exit 1
 }
 
-# One account per mode of the tests: a session the agent closes is only
-# disconnected by the target, which reconnects the next connection of the
-# same account to it (observed: the Restricted Admin test attached to the
-# session the delegation test had opened, then reset by the target). Each
-# test thus opens its own session.
-$Accounts = [ordered]@{ DELEGATION = 'ostena-rdp-deleg'; RA = 'ostena-rdp-ra' }
-$Passwords = @{}
+$User = 'ostena-rdp'
 
 Set-Service -Name seclogon -StartupType Manual
 Start-Service -Name seclogon
-foreach ($Mode in $Accounts.Keys) {
-    $User = $Accounts[$Mode]
-    Write-Host "=== local administrator $User, random password"
-    $Bytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(24)
-    $Random = [Convert]::ToBase64String($Bytes).Replace('+', 'x').Replace('/', 'y').Replace('=', '')
-    # Upper case, lower case, digit and symbol: the complexity policy.
-    $Password = "Aa1-$Random"
-    Write-Host "::add-mask::$Password"
-    $Passwords[$Mode] = $Password
-    $Secure = ConvertTo-SecureString $Password -AsPlainText -Force
-    if (Get-LocalUser -Name $User -ErrorAction SilentlyContinue) {
-        Set-LocalUser -Name $User -Password $Secure
-    } else {
-        New-LocalUser -Name $User -Password $Secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
-    }
-    # Administrators (S-1-5-32-544): Restricted Admin needs one.
-    Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $User -ErrorAction SilentlyContinue
-
-    Write-Host "=== profile of $User"
-    # The first logon of an account creates its profile (about 15 s on a CI
-    # runner), during the session itself otherwise. It is created here, by
-    # a logon that loads it, as on a target whose administrators have
-    # already logged on.
-    $Sid = (Get-LocalUser -Name $User).SID.Value
-    $Credential = New-Object System.Management.Automation.PSCredential(".\$User", $Secure)
-    Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', 'exit 0' `
-        -Credential $Credential -LoadUserProfile -WorkingDirectory $env:SystemRoot `
-        -WindowStyle Hidden -Wait
-    $UserProfile = $null
-    for ($i = 0; $i -lt 120 -and -not $UserProfile; $i++) {
-        $Found = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$Sid'" -ErrorAction SilentlyContinue
-        if ($Found -and $Found.LocalPath -and (Test-Path -LiteralPath (Join-Path $Found.LocalPath 'NTUSER.DAT'))) {
-            $UserProfile = $Found
-        } else {
-            Start-Sleep -Seconds 1
-        }
-    }
-    if (-not $UserProfile) { Fail "profile of $User missing after 120 s" }
-    Write-Host "profile: $($UserProfile.LocalPath)"
+Write-Host "=== local administrator $User, random password"
+$Bytes = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(24)
+$Random = [Convert]::ToBase64String($Bytes).Replace('+', 'x').Replace('/', 'y').Replace('=', '')
+# Upper case, lower case, digit and symbol: the complexity policy.
+$Password = "Aa1-$Random"
+Write-Host "::add-mask::$Password"
+$Secure = ConvertTo-SecureString $Password -AsPlainText -Force
+if (Get-LocalUser -Name $User -ErrorAction SilentlyContinue) {
+    Set-LocalUser -Name $User -Password $Secure
+} else {
+    New-LocalUser -Name $User -Password $Secure -PasswordNeverExpires -AccountNeverExpires | Out-Null
 }
+# Administrators (S-1-5-32-544): Restricted Admin needs one, and so does
+# the logoff of its sessions by the agent (WTS API).
+Add-LocalGroupMember -SID 'S-1-5-32-544' -Member $User -ErrorAction SilentlyContinue
+
+Write-Host "=== profile of $User"
+# The first logon of an account creates its profile (about 15 s on a CI
+# runner), during the session itself otherwise. It is created here, by
+# a logon that loads it, as on a target whose administrators have
+# already logged on.
+$Sid = (Get-LocalUser -Name $User).SID.Value
+$Credential = New-Object System.Management.Automation.PSCredential(".\$User", $Secure)
+Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c', 'exit 0' `
+    -Credential $Credential -LoadUserProfile -WorkingDirectory $env:SystemRoot `
+    -WindowStyle Hidden -Wait
+$UserProfile = $null
+for ($i = 0; $i -lt 120 -and -not $UserProfile; $i++) {
+    $Found = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$Sid'" -ErrorAction SilentlyContinue
+    if ($Found -and $Found.LocalPath -and (Test-Path -LiteralPath (Join-Path $Found.LocalPath 'NTUSER.DAT'))) {
+        $UserProfile = $Found
+    } else {
+        Start-Sleep -Seconds 1
+    }
+}
+if (-not $UserProfile) { Fail "profile of $User missing after 120 s" }
+Write-Host "profile: $($UserProfile.LocalPath)"
 
 Write-Host '=== RDP: NLA required, Restricted Admin allowed'
 Set-ItemProperty -Path $Ts -Name fDenyTSConnections -Value 0 -Type DWord
@@ -81,6 +73,9 @@ Set-ItemProperty -Path $Tcp -Name UserAuthentication -Value 1 -Type DWord
 # 2: TLS (SSL), the only security layer the agent accepts.
 Set-ItemProperty -Path $Tcp -Name SecurityLayer -Value 2 -Type DWord
 Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name DisableRestrictedAdmin -Value 0 -Type DWord
+# Remote session management (WTS API over RPC), used by the agent to log
+# off the sessions of the account (ADR-0026).
+Set-ItemProperty -Path $Ts -Name AllowRemoteRPC -Value 1 -Type DWord
 Set-Service -Name TermService -StartupType Manual
 Restart-Service -Name TermService -Force
 
@@ -104,10 +99,8 @@ $Name = $env:COMPUTERNAME.ToLowerInvariant()
 @(
     "OSTENA_RDP_TARGET_PORT=3389"
     "OSTENA_RDP_TARGET_NAME=$Name"
-    "OSTENA_RDP_TARGET_DELEGATION_USER=$($Accounts.DELEGATION)"
-    "OSTENA_RDP_TARGET_DELEGATION_PASSWORD=$($Passwords.DELEGATION)"
-    "OSTENA_RDP_TARGET_RA_USER=$($Accounts.RA)"
-    "OSTENA_RDP_TARGET_RA_PASSWORD=$($Passwords.RA)"
+    "OSTENA_RDP_TARGET_USER=$User"
+    "OSTENA_RDP_TARGET_PASSWORD=$Password"
     "OSTENA_RDP_TARGET_SHA256=$Hash"
 ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-Write-Host "target ready: $Name, accounts $($Accounts.Values -join ', ')"
+Write-Host "target ready: $Name, account $User"

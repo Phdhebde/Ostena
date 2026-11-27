@@ -17,6 +17,7 @@ pub mod private_file;
 pub mod service;
 pub mod tty;
 pub mod worm;
+pub mod wts;
 
 pub use error::{Code, PlatformError};
 

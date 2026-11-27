@@ -14,12 +14,20 @@
 //!
 //! A dependency that panics is contained to the task of the connection:
 //! the session is cut (`RDP-E099`), the agent goes on.
+//!
+//! The Windows sessions of the account (ADR-0026): before a session, the
+//! disconnected sessions of the account on the target are logged off, and
+//! the session refused when they cannot be (or when another connection
+//! holds one); at the end, the session the target opened is logged off
+//! instead of being left disconnected. `[rdp] disconnected_sessions =
+//! "keep"` skips both, logged at every session and refused in production.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ironrdp_connector::DesktopSize;
+use ostena_common::config::DisconnectedSessions;
 use ostena_common::secret::SecretString;
 use ostena_crypto::hmac::HmacKey;
 use ostena_crypto::tls::target::TargetTrust;
@@ -29,11 +37,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::connect::PhaseMeasure;
 use crate::connect::{ConnectParams, ConnectReport, establish};
 use crate::credssp::{Authentication, Kdcs, Mechanism};
 use crate::error::RdpError;
 use crate::profile::{StoredLicense, TargetProfile, client_identity, from_hex};
 use crate::session::{Counters, SessionEnd, SessionLoop};
+use crate::target_sessions::{
+    self, DISCONNECT_WAIT, LoggedOff, SessionControl, ViewRequest, after_session, before_session,
+};
 
 /// Bounds of the desktop size requested.
 const DESKTOP_MIN: u16 = 200;
@@ -42,6 +54,8 @@ const DESKTOP_MAX: u16 = 8192;
 const INPUT_QUEUE: usize = 256;
 /// Delay of a clean close.
 const CLOSE_DELAY: Duration = Duration::from_secs(2);
+/// Delay of the logoff of the session at its end (ADR-0026).
+const LOGOFF_DELAY: Duration = Duration::from_secs(20);
 
 /// Delegation of the password or Restricted Admin, chosen per target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +153,8 @@ pub struct RdpPolicy {
     pub identity_key: HmacKey,
     /// Name of the agent as a workstation (NTLM, Kerberos).
     pub workstation: String,
+    /// `[rdp] disconnected_sessions` (ADR-0026).
+    pub disconnected_sessions: DisconnectedSessions,
 }
 
 impl std::fmt::Debug for RdpPolicy {
@@ -149,6 +165,7 @@ impl std::fmt::Debug for RdpPolicy {
             .field("password_delegation", &self.password_delegation)
             .field("ntlm_fallback", &self.ntlm_fallback)
             .field("realms", &self.realms)
+            .field("disconnected_sessions", &self.disconnected_sessions)
             .finish_non_exhaustive()
     }
 }
@@ -238,6 +255,7 @@ impl std::fmt::Debug for TargetParams {
 pub struct RdpDriver {
     policy: Arc<RdpPolicy>,
     secrets: Arc<dyn SecretSource>,
+    control: Arc<dyn SessionControl>,
 }
 
 impl std::fmt::Debug for RdpDriver {
@@ -249,9 +267,67 @@ impl std::fmt::Debug for RdpDriver {
 }
 
 impl RdpDriver {
-    /// A driver applying `policy`, reading secrets from `secrets`.
+    /// A driver applying `policy`, reading secrets from `secrets`, driving
+    /// the Windows sessions of the targets with the mechanism of this
+    /// platform ([`target_sessions::platform_control`]).
     pub fn new(policy: Arc<RdpPolicy>, secrets: Arc<dyn SecretSource>) -> Self {
-        Self { policy, secrets }
+        Self {
+            policy,
+            secrets,
+            control: target_sessions::platform_control(),
+        }
+    }
+
+    /// The same driver with another control of the target sessions.
+    #[must_use]
+    pub fn with_session_control(mut self, control: Arc<dyn SessionControl>) -> Self {
+        self.control = control;
+        self
+    }
+
+    /// What the agent does with the Windows sessions of the account
+    /// (ADR-0026), `None` when they are kept (development only).
+    ///
+    /// # Errors
+    ///
+    /// [`RdpError::SessionCleanup`] when they are kept in production, or
+    /// the target has no address.
+    fn cleanup(
+        &self,
+        target: &PinnedTarget,
+        session: &RdpSessionParams,
+        label: &str,
+    ) -> Result<Option<Cleanup>, RdpError> {
+        match self.policy.disconnected_sessions {
+            DisconnectedSessions::Keep if self.policy.production => Err(RdpError::SessionCleanup(
+                "rdp.disconnected_sessions = \"keep\" refusé en production (CFG-P022)".into(),
+            )),
+            DisconnectedSessions::Keep => {
+                tracing::warn!(
+                    event = "rdp.session_cleanup_skipped",
+                    code = "CFG-P022",
+                    target = label,
+                    "sessions Windows du compte laissées déconnectées : une connexion suivante \
+                     peut s'y rattacher (rdp.disconnected_sessions = \"keep\")"
+                );
+                Ok(None)
+            }
+            DisconnectedSessions::Logoff => {
+                let address = target
+                    .addrs()
+                    .first()
+                    .ok_or_else(|| RdpError::Unreachable("aucune adresse".into()))?
+                    .ip();
+                Ok(Some(Cleanup {
+                    control: self.control.clone(),
+                    secrets: self.secrets.clone(),
+                    address,
+                    target_name: session.target_name.clone(),
+                    account: session.account.clone(),
+                    label: label.to_owned(),
+                }))
+            }
+        }
     }
 
     /// Everything [`establish`] needs, decided from the policy.
@@ -321,6 +397,73 @@ impl RdpDriver {
     }
 }
 
+/// The Windows sessions of the account on one target (ADR-0026).
+#[derive(Clone)]
+struct Cleanup {
+    control: Arc<dyn SessionControl>,
+    secrets: Arc<dyn SecretSource>,
+    address: std::net::IpAddr,
+    target_name: Option<String>,
+    account: String,
+    label: String,
+}
+
+impl Cleanup {
+    fn request(&self) -> Result<ViewRequest, RdpError> {
+        Ok(ViewRequest {
+            address: self.address,
+            target_name: self.target_name.clone(),
+            account: self.account.clone(),
+            password: self.secrets.password(&self.account)?,
+        })
+    }
+
+    fn logged(&self, done: &[LoggedOff], moment: &'static str) {
+        for s in done {
+            tracing::info!(
+                event = "rdp.session_logged_off",
+                target = self.label,
+                session = s.id,
+                state = ?s.state,
+                moment,
+                "session Windows du compte fermée sur la cible"
+            );
+        }
+    }
+
+    /// Before a session: logs off the sessions of the account left on the
+    /// target, or refuses.
+    async fn before(&self) -> Result<Vec<LoggedOff>, RdpError> {
+        let done = target_sessions::run(self.control.clone(), self.request()?, |view, account| {
+            before_session(view, account)
+        })
+        .await?;
+        self.logged(&done, "before");
+        Ok(done)
+    }
+
+    /// At the end: logs off the session `id` (unknown: the disconnected
+    /// sessions of the account).
+    async fn after(&self, id: Option<u32>) -> Result<Vec<LoggedOff>, RdpError> {
+        let work = target_sessions::run(
+            self.control.clone(),
+            self.request()?,
+            move |view, account| {
+                after_session(view, account, id, DISCONNECT_WAIT, &std::thread::sleep)
+            },
+        );
+        let done = tokio::time::timeout(LOGOFF_DELAY, work)
+            .await
+            .unwrap_or_else(|_| {
+                Err(RdpError::SessionCleanup(
+                    "délai de fermeture de la session dépassé".into(),
+                ))
+            })?;
+        self.logged(&done, "end");
+        Ok(done)
+    }
+}
+
 /// Emits the event of a failed connection.
 fn log_failure(label: &str, error: &RdpError) {
     tracing::warn!(
@@ -359,19 +502,43 @@ impl Driver for RdpDriver {
         timeout: Duration,
     ) -> impl Future<Output = Result<RdpConnection, RdpError>> + Send {
         let label = params.label.clone();
-        let planned = self.plan(target, params);
+        let session = params.session.clone();
+        let planned = self.plan(target, params).and_then(|planned| {
+            let cleanup = self.cleanup(target, &session, &label)?;
+            Ok((planned, cleanup))
+        });
         let target = target.clone();
         async move {
-            let planned = match planned {
+            let (planned, cleanup) = match planned {
                 Ok(p) => p,
                 Err(e) => {
                     log_failure(&label, &e);
                     return Err(e);
                 }
             };
+            let before = cleanup.clone();
             // A panic in a dependency stays in this task (RDP-E099).
             let task = tokio::spawn(async move {
-                tokio::time::timeout(timeout, connect_any(&target, planned)).await
+                tokio::time::timeout(timeout, async move {
+                    let started = Instant::now();
+                    let logged_off = match &before {
+                        Some(c) => c.before().await?,
+                        None => Vec::new(),
+                    };
+                    let sessions = PhaseMeasure {
+                        phase: "sessions",
+                        millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        round_trips: 0,
+                    };
+                    let mut established = connect_any(&target, planned).await?;
+                    if before.is_some() {
+                        established.report.phases.insert(0, sessions);
+                        established.report.sessions_logged_off =
+                            logged_off.iter().map(|s| s.id).collect();
+                    }
+                    Ok(established)
+                })
+                .await
             });
             let outcome = match task.await {
                 Ok(Ok(result)) => result,
@@ -379,7 +546,7 @@ impl Driver for RdpDriver {
                 Err(_) => Err(RdpError::Internal),
             };
             match outcome {
-                Ok(established) => Ok(RdpConnection::start(established, label)),
+                Ok(established) => Ok(RdpConnection::start(established, label, cleanup)),
                 Err(e) => {
                     log_failure(&label, &e);
                     Err(e)
@@ -396,6 +563,10 @@ pub struct Ended {
     pub end: SessionEnd,
     /// Counters of the loop.
     pub counters: Counters,
+    /// The Windows sessions logged off at the end (ADR-0026).
+    pub logged_off: Vec<LoggedOff>,
+    /// Why the session could not be logged off, if so.
+    pub logoff_error: Option<RdpError>,
 }
 
 /// An established RDP connection, its session loop running.
@@ -419,7 +590,11 @@ impl std::fmt::Debug for RdpConnection {
 }
 
 impl RdpConnection {
-    fn start(established: crate::connect::Established, label: String) -> Self {
+    fn start(
+        established: crate::connect::Established,
+        label: String,
+        cleanup: Option<Cleanup>,
+    ) -> Self {
         let crate::connect::Established {
             transport,
             result,
@@ -440,11 +615,29 @@ impl RdpConnection {
                 Ok(done) => done,
                 Err(_) => (SessionEnd::Failed(RdpError::Internal), Counters::default()),
             };
+            // The RDP connection is over: closed from now on, while the
+            // Windows session is logged off.
             flag.store(true, Ordering::Release);
             if let SessionEnd::Failed(e) = &end {
                 log_failure(&task_label, e);
             }
-            Ended { end, counters }
+            // Logged off, never left disconnected (ADR-0026).
+            let (logged_off, logoff_error) = match &cleanup {
+                Some(c) => match c.after(counters.logon_session).await {
+                    Ok(done) => (done, None),
+                    Err(e) => {
+                        log_failure(&task_label, &e);
+                        (Vec::new(), Some(e))
+                    }
+                },
+                None => (Vec::new(), None),
+            };
+            Ended {
+                end,
+                counters,
+                logged_off,
+                logoff_error,
+            }
         });
         Self {
             report,
@@ -486,7 +679,7 @@ impl DriverConnection for RdpConnection {
         async move {
             let _ = self.stop.send(true);
             if let Some(task) = self.task.lock().await.take() {
-                let _ = tokio::time::timeout(CLOSE_DELAY, task).await;
+                let _ = tokio::time::timeout(CLOSE_DELAY + LOGOFF_DELAY, task).await;
             }
             self.closed.store(true, Ordering::Release);
         }
@@ -510,6 +703,7 @@ mod tests {
             realms,
             identity_key: HmacKey::new(&HmacKey::generate().unwrap()).unwrap(),
             workstation: "OST-AGENT".into(),
+            disconnected_sessions: DisconnectedSessions::Logoff,
         }
     }
 

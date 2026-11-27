@@ -4,7 +4,10 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
-use super::{CertificateValidation, Config, HostKeyVerification, Output, SyslogTls, Transport};
+use super::{
+    CertificateValidation, Config, DisconnectedSessions, HostKeyVerification, Output, SyslogTls,
+    Transport,
+};
 
 /// The only grant signature algorithm accepted in production (ADR-0004).
 pub const GRANT_SIGNATURE_ALGORITHM: &str = "ecdsa-p256-sha256";
@@ -116,6 +119,9 @@ pub enum Code {
     /// accepted deviation (ADR-0009), logged at every start and never
     /// refused.
     DirectoryTls12,
+    /// Agent: Windows sessions of the target account left disconnected
+    /// (`rdp.disconnected_sessions = "keep"`, ADR-0026).
+    RdpSessionsKept,
     /// Core: sealed files (transcripts, recordings) written without the
     /// append-only then immutable attributes (`core.audit.worm = "disabled"`).
     WormDisabled,
@@ -128,7 +134,7 @@ pub enum Code {
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 45] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -171,6 +177,7 @@ impl Code {
         Self::CoreIdentity,
         Self::IdentitySecretExposed,
         Self::DirectoryTls12,
+        Self::RdpSessionsKept,
         Self::WormDisabled,
         Self::SyslogTls,
     ];
@@ -220,6 +227,7 @@ impl Code {
             Self::CoreIdentity => "CFG-V020",
             Self::IdentitySecretExposed => "CFG-P020",
             Self::DirectoryTls12 => "CFG-P021",
+            Self::RdpSessionsKept => "CFG-P022",
             Self::WormDisabled => "CFG-P024",
             Self::SyslogTls => "CFG-V021",
         }
@@ -249,6 +257,7 @@ impl Code {
                 | Self::WebTlsClassic
                 | Self::IdentitySecretExposed
                 | Self::DirectoryTls12
+                | Self::RdpSessionsKept
                 | Self::WormDisabled
         )
     }
@@ -421,6 +430,16 @@ pub(crate) fn weakenings(config: &Config, now: u64) -> Vec<Violation> {
             Code::NtlmWithPasswordDelegation,
             "rdp.ntlm_fallback = true alors que rdp.password_delegation = true : un repli \
              NTLM exposerait le mot de passe délégué ; désactivez ntlm_fallback en production.",
+        ));
+    }
+
+    if config.rdp.disconnected_sessions == DisconnectedSessions::Keep {
+        out.push(Violation::new(
+            Code::RdpSessionsKept,
+            "rdp.disconnected_sessions = \"keep\" : les sessions Windows du compte cible restent \
+             déconnectées et une connexion suivante peut s'y rattacher (mot de passe délégué \
+             en mémoire, fenêtres d'un autre administrateur) ; seul \"logoff\" est accepté \
+             en production.",
         ));
     }
 

@@ -302,9 +302,13 @@ Comme russh pour SSH, IronRDP et `sspi` apportent leur propre cryptographie, et 
 | `RDP-E015` | délai d'établissement dépassé | `rdp.target_unreachable` |
 | `RDP-E016` | secret du compte illisible sur l'agent | `rdp.target_auth_failed` |
 | `RDP-E017` | `session_params` invalides | `rdp.params_refused` |
+| `RDP-E018` | session du même compte tenue par une autre connexion (ADR-0026) | `rdp.session_in_use` |
+| `RDP-E019` | sessions Windows du compte impossibles à fermer (ADR-0026) | `rdp.session_cleanup_failed` |
 | `RDP-E099` | panique d'une dépendance, session coupée | `rdp.internal_error` |
 
-Événements de succès : `rdp.connect_phases` (durée et allers-retours par phase : `tcp`, `x224`, `tls`, `credssp`, `mcs`, `licensing`, `activation`), `rdp.ntlm_used`, `rdp.profile_changed`.
+Événements de succès : `rdp.connect_phases` (durée et allers-retours par phase : `tcp`, `x224`, `tls`, `credssp`, `mcs`, `licensing`, `activation`), `rdp.ntlm_used`, `rdp.profile_changed`, et depuis l'ADR-0026 `rdp.session_logged_off` et `rdp.session_cleanup_skipped`.
+
+**Fin de session (ADR-0026)** : la session Windows est fermée par l'agent (API WTS), jamais laissée déconnectée ; les sessions du compte laissées sur la cible sont fermées avant une nouvelle session, ou la session est refusée.
 
 **Écarts et précisions par rapport aux sections 2 à 7**, constatés pendant la mise en œuvre :
 

@@ -24,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ostena_common::config::DisconnectedSessions;
 use ostena_common::secret::SecretString;
 use ostena_crypto::hmac::HmacKey;
 use ostena_rdp::RdpError;
@@ -104,13 +105,15 @@ async fn memory_per_session() {
     let drain = std::thread::spawn(move || lines.count());
     let driver = RdpDriver::new(
         Arc::new(RdpPolicy {
-            production: true,
+            production: false,
             validation: Validation::Pinned,
             password_delegation: false,
             ntlm_fallback: true,
             realms: Vec::new(),
             identity_key: HmacKey::new(&HmacKey::generate().unwrap()).unwrap(),
             workstation: "OST-AGENT".into(),
+            // Measures the driver alone: no Windows session to drive.
+            disconnected_sessions: DisconnectedSessions::Keep,
         }),
         Arc::new(Secrets),
     );
