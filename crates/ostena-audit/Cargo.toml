@@ -13,6 +13,8 @@ ostena-crypto.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# A local time-stamping authority (RFC 3161) for the tests.
+ostena-crypto = { workspace = true, features = ["testing"] }
 # Field names are checked against the log redaction list; the key file of
 # the fuzz corpus is loaded from PKCS#8.
 ostena-common.workspace = true

@@ -27,6 +27,7 @@ pub mod ssh_ca;
 pub mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod timestamping;
 pub mod transcripts;
 pub mod web;
 

@@ -472,17 +472,24 @@ pub(crate) fn audit_head(path: &Path) -> ExitCode {
 
 /// `ostena core audit verify`: the whole chain in the database, with the
 /// public keys of the signer. Exit codes of `ostena audit verify`.
-pub(crate) fn audit_verify(path: &Path, keys: &[PathBuf], json: bool) -> ExitCode {
+pub(crate) fn audit_verify(
+    path: &Path,
+    keys: &[PathBuf],
+    tsa_ca: &[PathBuf],
+    json: bool,
+) -> ExitCode {
     init_admin_logging(path);
-    let trusted = match crate::audit::read_keys(keys) {
-        Ok(k) => k,
+    let trusted =
+        crate::audit::read_keys(keys).and_then(|k| Ok((k, crate::audit::read_tsa(tsa_ca)?)));
+    let (trusted, tsa) = match trusted {
+        Ok(t) => t,
         Err(e) => {
             let _ = writeln!(io::stderr(), "ostena core audit : {e}");
             return ExitCode::from(crate::audit::USAGE_ERROR);
         }
     };
     match admin(path, async move |pool| {
-        core_audit::verify_online(&pool, trusted).await
+        core_audit::verify_online(&pool, trusted, tsa).await
     }) {
         Ok(report) => {
             let label = Path::new("(base PostgreSQL du core)");

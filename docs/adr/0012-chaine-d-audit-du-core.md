@@ -5,6 +5,7 @@
 - **Date** : 2026-11-15
 - **Révision** : 2026-11-25, événements des transcripts et codes `AUD-E017` à `AUD-E020`, `AUD-W005` à `AUD-W008` ; `transcript.refused` de classe protectrice (jalon M1, PR 8, ADR-0016)
 - **Révision** : 2026-11-27, suite du lot L6 (jalon M2, PR 11) : stockage en ajout seul des fichiers scellés (champ `immutable` de `transcript.sealed`, `REC-E006`, `CFG-P024`)
+- **Révision** : 2026-11-27, horodatage RFC 3161 des têtes (jalon M2, PR 11b) : `audit.head_timestamped`, `audit.timestamp_failed`, `AUD-E021`, `AUD-W009`, `TSP-E001` à `TSP-E007`
 - **Révision** : 2026-11-26, événements du portail et classes (`web_session.*`, `user.role_granted`, `user.role_revoked`), champ `channel` des connexions (jalon M2, PR 8a, ADR-0020)
 - **Révision** : 2026-11-27, demande d'accès du portail : `access.web_granted` (accordant), `access.web_refused` (au mieux) (jalon M2, PR 8b, ADR-0020)
 - **Révision** : 2026-11-27, passerelle du portail : `gateway.opened` (accordant), `gateway.refused` et `gateway.closed` (au mieux) (jalon M2, PR 8b, ADR-0020)
@@ -151,10 +152,12 @@ Codes stables, jamais renumérotés ni réutilisés. Chaque message commence par
 | `AUD-E020` | erreur | `transcript.sealed` aux champs absents ou mal formés, ou second sceau pour la même session |
 | `AUD-W007` | avertissement | session SSH sans transcript scellé, peut-être encore ouverte à l'instant de l'export (`--transcripts`) |
 | `AUD-W008` | avertissement | sceau de transcript postérieur à la dernière tête signée (`--transcripts`) |
+| `AUD-E021` | erreur | horodatage d'une tête invalide : champs mal formés, hash différent de celui de la tête, tête pas encore lue, ou jeton refusé par les ancres de l'autorité (`--tsa-ca`, avec son code `TSP-E…`) |
+| `AUD-W009` | avertissement | heure d'un horodatage antérieure à celle de la tête qu'il couvre, au-delà de la tolérance et de la précision du jeton |
 
 ### Place réservée
 
-- **Horodatage RFC 3161** : trame d'export de type 3, hors de la signature de la tête, portant un jeton sur le hash de tête. Une version ultérieure du vérificateur l'acceptera ; la v1 la refuse plutôt que de l'ignorer.
+- **Horodatage RFC 3161** : réalisé par la PR 11b (voir la suite), dans des enregistrements de la chaîne et non dans une trame d'export. La trame de type 3 reste réservée et refusée.
 - **Têtes hybrides v2** : ECDSA P-256 + ML-DSA-65 par concaténation, comme prévu par l'ADR-0009 pour les têtes de chaîne d'audit, dans une tête de version 2 avec son propre algorithme. Les enregistrements ne changent pas. Bloquant : ML-DSA n'est exposé par `aws-lc-rs` que derrière une fonctionnalité instable (ADR-0009).
 
 ### Intégration au core
@@ -221,13 +224,47 @@ Jusqu'ici, un transcript scellé n'était protégé que par ses droits (0400) et
 
 Limites : ces attributs n'arrêtent pas un compte qui détient lui-même `CAP_LINUX_IMMUTABLE` (root, ou le service, qui en a besoin pour les poser) : il peut les retirer. Ils protègent contre tout autre compte et contre les erreurs, et la chaîne d'audit reste la preuve d'intégrité. Un stockage WORM matériel ou un objet verrouillé hors du bastion reste le moyen d'une protection contre root. La rétention n'est pas automatisée : supprimer un transcript demande de retirer l'attribut à la main (procédure d'exploitation).
 
+#### Horodatage RFC 3161 des têtes (PR 11b)
+
+Une tête signée prouve l'intégrité de ce qu'elle couvre, pas sa date : celui qui détient la clé de signature peut réécrire la chaîne et signer de nouvelles têtes à la date qu'il veut. Un jeton d'horodatage d'un tiers (RFC 3161) sur le hash d'une tête prouve que cette tête existait à cette heure.
+
+- **Réglage** : section `[core.audit.timestamping]`, absente par défaut (pas d'horodatage) : `url` (`http://hôte[:port]/chemin`, sans identifiants ni fragment), `ca` (fichier PEM des ancres de l'autorité, 16 au plus, lu au démarrage : un fichier illisible refuse le démarrage), `interval_secs` (600 par défaut, 60 à 86400), `timeout_secs` (10 par défaut, 1 à 60). L'absence de la section n'affaiblit rien de ce qui existait : elle n'est pas une dérogation.
+- **Cadence** : à chaque intervalle, le core horodate la dernière tête si elle a changé depuis le dernier jeton. Comme le battement produit une tête même sans activité, cela revient à un jeton par intervalle : une preuve de fraîcheur datée par un tiers.
+- **Demande** (RFC 3161, section 2.4.1) : empreinte SHA-256 de la tête, nonce aléatoire de 64 bits, `certReq` vrai. Transport HTTP (section 3.4) : un `POST` `application/timestamp-query`, réponse 200 de 16 Kio au plus, avec un délai.
+- **Contrôle avant écriture** : statut accordé, nonce et empreinte identiques à la demande, puis le jeton entier comme le vérificateur (ci-dessous). Un jeton refusé n'est jamais écrit.
+- **Profil du jeton** (`ostena_crypto::tsp`, décodeur DER strict sans dépendance de décodage) : `SignedData` à un seul signataire, `TSTInfo` v1 ; empreintes SHA-256 seulement (imprint, attribut `messageDigest`) ; signature ECDSA P-256 / SHA-256 sur les attributs signés ; attribut `signingCertificateV2` (RFC 5816) obligatoire, empreinte SHA-256 du certificat signataire, qui doit être celui désigné par `sid` ; certificat signataire porté par le jeton ou présent parmi les ancres ; usage étendu `id-kp-timeStamping` seul et critique (RFC 3161, section 2.3) ; chaîne vers une ancre de `ca`, valide à `genTime`, contrôlée par `rustls-webpki`. Les algorithmes ne sont pas négociés : un jeton d'une autre famille est refusé (`TSP-E003`).
+- **Enregistrement** : `audit.head_timestamped` (classe « au mieux », par la file de l'enregistreur) porte `head_no`, `head_hash`, `stamped_at` (`genTime`, en ms), `policy` (OID de la politique de l'autorité) et le jeton DER découpé en champs binaires `tst_01` à `tst_24` de 256 octets (6 Kio au plus), car un champ binaire d'enregistrement en tient 256. Le jeton est dans la chaîne : il est couvert par la tête suivante, exporté sans changer le format d'export, et l'enregistrement reste vérifiable sans l'autorité.
+- **Échecs** : chaque tentative manquée est journalisée (`audit.timestamp_failed`, avec son code) ; la première d'une série est aussi enregistrée dans la chaîne (`audit.timestamp_failed`, champs `code` et `reason`), la suivante réussie est journalisée (`audit.timestamp_restored`). Le core continue de fonctionner : l'horodatage ne bloque aucune opération.
+- **Vérification** : `ostena audit verify --tsa-ca <pem>` (et `ostena core audit verify --tsa-ca`) contrôle chaque `audit.head_timestamped` : la tête désignée doit avoir été lue (parmi les 64 dernières, ou plus ancienne que la dernière lue), avec le même hash ; le jeton est vérifié contre les ancres données, avec le même profil, et `genTime` doit être égal à `stamped_at`. Un écart est `AUD-E021` ; un jeton antérieur à sa tête (au-delà de la tolérance d'horloge et de la précision `accuracy`) est `AUD-W009`. Sans `--tsa-ca`, la forme et le lien à la tête sont vérifiés, pas le jeton. Le résumé donne le nombre de jetons, de jetons vérifiés, et le dernier horodatage (tête et heure UTC).
+
+Codes de `ostena_crypto::tsp` et du core :
+
+| Code | Signification |
+|---|---|
+| `TSP-E001` | jeton ou réponse d'horodatage mal formé (DER strict, tailles bornées, attribut obligatoire absent) |
+| `TSP-E002` | horodatage refusé par l'autorité (statut et texte de l'autorité) |
+| `TSP-E003` | algorithme non admis (seuls SHA-256 et ECDSA P-256 / SHA-256) |
+| `TSP-E004` | signature du jeton invalide |
+| `TSP-E005` | certificat de l'autorité refusé (chaîne, validité à `genTime`, usage étendu, absent) |
+| `TSP-E006` | jeton étranger à la demande (empreinte ou nonce) |
+| `TSP-E007` | autorité injoignable ou hors protocole (connexion, délai, statut HTTP, taille) |
+
+Choix :
+
+- **Dans la chaîne plutôt qu'en trame d'export** : la place réservée prévoyait une trame de type 3. Un enregistrement évite une migration (le jeton n'a pas de table), garde un seul format d'export, et met le jeton sous la protection de la chaîne. Le découpage en 24 champs est le prix de la limite de 256 octets par champ binaire, sans changer le format d'enregistrement v1.
+- **HTTP sans TLS** : la demande ne porte qu'une empreinte, la réponse est signée et entièrement vérifiée. Un intermédiaire ne peut que faire échouer un horodatage, ce qui se voit (`audit.timestamp_failed`), jamais en faire accepter un faux. C'est le transport de la RFC 3161, et celui des autorités courantes.
+- **Nouvelle dépendance** : `rustls-webpki` devient une dépendance directe de `ostena-crypto` (déjà présente par `rustls`, même version, ISC) pour la validation de la chaîne de l'autorité avec l'usage étendu `id-kp-timeStamping`. Le client HTTP est celui de `hyper`, déjà présent (fonctionnalité `client` ajoutée au core).
+- **En CI et hors ligne** : une autorité de test (`ostena_crypto::tsp::testing::TestTsa`, fonctionnalité `testing`) produit de vrais jetons ; le test du core la sert en HTTP sur la boucle locale. L'analyseur des réponses a ses tests `proptest` et sa cible de fuzzing `tsp_response`, dont le corpus est rejoué en test.
+
+Limites : l'autorité doit signer en ECDSA P-256 / SHA-256 ; une autorité RSA est refusée (`TSP-E003`). La révocation du certificat de l'autorité (CRL, OCSP) n'est pas contrôlée : l'auditeur choisit ses ancres et peut les retirer. Un horodatage prouve qu'une tête existait à une heure, pas qu'elle n'a pas été remplacée ensuite : il faut conserver les exports, ou les têtes horodatées, hors du bastion.
+
 ## Conséquences
 
 - Un auditeur vérifie un export avec un binaire `ostena` et la clé publique, hors ligne, sans secret. Les décodeurs font quelques centaines de lignes sans dépendance, couverts par deux cibles de fuzzing (`audit_decode`, `audit_verify`) dont les corpus sont rejoués en test sur la toolchain stable, et par un modèle de chaîne en `proptest` qui applique une altération aléatoire à chaque export.
 - Le format n'est pas un standard : un outil tiers l'implémente d'après cet ADR. Toute évolution passe par une nouvelle version, et les versions inconnues sont refusées.
 - **Risques acceptés** :
   - **Troncature** : supprimer la fin de la chaîne et les têtes qui la couvrent donne un export cohérent. Elle n'est détectable qu'avec une copie externe d'une tête plus récente (`AUD-E013`) ou par la fraîcheur (`AUD-W004`, dernière tête trop ancienne au moment de l'export). Les procédures d'exploitation devront prévoir la sortie régulière de têtes hors du core.
-  - **Core compromis** : celui qui contrôle le core et sa clé de signature peut réécrire toute la partie de la chaîne qui n'est pas encore couverte par une tête sortie du core. Aucun mécanisme interne (HMAC compris) n'y remédie ; seules les têtes externes et l'horodatage par un tiers le bornent.
+  - **Core compromis** : celui qui contrôle le core et sa clé de signature peut réécrire toute la partie de la chaîne qui n'est pas encore couverte par une tête sortie du core. Aucun mécanisme interne (HMAC compris) n'y remédie ; seules les têtes externes et l'horodatage par un tiers (PR 11b) le bornent.
   - **Signatures classiques à longue durée de vie** : une tête doit rester vérifiable des années. ECDSA P-256 n'est pas résistant à un ordinateur quantique ; la question sera réexaminée avec les têtes hybrides ML-DSA-65 (ADR-0009). Une falsification future exigerait de casser la clé publique, et un horodatage RFC 3161 antérieur à cette date la rendrait visible.
   - **SHA-256 et pas SHA-384** : le guide ANSSI recommande des empreintes d'au moins 384 bits si une sécurité post-quantique est visée (ADR-0009). SHA-256 est retenu pour rester aligné sur ECDSA P-256 / SHA-256 et sur les grants ; un passage à SHA-384 se ferait avec une nouvelle version des enregistrements et des têtes.
 - Le code `AUD-E004` couvre aussi une erreur de lecture du fichier ; la commande la distingue par son code de sortie 3.

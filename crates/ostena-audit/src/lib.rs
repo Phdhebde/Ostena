@@ -23,6 +23,7 @@ pub mod export;
 pub mod head;
 mod ids;
 pub mod record;
+pub mod timestamp;
 pub mod transcripts;
 pub mod verify;
 

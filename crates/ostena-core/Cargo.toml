@@ -17,8 +17,9 @@ testing = []
 # Keys in the tunnel messages (base64url, ADR-0008).
 base64.workspace = true
 http-body-util.workspace = true
-# HTTPS login API (ADR-0015): HTTP/1.1 server only.
-hyper = { workspace = true, features = ["server"] }
+# HTTPS login API (ADR-0015): HTTP/1.1 server; the HTTP/1.1 client of the
+# time-stamping authority (RFC 3161 section 3.4, ADR-0012).
+hyper = { workspace = true, features = ["server", "client"] }
 hyper-util = { workspace = true, features = ["server", "http1", "service"] }
 idna_adapter.workspace = true
 ostena-audit.workspace = true
@@ -60,8 +61,6 @@ ostena-crypto = { workspace = true, features = ["testing"] }
 # The identity tests: a directory served by the test LDAP server.
 ostena-ldap = { workspace = true, features = ["testing"] }
 toml.workspace = true
-# The login API tests: foreign TLS clients, an HTTP client.
-hyper = { workspace = true, features = ["client"] }
 # The property test of the login rate limiter.
 proptest.workspace = true
 # The gateway end-to-end test: a WebSocket client.

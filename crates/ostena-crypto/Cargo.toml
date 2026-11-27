@@ -22,6 +22,9 @@ rcgen.workspace = true
 # and the directories that admit it (tls::directory, « Annuaires LDAPS »);
 # every other configuration pins TLS 1.3.
 rustls = { workspace = true, features = ["tls12"] }
+# Chain of a time-stamping certificate (RFC 3161): the verifier of rustls,
+# with an extended key usage of our own (tsp).
+rustls-webpki.workspace = true
 thiserror.workspace = true
 time.workspace = true
 vsss-rs.workspace = true

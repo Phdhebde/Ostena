@@ -17,6 +17,10 @@ use crate::export::{ExportReader, Frame};
 use crate::head::{Head, TrustedKeys};
 use crate::ids::ChainId;
 use crate::record::{Digest, Record, Value, ZERO_DIGEST, record_hash};
+use crate::timestamp::Stamped;
+
+/// Heads remembered to check the time-stamps that follow them.
+const RECENT_HEADS: usize = 64;
 
 /// Largest number of findings kept in a report; the others are only counted.
 pub const MAX_FINDINGS: usize = 1000;
@@ -177,6 +181,25 @@ pub enum Finding {
         file: String,
         /// Seq of its seal.
         seq: u64,
+    },
+    /// `AUD-E021`: an `audit.head_timestamped` record that is malformed,
+    /// whose token does not verify against the trusted authorities, or
+    /// that does not stamp the head it names.
+    TimestampInvalid {
+        /// Seq of the record.
+        seq: u64,
+        /// What is wrong (with the `TSP-E…` code of a token).
+        why: String,
+    },
+    /// `AUD-W009`: a head time-stamped before the time it carries, beyond
+    /// the clock tolerance: the clock of the core was ahead.
+    TimestampBeforeHead {
+        /// Seq of the record.
+        seq: u64,
+        /// The head.
+        head_no: u64,
+        /// How far ahead, ms.
+        ahead_ms: u64,
     },
     /// `AUD-W006`: a transcript sealed as incomplete (stream cut, core
     /// stopped): it is intact, but the session may not be in full.
@@ -359,6 +382,8 @@ impl Finding {
             Self::TranscriptPending { .. } => "AUD-W007",
             Self::TranscriptSealInvalid { .. } => "AUD-E020",
             Self::TranscriptSealUncovered { .. } => "AUD-W008",
+            Self::TimestampInvalid { .. } => "AUD-E021",
+            Self::TimestampBeforeHead { .. } => "AUD-W009",
         }
     }
 
@@ -372,7 +397,8 @@ impl Finding {
             | Self::TranscriptUnsealed { .. }
             | Self::TranscriptIncomplete { .. }
             | Self::TranscriptPending { .. }
-            | Self::TranscriptSealUncovered { .. } => Severity::Warning,
+            | Self::TranscriptSealUncovered { .. }
+            | Self::TimestampBeforeHead { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -468,6 +494,10 @@ impl fmt::Display for Finding {
                 "[{code}] session SSH ouverte (enregistrement n° {seq}) sans transcript scellé \
                  dans l'export, alors qu'elle était forcément terminée : {file}"
             ),
+            Self::TimestampInvalid { seq, why } => write!(
+                f,
+                "[{code}] horodatage invalide à l'enregistrement n° {seq} : {why}"
+            ),
             _ => self.fmt_warning(f, code),
         }
     }
@@ -532,6 +562,15 @@ impl Finding {
                 "[{code}] session SSH ouverte (enregistrement n° {seq}) sans transcript scellé \
                  dans l'export, peut-être encore en cours à l'export : {file}"
             ),
+            Self::TimestampBeforeHead {
+                seq,
+                head_no,
+                ahead_ms,
+            } => write!(
+                f,
+                "[{code}] la tête n° {head_no} est horodatée (enregistrement n° {seq}) \
+                 {ahead_ms} ms avant l'heure qu'elle porte : horloge du core en avance"
+            ),
             // Errors are written by `Display::fmt`.
             _ => write!(f, "[{code}]"),
         }
@@ -541,6 +580,10 @@ impl Finding {
 /// Verification options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
+    /// The trusted certificates of the time-stamping authorities: every
+    /// `audit.head_timestamped` token is then verified (`AUD-E021`).
+    /// Without them, tokens are counted, not verified.
+    pub tsa: Option<ostena_crypto::tsp::TsaTrust>,
     /// Heads kept outside the core (noted by an administrator, sent to a
     /// second system): each must verify, and the export must contain its
     /// record with the same hash, otherwise `AUD-E013`.
@@ -554,6 +597,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            tsa: None,
             external_heads: Vec::new(),
             clock_tolerance_ms: 5_000,
             head_gap_tolerance_secs: 60,
@@ -588,6 +632,13 @@ pub struct Report {
     pub ssh_sessions: Vec<SshSession>,
     /// Time of the export, Unix milliseconds, when known.
     pub export_time_ms: Option<u64>,
+    /// `audit.head_timestamped` records read.
+    pub timestamps: u64,
+    /// Those whose token verified against the trusted authorities.
+    pub timestamps_verified: u64,
+    /// The last head whose time-stamp verified, and its `genTime` (Unix
+    /// ms): the chain up to this head existed then.
+    pub last_timestamp: Option<(u64, u64)>,
 }
 
 impl Report {
@@ -666,6 +717,12 @@ pub struct Verifier {
     /// Sessions sealed so far: a second seal is an error.
     sealed_sessions: std::collections::HashSet<[u8; 16]>,
     ssh_sessions: Vec<SshSession>,
+    tsa: Option<ostena_crypto::tsp::TsaTrust>,
+    /// The last heads read: number, hash, time.
+    recent_heads: std::collections::VecDeque<(u64, Digest, u64)>,
+    timestamps: u64,
+    timestamps_verified: u64,
+    last_timestamp: Option<(u64, u64)>,
 }
 
 impl Verifier {
@@ -694,6 +751,11 @@ impl Verifier {
             transcripts: Vec::new(),
             sealed_sessions: std::collections::HashSet::new(),
             ssh_sessions: Vec::new(),
+            tsa: options.tsa,
+            recent_heads: std::collections::VecDeque::with_capacity(RECENT_HEADS),
+            timestamps: 0,
+            timestamps_verified: 0,
+            last_timestamp: None,
         };
         for head in options.external_heads {
             match head.verify(&verifier.keys) {
@@ -812,6 +874,7 @@ impl Verifier {
             time_ms: head.time_ms(),
             heartbeat_secs: head.heartbeat_secs(),
         });
+        self.remember_head(head);
         let mut ignored = None;
         self.check_external(&mut ignored, head.record_seq(), &head.record_hash());
         Ok(())
@@ -839,6 +902,93 @@ impl Verifier {
             );
         } else if let Some(opened) = SshSession::of(record) {
             self.ssh_sessions.push(opened);
+        }
+    }
+
+    fn remember_head(&mut self, head: &Head) {
+        if self.recent_heads.len() == RECENT_HEADS {
+            self.recent_heads.pop_front();
+        }
+        self.recent_heads
+            .push_back((head.head_no(), head.hash(), head.time_ms()));
+    }
+
+    /// Checks an `audit.head_timestamped` record: well formed, naming a
+    /// head already read with its hash (when still remembered), and, with
+    /// trusted authorities, a token that stamps that hash at the time
+    /// recorded (`AUD-E021`); a stamp before the time of its head is
+    /// `AUD-W009`.
+    fn check_timestamp(&mut self, first: &mut Option<Finding>, record: &Record) {
+        let Some(parsed) = Stamped::of(record) else {
+            return;
+        };
+        self.timestamps += 1;
+        let invalid = |why: String| Finding::TimestampInvalid {
+            seq: record.seq,
+            why,
+        };
+        let stamped = match parsed {
+            Ok(stamped) => stamped,
+            Err(why) => return self.flag(first, invalid(why.into())),
+        };
+        let known = self
+            .recent_heads
+            .iter()
+            .find(|(no, _, _)| *no == stamped.head_no)
+            .copied();
+        match known {
+            Some((_, hash, _)) if hash != stamped.head_hash => {
+                return self.flag(
+                    first,
+                    invalid(format!(
+                        "hash différent de celui de la tête n° {}",
+                        stamped.head_no
+                    )),
+                );
+            }
+            None if self
+                .last_head
+                .is_none_or(|last| stamped.head_no > last.head_no) =>
+            {
+                return self.flag(
+                    first,
+                    invalid(format!(
+                        "la tête n° {} n'a pas encore été lue",
+                        stamped.head_no
+                    )),
+                );
+            }
+            _ => {}
+        }
+        let Some(trust) = &self.tsa else {
+            return;
+        };
+        match stamped.verify(trust) {
+            Err(e) => self.flag(first, invalid(e.to_string())),
+            Ok(stamp) => {
+                self.timestamps_verified += 1;
+                if self
+                    .last_timestamp
+                    .is_none_or(|(no, _)| stamped.head_no >= no)
+                {
+                    self.last_timestamp = Some((stamped.head_no, stamp.gen_time_ms));
+                }
+                if let Some((_, _, head_ms)) = known {
+                    let tolerance = self
+                        .clock_tolerance_ms
+                        .saturating_add(stamp.accuracy_ms.unwrap_or(0));
+                    if stamp.gen_time_ms.saturating_add(tolerance) < head_ms {
+                        self.flag(
+                            first,
+                            Finding::TimestampBeforeHead {
+                                seq: record.seq,
+                                head_no: stamped.head_no,
+                                ahead_ms: head_ms - stamp.gen_time_ms,
+                            },
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -922,6 +1072,7 @@ impl Verifier {
                 self.last_time_ms = Some(record.time_ms);
                 self.check_external(&mut first, record.seq, &hash);
                 self.collect_transcripts(&mut first, &record);
+                self.check_timestamp(&mut first, &record);
                 record.seq
             }
         };
@@ -1014,6 +1165,7 @@ impl Verifier {
             time_ms: head.time_ms(),
             heartbeat_secs: head.heartbeat_secs(),
         });
+        self.remember_head(head);
         if matches_tip {
             self.covered_seq = Some(head.record_seq());
         }
@@ -1084,6 +1236,9 @@ impl Verifier {
             transcripts: self.transcripts,
             ssh_sessions: self.ssh_sessions,
             export_time_ms,
+            timestamps: self.timestamps,
+            timestamps_verified: self.timestamps_verified,
+            last_timestamp: self.last_timestamp,
         }
     }
 }

@@ -1973,3 +1973,49 @@ fn p024_worm_disabled_is_refused_in_production() {
     );
     assert!(Config::from_toml_str(&unknown).is_err());
 }
+
+// ---------------------------------------------------------------- time-stamps
+
+#[test]
+fn timestamping_is_checked() {
+    let with = |extra: &str| {
+        parse(&format!(
+            "{}\n[core.audit.timestamping]\n{extra}",
+            CORE.replace(
+                "audit = { signing_key = { credential = \"audit.key\" } }",
+                "[core.audit]\nsigning_key = { credential = \"audit.key\" }"
+            )
+        ))
+    };
+    let c = with("url = \"http://tsa.lab:318/tsr\"\nca = \"/etc/ostena/tsa.pem\"\n");
+    assert_eq!(core_codes(&c), Vec::new());
+    assert_eq!(production_codes(&c), Vec::new());
+    let ts = c.core.unwrap().audit.timestamping.unwrap();
+    assert_eq!((ts.interval_secs, ts.timeout_secs), (600, 10));
+    assert_eq!(
+        ts.target().unwrap(),
+        HttpTarget {
+            host: "tsa.lab".into(),
+            port: 318,
+            path: "/tsr".into()
+        }
+    );
+    for (url, ok) in [
+        ("http://10.0.0.5", true),
+        ("http://[fd00::5]:8080/a?b=c", true),
+        ("https://tsa.lab/", false),
+        ("http://user@tsa.lab/", false),
+        ("http://tsa.lab:0/", false),
+        ("http://tsa lab/", false),
+        ("http:///x", false),
+        ("http://[zz]/", false),
+    ] {
+        let c = with(&format!("url = \"{url}\"\nca = \"/a.pem\"\n"));
+        assert_eq!(core_codes(&c).is_empty(), ok, "{url}");
+    }
+    let c = with("url = \"http://t/\"\nca = \"rel.pem\"\ninterval_secs = 10\ntimeout_secs = 0\n");
+    assert_eq!(
+        core_codes(&c),
+        vec![Code::RelativePath, Code::CoreBounds, Code::CoreBounds]
+    );
+}

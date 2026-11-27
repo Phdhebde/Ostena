@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [grant_decode, login_messages, web_messages, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, tunnel_mux_decode, ssh_precheck, ssh_certificate, ssh_login, ssh_sftp, audit_decode, audit_verify, release_manifest, recorder_decode, recorder_cast, rdp_x224, rdp_mcs_gcc, rdp_tsrequest, rdp_license, rdp_session, ldap_message, ldap_filter, ws_frame]
+        target: [grant_decode, login_messages, web_messages, scope_target, scope_policy, frame_decode, frame_reassembly, tunnel_control_decode, tunnel_mux_decode, ssh_precheck, ssh_certificate, ssh_login, ssh_sftp, audit_decode, audit_verify, release_manifest, recorder_decode, recorder_cast, rdp_x224, rdp_mcs_gcc, rdp_tsrequest, rdp_license, rdp_session, ldap_message, ldap_filter, ws_frame, tsp_response]
     runs-on: ubuntu-24.04
     timeout-minutes: 80
     steps:
