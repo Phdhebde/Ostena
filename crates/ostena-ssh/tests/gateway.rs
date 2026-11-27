@@ -332,6 +332,20 @@ fn record_with_grace(
     )
 }
 
+/// Waits until the core has received the start of the transcript of
+/// `session`: only then can a cut be resumed within the grace (the core
+/// refuses to resume a transcript it never saw).
+async fn known_to_core(core: &TestCore, session: Uuid) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while core.recording(session).is_none_or(|(b, _)| b.is_empty()) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "transcript never reached the core"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// The frames of a transcript received by the test core.
 fn frames_of(bytes: &[u8]) -> Vec<ostena_recorder::Frame> {
     use ostena_recorder::{Decoder, Limits as RecLimits};
@@ -367,13 +381,7 @@ fn a_cut_shorter_than_the_grace_keeps_the_session_and_its_transcript() {
         let (transcript, pumped) = record_with_grace(&gateway, session, Duration::from_secs(30));
         transcript.start(None, None).await.unwrap();
         transcript.output(b"before\n").await.unwrap();
-        // The transcript is known to the core before the cut.
-        for _ in 0..100 {
-            if core.recording(id).is_some_and(|(b, _)| !b.is_empty()) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        known_to_core(&core, id).await;
 
         core.stop();
         // Shown while the link is down: buffered, not lost.
@@ -436,8 +444,12 @@ fn a_cut_longer_than_the_grace_cuts_the_session() {
             .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
             .await
             .unwrap();
+        let id = session.session.session_id;
         let (transcript, pumped) = record_with_grace(&gateway, session, Duration::from_secs(2));
         transcript.start(None, None).await.unwrap();
+        // A cut before the core has the transcript leaves nothing to resume:
+        // the session is cut at once, without grace.
+        known_to_core(&core, id).await;
         core.stop();
         transcript.output(b"unacknowledged").await.unwrap();
         tokio::time::timeout(Duration::from_secs(20), transcript.closed())
@@ -468,8 +480,10 @@ fn a_full_buffer_during_a_cut_cuts_the_session() {
             .open_ssh_session(&access("root", "srv-lab01"), now(), &store)
             .await
             .unwrap();
+        let id = session.session.session_id;
         let (transcript, pumped) = record_with_grace(&gateway, session, Duration::from_secs(60));
         transcript.start(None, None).await.unwrap();
+        known_to_core(&core, id).await;
         core.stop();
         let writer = tokio::spawn({
             let transcript = transcript.clone();

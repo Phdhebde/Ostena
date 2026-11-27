@@ -356,8 +356,11 @@ pub async fn run(
     });
     let preamble = Preamble::New { grace_secs }.encode();
     let link = async {
+        // Lost before the core has the preamble: it would refuse to resume
+        // a transcript it never saw, so the session is cut at once, without
+        // grace; the frames queued meanwhile are unacknowledged all the same.
         if let Err(e) = channel.send.write_all(&preamble).await {
-            return Err(lost_error(&e.to_string(), 0));
+            return Err(lost_error(&e.to_string(), state.with(|b| b.unacked())));
         }
         loop {
             match stream(&mut channel, &state, options.write_timeout).await {
