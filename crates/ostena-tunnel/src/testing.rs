@@ -1110,11 +1110,19 @@ async fn control(
                 continue;
             }
             AgentMessage::SessionClosed {
-                session_id, reason, ..
+                report_id,
+                session_id,
+                reason,
+                ..
             } => {
                 if let Ok(mut closed) = state.closed.lock() {
                     closed.push((session_id, reason));
                 }
+                let _ = tunnel.send(&CoreMessage::ReportAck { report_id }).await;
+                continue;
+            }
+            AgentMessage::ReportsLost { report_id, .. } => {
+                let _ = tunnel.send(&CoreMessage::ReportAck { report_id }).await;
                 continue;
             }
             AgentMessage::SshHostKey { p256_public, proof } => {

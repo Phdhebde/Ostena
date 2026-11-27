@@ -26,6 +26,7 @@ pub mod link;
 pub mod mux;
 pub mod recording;
 pub mod renewal;
+pub mod reports;
 pub mod ssh;
 pub mod transport;
 pub mod tunnel;

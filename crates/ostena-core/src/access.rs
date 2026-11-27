@@ -1070,9 +1070,10 @@ pub async fn open_session(
     })
 }
 
-/// Records the end of `session` of `agent`; returns its
-/// `access.session_closed` record, or `None` for a session unknown to this
-/// agent or already closed.
+/// Records the end of `session` of `agent` at `closed_at` (never before its
+/// opening: the report of the agent may come late, from its queue); returns
+/// its `access.session_closed` record, or `None` for a session unknown to
+/// this agent or already closed.
 ///
 /// # Errors
 ///
@@ -1084,16 +1085,16 @@ pub async fn close_session(
     reason: &str,
     bytes_to_target: u64,
     bytes_from_target: u64,
-    now: u64,
+    closed_at: u64,
 ) -> Result<Option<Event>, CoreError> {
     let reason: String = truncate(reason).chars().take(128).collect();
     let found = sqlx::query!(
-        "UPDATE access_session SET closed_at = $3, close_reason = $4,
+        "UPDATE access_session SET closed_at = GREATEST(opened_at, $3), close_reason = $4,
                 bytes_to_target = $5, bytes_from_target = $6
          WHERE id = $1::text::uuid AND agent_id = $2::text::uuid AND closed_at IS NULL",
         session.to_string(),
         agent.to_string(),
-        i64_of(now),
+        i64_of(closed_at),
         reason,
         i64_of(bytes_to_target),
         i64_of(bytes_from_target),

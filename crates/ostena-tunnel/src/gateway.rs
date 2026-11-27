@@ -36,6 +36,7 @@ use crate::control::{AgentMessage, CoreMessage, GrantKey, SessionProtocol, p256_
 use crate::error::TunnelError;
 use crate::ids::Uuid;
 use crate::link::{AgentLink, KeyWriter};
+use crate::reports::ReportQueue;
 use crate::ssh::SshTrust;
 
 /// How long the agent waits for the core to answer a session request.
@@ -545,7 +546,9 @@ pub struct Gateway {
     pending: Pending,
     next_request: AtomicU64,
     revocations: broadcast::Sender<Uuid>,
+    reports: Option<Arc<ReportQueue>>,
     task: JoinHandle<()>,
+    queue_task: Option<JoinHandle<()>>,
 }
 
 impl Gateway {
@@ -564,6 +567,25 @@ impl Gateway {
     ///
     /// Outside a Tokio runtime.
     pub fn start(state: Arc<GatewayState>, link: Arc<AgentLink>) -> Result<Self, TunnelError> {
+        Self::start_with(state, link, None)
+    }
+
+    /// The same, with the encrypted queue of the session reports: they are
+    /// queued, sent at every connection and dropped once acknowledged
+    /// (ADR-0012). Without it, a report is sent once, lost with the link.
+    ///
+    /// # Errors
+    ///
+    /// The pushes of `link` were already taken.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime.
+    pub fn start_with(
+        state: Arc<GatewayState>,
+        link: Arc<AgentLink>,
+        reports: Option<Arc<ReportQueue>>,
+    ) -> Result<Self, TunnelError> {
         let pushes = link
             .take_pushes()
             .ok_or_else(|| TunnelError::Config("messages du core déjà pris".into()))?;
@@ -574,14 +596,20 @@ impl Gateway {
             state.clone(),
             pending.clone(),
             revocations.clone(),
+            reports.clone(),
         ));
+        let queue_task = reports
+            .clone()
+            .map(|queue| tokio::spawn(queue.run(link.clone())));
         Ok(Self {
             state,
             link,
             pending,
             next_request: AtomicU64::new(1),
             revocations,
+            reports,
             task,
+            queue_task,
         })
     }
 
@@ -832,9 +860,32 @@ impl Gateway {
             .await;
     }
 
+    /// The queue of the session reports, if the gateway has one.
+    #[must_use]
+    pub fn reports(&self) -> Option<&Arc<ReportQueue>> {
+        self.reports.as_ref()
+    }
+
+    /// Queues the report of the end of session `session_id` if the gateway
+    /// has a queue; `false` without one (the caller sends it itself).
+    pub fn queue_closed(
+        &self,
+        session_id: Uuid,
+        reason: &str,
+        bytes_to_target: u64,
+        bytes_from_target: u64,
+    ) -> bool {
+        let Some(queue) = &self.reports else {
+            return false;
+        };
+        queue.push(session_id, reason, bytes_to_target, bytes_from_target);
+        true
+    }
+
     /// Reports to the core the end of session `session_id`, with its reason
-    /// and the bytes sent to and received from the target (best effort: on
-    /// a lost tunnel, the report is lost too).
+    /// and the bytes sent to and received from the target: through the
+    /// queue if the gateway has one, otherwise sent once (lost with the
+    /// tunnel).
     pub async fn report_closed(
         &self,
         session_id: Uuid,
@@ -842,11 +893,18 @@ impl Gateway {
         bytes_to_target: u64,
         bytes_from_target: u64,
     ) {
+        if self.queue_closed(session_id, &reason, bytes_to_target, bytes_from_target) {
+            return;
+        }
         let message = AgentMessage::SessionClosed {
+            report_id: 0,
             session_id: session_id.to_string(),
             reason,
             bytes_to_target,
             bytes_from_target,
+            closed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
         };
         if let Err(e) = self.link.send(&message).await {
             tracing::warn!(
@@ -862,6 +920,9 @@ impl Gateway {
 impl Drop for Gateway {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(task) = &self.queue_task {
+            task.abort();
+        }
     }
 }
 
@@ -870,6 +931,7 @@ async fn dispatch(
     state: Arc<GatewayState>,
     pending: Pending,
     revocations: broadcast::Sender<Uuid>,
+    reports: Option<Arc<ReportQueue>>,
 ) {
     while let Some(message) = pushes.recv().await {
         match message {
@@ -931,6 +993,11 @@ async fn dispatch(
                     "{e}"
                 ),
             },
+            CoreMessage::ReportAck { report_id } => {
+                if let Some(queue) = &reports {
+                    queue.ack(report_id);
+                }
+            }
             CoreMessage::LoginRevoked { login_session } => {
                 if let Some(login) = Uuid::parse(&login_session) {
                     tracing::info!(event = "agent.login_revoked", login_session = %login);

@@ -2,7 +2,7 @@
 //! Ostena component names (`CFG-P010`), then the tunnel kept up for the life
 //! of the agent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use ostena_scope::infrastructure::{self, Unresolved};
 use ostena_scope::{InfrastructureSpec, LocalAddresses, SharedLocalAddresses, SystemResolver};
 use ostena_tunnel::gateway::{Gateway, GatewayParams, GatewayState};
 use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, SystemClock};
+use ostena_tunnel::reports::ReportQueue;
 use ostena_tunnel::{Hello, Limits, TransportMode, Uuid};
 
 /// How often the component names are resolved again.
@@ -188,7 +189,17 @@ pub(crate) fn start_gateway(
         grant_policy: ostena_grant::Policy::default(),
     })
     .map_err(|e| e.to_string())?;
-    Gateway::start(Arc::new(state), link).map_err(|e| e.to_string())
+    // The session reports wait in an encrypted queue, next to the replay
+    // journal, until the core acknowledges them (ADR-0012).
+    let dir = agent
+        .replay_journal
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let reports = ReportQueue::open(&dir, |path, bytes| {
+        private_file::create(path, bytes, Reader::CurrentProcess)
+    })
+    .map_err(|e| format!("file des bilans de session : {e}"))?;
+    Gateway::start_with(Arc::new(state), link, Some(Arc::new(reports))).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
