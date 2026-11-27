@@ -45,6 +45,7 @@ use crate::identity::Directories;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
 use crate::transcripts::{self, Transcripts};
+use crate::web::gateway::Relays;
 use crate::web::pg::{Agents, PgWebBackend, WebAccess};
 use crate::web::{WebListener, WebSettings};
 use crate::{login, pushes, rate};
@@ -395,6 +396,13 @@ impl Agents for Directory {
             .min()
             .map(|(_, agent)| agent)
     }
+
+    fn tunnel(&self, agent: Uuid) -> Option<Arc<CoreTunnel>> {
+        self.tunnels
+            .live()
+            .into_iter()
+            .find_map(|(fp, tunnel)| (self.cache.active(&fp)?.agent == agent).then_some(tunnel))
+    }
 }
 
 struct Shared {
@@ -403,6 +411,8 @@ struct Shared {
     issuer: Arc<IssuingAuthority>,
     enrollment: EnrollmentService,
     tunnels: Arc<Tunnels>,
+    /// The gateway sessions of the portal (ADR-0020).
+    relays: Arc<Relays>,
     certificate_lifetime: u64,
     limits: Limits,
     recorder: Arc<Recorder>,
@@ -579,6 +589,7 @@ fn web_access(shared: &Shared) -> WebAccess {
             tunnels: shared.tunnels.clone(),
             cache: shared.cache.clone(),
         }),
+        relays: shared.relays.clone(),
     }
 }
 
@@ -643,6 +654,7 @@ impl RunningCore {
             issuer: keys.issuing.clone(),
             enrollment,
             tunnels: Arc::default(),
+            relays: Arc::default(),
             certificate_lifetime,
             limits,
             recorder: recorder.clone(),
@@ -1611,6 +1623,11 @@ fn connected(shared: &Shared) -> Vec<(Uuid, Uuid, Arc<CoreTunnel>)> {
 /// Tells the connected agents that received a grant for `session` that it
 /// is revoked; those not connected are told when they connect.
 async fn apply_login_revocation(shared: Arc<Shared>, session: Uuid) {
+    // The gateway sessions of the portal end at once (ADR-0020).
+    let cut = shared.relays.cut(session);
+    if cut > 0 {
+        tracing::warn!(event = "gateway.cut", login_session = %session, sessions = cut);
+    }
     let agents = match login::agents_to_notify(shared.store.pool(), session).await {
         Ok(agents) => agents,
         Err(e) => {

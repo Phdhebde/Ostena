@@ -355,6 +355,41 @@
           }
         }
       }
+    },
+    "/api/v1/gateway": {
+      "get": {
+        "operationId": "openGateway",
+        "summary": "Ouvre la WebSocket de la passerelle navigateur pour un grant obtenu par POST /api/v1/access.",
+        "description": "Poignée de main WebSocket (RFC 6455) avec deux sous-protocoles : ostena-frame.v1 et ostena-grant.<grant> ; le grant ne passe jamais dans l'URL. Le core vérifie dans l'ordre : Origin, cookie de session, poignée de main et ostena-frame.v1, puis la signature ECDSA du grant et sa ligne (canal web, cette session de connexion, non expiré, jamais présenté), qu'il marque présentée de façon atomique (gateway.opened, accordant). L'agent ouvre alors la session ; la réponse 101 ne sélectionne que ostena-frame.v1. Chaque message WebSocket est une trame ostena-frame (binaire, 32 Kio au plus). Fermetures : 1000 (fin), 1002 (trame refusée, GTW-E005), 1003 (texte), 1008 (session révoquée), 1009 (trop grand), 4003 (navigateur trop lent, GTW-E004).",
+        "parameters": [
+          {
+            "name": "Sec-WebSocket-Protocol",
+            "in": "header",
+            "required": true,
+            "description": "ostena-frame.v1, ostena-grant.<grant>",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket ouverte, sous-protocole ostena-frame.v1."
+          },
+          "400": {
+            "$ref": "#/components/responses/GatewayHandshake"
+          },
+          "401": {
+            "$ref": "#/components/responses/NoSession"
+          },
+          "403": {
+            "$ref": "#/components/responses/GatewayRefused"
+          },
+          "503": {
+            "$ref": "#/components/responses/NoAgent"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -495,6 +530,26 @@
       },
       "AccessRateLimited": {
         "description": "ACC-E009 : trop de demandes d'accès pour cette session (10 d'un coup, puis une toutes les 6 s).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "GatewayRefused": {
+        "description": "Passerelle refusée : GTW-E001 (grant absent, inconnu, expiré, déjà présenté ou émis pour une autre session), GTW-E006 (protocole non servi dans le navigateur par l'agent) ; WEB-E002 (Origin absente ou étrangère). La cause est dans la chaîne d'audit (gateway.refused).",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "GatewayHandshake": {
+        "description": "GTW-E002 : poignée de main WebSocket invalide, ou sous-protocole ostena-frame.v1 absent.",
         "content": {
           "application/json": {
             "schema": {

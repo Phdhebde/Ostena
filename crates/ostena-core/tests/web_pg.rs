@@ -59,6 +59,11 @@ impl Agents for FakeAgents {
     fn pick(&self, group: Uuid) -> Option<Uuid> {
         (group == GROUP && self.0.load(Ordering::Relaxed)).then_some(AGENT)
     }
+
+    // No tunnel here: the gateway is tested end to end in web_gateway.rs.
+    fn tunnel(&self, _: Uuid) -> Option<Arc<ostena_tunnel::CoreTunnel>> {
+        None
+    }
 }
 
 fn now() -> u64 {
@@ -90,6 +95,7 @@ struct Fixture {
     totp: Vec<(String, TotpSecret)>,
     agents: Arc<FakeAgents>,
     grants: Arc<GrantAuthority>,
+    backend: Arc<PgWebBackend>,
 }
 
 async fn enroll(pool: &PgPool, key: &TotpKey, name: &str) -> TotpSecret {
@@ -172,14 +178,16 @@ async fn fixture(test: &str) -> Option<Fixture> {
     let access = WebAccess {
         grants: grants.clone(),
         agents: agents.clone(),
+        relays: Arc::default(),
     };
     let pki = TestPki::new("web-pg").unwrap();
     let server = pki.server(&["core.test"]).unwrap();
+    let backend = Arc::new(PgWebBackend::new(Arc::new(auth)).with_access(access));
     let listener = WebListener::bind(
         "127.0.0.1:0".parse().unwrap(),
         tls::web_server_config(&server, WebGroups::Hybrid).unwrap(),
         WebSettings::new(ORIGIN.into()),
-        Arc::new(PgWebBackend::new(Arc::new(auth)).with_access(access)),
+        backend.clone(),
         Arc::new(Attempts::new(600)),
     )
     .await
@@ -193,6 +201,7 @@ async fn fixture(test: &str) -> Option<Fixture> {
         totp,
         agents,
         grants,
+        backend,
     })
 }
 
@@ -542,6 +551,52 @@ fn an_access_of_the_portal_issues_a_web_grant() {
         f.flushed().await;
         assert_eq!(audit_count(&f.pool, "access.web_granted").await, 1);
 
+        // Never presented on the gateway: the agent cannot open it.
+        let refused = ostena_core::access::open_session(
+            &f.pool,
+            &f.grants,
+            AGENT,
+            GROUP,
+            1,
+            &granted.grant,
+            now(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.code, "ACC-E008");
+        // Presented by its browser session, once.
+        let by = ostena_core::access::Presenter {
+            subject: Uuid::parse(&info.user).unwrap(),
+            login_session: login,
+            client_address: "127.0.0.1:1",
+        };
+        let presented =
+            ostena_core::access::present_web_grant(&f.pool, &f.grants, &by, &granted.grant, now())
+                .await
+                .unwrap();
+        assert_eq!((presented.agent, presented.group), (AGENT, GROUP));
+        let again =
+            ostena_core::access::present_web_grant(&f.pool, &f.grants, &by, &granted.grant, now())
+                .await
+                .unwrap_err();
+        assert_eq!(again.code, "GTW-E001");
+        let other = ostena_core::access::Presenter {
+            login_session: Uuid::from_bytes([9; 16]),
+            ..by
+        };
+        assert_eq!(
+            ostena_core::access::present_web_grant(
+                &f.pool,
+                &f.grants,
+                &other,
+                &granted.grant,
+                now()
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "GTW-E001"
+        );
         // The agent opens the session as for native SSH: the web grant
         // goes the common way (ADR-0014).
         let opened = ostena_core::access::open_session(
@@ -607,6 +662,35 @@ fn an_access_of_the_portal_issues_a_web_grant() {
             }
         }
         assert!(limited, "no limit on the access requests");
+        f.end().await;
+    });
+}
+
+#[test]
+fn idle_browser_sessions_are_swept() {
+    use ostena_core::web::session::WebBackend;
+    block_on(async {
+        let Some(f) = fixture("web_pg_sweep").await else {
+            return;
+        };
+        let (idle, _) = f.login("alice", "127.0.0.1").await;
+        let (active, _) = f.login("root", "127.0.0.1").await;
+        sqlx::query("UPDATE web_session SET authenticated_at = $1, last_activity_at = $1 WHERE cookie_sha256 = $2")
+            .bind(i64::try_from(now() - 3600).unwrap())
+            .bind(digest_of(&idle))
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        // Revoked without a request of its own, the other one stays.
+        assert_eq!(f.backend.sweep(now(), 900).await.unwrap(), 1);
+        assert_eq!(f.backend.sweep(now(), 900).await.unwrap(), 0);
+        assert_eq!(
+            f.get(&idle, "127.0.0.1").await.status,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(f.get(&active, "127.0.0.1").await.status, StatusCode::OK);
+        f.flushed().await;
+        assert_eq!(audit_count(&f.pool, "web_session.expired").await, 1);
         f.end().await;
     });
 }

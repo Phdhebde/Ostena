@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT w.login_session_id::text AS \"id!\", w.last_activity_at\n               FROM web_session w JOIN login_session l ON l.id = w.login_session_id\n               WHERE l.revoked_at IS NULL AND w.last_activity_at < $1\n               ORDER BY w.last_activity_at LIMIT 256",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_activity_at",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "web_session",
+            "name": "last_activity_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      false
+    ]
+  },
+  "hash": "62921c543cdffbbef56ba8175bad6ee99f5076a130fcc394b47538f0843e14c0"
+}
