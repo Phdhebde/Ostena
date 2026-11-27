@@ -33,6 +33,7 @@ use ostena_core::credential::{self, TotpKey};
 use ostena_core::functions::Functions;
 use ostena_core::grant_keys::GrantAuthority;
 use ostena_core::inventory;
+use ostena_core::policy::Policies;
 use ostena_core::ssh_ca::SshAuthorities;
 use ostena_core::store::PgStore;
 use ostena_core::web::pg::{Agents, PgWebBackend, WebAccess};
@@ -43,6 +44,7 @@ use ostena_crypto::tls::testing::{Offer, browser_client_config};
 use ostena_crypto::tls::{self, WebGroups};
 use ostena_crypto::totp::{TotpAlgorithm, TotpSecret, step_at};
 use ostena_grant::{Binding, GatewayGroupId, Issuer, SignedGrant, Verifier};
+use ostena_policy::roles::Separation;
 use ostena_tunnel::Uuid;
 use ostena_tunnel::enroll::AgentRegistry;
 use sqlx::PgPool;
@@ -95,6 +97,7 @@ struct Fixture {
     totp: Vec<(String, TotpSecret)>,
     agents: Arc<FakeAgents>,
     grants: Arc<GrantAuthority>,
+    policies: Arc<Policies>,
     backend: Arc<PgWebBackend>,
 }
 
@@ -124,12 +127,12 @@ async fn fixture(test: &str) -> Option<Fixture> {
         totp.push((name.to_owned(), enroll(&pool, &key, name).await));
     }
     assert!(
-        inventory::grant_role(&pool, "root", Role::Admin)
+        inventory::grant_role(&pool, "root", Role::Admin, Separation::Strict)
             .await
             .unwrap()
     );
     assert!(
-        !inventory::grant_role(&pool, "root", Role::Admin)
+        !inventory::grant_role(&pool, "root", Role::Admin, Separation::Strict)
             .await
             .unwrap()
     );
@@ -175,8 +178,10 @@ async fn fixture(test: &str) -> Option<Fixture> {
     let issuer = Arc::new(Issuer::new(SigningKey::generate().unwrap().0));
     let grants = Arc::new(GrantAuthority::load(&pool, issuer).await.unwrap().0);
     let agents = Arc::new(FakeAgents(AtomicBool::new(true)));
+    let policies = Policies::new();
     let access = WebAccess {
         grants: grants.clone(),
+        policies: policies.clone(),
         agents: agents.clone(),
         relays: Arc::default(),
     };
@@ -201,6 +206,7 @@ async fn fixture(test: &str) -> Option<Fixture> {
         totp,
         agents,
         grants,
+        policies,
         backend,
     })
 }
@@ -554,6 +560,7 @@ fn an_access_of_the_portal_issues_a_web_grant() {
         // Never presented on the gateway: the agent cannot open it.
         let refused = ostena_core::access::open_session(
             &f.pool,
+            &f.policies,
             &f.grants,
             AGENT,
             GROUP,
@@ -601,6 +608,7 @@ fn an_access_of_the_portal_issues_a_web_grant() {
         // goes the common way (ADR-0014).
         let opened = ostena_core::access::open_session(
             &f.pool,
+            &f.policies,
             &f.grants,
             AGENT,
             GROUP,

@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM access_right\n                   WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid\n                     AND protocol = 'ssh' AND revoked_at IS NULL\n                     AND valid_from <= $3 AND valid_until > $3) AS \"known!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "24455013be82995f322987ea821a264c4ced975d9fb951d46e9468f995fa998c"
+}

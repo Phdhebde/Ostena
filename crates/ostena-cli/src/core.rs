@@ -21,6 +21,7 @@ use ostena_common::config::{self, Config, CoreConfig, DatabaseConfig, LoggingCon
 use ostena_core::audit::{self as core_audit, ExportSummary};
 use ostena_core::cache::AgentCache;
 use ostena_core::db::Role;
+use ostena_core::policy;
 use ostena_core::roles::{self, Logins};
 use ostena_core::schema::{self, SchemaState};
 use ostena_core::server::{self, Keys, RunningCore, StartInfo};
@@ -147,6 +148,8 @@ async fn serve(loaded: Loaded) -> Result<(), CoreError> {
     schema::require_up_to_date(&pool).await?;
     roles::check_service(&pool).await?;
     enforce_roles(&pool, &core.database, config.mode).await?;
+    // Separate administration roles (ADR-0022), POL-E006.
+    policy::enforce_role_separation(&pool, policy::separation(&core.admin), config.mode).await?;
     let store = PgStore::new(pool, Arc::new(AgentCache::default()));
     let info = StartInfo {
         waivers,

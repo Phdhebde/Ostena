@@ -12,6 +12,7 @@ use ostena_common::api::web::Role;
 use ostena_common::config::Mode;
 use ostena_common::config::scope::PolicySpec;
 use ostena_crypto::p256::VerifyingKey;
+use ostena_policy::roles::Separation;
 use ostena_tunnel::Uuid;
 use sqlx::PgPool;
 
@@ -455,15 +456,25 @@ pub async fn disable_user(pool: &PgPool, name: &str) -> Result<usize, CoreError>
 }
 
 /// Gives `role` to the user `name` (portal, ADR-0020). Giving a role the
-/// user has changes nothing. Returns whether it was given now.
+/// user has changes nothing. Returns whether it was given now. A role
+/// incompatible with one the user holds is refused under strict
+/// `separation` (ADR-0022).
 ///
 /// # Errors
 ///
-/// [`CoreError::NotFound`], [`CoreError::AuditWrite`], [`CoreError::Database`].
-pub async fn grant_role(pool: &PgPool, name: &str, role: Role) -> Result<bool, CoreError> {
+/// [`CoreError::NotFound`], [`CoreError::Policy`] (`POL-E006`),
+/// [`CoreError::AuditWrite`], [`CoreError::Database`].
+pub async fn grant_role(
+    pool: &PgPool,
+    name: &str,
+    role: Role,
+    separation: Separation,
+) -> Result<bool, CoreError> {
     let mut tx = pool.begin().await?;
     let actor = audit::admin_actor(&mut tx).await?;
     let id = user_id(&mut tx, name).await?;
+    // Separate administration roles (ADR-0022), `POL-E006`.
+    crate::policy::check_role_grant(&mut tx, id, role.as_str(), separation).await?;
     let granted = sqlx::query!(
         "INSERT INTO user_role (user_id, role, granted_by) VALUES ($1::text::uuid, $2, $3)
          ON CONFLICT DO NOTHING",
@@ -807,6 +818,8 @@ pub async fn grant_right(
         .u64(field::VALID_UNTIL, valid_until)
         .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
         .text(field::FUNCTIONS, functions.label());
+    // The core reloads its access policy (ADR-0022).
+    notify_notice(&mut tx, &Notice::Policy).await?;
     commit_granting(tx, event).await?;
     tracing::info!(
         event = "right.granted",
@@ -853,6 +866,7 @@ pub async fn revoke_right(pool: &PgPool, right: Uuid) -> Result<(), CoreError> {
         };
     }
     notify_audit(&mut tx).await?;
+    notify_notice(&mut tx, &Notice::Policy).await?;
     // Protective, last statement before the commit.
     audit::append_protective(
         &mut tx,

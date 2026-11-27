@@ -295,6 +295,7 @@ pub async fn certify_host(
         keep_host_key(&mut tx, agent, &public).await?;
         tx.commit().await?;
         return Err(Refusal {
+            pdp_version: None,
             code: NO_HOST_NAME,
             reason: format!(
                 "groupe {group} inconnu ou sans nom d'hôte SSH : clé d'hôte gardée, non certifiée"

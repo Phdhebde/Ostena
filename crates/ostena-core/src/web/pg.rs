@@ -26,6 +26,7 @@ use crate::audit::{self, CORE_ACTOR};
 use crate::authn::{Opening, PgAuthenticator};
 use crate::error::CoreError;
 use crate::grant_keys::GrantAuthority;
+use crate::policy::Policies;
 use crate::rate;
 use crate::store::{Notice, i64_of, notify_notice, truncate, unix_now, uuid};
 
@@ -43,6 +44,8 @@ pub trait Agents: Send + Sync + 'static {
 pub struct WebAccess {
     /// The grant signing key of the core.
     pub grants: Arc<GrantAuthority>,
+    /// The access decision point (ADR-0022).
+    pub policies: Arc<Policies>,
     /// The connected agents.
     pub agents: Arc<dyn Agents>,
     /// The gateway sessions, cut by the revocation of their login session.
@@ -441,6 +444,7 @@ impl WebBackend for PgWebBackend {
             return Err(refuse(Refusal {
                 code: access::NO_AGENT,
                 reason: format!("aucun agent du groupe {} connecté", presented.group),
+                pdp_version: None,
             }));
         };
         match gateway::open_stream(&tunnel, presented.jti, grant).await {
@@ -469,11 +473,13 @@ impl WebBackend for PgWebBackend {
                 Err(refuse(Refusal {
                     code: known,
                     reason: format!("refus de l'agent {agent} : {code}"),
+                    pdp_version: None,
                 }))
             }
             Err(e) => Err(refuse(Refusal {
                 code: access::NO_AGENT,
                 reason: format!("flux navigateur vers l'agent {agent} : {e}"),
+                pdp_version: None,
             })),
         }
     }
@@ -577,6 +583,7 @@ impl WebBackend for PgWebBackend {
             None => Err(Refusal {
                 code: access::NO_AGENT,
                 reason: "décision d'accès du portail non configurée".into(),
+                pdp_version: None,
             }),
             Some(_)
                 if self
@@ -587,11 +594,13 @@ impl WebBackend for PgWebBackend {
                 Err(Refusal {
                     code: access::RATE_LIMITED,
                     reason: "demandes d'accès de la session au-delà de la limite".into(),
+                    pdp_version: None,
                 })
             }
             Some(web) => {
                 access::web_grant(
                     self.auth.pool(),
+                    &web.policies,
                     &web.grants,
                     &request_of,
                     |group| web.agents.pick(group),
