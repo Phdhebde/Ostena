@@ -13,6 +13,7 @@ pub mod cache;
 pub mod credential;
 pub mod db;
 mod error;
+pub mod forwarding;
 pub mod functions;
 pub mod grant_keys;
 pub mod identity;
@@ -27,6 +28,7 @@ pub mod ssh_ca;
 pub mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod timestamping;
 pub mod transcripts;
 pub mod web;
 

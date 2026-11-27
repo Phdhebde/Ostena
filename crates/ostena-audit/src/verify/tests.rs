@@ -525,10 +525,20 @@ fn every_finding_displays_its_code() {
             age_secs: 200,
             allowed_secs: 120,
         },
+        Finding::TimestampInvalid {
+            seq: 3,
+            why: "x".into(),
+        },
+        Finding::TimestampBeforeHead {
+            seq: 3,
+            head_no: 1,
+            ahead_ms: 9000,
+        },
     ];
     let expected = [
         "AUD-E001", "AUD-E005", "AUD-E006", "AUD-E007", "AUD-E011", "AUD-E011", "AUD-E012",
         "AUD-E013", "AUD-E013", "AUD-E014", "AUD-W001", "AUD-W002", "AUD-W003", "AUD-W004",
+        "AUD-E021", "AUD-W009",
     ];
     for (finding, code) in samples.iter().zip(expected) {
         assert_eq!(finding.code(), code);
@@ -601,4 +611,73 @@ fn transcript_seals_are_well_formed_and_unique() {
     assert_eq!(report.ssh_sessions.len(), 1);
     assert_eq!(report.ssh_sessions[0].session, [1; 16]);
     assert!(report.export_time_ms.is_some());
+}
+
+/// Time-stamps of heads: verified against the trusted authority when one
+/// is given, checked against the head they name, counted otherwise.
+#[test]
+fn head_timestamps_are_verified_against_the_authority() {
+    use ostena_crypto::tsp::testing::{TestTsa, TokenOptions};
+    let tsa = TestTsa::new();
+    let mut chain = Chain::new();
+    chain.time_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let mut items = vec![chain.record(), chain.head()];
+    let head = chain.last_head.unwrap();
+    let stamp_of = |hash: &Digest, at: u64| {
+        let token = tsa.token(hash, None, at, &TokenOptions::default());
+        let stamp = ostena_crypto::tsp::verify(&token, hash, &tsa.trust()).unwrap();
+        crate::timestamp::event(head.head_no(), hash, &token, &stamp).unwrap()
+    };
+    // Stamped 2 s after the head: good.
+    items.push(chain.event(stamp_of(&head.hash(), head.time_ms() + 2000)));
+    items.push(chain.head());
+    let trusted = Options {
+        tsa: Some(tsa.trust()),
+        ..Options::default()
+    };
+    let report = chain.verify(&items, 1, trusted.clone());
+    assert_eq!(codes(&report), Vec::<&str>::new());
+    assert_eq!((report.timestamps, report.timestamps_verified), (1, 1));
+    assert_eq!(report.last_timestamp, Some((1, head.time_ms() + 2000)));
+    // Without the authority: counted, not verified.
+    let report = chain.verify(&items, 1, Options::default());
+    assert_eq!(codes(&report), Vec::<&str>::new());
+    assert_eq!((report.timestamps, report.timestamps_verified), (1, 0));
+    // Another authority: refused.
+    let other = Options {
+        tsa: Some(TestTsa::new().trust()),
+        ..Options::default()
+    };
+    assert_eq!(codes(&chain.verify(&items, 1, other)), ["AUD-E021"]);
+
+    // A stamp of another hash than the head named; a stamp before the
+    // time of its head; a stamp of a head not read yet; a malformed one.
+    let mut more = items.clone();
+    more.push(chain.event(stamp_of(&[7; 32], head.time_ms() + 3000)));
+    more.push(chain.event(stamp_of(&head.hash(), head.time_ms() - 60_000)));
+    let future = {
+        let token = tsa.token(&[1; 32], None, head.time_ms(), &TokenOptions::default());
+        let stamp = ostena_crypto::tsp::verify(&token, &[1; 32], &tsa.trust()).unwrap();
+        crate::timestamp::event(99, &[1; 32], &token, &stamp).unwrap()
+    };
+    more.push(chain.event(future));
+    more.push(chain.event(Event::new(
+        EventKind::AuditHeadTimestamped,
+        Outcome::Success,
+        ActorKind::Core,
+        "core",
+    )));
+    more.push(chain.head());
+    let report = chain.verify(&more, 1, trusted);
+    assert_eq!(
+        codes(&report),
+        ["AUD-E021", "AUD-W009", "AUD-E021", "AUD-E021"]
+    );
+    assert!(report.findings.iter().all(|f| !f.to_string().is_empty()));
 }

@@ -2048,6 +2048,7 @@ dependencies = [
  "ostena-common",
  "ostena-core",
  "ostena-crypto",
+ "ostena-frame",
  "ostena-grant",
  "ostena-ldap",
  "ostena-platform",
@@ -2055,6 +2056,7 @@ dependencies = [
  "ostena-scope",
  "ostena-ssh",
  "ostena-tunnel",
+ "ostena-ws",
  "proptest",
  "serde",
  "serde_json",
@@ -2078,6 +2080,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rcgen",
  "rustls",
+ "rustls-webpki",
  "thiserror",
  "time",
  "vsss-rs",
@@ -2230,6 +2233,13 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "ostena-ws"
+version = "0.0.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

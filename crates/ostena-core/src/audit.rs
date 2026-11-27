@@ -1599,9 +1599,19 @@ impl Sink for VerifySink {
 ///
 /// [`CoreError::NotFound`] for an empty chain, [`CoreError::AuditChain`] if
 /// the first record cannot be read, [`CoreError::Database`].
-pub async fn verify_online(pool: &PgPool, keys: TrustedKeys) -> Result<Report, CoreError> {
+pub async fn verify_online(
+    pool: &PgPool,
+    keys: TrustedKeys,
+    tsa: Option<ostena_crypto::tsp::TsaTrust>,
+) -> Result<Report, CoreError> {
     let mut sink = VerifySink {
-        verifier: Verifier::new(keys, Options::default()),
+        verifier: Verifier::new(
+            keys,
+            Options {
+                tsa,
+                ..Options::default()
+            },
+        ),
     };
     walk(pool, None, &mut sink).await?;
     Ok(sink.verifier.finish(Some(unix_now_ms())))

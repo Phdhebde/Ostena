@@ -9,7 +9,9 @@
 //! - [`event`] — the documented event kinds and a record builder;
 //! - [`head`] — signed heads v1, their text form and the trusted keys;
 //! - [`export`] — the streamed export container v1;
-//! - [`verify`] — the streaming verifier, its findings and its report.
+//! - [`verify`] — the streaming verifier, its findings and its report;
+//! - [`timestamp`] — the RFC 3161 time-stamps of the heads, as records;
+//! - [`siem`] — OCSF events in RFC 5424 messages, framed as RFC 5425 says.
 //!
 //! This crate has no I/O of its own besides [`std::io::Read`] and
 //! [`std::io::Write`], and no database: the core writes records and heads
@@ -23,6 +25,8 @@ pub mod export;
 pub mod head;
 mod ids;
 pub mod record;
+pub mod siem;
+pub mod timestamp;
 pub mod transcripts;
 pub mod verify;
 

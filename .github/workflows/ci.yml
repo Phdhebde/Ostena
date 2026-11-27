@@ -148,6 +148,45 @@ jobs:
           cargo bench --locked -p ostena-scope
           cargo bench --locked -p ostena-frame
 
+  # The portal (ADR-0020, § 1): npm packages cached into vendor/npm/ while
+  # connected (cargo xtask vendor npm), then built twice, offline, in two
+  # clean copies of the sources: the manifests must be identical byte for
+  # byte, and the budget holds (shown in the summary). The build goes to
+  # the release jobs as an artifact, so both binaries embed the same portal.
+  portal:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: portal/.node-version
+      - run: rustup toolchain install
+      - run: cargo xtask vendor npm
+      - name: Two offline builds in clean copies, compared
+        run: |
+          for copy in a b; do
+            dir="$RUNNER_TEMP/portal-$copy"
+            mkdir -p "$dir"
+            git ls-files -z | xargs -0 cp --parents -t "$dir"
+            cp -r vendor "$dir/vendor"
+            # No registry reachable: npm must take everything from vendor/npm.
+            (cd "$dir" && npm_config_registry=http://127.0.0.1:9/ cargo xtask portal --offline)
+          done
+          cmp "$RUNNER_TEMP/portal-a/portal/dist/manifest.json" "$RUNNER_TEMP/portal-b/portal/dist/manifest.json"
+          diff -r "$RUNNER_TEMP/portal-a/portal/dist" "$RUNNER_TEMP/portal-b/portal/dist"
+          (cd "$RUNNER_TEMP/portal-a/portal/dist" && sha256sum --check --quiet SHA256SUMS)
+          echo "Deux constructions hors ligne identiques : $(sha256sum "$RUNNER_TEMP/portal-a/portal/dist/SHA256SUMS")" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: portal-dist
+          path: ${{ runner.temp }}/portal-a/portal/dist/
+          retention-days: 7
+
   # SSH interoperability (ADR-0010): the OpenSSH client of the runner against
   # our server behind the pre-check (sessions, refusals, audit) and, with a
   # certificate, through the agent server to a target; the SSH access through
@@ -781,6 +820,7 @@ jobs:
     needs:
       - changes
       - checks
+      - portal
       - linux
       - ssh-interop
       - core-db

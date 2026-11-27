@@ -874,6 +874,41 @@ impl TestCore {
             .unwrap_or_default()
     }
 
+    /// Opens a browser stream (ADR-0020, § 4) on the first open tunnel and
+    /// presents `grant`, as the core does for a WebSocket of the portal;
+    /// returns the answer of the agent and the channel.
+    ///
+    /// # Errors
+    ///
+    /// No open tunnel, or the stream fails.
+    pub async fn open_browser(
+        &self,
+        grant: &str,
+    ) -> Result<(crate::browser::Answer, Channel), TunnelError> {
+        let tunnel = self
+            .state
+            .tunnels
+            .lock()
+            .ok()
+            .and_then(|t| {
+                t.iter()
+                    .find(|(_, t)| !t.is_closed())
+                    .map(|(_, t)| t.clone())
+            })
+            .ok_or_else(|| TunnelError::ConnectionLost("aucun agent connecté".into()))?;
+        let session = Uuid::random().map_err(|e| TunnelError::Config(e.to_string()))?;
+        let mut channel = tunnel
+            .open_channel(session, StreamClass::Interactive)
+            .await?;
+        channel
+            .send
+            .write_all(&crate::browser::encode_open(grant)?)
+            .await
+            .map_err(|e| TunnelError::ConnectionLost(e.to_string()))?;
+        let answer = crate::browser::read_answer(&mut channel.recv).await?;
+        Ok((answer, channel))
+    }
+
     /// Sends `message` to every connected agent; returns how many.
     pub async fn push(&self, message: &CoreMessage) -> usize {
         let tunnels: Vec<Arc<CoreTunnel>> = self
@@ -1075,11 +1110,19 @@ async fn control(
                 continue;
             }
             AgentMessage::SessionClosed {
-                session_id, reason, ..
+                report_id,
+                session_id,
+                reason,
+                ..
             } => {
                 if let Ok(mut closed) = state.closed.lock() {
                     closed.push((session_id, reason));
                 }
+                let _ = tunnel.send(&CoreMessage::ReportAck { report_id }).await;
+                continue;
+            }
+            AgentMessage::ReportsLost { report_id, .. } => {
+                let _ = tunnel.send(&CoreMessage::ReportAck { report_id }).await;
                 continue;
             }
             AgentMessage::SshHostKey { p256_public, proof } => {

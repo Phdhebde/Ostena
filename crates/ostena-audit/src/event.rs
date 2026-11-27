@@ -41,6 +41,22 @@ event_kinds! {
     AuditBreakAcknowledged => "audit.break_acknowledged",
     /// An export was produced (first and last seq).
     AuditExported => "audit.exported",
+    /// A head was time-stamped by an RFC 3161 authority: head number and
+    /// hash, `genTime`, policy and the token (ADR-0012).
+    AuditHeadTimestamped => "audit.head_timestamped",
+    /// A head could not be time-stamped (code, reason); written once per
+    /// run of failures.
+    AuditTimestampFailed => "audit.timestamp_failed",
+    /// Everything up to `last_seq` was written to the syslog collector
+    /// `destination` (its position, ADR-0012); at most every minute.
+    AuditForwarded => "audit.forwarded",
+    /// The export to a syslog collector stopped (destination, code,
+    /// reason); written once per run of failures.
+    AuditForwardFailed => "audit.forward_failed",
+    /// An agent dropped session reports: its encrypted queue was full
+    /// (`lost_count`, first and last drop) or could not be read back
+    /// (`complete` false: the number is unknown) (ADR-0012).
+    AgentReportsLost => "agent.reports_lost",
     /// The core started.
     CoreStarted => "core.started",
     /// The core stopped.
@@ -179,6 +195,19 @@ event_kinds! {
     UserGroupMemberAdded => "user_group.member_added",
     /// A user left a group of users.
     UserGroupMemberRemoved => "user_group.member_removed",
+    /// An access asked by a browser session was granted: a grant issued
+    /// for the browser gateway (ADR-0020).
+    AccessWebGranted => "access.web_granted",
+    /// An access asked by a browser session was refused (code, reason).
+    AccessWebRefused => "access.web_refused",
+    /// A grant presented by its browser session opened the WebSocket of the
+    /// gateway (ADR-0020): granting, with the marking of the grant.
+    GatewayOpened => "gateway.opened",
+    /// A WebSocket of the gateway refused after its session was
+    /// authenticated (grant, agent).
+    GatewayRefused => "gateway.refused",
+    /// A WebSocket of the gateway ended (reason, bytes in each direction).
+    GatewayClosed => "gateway.closed",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -216,6 +245,14 @@ pub mod field {
     pub const LAST_SEQ: &str = "last_seq";
     /// Head number.
     pub const HEAD_NO: &str = "head_no";
+    /// Hash of a head (`audit.head_timestamped`).
+    pub const HEAD_HASH: &str = "head_hash";
+    /// `genTime` of a time-stamp token, Unix milliseconds.
+    pub const STAMPED_AT: &str = "stamped_at";
+    /// Policy of a time-stamping authority (dotted OID).
+    pub const POLICY: &str = "policy";
+    /// The `address` of a syslog collector of the audit export.
+    pub const DESTINATION: &str = "destination";
     /// Heartbeat of the head signer, in seconds.
     pub const HEARTBEAT_SECS: &str = "heartbeat_secs";
     /// Schema version after migration.
@@ -310,6 +347,8 @@ pub mod field {
     pub const LENGTH: &str = "length";
     /// Whether a transcript is complete (ended by its end frame).
     pub const COMPLETE: &str = "complete";
+    /// Whether a sealed file is immutable on disk (write-once storage).
+    pub const IMMUTABLE: &str = "immutable";
     /// How a login session is opened: `cli` (`ostena login`) or `web` (the
     /// portal).
     pub const CHANNEL: &str = "channel";
@@ -348,6 +387,10 @@ pub mod field {
 
     /// Every name above.
     pub const ALL: &[&str] = &[
+        HEAD_HASH,
+        STAMPED_AT,
+        POLICY,
+        DESTINATION,
         AGENT_ID,
         GROUP_ID,
         ENROLLMENT_ID,
@@ -410,6 +453,7 @@ pub mod field {
         COMMAND_HMAC,
         LENGTH,
         COMPLETE,
+        IMMUTABLE,
         CHANNEL,
         ROLE,
         SOURCE,
@@ -595,7 +639,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 66);
+        assert_eq!(names.len(), 76);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())
@@ -614,6 +658,7 @@ mod tests {
     #[test]
     fn field_names_are_valid_unique_and_never_redacted() {
         let mut names = field::ALL.to_vec();
+        names.extend(crate::timestamp::TOKEN_FIELDS);
         for name in &names {
             assert!(crate::record::is_field_name(name.as_bytes()), "{name}");
             assert!(
@@ -623,7 +668,10 @@ mod tests {
         }
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), field::ALL.len());
+        assert_eq!(
+            names.len(),
+            field::ALL.len() + crate::timestamp::TOKEN_FIELDS.len()
+        );
     }
 
     #[test]

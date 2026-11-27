@@ -26,13 +26,15 @@
 //! share the attempt limiter of `ostena login` (same counter per source);
 //! the lockout is the account's, in the database.
 
+pub mod gateway;
 pub mod pg;
 pub mod routes;
 pub mod session;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
@@ -43,7 +45,7 @@ use hyper::header::{
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use ostena_common::api::web::{
-    ErrorBody, ReauthenticateRequest, RevokeRequest, SessionRequest, WireError,
+    AccessRequest, ErrorBody, ReauthenticateRequest, RevokeRequest, SessionRequest, WireError,
 };
 use ostena_common::config::CoreWebConfig;
 use ostena_crypto::tls::ServerConfig;
@@ -179,6 +181,21 @@ pub struct WebError {
 }
 
 impl WebError {
+    /// A refusal with its status, stable code and message (generic: the
+    /// reason, if any, is for the audit chain).
+    pub fn refused(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The stable code.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
     fn body(error: &WireError) -> Self {
         let status = if *error == WireError::TooLarge {
             StatusCode::PAYLOAD_TOO_LARGE
@@ -242,6 +259,11 @@ pub struct WebSettings {
     pub header_timeout: Duration,
     /// Longest connection, requests included.
     pub connection_timeout: Duration,
+    /// A browser that reads nothing from its gateway session for this long
+    /// is closed (`GTW-E004`).
+    pub gateway_stall: Duration,
+    /// How often the idle browser sessions are revoked.
+    pub sweep_interval: Duration,
 }
 
 impl WebSettings {
@@ -270,6 +292,8 @@ impl WebSettings {
             handshake_timeout: Duration::from_secs(10),
             header_timeout: Duration::from_secs(10),
             connection_timeout: Duration::from_secs(300),
+            gateway_stall: gateway::STALL,
+            sweep_interval: Duration::from_secs(30),
         }
     }
 }
@@ -296,6 +320,7 @@ struct Shared<B> {
 pub struct WebListener {
     addr: SocketAddr,
     task: JoinHandle<()>,
+    sweeper: JoinHandle<()>,
 }
 
 impl WebListener {
@@ -326,9 +351,14 @@ impl WebListener {
             csrf_logs: LogBudget::default(),
             csp_logs: LogBudget::default(),
         });
+        let sweeper = tokio::spawn(sweep(shared.clone()));
         let task = tokio::spawn(accept(listener, TlsAcceptor::from(tls), shared));
         tracing::info!(event = "web.listener_started", listener = %addr, "écouteur web démarré");
-        Ok(Self { addr, task })
+        Ok(Self {
+            addr,
+            task,
+            sweeper,
+        })
     }
 
     /// The bound address.
@@ -339,8 +369,37 @@ impl WebListener {
     /// Stops accepting; connections in progress end within their bounds.
     pub fn close(&self) {
         self.task.abort();
+        self.sweeper.abort();
     }
 }
+
+/// Revokes the idle browser sessions every `sweep_interval`: their gateway
+/// sessions are cut by the revocation, without waiting for a request.
+async fn sweep<B: WebBackend>(shared: Arc<Shared<B>>) {
+    let mut tick = tokio::time::interval(shared.settings.sweep_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        match shared
+            .backend
+            .sweep(unix_now(), shared.settings.idle_secs)
+            .await
+        {
+            Ok(0) => {}
+            Ok(revoked) => tracing::info!(
+                event = "web.sessions_swept",
+                revoked,
+                "sessions du portail inactives révoquées"
+            ),
+            Err(e) => tracing::warn!(event = "web.sweep_failed", "{e}"),
+        }
+    }
+}
+
+/// The relays of the upgraded connections of one TCP connection: awaited
+/// before the connection releases its slot.
+type Upgrades = Arc<Mutex<Vec<JoinHandle<()>>>>;
 
 async fn accept<B: WebBackend>(listener: TcpListener, tls: TlsAcceptor, shared: Arc<Shared<B>>) {
     let slots = Arc::new(Semaphore::new(shared.settings.max_connections));
@@ -397,9 +456,12 @@ async fn serve<B: WebBackend>(
             return;
         }
     };
+    let upgrades = Upgrades::default();
+    let relays = upgrades.clone();
     let service = hyper::service::service_fn(move |request| {
         let shared = shared.clone();
-        async move { Ok::<_, Infallible>(respond(request, peer, &shared).await) }
+        let upgrades = upgrades.clone();
+        async move { Ok::<_, Infallible>(respond(request, peer, &shared, &upgrades).await) }
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder
@@ -408,8 +470,15 @@ async fn serve<B: WebBackend>(
         .keep_alive(true)
         .max_headers(MAX_HEADERS)
         .max_buf_size(MAX_BUFFER);
-    let connection = builder.serve_connection(TokioIo::new(stream), service);
+    let connection = builder
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades();
     let _ = tokio::time::timeout(settings.connection_timeout, connection).await;
+    // A gateway session keeps the connection slot and the source slot.
+    let pending = relays.lock().map(|mut r| std::mem::take(&mut *r));
+    for relay in pending.unwrap_or_default() {
+        let _ = relay.await;
+    }
 }
 
 fn tls_refused<B>(shared: &Shared<B>, peer: SocketAddr, error: &dyn std::fmt::Display) {
@@ -459,9 +528,10 @@ fn secure(response: &mut Response<Full<Bytes>>) {
 async fn respond<B: WebBackend>(
     request: Request<Incoming>,
     peer: SocketAddr,
-    shared: &Shared<B>,
+    shared: &Arc<Shared<B>>,
+    upgrades: &Upgrades,
 ) -> Response<Full<Bytes>> {
-    let mut response = match handle(request, peer, shared).await {
+    let mut response = match handle(request, peer, shared, upgrades).await {
         Ok(response) => response,
         Err(error) => error.response(),
     };
@@ -594,7 +664,8 @@ fn portal(method: &Method) -> Result<Response<Full<Bytes>>, WebError> {
 async fn handle<B: WebBackend>(
     request: Request<Incoming>,
     peer: SocketAddr,
-    shared: &Shared<B>,
+    shared: &Arc<Shared<B>>,
+    upgrades: &Upgrades,
 ) -> Result<Response<Full<Bytes>>, WebError> {
     let now = unix_now();
     let path = request.uri().path();
@@ -606,6 +677,9 @@ async fn handle<B: WebBackend>(
         authenticate(request.headers(), shared, peer, now).await?;
         return Err(WebCode::NotFound.into());
     };
+    if route.handler == Handler::Gateway {
+        return open_gateway(request, peer, shared, upgrades, now).await;
+    }
     let mut session = match route.access {
         Access::Public => None,
         Access::Session | Access::Role(_) => {
@@ -689,6 +763,168 @@ impl<B> Context<'_, B> {
     }
 }
 
+/// A refusal of the gateway, with its code and generic label.
+fn gateway_refused(status: StatusCode, code: &'static str, label: &'static str) -> WebError {
+    WebError::refused(status, code, label)
+}
+
+/// `GET /api/v1/gateway` (ADR-0020, § 4), checked in this order: `Origin`,
+/// the session cookie, the WebSocket handshake and the `ostena-frame.v1`
+/// sub-protocol, then the grant (sub-protocol `ostena-grant.<grant>`),
+/// checked and marked presented by the store, and the agent answer. The
+/// `101` selects `ostena-frame.v1` only; the relay runs on the upgraded
+/// connection.
+async fn open_gateway<B: WebBackend>(
+    mut request: Request<Incoming>,
+    peer: SocketAddr,
+    shared: &Arc<Shared<B>>,
+    upgrades: &Upgrades,
+    now: u64,
+) -> Result<Response<Full<Bytes>>, WebError> {
+    let mut origins = request.headers().get_all(ORIGIN).iter();
+    let origin_ok = matches!(
+        (origins.next(), origins.next()),
+        (Some(o), None) if o.as_bytes() == shared.settings.origin.as_bytes()
+    );
+    if !origin_ok {
+        if let Some(unlogged) = shared.csrf_logs.take(now) {
+            tracing::warn!(
+                event = "web.origin_refused",
+                code = WebCode::Origin.as_str(),
+                peer = %peer,
+                origin = ?request.headers().get(ORIGIN),
+                unlogged,
+                "WebSocket refusée (au plus une ligne par minute)"
+            );
+        }
+        return Err(WebCode::Origin.into());
+    }
+    let session = authenticate(request.headers(), shared, peer, now).await?;
+    let (accept, grant) = check_upgrade(&request)?;
+    let stream = shared.backend.open_gateway(&session, &grant, peer).await?;
+    let on_upgrade = hyper::upgrade::on(&mut request);
+    let backend = shared.backend.clone();
+    let stall = shared.settings.gateway_stall;
+    let relay = tokio::spawn(async move {
+        let gateway::GatewayStream {
+            session: id,
+            jti,
+            channel,
+            cut,
+            ..
+        } = stream;
+        let ended = match on_upgrade.await {
+            Ok(io) => {
+                relay_touching(&*backend, &session, TokioIo::new(io), channel, cut, stall).await
+            }
+            Err(_) => gateway::Relayed {
+                reason: "poignée de main WebSocket interrompue",
+                code: None,
+                from_browser: 0,
+                to_browser: 0,
+            },
+        };
+        backend
+            .gateway_closed(&session, peer, (id, jti), &ended)
+            .await;
+    });
+    if let Ok(mut relays) = upgrades.lock() {
+        relays.push(relay);
+    }
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    let headers = response.headers_mut();
+    headers.insert(
+        hyper::header::UPGRADE,
+        HeaderValue::from_static("websocket"),
+    );
+    headers.insert(
+        hyper::header::CONNECTION,
+        HeaderValue::from_static("Upgrade"),
+    );
+    headers.insert(
+        hyper::header::SEC_WEBSOCKET_PROTOCOL,
+        HeaderValue::from_static(gateway::FRAME_PROTOCOL),
+    );
+    if let Ok(value) = HeaderValue::from_str(&accept) {
+        headers.insert(hyper::header::SEC_WEBSOCKET_ACCEPT, value);
+    }
+    Ok(response)
+}
+
+/// The WebSocket handshake of the gateway: its `Sec-WebSocket-Accept` and
+/// the grant of its `ostena-grant.` sub-protocol (exactly one).
+fn check_upgrade(request: &Request<Incoming>) -> Result<(String, String), WebError> {
+    let headers = request
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_bytes()));
+    let upgrade = ostena_ws::handshake::check(
+        request.method().as_str(),
+        request.version() == hyper::Version::HTTP_11,
+        headers,
+    )
+    .map_err(|_| {
+        gateway_refused(
+            StatusCode::BAD_REQUEST,
+            "GTW-E002",
+            "poignée de main WebSocket invalide",
+        )
+    })?;
+    if !upgrade.offers(gateway::FRAME_PROTOCOL) {
+        return Err(gateway_refused(
+            StatusCode::BAD_REQUEST,
+            "GTW-E002",
+            "sous-protocole ostena-frame.v1 absent",
+        ));
+    }
+    let mut grants = upgrade.with_prefix(gateway::GRANT_PREFIX);
+    let (Some(grant), None) = (grants.next(), grants.next()) else {
+        return Err(gateway_refused(
+            StatusCode::FORBIDDEN,
+            crate::access::GATEWAY_GRANT,
+            "grant refusé",
+        ));
+    };
+    let grant = grant.to_owned();
+    Ok((
+        ostena_crypto::websocket::accept_key(upgrade.key.as_bytes()),
+        grant,
+    ))
+}
+
+/// Runs the relay; the frames of the browser keep its session active
+/// (recorded at most every `TOUCH_SECS`).
+async fn relay_touching<B: WebBackend, IO>(
+    backend: &B,
+    session: &SessionRecord,
+    io: IO,
+    channel: ostena_tunnel::Channel,
+    cut: tokio::sync::watch::Receiver<bool>,
+    stall: Duration,
+) -> gateway::Relayed
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send,
+{
+    let inputs = AtomicBool::new(false);
+    let relay = gateway::relay(io, channel, cut, stall, || {
+        inputs.store(true, Ordering::Relaxed);
+    });
+    tokio::pin!(relay);
+    let mut tick = tokio::time::interval(Duration::from_secs(session::TOUCH_SECS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            ended = &mut relay => return ended,
+            _ = tick.tick() => {
+                if inputs.swap(false, Ordering::Relaxed) {
+                    let _ = backend.touch(session.login_session, unix_now()).await;
+                }
+            }
+        }
+    }
+}
+
 fn with_cookie(mut response: Response<Full<Bytes>>, cookie: &str) -> Response<Full<Bytes>> {
     if let Ok(value) = HeaderValue::from_str(cookie) {
         response.headers_mut().insert(SET_COOKIE, value);
@@ -759,6 +995,17 @@ async fn run<B: WebBackend>(
         Handler::ListLoginSessions => {
             let list = c.shared.backend.login_sessions().await?;
             Ok(json(StatusCode::OK, &list))
+        }
+        // Answered by `open_gateway` before the body is read.
+        Handler::Gateway => Err(WebCode::NotFound.into()),
+        Handler::Access => {
+            let request = AccessRequest::parse(body).map_err(|e| WebError::body(&e))?;
+            let grant = c
+                .shared
+                .backend
+                .grant_access(c.session()?, request, c.peer)
+                .await?;
+            Ok(json(StatusCode::OK, &grant))
         }
         Handler::RevokeLoginSession => {
             let request = RevokeRequest::parse(body).map_err(|e| WebError::body(&e))?;

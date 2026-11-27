@@ -44,7 +44,7 @@ Reports de M1 repris ici : rôles séparés de la base, transcripts en stockage 
 | 8 | `m2/web-gateway` | L3, L7 | API REST du core (OpenAPI, test qui énumère les routes et vérifie le refus sans jeton), session navigateur, WebSocket `ostena-frame` du navigateur jusqu'à l'agent par le tunnel. | 0020 | 1, 6 | à faire |
 | 9 | `m2/identities-ldaps` | L3 | Sources LDAPS multiples (AD multi-forêts, OpenLDAP), groupes imbriqués, bascule entre serveurs, identités `source/identifiant`, refus du clair et de StartTLS ; coupure en moins de 60 s d'un compte désactivé. | 0021 | 3 | à faire |
 | 10 | `m2/pdp` | L3 | PDP v0 compilé en mémoire (groupe × groupe de comptes × protocole × fonctions), invalidation, banc < 1 ms p99 pour 10 000 autorisations et 50 000 ressources ; rôles d'administration séparés (politiques, audit). | 0022 | 3 | à faire |
-| 11 | `m2/audit-l6` | L6 | Stockage en ajout seul des transcripts et enregistrements (WORM fichier), export syslog TLS RFC 5425 en OCSF, file locale chiffrée sur l'agent quand le core est injoignable, horodatage RFC 3161 des têtes. | 0012 (suite) | 3 | à faire |
+| 11 | `m2/audit-l6` | L6 | Stockage en ajout seul des transcripts et enregistrements (WORM fichier), export syslog TLS RFC 5425 en OCSF, file locale chiffrée sur l'agent quand le core est injoignable, horodatage RFC 3161 des têtes. | 0012 (suite) | 3 | PR #79, #80, #82, #83 |
 
 ### Vague 3 : navigateur, enregistrement, portail
 

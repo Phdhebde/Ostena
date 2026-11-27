@@ -128,7 +128,7 @@ deny = [
     # QUIC is the tunnel's business only (ADR-0008).
     { crate = "quinn", wrappers = ["ostena-tunnel"], reason = "QUIC is used by ostena-tunnel only" },
     { crate = "quinn-proto", wrappers = ["quinn"], reason = "only reachable through quinn" },
-    { crate = "rustls-webpki", wrappers = ["rustls"], reason = "certificate verification only through rustls" },
+    { crate = "rustls-webpki", wrappers = ["rustls", "ostena-crypto"], reason = "certificate verification only through rustls, and in ostena-crypto::tsp for the time-stamping certificates" },
     { crate = "rcgen", wrappers = ["ostena-crypto"], reason = "certificates are issued by ostena-crypto::pki only" },
     { crate = "vsss-rs", wrappers = ["ostena-crypto"], reason = "secret sharing of the root secret by ostena-crypto::sealed only" },
     { crate = "ring", reason = "use ostena-crypto (aws-lc-rs)" },

@@ -11,6 +11,8 @@
 - **Révision** : 2026-11-26, écart RDP : cryptographie d'IronRDP et de `sspi` dans `ostena-rdp`, profil TLS 1.2 des cibles Windows, règle NTLM (amendement accepté, décision du responsable du projet, 2026-11-26)
 - **Révision** : 2026-11-26, portail web (ADR-0020) : groupes TLS de l'écouteur `core.web` et écart `X25519MLKEM768`, SHA-1 confiné à `Sec-WebSocket-Accept`, licence OFL-1.1 des polices embarquées (amendement accepté, décision du responsable du projet, 2026-11-26)
 - **Révision** : 2026-11-26, écart des annuaires LDAPS : profil TLS 1.3 à échange classique et certificats RSA, TLS 1.2 en option par source (amendement accepté, décision du responsable du projet, 2026-11-26, ADR-0021)
+- **Révision** : 2026-11-26, PR 8b : module `ostena-crypto::websocket` livré, seul usage de SHA-1 dans `ostena-crypto` hors TOTP
+- **Révision** : 2026-11-27, audit scellé (ADR-0012, PR 11) : jetons d'horodatage RFC 3161 en ECDSA P-256 / SHA-256, profil du tunnel sans écart vers les collecteurs syslog
 
 ## Contexte
 
@@ -60,6 +62,10 @@ L'encadré « Attention » du § 2.2.3 rappelle qu'ECDSA n'est pas fortement ré
 - groupes `SecP256r1MLKEM768` puis `X25519MLKEM768`, ce dernier admis comme écart (plus bas, « Écarts ») parce qu'aucun navigateur ne propose aujourd'hui le premier ;
 - l'échange classique `secp256r1` n'est accepté qu'avec `core.web.tls_classic_fallback = true` (navigateur sans hybride) : affaiblissement journalisé à chaque démarrage, **refusé en mode production** (`CFG-P019`) ;
 - l'écouteur de `ostena login` et le tunnel gardent `SecP256r1MLKEM768` seul : l'écart ne vaut que pour les navigateurs.
+
+**Collecteurs syslog de l'export d'audit** (RFC 5425, ADR-0012 ; amendement du 2026-11-27) : le profil figé du tunnel, sans écart : TLS 1.3 seul, `TLS_AES_256_GCM_SHA384` seule, `SecP256r1MLKEM768` seul, certificats et signatures ECDSA P-256 / SHA-256, ni reprise de session ni données précoces (`ostena_crypto::tls::syslog`). Le collecteur est authentifié par le seul lot d'autorités de la destination (chaîne, nom, `serverAuth`) ; le core présente son certificat si la destination en configure un. Un collecteur qui ne propose pas ce profil est refusé (`SYS-E001`) : c'est au collecteur de s'adapter, faute d'écart décidé.
+
+**Jetons d'horodatage RFC 3161** (ADR-0012, PR 11b) : empreintes SHA-256, signature ECDSA P-256 / SHA-256, chaîne de l'autorité contrôlée par `rustls-webpki` ; une autorité RSA est refusée.
 
 **Aléa et dérivation** :
 - aléa du système d'exploitation via `aws-lc-rs` ;
@@ -177,7 +183,7 @@ Un mot de passe est un secret de faible entropie, attaquable hors ligne si le co
 **Confinement.**
 - SHA-1 est exposé par `ostena-crypto` dans le seul module `websocket`, par la constante `SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs, sur le modèle du TOTP. Le module ne rend que la valeur de `Sec-WebSocket-Accept` ; il n'offre pas de hachage SHA-1 générique.
 - Le crate `sha1` reste refusé par `deny.toml`.
-- Le module arrive avec la passerelle navigateur (PR 8b) ; le RD Gateway (`ostena-tsgu`, transport WebSocket) le réutilisera.
+- Le module est livré par la PR 8b : `ostena_crypto::websocket::accept_key` rend la valeur pour la clé reçue, et rien d'autre ; son test vérifie l'exemple de la RFC 6455 (§ 1.3). Le crate `ostena-ws` ne fait que vérifier la forme de la clé (16 octets en base64) et ne dépend de rien. Le RD Gateway (`ostena-tsgu`, transport WebSocket) réutilisera ce module.
 
 #### SSH : la cryptographie de russh dans `ostena-ssh` (décidé le 2026-11-13)
 

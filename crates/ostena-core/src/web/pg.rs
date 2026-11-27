@@ -9,31 +9,111 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use hyper::StatusCode;
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
 use ostena_common::api::web::{
-    Channel, LoginSessionItem, LoginSessionList, MAX_LISTED_SESSIONS, ReauthenticateRequest, Role,
-    SessionRequest,
+    AccessGrant, AccessProtocol, AccessRequest, Channel, LoginSessionItem, LoginSessionList,
+    MAX_LISTED_SESSIONS, ReauthenticateRequest, Role, SessionRequest,
 };
-use ostena_tunnel::Uuid;
+use ostena_tunnel::{CoreTunnel, Uuid};
 
+use super::WebError;
+use super::gateway::{self, GatewayStream, Opening as StreamOpening, Relayed, Relays};
 use super::session::{SessionEnd, SessionRecord, WebBackend};
+use crate::access::{self, Refusal, WebRequest};
 use crate::api::ApiError;
 use crate::audit::{self, CORE_ACTOR};
 use crate::authn::{Opening, PgAuthenticator};
 use crate::error::CoreError;
+use crate::grant_keys::GrantAuthority;
+use crate::rate;
 use crate::store::{Notice, i64_of, notify_notice, truncate, unix_now, uuid};
+
+/// The agents connected to the core, as the web listener sees them; the
+/// running core implements it on its tunnels.
+pub trait Agents: Send + Sync + 'static {
+    /// A connected agent of `group`, the least busy; `None` if none is.
+    fn pick(&self, group: Uuid) -> Option<Uuid>;
+
+    /// The tunnel of `agent`, if it is connected.
+    fn tunnel(&self, agent: Uuid) -> Option<Arc<CoreTunnel>>;
+}
+
+/// What the access decisions of the portal need (ADR-0020, § 4).
+pub struct WebAccess {
+    /// The grant signing key of the core.
+    pub grants: Arc<GrantAuthority>,
+    /// The connected agents.
+    pub agents: Arc<dyn Agents>,
+    /// The gateway sessions, cut by the revocation of their login session.
+    pub relays: Arc<Relays>,
+}
+
+impl std::fmt::Debug for WebAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebAccess").finish_non_exhaustive()
+    }
+}
+
+/// Access requests of one browser session: 10 at once, then one every
+/// six seconds.
+pub const ACCESS_REQUESTS: rate::Rate = rate::Rate {
+    burst: 10,
+    refill: std::time::Duration::from_secs(6),
+};
 
 /// The browser sessions in PostgreSQL.
 #[derive(Debug)]
 pub struct PgWebBackend {
     auth: Arc<PgAuthenticator>,
+    access: Option<WebAccess>,
+    requests: rate::Limiter,
 }
 
 impl PgWebBackend {
-    /// The store behind `auth`, the authenticator of `[core.login]`.
+    /// The store behind `auth`, the authenticator of `[core.login]`,
+    /// without access decision (`POST /api/v1/access` answers `GTW-E003`).
     pub fn new(auth: Arc<PgAuthenticator>) -> Self {
-        Self { auth }
+        Self {
+            auth,
+            access: None,
+            requests: rate::Limiter::new(ACCESS_REQUESTS),
+        }
     }
+
+    /// The same store, deciding the accesses of the portal with `access`.
+    #[must_use]
+    pub fn with_access(mut self, access: WebAccess) -> Self {
+        self.access = Some(access);
+        self
+    }
+}
+
+/// The answer to a refused gateway session: the code and its generic
+/// label, the cause in the audit chain only.
+fn gateway_refused(code: &'static str) -> WebError {
+    let (status, label) = match code {
+        access::NO_AGENT => (StatusCode::SERVICE_UNAVAILABLE, access::label(code)),
+        "GTW-E006" => (
+            StatusCode::FORBIDDEN,
+            "protocole non servi dans le navigateur",
+        ),
+        c if c.starts_with("GTW-") => (StatusCode::FORBIDDEN, "grant refusé"),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "service indisponible"),
+    };
+    WebError::refused(status, code, label)
+}
+
+/// The answer to a refused access: the stable code and its generic label;
+/// the reason goes to the audit chain only.
+fn access_refused(refusal: &Refusal) -> WebError {
+    let status = match refusal.code {
+        access::NO_AGENT => StatusCode::SERVICE_UNAVAILABLE,
+        access::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
+        code if code.starts_with("ACC-") || code.starts_with("INV-") => StatusCode::FORBIDDEN,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    WebError::refused(status, refusal.code, access::label(refusal.code))
 }
 
 fn broken(e: &CoreError) -> ApiError {
@@ -272,6 +352,165 @@ impl WebBackend for PgWebBackend {
             .map_err(|e| broken(&e))
     }
 
+    async fn sweep(&self, now: u64, idle_secs: u64) -> Result<usize, ApiError> {
+        let idle = sqlx::query!(
+            r#"SELECT w.login_session_id::text AS "id!", w.last_activity_at
+               FROM web_session w JOIN login_session l ON l.id = w.login_session_id
+               WHERE l.revoked_at IS NULL AND w.last_activity_at < $1
+               ORDER BY w.last_activity_at LIMIT 256"#,
+            i64_of(now.saturating_sub(idle_secs)),
+        )
+        .fetch_all(self.auth.pool())
+        .await
+        .map_err(|e| broken(&e.into()))?;
+        let mut revoked = 0;
+        for row in idle {
+            let id = uuid(&row.id).map_err(|e| broken(&e))?;
+            let revocation = Revocation {
+                revoked_by: CORE_ACTOR.into(),
+                reason: "inactivité du portail",
+                event: Event::new(
+                    EventKind::WebSessionExpired,
+                    Outcome::Success,
+                    ActorKind::Core,
+                    CORE_ACTOR,
+                )
+                .u64(field::EXPIRES_AT, u64_of(row.last_activity_at)),
+                log: "web_session.expired",
+            };
+            if self
+                .revoke_with(id, revocation)
+                .await
+                .map_err(|e| broken(&e))?
+            {
+                revoked += 1;
+            }
+        }
+        Ok(revoked)
+    }
+
+    async fn open_gateway(
+        &self,
+        session: &SessionRecord,
+        grant: &str,
+        peer: SocketAddr,
+    ) -> Result<GatewayStream, WebError> {
+        let Some(web) = &self.access else {
+            return Err(gateway_refused(access::NO_AGENT));
+        };
+        let client = peer.to_string();
+        let by = access::Presenter {
+            subject: session.user,
+            login_session: session.login_session,
+            client_address: &client,
+        };
+        let refuse = |refusal: Refusal| {
+            tracing::warn!(
+                event = "gateway.refused",
+                login_session = %session.login_session,
+                code = refusal.code,
+                "{}",
+                refusal.reason
+            );
+            self.auth
+                .recorder()
+                .emit(access::gateway_refused_event(&by, &refusal));
+            gateway_refused(refusal.code)
+        };
+        // Watched before the grant is presented: a revocation in between
+        // still cuts the session.
+        let cut = web.relays.watch(session.login_session);
+        let presented =
+            match access::present_web_grant(self.auth.pool(), &web.grants, &by, grant, unix_now())
+                .await
+            {
+                Ok(presented) => presented,
+                Err(refusal) => return Err(refuse(refusal)),
+            };
+        self.auth.recorder().critical(&[presented.appended]);
+        // The agent chosen at issue, or another agent of the group.
+        let tunnel = web
+            .agents
+            .tunnel(presented.agent)
+            .map(|t| (presented.agent, t))
+            .or_else(|| {
+                let agent = web.agents.pick(presented.group)?;
+                web.agents.tunnel(agent).map(|t| (agent, t))
+            });
+        let Some((agent, tunnel)) = tunnel else {
+            return Err(refuse(Refusal {
+                code: access::NO_AGENT,
+                reason: format!("aucun agent du groupe {} connecté", presented.group),
+            }));
+        };
+        match gateway::open_stream(&tunnel, presented.jti, grant).await {
+            Ok(StreamOpening::Opened(id, channel)) => {
+                tracing::info!(
+                    event = "gateway.opened",
+                    login_session = %session.login_session,
+                    session = %id,
+                    jti = %presented.jti,
+                    agent = %agent,
+                );
+                Ok(GatewayStream {
+                    session: id,
+                    jti: presented.jti,
+                    agent,
+                    channel,
+                    cut,
+                })
+            }
+            Ok(StreamOpening::Refused(code)) => {
+                let known = if code == "GTW-E006" {
+                    "GTW-E006"
+                } else {
+                    access::GATEWAY_GRANT
+                };
+                Err(refuse(Refusal {
+                    code: known,
+                    reason: format!("refus de l'agent {agent} : {code}"),
+                }))
+            }
+            Err(e) => Err(refuse(Refusal {
+                code: access::NO_AGENT,
+                reason: format!("flux navigateur vers l'agent {agent} : {e}"),
+            })),
+        }
+    }
+
+    async fn gateway_closed(
+        &self,
+        session: &SessionRecord,
+        peer: SocketAddr,
+        opened: (Uuid, Uuid),
+        ended: &Relayed,
+    ) {
+        let client = peer.to_string();
+        let by = access::Presenter {
+            subject: session.user,
+            login_session: session.login_session,
+            client_address: &client,
+        };
+        tracing::info!(
+            event = "gateway.closed",
+            login_session = %session.login_session,
+            session = %opened.0,
+            code = ended.code,
+            bytes_from_browser = ended.from_browser,
+            bytes_to_browser = ended.to_browser,
+            "{}",
+            ended.reason
+        );
+        self.auth.recorder().emit(access::gateway_closed_event(
+            &by,
+            opened.0,
+            opened.1,
+            ended.code.unwrap_or(ended.reason),
+            ended.from_browser,
+            ended.to_browser,
+        ));
+    }
+
     async fn login_sessions(&self) -> Result<LoginSessionList, ApiError> {
         let rows = sqlx::query!(
             r#"SELECT s.id::text AS "id!", s.user_id::text AS "user!", u.name, s.channel,
@@ -319,5 +558,81 @@ impl WebBackend for PgWebBackend {
         self.revoke_with(id, revocation)
             .await
             .map_err(|e| broken(&e))
+    }
+
+    async fn grant_access(
+        &self,
+        session: &SessionRecord,
+        request: AccessRequest,
+        peer: SocketAddr,
+    ) -> Result<AccessGrant, WebError> {
+        let request_of = WebRequest {
+            subject: session.user,
+            login_session: session.login_session,
+            account: request.account,
+            resource: request.resource,
+            client_address: peer.to_string(),
+        };
+        let decided = match &self.access {
+            None => Err(Refusal {
+                code: access::NO_AGENT,
+                reason: "décision d'accès du portail non configurée".into(),
+            }),
+            Some(_)
+                if self
+                    .requests
+                    .check(session.login_session, std::time::Instant::now())
+                    != rate::Decision::Allowed =>
+            {
+                Err(Refusal {
+                    code: access::RATE_LIMITED,
+                    reason: "demandes d'accès de la session au-delà de la limite".into(),
+                })
+            }
+            Some(web) => {
+                access::web_grant(
+                    self.auth.pool(),
+                    &web.grants,
+                    &request_of,
+                    |group| web.agents.pick(group),
+                    unix_now(),
+                )
+                .await
+            }
+        };
+        match decided {
+            Ok(issued) => {
+                self.auth.recorder().critical(&[issued.appended]);
+                tracing::info!(
+                    event = "access.web_granted",
+                    login_session = %session.login_session,
+                    jti = %issued.content.jti,
+                    agent = %issued.agent,
+                );
+                Ok(AccessGrant {
+                    grant: issued.grant,
+                    resource: request_of.resource,
+                    account: request_of.account,
+                    protocol: AccessProtocol::Ssh,
+                    expires_at: issued.content.expires_at,
+                    max_session_secs: issued.content.claims.max_session_secs,
+                })
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    event = "access.web_refused",
+                    login_session = %session.login_session,
+                    code = refusal.code,
+                    "{}",
+                    refusal.reason
+                );
+                if refusal.code != access::RATE_LIMITED {
+                    self.auth
+                        .recorder()
+                        .emit(access::web_refused_event(&request_of, &refusal));
+                }
+                Err(access_refused(&refusal))
+            }
+        }
     }
 }

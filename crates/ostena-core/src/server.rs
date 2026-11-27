@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
-use ostena_common::config::{CoreConfig, KeySource};
+use ostena_common::config::{CoreConfig, KeySource, Output};
 use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::{IssuingAuthority, Validity};
@@ -40,12 +40,15 @@ use crate::authn::PgAuthenticator;
 use crate::cache::AgentCache;
 use crate::credential::TotpKey;
 use crate::error::CoreError;
+use crate::forwarding::Forwarder;
 use crate::grant_keys::GrantAuthority;
 use crate::identity::Directories;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
+use crate::timestamping::Timestamper;
 use crate::transcripts::{self, Transcripts};
-use crate::web::pg::PgWebBackend;
+use crate::web::gateway::Relays;
+use crate::web::pg::{Agents, PgWebBackend, WebAccess};
 use crate::web::{WebListener, WebSettings};
 use crate::{login, pushes, rate};
 use ostena_crypto::hmac::HmacKey;
@@ -131,6 +134,7 @@ fn load_transcripts(
     Ok(Some(Arc::new(Transcripts::open(
         &ssh.transcripts_dir,
         mac,
+        config.audit.worm,
     )?)))
 }
 
@@ -377,16 +381,45 @@ impl Tunnels {
     }
 }
 
+/// The connected agents by gateway group, for the web listener.
+struct Directory {
+    tunnels: Arc<Tunnels>,
+    cache: Arc<AgentCache>,
+}
+
+impl Agents for Directory {
+    fn pick(&self, group: Uuid) -> Option<Uuid> {
+        self.tunnels
+            .live()
+            .into_iter()
+            .filter_map(|(fp, tunnel)| {
+                let entry = self.cache.active(&fp)?;
+                (entry.group == group).then(|| (tunnel.open_channels(), entry.agent))
+            })
+            .min()
+            .map(|(_, agent)| agent)
+    }
+
+    fn tunnel(&self, agent: Uuid) -> Option<Arc<CoreTunnel>> {
+        self.tunnels
+            .live()
+            .into_iter()
+            .find_map(|(fp, tunnel)| (self.cache.active(&fp)?.agent == agent).then_some(tunnel))
+    }
+}
+
 struct Shared {
     store: PgStore,
     cache: Arc<AgentCache>,
     issuer: Arc<IssuingAuthority>,
     enrollment: EnrollmentService,
-    tunnels: Tunnels,
+    tunnels: Arc<Tunnels>,
+    /// The gateway sessions of the portal (ADR-0020).
+    relays: Arc<Relays>,
     certificate_lifetime: u64,
     limits: Limits,
     recorder: Arc<Recorder>,
-    grants: GrantAuthority,
+    grants: Arc<GrantAuthority>,
     ssh: Option<Arc<SshAuthorities>>,
     transcripts: Option<Arc<Transcripts>>,
     /// Asks for a replay of what lost notices would have applied.
@@ -404,6 +437,41 @@ struct Shared {
 pub struct StartInfo {
     /// Weakening options and dated waivers in effect: (code, message).
     pub waivers: Vec<(String, String)>,
+    /// `[[audit.outputs]]`: the syslog collectors of the audit export.
+    pub audit_outputs: Vec<Output>,
+}
+
+/// What leaves the core besides the chain itself: the time-stamps of the
+/// heads and the SIEM export (ADR-0012).
+struct Exports {
+    timestamper: Option<Timestamper>,
+    forwarders: Vec<Forwarder>,
+}
+
+impl Exports {
+    /// Reads the anchors, bundles and keys of both.
+    fn load(config: &CoreConfig, info: &StartInfo) -> Result<Self, CoreError> {
+        Ok(Self {
+            timestamper: Timestamper::of(&config.audit)?,
+            forwarders: Forwarder::load_all(
+                &info.audit_outputs,
+                credentials_directory().as_deref(),
+            )?,
+        })
+    }
+
+    fn spawn(self, pool: &sqlx::PgPool, recorder: &Arc<Recorder>) -> Vec<JoinHandle<()>> {
+        let mut tasks: Vec<_> = self
+            .forwarders
+            .into_iter()
+            .map(|f| f.spawn(pool.clone(), recorder.clone()))
+            .collect();
+        tasks.extend(
+            self.timestamper
+                .map(|t| t.spawn(pool.clone(), recorder.clone())),
+        );
+        tasks
+    }
 }
 
 /// Time allowed at stop for the queue, `core.stopped` and the final head.
@@ -466,16 +534,40 @@ fn identity_of(
     )))
 }
 
+/// The background tasks of a started core.
+fn background(
+    listener: &Arc<CoreListener>,
+    notices: PgListener,
+    shared: &Arc<Shared>,
+    signer: &Arc<HeadSigner>,
+    identity: Option<&Arc<crate::identity::Identity>>,
+) -> Vec<JoinHandle<()>> {
+    let mut tasks = vec![
+        tokio::spawn(accept(listener.clone(), shared.clone())),
+        tokio::spawn(follow_notices(notices, shared.clone())),
+        tokio::spawn(resync_on_request(shared.clone())),
+        tokio::spawn(reload_periodically(shared.clone())),
+        tokio::spawn(signer.clone().run()),
+        tokio::spawn(renew_host_certificates(shared.clone())),
+    ];
+    // The synchronisation of the identity sources (ADR-0021).
+    if let Some(identity) = identity {
+        tasks.extend(identity.spawn());
+    }
+    tasks
+}
+
 /// The listeners of `[core.login]` (ADR-0010, ADR-0015) and of
 /// `[core.web]` (ADR-0020): one authenticator and one attempt limiter for
 /// both.
 async fn start_login(
     config: &CoreConfig,
     keys: &Keys,
-    store: &PgStore,
+    shared: &Arc<Shared>,
     recorder: &Arc<Recorder>,
     identity: Option<Arc<crate::identity::Identity>>,
 ) -> Result<(Option<LoginListener>, Option<WebListener>), CoreError> {
+    let store = &shared.store;
     let Some(settings) = &config.login else {
         return Ok((None, None));
     };
@@ -516,7 +608,7 @@ async fn start_login(
         web.listen,
         tls,
         WebSettings::from_config(web),
-        Arc::new(PgWebBackend::new(authenticator)),
+        Arc::new(PgWebBackend::new(authenticator).with_access(web_access(shared))),
         attempts,
     )
     .await?;
@@ -549,6 +641,19 @@ impl std::fmt::Debug for RunningCore {
     }
 }
 
+/// What the access decisions of the portal need: the grant key and the
+/// connected agents.
+fn web_access(shared: &Shared) -> WebAccess {
+    WebAccess {
+        grants: shared.grants.clone(),
+        agents: Arc::new(Directory {
+            tunnels: shared.tunnels.clone(),
+            cache: shared.cache.clone(),
+        }),
+        relays: shared.relays.clone(),
+    }
+}
+
 impl RunningCore {
     /// Loads the registry, checks the audit chain and signs a head, writes
     /// the start records, binds the tunnel listener, prepares the enrolment
@@ -570,6 +675,9 @@ impl RunningCore {
         keys: &Keys,
         info: &StartInfo,
     ) -> Result<Self, CoreError> {
+        // Unreadable anchors, bundles or keys refuse the start before
+        // anything is written.
+        let exports = Exports::load(config, info)?;
         let cache = store.cache();
         store.reload().await?;
         let recorder = store.recorder();
@@ -609,11 +717,12 @@ impl RunningCore {
             cache,
             issuer: keys.issuing.clone(),
             enrollment,
-            tunnels: Tunnels::default(),
+            tunnels: Arc::default(),
+            relays: Arc::default(),
             certificate_lifetime,
             limits,
             recorder: recorder.clone(),
-            grants,
+            grants: Arc::new(grants),
             ssh: keys.ssh.clone(),
             transcripts: keys.transcripts.clone(),
             resync: tokio::sync::Notify::new(),
@@ -631,24 +740,14 @@ impl RunningCore {
         )
         .await?;
         let identity = identity_of(keys, &shared.store, &recorder);
-        let (login, web) =
-            start_login(config, keys, &shared.store, &recorder, identity.clone()).await?;
+        let (login, web) = start_login(config, keys, &shared, &recorder, identity.clone()).await?;
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
         let notices = listen(shared.store.pool()).await?;
+        let exporting = exports.spawn(shared.store.pool(), &recorder);
         let writer = tokio::spawn(audit::run_writer(shared.store.pool().clone(), recorder));
-        let mut tasks = vec![
-            tokio::spawn(accept(listener.clone(), shared.clone())),
-            tokio::spawn(follow_notices(notices, shared.clone())),
-            tokio::spawn(resync_on_request(shared.clone())),
-            tokio::spawn(reload_periodically(shared.clone())),
-            tokio::spawn(signer.clone().run()),
-            tokio::spawn(renew_host_certificates(shared.clone())),
-        ];
-        // The synchronisation of the identity sources (ADR-0021).
-        if let Some(identity) = &identity {
-            tasks.extend(identity.spawn());
-        }
+        let mut tasks = background(&listener, notices, &shared, &signer, identity.as_ref());
+        tasks.extend(exporting);
         tracing::info!(
             event = "core.started",
             tunnel = %tunnel_addr,
@@ -1203,12 +1302,18 @@ async fn answer_session(
     send(tunnel, agent, &reply).await;
 }
 
-async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
+/// Records a session report of the agent, then acknowledges it so that
+/// the agent drops it from its queue (ADR-0012). A report already applied
+/// (sent again after a lost link) is acknowledged without a second record;
+/// one that cannot be written is not acknowledged, and comes back.
+async fn close_session(tunnel: &CoreTunnel, agent: Uuid, message: AgentMessage, shared: &Shared) {
     let AgentMessage::SessionClosed {
+        report_id,
         session_id,
         reason,
         bytes_to_target,
         bytes_from_target,
+        closed_at,
     } = message
     else {
         return;
@@ -1223,12 +1328,16 @@ async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
         &reason,
         bytes_to_target,
         bytes_from_target,
-        unix_now(),
+        closed_at.min(unix_now()),
     )
     .await
     {
-        Ok(Some(event)) => shared.recorder.emit(event),
-        Ok(None) => {}
+        Ok(event) => {
+            if let Some(event) = event {
+                shared.recorder.emit(event);
+            }
+            send(tunnel, agent, &CoreMessage::ReportAck { report_id }).await;
+        }
         Err(e) => tracing::warn!(
             event = "access.session_close_failed",
             agent = %agent,
@@ -1236,6 +1345,60 @@ async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
             "{e}"
         ),
     }
+}
+
+/// Records the reports an agent dropped (full or unreadable queue), then
+/// acknowledges the notice.
+async fn reports_lost(tunnel: &CoreTunnel, agent: Uuid, message: &AgentMessage, shared: &Shared) {
+    let &AgentMessage::ReportsLost {
+        report_id,
+        count,
+        first_at,
+        last_at,
+        unreadable,
+    } = message
+    else {
+        return;
+    };
+    tracing::error!(
+        event = "agent.reports_lost",
+        agent = %agent,
+        count,
+        unreadable,
+        "bilans de session perdus par l'agent (file pleine ou illisible)"
+    );
+    let event = Event::new(
+        EventKind::AgentReportsLost,
+        Outcome::Failure,
+        ActorKind::Agent,
+        agent.to_string(),
+    )
+    .uuid(field::AGENT_ID, agent.to_bytes())
+    .u64(field::LOST_COUNT, count)
+    .u64(field::FIRST_MS, first_at.saturating_mul(1000))
+    .u64(field::LAST_MS, last_at.saturating_mul(1000))
+    .bool(field::COMPLETE, !unreadable);
+    let mut tx = match shared.store.pool().begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(event = "agent.reports_lost", agent = %agent, "{e}");
+            return;
+        }
+    };
+    // Written before the acknowledgement: a notice is never dropped unseen.
+    let appended = match audit::append(&mut tx, event).await {
+        Ok(appended) => appended,
+        Err(e) => {
+            tracing::warn!(event = "agent.reports_lost", agent = %agent, code = e.code(), "{e}");
+            return;
+        }
+    };
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(event = "agent.reports_lost", agent = %agent, "{e}");
+        return;
+    }
+    shared.recorder.critical(&[appended]);
+    send(tunnel, agent, &CoreMessage::ReportAck { report_id }).await;
 }
 
 /// Binds the tunnel listener: agents authenticated by a certificate of the
@@ -1330,7 +1493,10 @@ async fn control(
                 answer_session(&tunnel, agent, group, request_id, &grant, &shared).await;
             }
             message @ AgentMessage::SessionClosed { .. } => {
-                close_session(agent, message, &shared).await;
+                close_session(&tunnel, agent, message, &shared).await;
+            }
+            message @ AgentMessage::ReportsLost { .. } => {
+                reports_lost(&tunnel, agent, &message, &shared).await;
             }
             _ => {}
         }
@@ -1579,6 +1745,11 @@ fn connected(shared: &Shared) -> Vec<(Uuid, Uuid, Arc<CoreTunnel>)> {
 /// Tells the connected agents that received a grant for `session` that it
 /// is revoked; those not connected are told when they connect.
 async fn apply_login_revocation(shared: Arc<Shared>, session: Uuid) {
+    // The gateway sessions of the portal end at once (ADR-0020).
+    let cut = shared.relays.cut(session);
+    if cut > 0 {
+        tracing::warn!(event = "gateway.cut", login_session = %session, sessions = cut);
+    }
     let agents = match login::agents_to_notify(shared.store.pool(), session).await {
         Ok(agents) => agents,
         Err(e) => {

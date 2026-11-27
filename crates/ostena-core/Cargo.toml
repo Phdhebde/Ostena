@@ -17,8 +17,9 @@ testing = []
 # Keys in the tunnel messages (base64url, ADR-0008).
 base64.workspace = true
 http-body-util.workspace = true
-# HTTPS login API (ADR-0015): HTTP/1.1 server only.
-hyper = { workspace = true, features = ["server"] }
+# HTTPS login API (ADR-0015): HTTP/1.1 server; the HTTP/1.1 client of the
+# time-stamping authority (RFC 3161 section 3.4, ADR-0012).
+hyper = { workspace = true, features = ["server", "client"] }
 hyper-util = { workspace = true, features = ["server", "http1", "service"] }
 idna_adapter.workspace = true
 ostena-audit.workspace = true
@@ -30,12 +31,17 @@ ostena-grant.workspace = true
 ostena-ldap.workspace = true
 # Session transcripts (ADR-0016): strict decoder and asciicast writer.
 ostena-recorder.workspace = true
+# Write-once sealed files: append-only then immutable attributes (ADR-0012).
+ostena-platform.workspace = true
 # The scope policy of a group, compiled before it is stored and pushed.
 ostena-scope.workspace = true
 # SSH certificates only (cert, keys): without the SSH library, which the
 # core never runs (ADR-0014).
 ostena-ssh = { path = "../ostena-ssh", default-features = false }
 ostena-tunnel.workspace = true
+# The browser gateway: the WebSocket codec and the frames it checks.
+ostena-frame.workspace = true
+ostena-ws.workspace = true
 # The responses of the portal API (ADR-0020).
 serde.workspace = true
 # The stored scope policy (JSON) and the digest of a pushed SSH trust.
@@ -54,12 +60,11 @@ ostena-core = { path = ".", features = ["testing"] }
 ostena-crypto = { workspace = true, features = ["testing"] }
 # The identity tests: a directory served by the test LDAP server.
 ostena-ldap = { workspace = true, features = ["testing"] }
-ostena-platform.workspace = true
 toml.workspace = true
-# The login API tests: foreign TLS clients, an HTTP client.
-hyper = { workspace = true, features = ["client"] }
 # The property test of the login rate limiter.
 proptest.workspace = true
+# The gateway end-to-end test: a WebSocket client.
+ostena-ws = { workspace = true, features = ["client"] }
 
 [[bench]]
 # Cost of one authenticated request on the portal API.

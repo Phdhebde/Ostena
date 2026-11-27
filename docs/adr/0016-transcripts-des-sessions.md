@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté, implémenté (jalon M1, PR 8) : format du flux, écrivain asciicast, primitives cryptographiques, capture par l'agent, réception, stockage et scellement par le core, vérification hors ligne.
 - **Date** : 2026-11-25
+- **Révision** : 2026-11-27, jalon M2 (PR 11a) : fichiers en ajout seul puis immuables (ADR-0012, `REC-E006`)
 - **Révision** : 2026-11-26, jalon M2 (PR 2c) : grâce de reconnexion. Accusés applicatifs du core, tampon borné sur l'agent, reprise du flux sur la nouvelle connexion, scellement différé ; l'échec fermé est gardé au-delà de la grâce ou du tampon.
 - **Révision** : 2026-11-26, trame de note (type 6) : transferts, opérations sur les fichiers, redirections et demandes refusées, en marqueurs dans l'asciicast (jalon M2, PR 4a)
 - **Révision** : 2026-11-25, relecture de sécurité : session coupée quand le core ne lit plus, écriture hors des workers async, limite des refus de flux, `AUD-E019`, `AUD-E020`, `AUD-W007`, `AUD-W008`, `CFG-P016`, empreinte de la commande dans le sceau avec l'identifiant de sa clé, fin de commande enregistrée, caractères bidirectionnels échappés, borne de ce qui peut être montré sans être enregistré
@@ -80,7 +81,7 @@ Mise en œuvre :
 
   L'erreur dit combien d'octets le core n'a jamais accusés.
 - **fin normale** : l'agent termine le flux et attend 5 s au plus que le core accuse tous les octets, synchronisés sur le disque. Cela ne dit **pas** que le core les a scellés : le sceau se lit dans la chaîne d'audit (`transcript.sealed`).
-- **gestionnaire SSH** : il n'attend jamais le core. Un changement de taille est gardé et enregistré avant la sortie suivante. La fin du transcript est attendue 40 s au plus ; le permis de session et le bilan sont toujours rendus. Le bilan (`session_closed`) attend lui aussi le retour du lien pendant la grâce.
+- **gestionnaire SSH** : il n'attend jamais le core. Un changement de taille est gardé et enregistré avant la sortie suivante. La fin du transcript est attendue 40 s au plus ; le permis de session et le bilan sont toujours rendus. Le bilan (`session_closed`) passe par la file chiffrée de l'agent, gardé jusqu'à l'accusé du core, au-delà de la grâce et d'un redémarrage (ADR-0012, PR 11d).
 - **ouverture interrompue** : si l'agent ne peut pas commencer une session que le core a ouverte (compte ou clé d'hôte de la cible différents, flux `Recording` impossible à ouvrir), il envoie aussitôt son bilan (`session_closed`, raison « ouverture interrompue »).
 - **raison de fin** scellée : `closed`, `revoked`, `expired`, `shutdown` ou `error` (transcript perdu).
 
@@ -96,7 +97,7 @@ Mise en œuvre :
 - À la trame de début d'un `exec`, le core consigne `access.ssh_exec` : longueur de la commande et HMAC (ci-dessous), jamais le texte.
 - Un flux mal formé, une limite dépassée ou une écriture impossible arrête le flux : le transcript est scellé incomplet avec son code (`REC-E001`, `REC-E003`, `REC-E004`) et la session est coupée par l'agent.
 - **Sceau d'un fichier après une erreur d'écriture** : le core mesure le fichier réel sur le disque (taille, SHA-256) et scelle cette mesure, jamais ce qu'il croyait avoir écrit ; un fichier absent est scellé sans empreinte ni taille. Si la mesure elle-même échoue, rien n'est scellé : la ligne reste `recording` (`transcript.seal_failed`, niveau erreur) et la reprise du démarrage suivant la scelle.
-- **Scellement** : à la fin du flux, le fichier est synchronisé sur le disque et passé en lecture seule (0400) ; son SHA-256, sa taille, le nombre d'événements, d'octets de sortie et de séquences UTF-8 invalides, la raison de fin et le code éventuel sont écrits dans la ligne et dans l'enregistrement d'audit `transcript.sealed`, dans une même transaction. Un flux coupé sans trame de fin est scellé incomplet (`REC-E005`).
+- **Scellement** : à la fin du flux, le fichier est synchronisé sur le disque, en lecture seule (0400) dès sa création, et rendu immuable (`core.audit.worm`, ADR-0012) ; son SHA-256, sa taille, le nombre d'événements, d'octets de sortie et de séquences UTF-8 invalides, la raison de fin et le code éventuel sont écrits dans la ligne et dans l'enregistrement d'audit `transcript.sealed`, dans une même transaction. Un flux coupé sans trame de fin est scellé incomplet (`REC-E005`).
 - **Reprise** : au démarrage, les lignes encore `recording` (core arrêté pendant une session) sont scellées incomplètes, `REC-E005`, sur le contenu présent du fichier ; le journal montre `transcript.recovered`.
 - **Pas de SSH sans transcript** : avec `[core.ssh]`, `transcripts_dir` et `command_mac_key` sont obligatoires ; à défaut, la configuration est refusée, et le core refuse de démarrer (`REC-E002`).
 
@@ -127,6 +128,7 @@ L'agent ne journalise plus que la longueur d'une commande. Le core, qui reçoit 
 | `REC-E003` | taille ou durée maximale dépassée |
 | `REC-E004` | écriture du transcript impossible |
 | `REC-E005` | transcript incomplet : flux terminé sans trame de fin ou au milieu d'une trame, ou interrompu par l'arrêt du core |
+| `REC-E006` | répertoire des transcripts qui ne permet pas les fichiers en ajout seul puis immuables, avec `core.audit.worm = "required"` (ADR-0012) |
 | `SSH-E021` | session coupée par l'agent : transcript perdu |
 | `AUD-E017` | transcript scellé absent du répertoire vérifié |
 | `AUD-E018` | transcript modifié depuis son scellement |
@@ -149,7 +151,7 @@ Nouvelle crate `ostena-recorder`, prévue dans l'organisation du dépôt : évé
 ## Conséquences
 
 - Un transcript se vérifie avec `sha256sum` contre le hachage scellé dans la chaîne d'audit, ou par `ostena audit verify --transcripts`.
-- Le répertoire des transcripts grossit sans limite au jalon M1 : sa rétention et son archivage (WORM) relèvent de l'exploitation, puis d'un lot ultérieur.
+- Le répertoire des transcripts grossit sans limite : sa rétention relève de l'exploitation. Depuis le jalon M2 (PR 11a, ADR-0012, « Stockage en ajout seul »), chaque transcript est en ajout seul pendant l'enregistrement et immuable une fois scellé (`core.audit.worm`, `REC-E006`, `CFG-P024`).
 - L'écriture du fichier se fait dans un écrivain dédié, par blocs ; un disque lent ralentit, par contre-pression, la seule session concernée, que l'agent coupe au bout de 15 s d'attente.
 - Les transcripts contiennent ce que la session a affiché, secrets compris, et la commande d'un `exec` en clair : ils sont aussi sensibles que la session elle-même.
 - Une panne du lien entre l'agent et le core plus longue que la grâce (60 s par défaut), ou pendant laquelle une session affiche plus d'1 Mio, coupe les sessions SSH en cours. C'est le prix de la traçabilité.

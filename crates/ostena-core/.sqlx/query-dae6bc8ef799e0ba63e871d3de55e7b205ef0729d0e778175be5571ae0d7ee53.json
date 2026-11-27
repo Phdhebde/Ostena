@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT login_session_id::text AS \"login!\",\n                  resource_id::text AS \"resource!\", account, protocol, max_session_secs,\n                  consumed_at IS NOT NULL AS \"consumed!\"\n           FROM access_grant WHERE jti = $1 AND gateway_group = $2::text::uuid FOR UPDATE",
+  "query": "SELECT login_session_id::text AS \"login!\",\n                  resource_id::text AS \"resource!\", account, protocol, max_session_secs,\n                  consumed_at IS NOT NULL AS \"consumed!\",\n                  (channel = 'web' AND presented_at IS NULL) AS \"unpresented!\"\n           FROM access_grant WHERE jti = $1 AND gateway_group = $2::text::uuid FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -53,6 +53,12 @@
         "name": "consumed!",
         "type_info": "Bool",
         "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "unpresented!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -67,8 +73,9 @@
       false,
       false,
       false,
+      null,
       null
     ]
   },
-  "hash": "1b6ccc2c5bea5e596654499c172512fbd52b9263dd680781249653b9f47f840b"
+  "hash": "dae6bc8ef799e0ba63e871d3de55e7b205ef0729d0e778175be5571ae0d7ee53"
 }

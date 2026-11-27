@@ -161,6 +161,9 @@ mod tests {
             transcripts: seals,
             ssh_sessions: Vec::new(),
             export_time_ms: Some(10_000_000),
+            timestamps: 0,
+            timestamps_verified: 0,
+            last_timestamp: None,
         }
     }
 

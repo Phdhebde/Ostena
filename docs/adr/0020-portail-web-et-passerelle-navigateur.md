@@ -1,8 +1,12 @@
 # ADR-0020 : Portail web et passerelle navigateur
 
-- **Statut** : Accepté pour les sections 2 (serveur web du core, hors WebSocket) et 3 (session navigateur), livrées par la PR 8a, et pour les trois arbitrages rendus par le responsable du projet le 2026-11-26 (amendement de l'ADR-0009). Proposé pour le reste (chaîne de build, passerelle, internationalisation, tests de bout en bout) : chaque partie passe à « Accepté » avec sa PR.
+- **Statut** : Accepté pour les sections 2 (serveur web du core ; la WebSocket `ostena-ws` avec la PR 8b), 3 (session navigateur) et 4 (passerelle navigateur : parcours, rôle du core dans le relais, contre-pression côté core et tunnel), livrées par les PR 8a et 8b, et pour les trois arbitrages rendus par le responsable du projet le 2026-11-26 (amendement de l'ADR-0009). Dans la section 4, le WebAssembly, l'ordonnanceur du navigateur et le SSH web restent proposés (PR 8c et 12). Proposé pour le reste (chaîne de build, internationalisation, tests de bout en bout dans un navigateur) : chaque partie passe à « Accepté » avec sa PR.
 - **Date** : 2026-11-26
 - **Révision** : 2026-11-26, PR 8a : arbitrages consignés, détails de mise en œuvre (« Mise en œuvre de la PR 8a »)
+- **Révision** : 2026-11-26, PR 8b (1/3) : crate `ostena-ws` et module `ostena-crypto::websocket` (« Mise en œuvre de la PR 8b »)
+- **Révision** : 2026-11-26, PR 8b (2/3) : `POST /api/v1/access`, flux navigateur du tunnel côté agent, code `GTW-E006`
+- **Révision** : 2026-11-27, PR 8b (3/3) : WebSocket `/api/v1/gateway`, relais du core, événements `gateway.*`, balayage des sessions inactives, latence mesurée ; section 4 acceptée ; le grant présenté est vérifié par sa signature ECDSA (arbitrage du 2026-11-27)
+- **Révision** : 2026-11-27, PR 8c (1/4) : `portal/` minimal, `cargo xtask portal`, vendorisation npm, contrôles du lockfile et des licences, budget, double construction hors ligne en CI (« Mise en œuvre de la PR 8c »)
 
 ## Contexte
 
@@ -191,7 +195,7 @@ Aucun en-tête `Server`. Les journaux du core n'écrivent jamais `Cookie`, `Set-
    - `Origin` exactement égale à `core.web.origin` ;
    - le cookie de session : valide, et de la même source ;
    - la présence du sous-protocole `ostena-frame.v1` ;
-   - le grant : connu du registre, émis pour **cette** session de connexion, non expiré, jamais présenté. Les octets sont comparés en temps constant par `ostena-crypto`.
+   - le grant : sa signature ECDSA P-256 (ostena-grant, pour le groupe qu'il désigne), puis sa ligne du registre : émis pour **cette** session de connexion, non expiré, jamais présenté. La signature couvre tous les octets du grant : aucune comparaison d'octets n'est faite (arbitrage du 2026-11-27, qui remplace la comparaison en temps constant prévue ici).
 
    Le grant est alors marqué « présenté », de façon atomique : une seconde WebSocket avec le même grant est refusée (`GTW-E001`). La réponse `101` ne sélectionne que `ostena-frame.v1`, jamais le sous-protocole du grant.
 4. Le core ouvre un flux du tunnel vers un agent connecté du groupe d'audience et lui transmet le grant. L'agent suit alors le chemin commun (ADR-0008, ADR-0014) :
@@ -313,12 +317,14 @@ Les codes sont réservés ici ; leur texte exact est fixé par la PR qui les int
 | `GTW-E002` | 400 | sous-protocole `ostena-frame.v1` absent, ou poignée de main WebSocket invalide |
 | `GTW-E003` | 503 | aucun agent du groupe joignable |
 | `GTW-E004` | — | navigateur trop lent (fermeture 4003) |
-| `GTW-E005` | — | message WebSocket invalide : texte, trop grand ou trame refusée (fermeture 1002 ou 1009) |
+| `GTW-E005` | — | message WebSocket invalide : texte (fermeture 1003), trop grand (1009), trame refusée (1002), raison de fermeture hors UTF-8 (1007) |
+| `GTW-E006` | — | protocole non servi dans le navigateur par l'agent (refus de l'agent sur le flux navigateur ; le grant est consommé) |
 
 **Événements** :
 - connexion : `login.succeeded`, `login.refused` et `login.locked`, avec le champ `channel` (`cli` ou `web`) ;
 - session : `web_session.expired`, `web_session.source_changed`, `web_session.reauthenticated` ; `login_session.revoked` comme aujourd'hui ;
 - refus : `web.origin_refused` et `web.csrf_refused`, journalisés avec un débit limité ;
+- accès : `access.web_granted` (accordant, jti, agent choisi), `access.web_refused` (au mieux, code et cause) ;
 - passerelle : `gateway.opened` (accordant, jti, agent), `gateway.refused`, `gateway.closed` (cause, octets dans chaque sens).
 
 ### Mise en œuvre de la PR 8a
@@ -345,7 +351,7 @@ Les codes sont réservés ici ; leur texte exact est fixé par la PR qui les int
 **Décision sur une session.** Elle est une fonction pure (`web::session::decide`), dans cet ordre : révoquée ou compte inactif, échéance absolue, changement de source, inactivité.
 - L'échéance absolue répond `401` sans événement : la fin de la session de connexion est déjà portée par son échéance.
 - L'inactivité et le changement de source révoquent la session et écrivent `web_session.expired` ou `web_session.source_changed`, acteur `core`.
-- L'activité n'est enregistrée qu'à partir de 10 s après la précédente : l'échéance d'inactivité peut être atteinte jusqu'à 10 s plus tôt que l'inactivité réelle, jamais plus tard. Une session inactive n'est révoquée qu'à sa requête suivante ; un balayage périodique viendra avec la passerelle (PR 8b), pour couper aussi les sessions de passerelle.
+- L'activité n'est enregistrée qu'à partir de 10 s après la précédente : l'échéance d'inactivité peut être atteinte jusqu'à 10 s plus tôt que l'inactivité réelle, jamais plus tard. Une session inactive est révoquée à sa requête suivante, ou par le balayage périodique livré avec la passerelle (PR 8b), qui coupe aussi ses sessions de passerelle.
 
 **Écouteur.** Plafond global de connexions (`core.web.max_connections`, 256) et par source (`core.web.connections_per_source`, 16), connexions persistantes bornées à 300 s. L'origine (`core.web.origin`) est une URL `https://` sans chemin. Les groupes TLS actifs sont journalisés au démarrage (`web.tls_groups`). Codes de configuration : `CFG-V019` (section `[core.web]` invalide), `CFG-P018` (`bind_source = false`) et `CFG-P019` (`tls_classic_fallback = true`), ces deux derniers refusés en production.
 
@@ -354,6 +360,81 @@ Les codes sont réservés ici ; leur texte exact est fixé par la PR qui les int
 **Tests.** Le test d'énumération et les tests de la CSRF tournent sur une mémoire de sessions en processus, qui implémente le même trait que PostgreSQL (`WebBackend`) : la décision sur la session est celle de l'écouteur, quelle que soit la mémoire. Des tests contre PostgreSQL couvrent le chemin réel (connexion, ré-authentification, inactivité, changement de source, révocation par un administrateur, désactivation du compte).
 
 **Coût mesuré** (`cargo bench -p ostena-core --bench web_request`, 2026-11-26, machine de développement, mémoire en processus) : un aller-retour `GET /api/v1/session` sur une connexion TLS persistante coûte 86 µs au p50 et 136 µs au p99, contre 77 µs et 127 µs pour la route publique `GET /api/v1/health`. L'authentification elle-même (cookie, recherche, décision, contrôles) ajoute donc environ 10 µs. La lecture dans PostgreSQL (une requête indexée par le SHA-256 du cookie) n'est pas comptée.
+
+### Mise en œuvre de la PR 8b
+
+La PR 8b est livrée en trois parties : le crate `ostena-ws` et le module `ostena-crypto::websocket` (1/3) ; la demande d'accès et les flux navigateur du tunnel côté agent (2/3) ; la WebSocket `/api/v1/gateway` et le relais du core (3/3).
+
+**`ostena-ws`.** Un analyseur sans entrées-sorties (*sans-I/O*) : l'appelant remplit un tampon, `Parser::parse` rend le nombre d'octets lus et l'événement complété (message binaire, ping, pong, fermeture). Aucune dépendance, aucun runtime, `#![forbid(unsafe_code)]`.
+- **Poignée de main** (`handshake::check`) : `GET` en HTTP/1.1, `Upgrade: websocket`, jeton `upgrade` dans `Connection`, `Sec-WebSocket-Version: 13` présent une seule fois, `Sec-WebSocket-Key` présent une seule fois et égal à 16 octets en base64 canonique, sous-protocoles en jetons HTTP (4 au plus, 512 octets chacun). `Sec-WebSocket-Extensions` est ignoré : rien n'est jamais négocié. L'origine, la session et le grant restent à l'appelant.
+- **Trames** : masque exigé, bits réservés nuls, opcodes réservés refusés, longueur dans son encodage le plus court, trames de contrôle finales et de 125 octets au plus, suites seulement après un message commencé, aucun nouveau message avant la fin du précédent, rien après une fermeture. Le masque est retiré pendant la copie dans le tampon du message : une seule copie.
+- **Borne** : 32 Kio par message, vérifiée sur le champ de longueur **avant** la lecture de la charge : un client ne peut pas faire tamponner davantage au core.
+- **Codes de fermeture** : 1003 pour un message texte (la RFC le prévoit pour un type de données refusé, plutôt que 1002 annoncé plus haut), 1009 pour un message trop grand, 1007 pour une raison de fermeture hors UTF-8, 1002 pour le reste. Le tableau des codes est mis à jour.
+- **Côté client** : une fonctionnalité `client` (trames masquées, opcodes et bits quelconques pour forger ce que le serveur doit refuser) sert aux tests de la passerelle et à la cible de fuzz. Elle n'entre jamais dans le binaire.
+- **Tests** : vecteurs de la RFC 6455 (§ 5.7), chaque refus avec son code, tests de propriétés (messages fragmentés et pings mêlés, masque quelconque, lectures découpées au hasard : mêmes messages), cible de fuzz `ws_frame` (mêmes événements quel que soit le découpage des lectures, aucun message au-delà de la borne, poignée de main sur les mêmes octets), corpus rejoué par les tests stables.
+
+**`ostena-crypto::websocket`.** `accept_key` rend `base64(SHA-1(clé ‖ GUID))` par `SHA1_FOR_LEGACY_USE_ONLY` d'aws-lc-rs, et rien d'autre (ADR-0009, amendement du 2026-11-26). Le crate `sha1` reste refusé par `deny.toml`.
+
+**Demande d'accès (2/3).** `POST /api/v1/access` (session exigée, contrôles CSRF de toutes les routes à effet) prend `{resource, account, protocol}`, protocole `ssh` seulement tant que l'affichage RDP n'est pas livré (PR 13).
+- La décision est celle de l'ADR-0014, dans une transaction : utilisateur actif, session de connexion valide, ressource, compte, droit valide, verrouillés ; durée de session la plus courte du droit, de sa fin et de la session de connexion.
+- Le core choisit l'agent connecté du groupe qui a le moins de flux ouverts ; sans agent, `503` `GTW-E003`. Le grant (audience le groupe, 60 s, lié à la session de connexion et au compte) est enregistré par son jti dans `access_grant`, avec `channel = 'web'` et l'agent choisi, et l'enregistrement accordant `access.web_granted` est écrit dans la même transaction.
+- Un refus rend le code et son libellé générique (`ACC-E…`, `INV-E…` en `403`) ; la cause va dans `access.web_refused` (au mieux). Les demandes d'une session sont limitées (10 d'un coup, puis une toutes les 6 s ; `429` `ACC-E009`, sans événement de chaîne).
+- La migration 0010, réversible, ajoute à `access_grant` les colonnes `channel` (`cli` ou `web`) et `presented_at` (heure de présentation par la WebSocket, seulement pour `web`). Le retour à la migration précédente supprime les grants `web`, leurs sessions et leurs transcripts.
+
+**Flux navigateur du tunnel (2/3).** Le core ouvre un canal du tunnel par session navigateur, classe interactive : les entrées du navigateur passent devant les transcripts et les transferts (ADR-0008). Sur ce canal (`ostena_tunnel::browser`) :
+- le core envoie `[version 1][longueur u16][grant]` ;
+- l'agent vérifie le grant et consomme son jti dans son journal, refuse un protocole qu'il ne sert pas dans le navigateur (`GTW-E006`, avant toute demande au core : un grant présenté une fois est brûlé), puis suit le chemin commun (`session_request`, `session_params`, contrôle de périmètre) ;
+- il répond `[0][identifiant de session]` ou `[1][code du refus]`, puis passe son demi-flux en classe affichage ;
+- les trames `ostena-frame` se suivent ensuite, auto-délimitées, dans les deux sens. La contre-pression est le contrôle de flux du canal : un lecteur qui ne lit plus arrête l'écrivain à l'autre bout.
+
+L'agent remet chaque session à un driver navigateur (trait `BrowserDriver`) puis rapporte sa fin au core (`session_closed`, octets dans chaque sens). Le binaire de la PR 8b n'a aucun driver navigateur (`NoDriver`) : chaque flux est refusé par `GTW-E006` après consommation du grant. Le terminal SSH arrive avec la PR 12, l'affichage RDP avec la PR 13. Le tunnel accepte désormais les canaux ouverts par le core (file de 16, puis la limite de flux du tunnel) ; seuls les canaux de classe interactive sont servis.
+
+Événements de l'agent (journal structuré) : `agent.browser_opened`, `agent.browser_refused` (code), `agent.browser_closed` (cause, octets dans chaque sens), `agent.channel_refused` (en-tête de canal invalide ou classe non servie).
+
+**WebSocket et relais (3/3).** `GET /api/v1/gateway` (session exigée) est vérifiée dans l'ordre du parcours : `Origin` (`WEB-E002`), cookie (`WEB-E001`), poignée de main et `ostena-frame.v1` (`GTW-E002`), puis le grant, présent exactement une fois dans `ostena-grant.<grant>` (`GTW-E001`).
+- **Grant** : signature ECDSA vérifiée par `ostena-grant` pour le groupe qu'il désigne, puis, dans une transaction, `UPDATE access_grant SET presented_at` sur la ligne `web` de cette session de connexion, non expirée, jamais présentée ni consommée. L'enregistrement **accordant** `gateway.opened` (jti, groupe, agent) est écrit dans la même transaction : une seconde WebSocket avec le même grant est refusée (`GTW-E001`). Côté agent, `session_request` refuse un grant `web` jamais présenté (`ACC-E008`) : un grant du portail n'ouvre de session que par sa WebSocket.
+- **Agent** : celui choisi à l'émission, sinon un autre agent connecté du groupe ; sans agent, `503` `GTW-E003`. Le core ouvre le flux navigateur et attend la réponse de l'agent **avant** le `101` : un refus de l'agent est rendu en HTTP (`GTW-E006`, ou `GTW-E001` pour les autres codes, le code de l'agent allant dans `gateway.refused`).
+- **Relais** : chaque message binaire du navigateur doit être une trame `ostena-frame` vers la passerelle, décodée et acceptée par un `Receiver` (version, séquence consécutive, fragmentation), puis écrite telle quelle dans le flux. La version négociée est apprise du `HelloAck` de l'agent. Vers le navigateur, les trames sont découpées par leur en-tête, vérifié (sens, type, longueur), et mises dans une file de 64 trames : pleine, le core cesse de lire le flux, et le contrôle de flux du tunnel ralentit l'agent. Une écriture vers le navigateur bloquée 30 s ferme la session (4003, `GTW-E004`).
+- **Fermetures** : 1000 (fin par l'agent ou le navigateur), 1002 (trame refusée, `GTW-E005`), 1003, 1007, 1009 (message WebSocket refusé, `GTW-E005`), 1008 (session de connexion révoquée), 1011 (trame de l'agent refusée), 4003 (navigateur trop lent).
+- **Révocation** : la révocation d'une session de connexion (déconnexion, administrateur, inactivité, changement de source) coupe à l'instant ses sessions de passerelle, à la réception de la notification de révocation par le core.
+- **Inactivité** : les trames du navigateur gardent la session active (enregistrée au plus toutes les 10 s). Toutes les 30 s, le core révoque les sessions du portail inactives (`web_session.expired`), ce qui coupe leurs sessions de passerelle sans attendre une requête.
+- **Connexions** : une WebSocket garde sa place dans le plafond global et dans celui de sa source jusqu'à sa fin.
+- **Événements** : `gateway.opened` (accordant), `gateway.refused` (au mieux : code, cause, dont le code de l'agent), `gateway.closed` (au mieux : session, jti, cause, octets reçus du navigateur et envoyés vers lui). Journal structuré : `gateway.cut`, `web.sessions_swept`.
+
+**Latence mesurée** (2026-11-27, machine de développement, boucle locale, build de test non optimisé) :
+- aller-retour complet navigateur → core → agent → core → navigateur, WebSocket sur TLS 1.3 hybride, trames `Ping`/`Pong` d'`ostena-frame`, 500 mesures (`tests/web_gateway.rs`) : p50 0,66 à 0,87 ms, p99 1,3 à 2,0 ms ;
+- le flux navigateur du tunnel seul, core → agent → core (`ostena-tunnel`, `tests/gateway.rs`) : p50 0,36 ms, p99 0,98 ms.
+
+La part du relais WebSocket (TLS, décodage, contrôle des trames, file) est donc d'environ 0,3 à 0,5 ms au p50 et 1 ms au p99, pour un aller-retour : bien sous l'objectif de 10 ms au p99 pour le navigateur.
+
+### Mise en œuvre de la PR 8c
+
+La PR 8c est livrée en quatre parties : la chaîne de build du portail (1/4) ; son embarquement dans le binaire et `ostena core portal-manifest` (2/4) ; `ostena-web-client` (3/4) ; le premier E2E Playwright (4/4).
+
+**Chaîne de build (1/4).**
+- **Paquets** (`portal/package.json`, versions exactes, toutes publiées depuis plus de deux semaines) :
+  - livrés au navigateur (`dependencies`) : `svelte` 5.57.3 (MIT) et `@fontsource-variable/inter` 5.3.0 (OFL-1.1, police) ;
+  - outils (`devDependencies`) : `vite` 8.3.8 (MIT, qui tire `rolldown` 1.2.19 et `lightningcss` 1.33.0, MPL-2.0), `@sveltejs/vite-plugin-svelte` 7.3.1, `typescript` 6.0.3 (Apache-2.0) et `svelte-check` 4.7.8 (vérification stricte des types, composants Svelte compris).
+  - Le lockfile compte 79 entrées (variantes des autres plateformes comprises) : MIT (59), MPL-2.0 (12), Apache-2.0 (4), ISC, BSD-3-Clause, 0BSD et OFL-1.1 (la police).
+- **Reportés** : JetBrains Mono arrive avec le terminal (PR 12) ; `openapi-typescript` avec le portail complet (PR 16). Les trois appels de la page de connexion sont typés à la main dans `src/api.ts`.
+- **Contrôles d'`xtask`** (`cargo xtask portal`, sans dépendance : un petit lecteur JSON strict) :
+  - Node : la version qui tourne est exactement celle de `portal/.node-version` (22.23.5) ;
+  - `package.json` : versions exactes, ni `optionalDependencies`, ni `peerDependencies`, ni `bundleDependencies` ; `.npmrc` fixe `ignore-scripts=true` ;
+  - lockfile : format 3 ; chaque entrée vient de `registry.npmjs.org` (archive `.tgz`), porte une seule intégrité SHA-512, une version exacte et une licence admise (expression SPDX : une alternative dont tous les termes sont admis). OFL-1.1 n'est admise que pour les polices d'une liste fermée, et seulement parmi les `dependencies` ;
+  - un paquet qui déclare un script d'installation doit figurer dans une liste fermée, relue en revue (`fsevents`, macOS seulement, jamais installé sur les plateformes de construction). Aucun script ne s'exécute de toute façon.
+- **Construction** : `npm ci --ignore-scripts` (avec `--offline --cache vendor/npm` dès que `vendor/npm/` existe ; `cargo xtask portal --offline` l'exige), `svelte-check`, `vite build`, puis `scripts/pack.mjs` (modules de Node seulement) :
+  - refuse toute URL absolue dans ce que le navigateur interprète (HTML, JS, CSS, SVG, JSON), hors de la liste fermée (espaces de noms XML, documentation des erreurs de Svelte) ;
+  - écrit `licenses.txt`, les licences des paquets livrés (dont l'OFL de la police), servi avec le portail ;
+  - compresse chaque fichier texte en brotli (qualité 11), gardé seulement s'il est plus petit ; les `woff2` ne sont pas recompressés ;
+  - écrit `SHA256SUMS`, au format de `sha256sum`, trié par chemin : chaque fichier servi, variantes brotli comprises. **L'empreinte du manifeste** est le SHA-256 de ce fichier. Un évaluateur la recalcule sans outil d'Ostena : `sha256sum --check SHA256SUMS && sha256sum SHA256SUMS` ;
+  - écrit `manifest.json` : chemin, type, taille et SHA-256 de chaque fichier et de sa variante brotli, l'empreinte, la liste des fichiers de la page de connexion et les trois mesures du budget.
+- **Budget** : en octets (1 Ko = 1 000 o), 400 000 pour le total et 150 000 pour la page de connexion, mesurés sur ce qui part compressé. La page de connexion est `index.html`, `theme.js`, l'icône, et le morceau d'entrée de Vite avec ses imports statiques, ses feuilles de style et leurs fichiers (manifeste de Vite, retiré ensuite). `xtask portal` échoue au-delà et écrit les mesures dans le résumé du job.
+- **Vendorisation** : `cargo xtask vendor` remplit aussi `vendor/npm/` (cache npm, archives adressées par leur intégrité) ; `cargo xtask vendor npm` ne fait que cette partie.
+- **SBOM** : `cargo xtask sbom` écrit `ostena-portal.cdx.json` (CycloneDX 1.5) depuis le lockfile : les paquets livrés, avec licence, URL et SHA-512. Il n'utilise pas `npm sbom`, dont `--omit dev` retire un paquet livré dès qu'un outil en dépend aussi (`svelte`, dépendance de `@sveltejs/vite-plugin-svelte`).
+- **CI** (job `portal`) : `cargo xtask vendor npm` (connecté), puis deux constructions `--offline` dans deux copies propres des sources, avec un registre injoignable ; `manifest.json` doit être identique octet pour octet, et les deux arbres aussi. Le portail construit est un artefact, pour que les binaires Linux et Windows embarquent le même.
+- **Mesures** (2026-11-27) : page de connexion 62,9 Ko, total 68,2 Ko (brotli, police comprise), soit 17 % du budget. Deux constructions, en ligne et hors ligne, dans deux dossiers différents : même empreinte.
+
+**Page de connexion.** Un formulaire natif (identifiant, mot de passe, code à usage unique) envoie `POST /api/v1/session` ; l'erreur est annoncée (`role="alert"`), liée aux champs, et affiche toujours le code stable. Lien d'évitement, repères `header` et `main`, focus visible, `prefers-reduced-motion` respecté. Les jetons de couleur de la charte sont des propriétés CSS ; le thème clair et le thème sombre sont de même rang, le système décide, et `theme.js` applique avant l'affichage un thème imposé par l'utilisateur. Une session ouverte affiche l'utilisateur et un bouton de déconnexion (`DELETE /api/v1/session`). Le français seul en attendant l'i18n de la PR 16.
 
 ## Conséquences
 

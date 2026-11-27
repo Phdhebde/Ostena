@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use common::{TestDb, block_on};
 use ostena_common::config::scope::{AllowRuleSpec, PolicySpec};
-use ostena_common::config::{CoreConfig, Mode};
+use ostena_common::config::{CoreConfig, Mode, WormSetting};
 use ostena_core::cache::AgentCache;
 use ostena_core::functions::Functions;
 use ostena_core::server::{Keys, RunningCore, StartInfo};
@@ -43,6 +43,7 @@ use ostena_ssh::transcript::Transcript;
 use ostena_tunnel::enroll::AgentRegistry;
 use ostena_tunnel::gateway::{Gateway, GatewayParams, GatewayState, SshAccess};
 use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, SystemClock};
+use ostena_tunnel::reports::ReportQueue;
 use ostena_tunnel::{Hello, Limits, Uuid};
 use tokio::sync::broadcast;
 
@@ -65,7 +66,23 @@ struct Dir(PathBuf);
 
 impl Drop for Dir {
     fn drop(&mut self) {
+        unprotect(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Clears the write-once attributes under `dir`, so that it can be removed.
+fn unprotect(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            unprotect(&path);
+        } else if let Ok(file) = std::fs::File::open(&path) {
+            let _ = ostena_platform::worm::protect(&file, ostena_platform::worm::Protection::None);
+        }
     }
 }
 
@@ -84,6 +101,17 @@ fn config(port: u16) -> CoreConfig {
         free_port()
     ))
     .unwrap()
+}
+
+/// Write-once files where this host allows them (root with
+/// `CAP_LINUX_IMMUTABLE`), read-only rights elsewhere (CI runners).
+fn worm_setting(transcripts: &Path) -> WormSetting {
+    std::fs::create_dir_all(transcripts).unwrap();
+    if ostena_platform::worm::probe(transcripts).is_ok() {
+        WormSetting::Required
+    } else {
+        WormSetting::Disabled
+    }
 }
 
 fn keys(pki: TestPki, transcripts: &Path) -> Keys {
@@ -111,6 +139,7 @@ fn keys(pki: TestPki, transcripts: &Path) -> Keys {
             Transcripts::open(
                 transcripts,
                 HmacKey::new(&HmacKey::generate().unwrap()).unwrap(),
+                worm_setting(transcripts),
             )
             .unwrap(),
         )),
@@ -235,7 +264,17 @@ fn agent_via(
         grant_policy: ostena_grant::Policy::default(),
     })
     .unwrap();
-    (Gateway::start(Arc::new(state), link.clone()).unwrap(), link)
+    // A queue of one report: the second one overflows (ADR-0012).
+    let reports = ReportQueue::open_bounded(
+        dir,
+        |path, bytes| private_file::create(path, bytes, Reader::CurrentProcess),
+        1,
+    )
+    .unwrap();
+    (
+        Gateway::start_with(Arc::new(state), link.clone(), Some(Arc::new(reports))).unwrap(),
+        link,
+    )
 }
 
 async fn until(what: &str, check: impl Fn() -> bool) {
@@ -278,6 +317,7 @@ fn ssh_access_and_login_revocation_end_to_end() {
         let pool = db.pool().await;
         let dir =
             Dir(std::env::temp_dir().join(format!("ostena-core-ssh-e2e-{}", std::process::id())));
+        unprotect(&dir.0);
         let _ = std::fs::remove_dir_all(&dir.0);
         std::fs::create_dir_all(&dir.0).unwrap();
 
@@ -413,6 +453,42 @@ fn ssh_access_and_login_revocation_end_to_end() {
         drop(transcript);
         pumped.await.unwrap().unwrap();
         assert_eq!(until_sealed(&pool, session_id).await, "sealed");
+
+        // The report of the session goes through the encrypted queue; the
+        // next one overflows it and is reported lost. The core records both
+        // and acknowledges them: the queue empties.
+        assert!(gateway.queue_closed(session_id, "fin normale", 10, 20));
+        assert!(gateway.queue_closed(Uuid::random().unwrap(), "x", 0, 0));
+        let queue = gateway.reports().unwrap().clone();
+        until("bilans acquittés", || {
+            queue.pending() == 0 && queue.lost().is_none()
+        })
+        .await;
+        let (reason, to_target, from_target): (String, i64, i64) = sqlx::query_as(
+            "SELECT close_reason, bytes_to_target, bytes_from_target FROM access_session
+             WHERE id = $1::uuid AND closed_at IS NOT NULL",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (reason.as_str(), to_target, from_target),
+            ("fin normale", 10, 20)
+        );
+        let lost: Vec<u8> =
+            sqlx::query_scalar("SELECT body FROM audit_record WHERE event = 'agent.reports_lost'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let lost = ostena_audit::Record::decode(&lost).unwrap();
+        assert!(
+            lost.fields
+                .iter()
+                .any(|f| f.name == "lost_count" && f.value == ostena_audit::Value::U64(1)),
+            "{lost:?}"
+        );
+
         let file = keys.transcripts.as_ref().unwrap().path(session_id);
         let written = std::fs::read(&file).unwrap();
         let text = String::from_utf8(written.clone()).unwrap();
@@ -492,6 +568,15 @@ fn ssh_access_and_login_revocation_end_to_end() {
         assert_eq!(
             get("kid"),
             Some(ostena_audit::Value::Text(key_id.to_owned()))
+        );
+        // Immutable on disk exactly when the store is write-once.
+        let immutable = std::fs::File::open(&file)
+            .and_then(|f| ostena_platform::worm::protection(&f))
+            .is_ok_and(|p| p == ostena_platform::worm::Protection::Immutable);
+        assert_eq!(get("immutable"), Some(ostena_audit::Value::Bool(immutable)));
+        assert_eq!(
+            immutable,
+            worm_setting(file.parent().unwrap()) == WormSetting::Required
         );
         #[cfg(unix)]
         {
@@ -669,6 +754,7 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
         let dir = Dir(
             std::env::temp_dir().join(format!("ostena-core-ssh-replay-{}", std::process::id()))
         );
+        unprotect(&dir.0);
         let _ = std::fs::remove_dir_all(&dir.0);
         std::fs::create_dir_all(&dir.0).unwrap();
         let pki = TestPki::new("Ostena replay").unwrap();
@@ -931,6 +1017,7 @@ fn a_network_cut_shorter_than_the_grace_keeps_the_ssh_sessions() {
         let pool = db.pool().await;
         let dir =
             Dir(std::env::temp_dir().join(format!("ostena-core-ssh-grace-{}", std::process::id())));
+        unprotect(&dir.0);
         let _ = std::fs::remove_dir_all(&dir.0);
         std::fs::create_dir_all(&dir.0).unwrap();
         let pki = TestPki::new("Ostena grace").unwrap();

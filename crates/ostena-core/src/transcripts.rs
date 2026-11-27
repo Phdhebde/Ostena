@@ -45,7 +45,9 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ostena_audit::{Event, EventKind, Outcome, field};
+use ostena_common::config::WormSetting;
 use ostena_crypto::hmac::HmacKey;
+use ostena_platform::worm::{self, Protection};
 use ostena_recorder::{
     CastWriter, Decoder, EndReason, Frame, Limits, NoteKind, RecorderError, Sealed,
 };
@@ -67,6 +69,9 @@ pub const WRITE_FAILED: &str = "REC-E004";
 pub const INCOMPLETE: &str = "REC-E005";
 /// Code of a malformed transcript stream.
 const MALFORMED: &str = "REC-E001";
+/// Code of a transcript directory that does not allow write-once files
+/// (`core.audit.worm = "required"`).
+pub const WORM_UNAVAILABLE: &str = "REC-E006";
 
 /// Added to the grace announced by the agent: the core and the agent do
 /// not see a lost connection at the same instant (each after its idle
@@ -92,6 +97,8 @@ pub struct Transcripts {
     mac: HmacKey,
     key_id: String,
     limits: Limits,
+    /// Files append only while written, immutable once sealed.
+    worm: bool,
     /// The transcripts being recorded, by session: their agent, and where
     /// a stream that resumes one is handed over.
     recording: Mutex<HashMap<Uuid, (Uuid, mpsc::Sender<Channel>)>>,
@@ -165,8 +172,37 @@ fn measured(size: u64, sha256: [u8; 32]) -> Sealed {
     }
 }
 
-/// Makes a sealed file read-only (owner read only on Unix).
-fn seal_rights(path: &Path) -> std::io::Result<()> {
+/// Makes a sealed file read-only (owner read only on Unix) and, with
+/// `worm`, immutable. An append-only file (being written) already has its
+/// final rights, which cannot change until it becomes immutable; an
+/// immutable file is left as it is.
+fn seal_rights(path: &Path, worm: bool) -> std::io::Result<()> {
+    let current = File::open(path).and_then(|f| worm::protection(&f).map(|p| (f, p)));
+    let file = match current {
+        Ok((_, Protection::Immutable)) => return Ok(()),
+        Ok((file, Protection::AppendOnly)) if worm => file,
+        Ok((file, Protection::AppendOnly)) => {
+            // Written under `worm`, sealed without: the attribute goes,
+            // the rights are set as below.
+            worm::protect(&file, Protection::None)?;
+            read_only(path)?;
+            file
+        }
+        Ok((file, Protection::None)) => {
+            read_only(path)?;
+            file
+        }
+        Err(e) if worm => return Err(e),
+        Err(_) => return read_only(path),
+    };
+    if worm {
+        worm::protect(&file, Protection::Immutable)?;
+    }
+    Ok(())
+}
+
+/// Read-only rights: owner read only on Unix.
+fn read_only(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -180,15 +216,24 @@ fn seal_rights(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Whether the file at `path` is immutable, as sealed under `worm`.
+fn is_immutable(path: &Path) -> bool {
+    File::open(path)
+        .and_then(|f| worm::protection(&f))
+        .is_ok_and(|p| p == Protection::Immutable)
+}
+
 impl Transcripts {
     /// The transcripts of `dir`, created if needed (private rights on
-    /// Unix), with the command key `mac`.
+    /// Unix), with the command key `mac`; with [`WormSetting::Required`],
+    /// every file is append only while written and immutable once sealed.
     ///
     /// # Errors
     ///
     /// [`CoreError::Startup`] if the directory cannot be created or is not
-    /// a directory.
-    pub fn open(dir: &Path, mac: HmacKey) -> Result<Self, CoreError> {
+    /// a directory, or (`REC-E006`) if it does not allow write-once files
+    /// under [`WormSetting::Required`].
+    pub fn open(dir: &Path, mac: HmacKey, worm: WormSetting) -> Result<Self, CoreError> {
         let fail = |e: &dyn std::fmt::Display| {
             CoreError::Startup(format!(
                 "[{WRITE_FAILED}] core.ssh.transcripts_dir {} : {e}",
@@ -208,6 +253,16 @@ impl Transcripts {
         if !std::fs::metadata(dir).map_err(|e| fail(&e))?.is_dir() {
             return Err(fail(&"pas un répertoire"));
         }
+        let worm = worm == WormSetting::Required;
+        if worm && let Err(e) = worm::probe(dir) {
+            return Err(CoreError::Startup(format!(
+                "[{WORM_UNAVAILABLE}] core.ssh.transcripts_dir {} : fichiers en ajout seul puis \
+                 immuables impossibles ({e}) ; il faut Linux, un système de fichiers qui les \
+                 prend en charge (ext4, XFS, Btrfs) et la capacité CAP_LINUX_IMMUTABLE pour le \
+                 service (core.audit.worm = « disabled » : CFG-P024, refusé en production)",
+                dir.display()
+            )));
+        }
         let id = mac.tag(&[KEY_ID_DOMAIN]);
         let key_id = id[..8].iter().fold(String::with_capacity(16), |mut s, b| {
             use std::fmt::Write as _;
@@ -219,6 +274,7 @@ impl Transcripts {
             mac,
             key_id,
             limits: Limits::default(),
+            worm,
             recording: Mutex::default(),
         })
     }
@@ -296,6 +352,8 @@ struct Ending {
     /// `None`: complete.
     code: Option<&'static str>,
     command: Option<Command>,
+    /// The file is immutable (`core.audit.worm`).
+    immutable: bool,
 }
 
 /// Seals the transcript of `session`: row and `transcript.sealed` record in
@@ -361,7 +419,8 @@ async fn seal(
     }
     event = event
         .u64(field::OUTPUT_BYTES, ending.output_bytes)
-        .bool(field::COMPLETE, complete);
+        .bool(field::COMPLETE, complete)
+        .bool(field::IMMUTABLE, ending.immutable);
     if let Some(command) = &ending.command {
         event = event
             .bytes(field::COMMAND_HMAC, command.tag)
@@ -402,17 +461,25 @@ async fn register(pool: &PgPool, agent: Uuid, session: Uuid, now: u64) -> Result
     Ok(inserted == 1)
 }
 
-/// Creates the file of a transcript, private, never over another, then
-/// syncs its directory so that the file survives a crash.
-fn create(path: &Path) -> std::io::Result<File> {
+/// Creates the file of a transcript, never over another, opened for
+/// appending, then syncs its directory so that the file survives a crash.
+/// Its rights are final at once (read only by the owner on Unix: the
+/// descriptor returned stays writable); with `worm`, it is append only.
+fn create(path: &Path, worm: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.append(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o400);
     }
     let file = options.open(path)?;
+    if worm && let Err(e) = worm::protect(&file, Protection::AppendOnly) {
+        // Still empty and unprotected: nothing is lost by removing it.
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
     if let Some(dir) = path.parent() {
         sync_dir(dir)?;
     }
@@ -448,6 +515,7 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
 fn write_file(
     file: File,
     path: &Path,
+    worm: bool,
     session: Uuid,
     mut items: mpsc::Receiver<Item>,
     written: &watch::Sender<u64>,
@@ -473,7 +541,7 @@ fn write_file(
         .map_err(|e| RecorderError::Io(e.error().to_string()))?;
     file.sync_all()
         .map_err(|e| RecorderError::Io(e.to_string()))?;
-    seal_rights(path).map_err(|e| RecorderError::Io(e.to_string()))?;
+    seal_rights(path, worm).map_err(|e| RecorderError::Io(e.to_string()))?;
     written.send_replace(mark);
     Ok(sealed)
 }
@@ -770,7 +838,8 @@ async fn record(
     let (acked, mut written) = watch::channel(0u64);
     let writing = {
         let path = store.path(session);
-        tokio::task::spawn_blocking(move || write_file(file, &path, session, queued, &acked))
+        let worm = store.worm;
+        tokio::task::spawn_blocking(move || write_file(file, &path, worm, session, queued, &acked))
     };
     let mut read = read_stream(
         pool,
@@ -885,7 +954,8 @@ pub async fn receive(
     let path = store.path(session);
     let created = {
         let path = path.clone();
-        tokio::task::spawn_blocking(move || create(&path))
+        let worm = store.worm;
+        tokio::task::spawn_blocking(move || create(&path, worm))
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
     };
@@ -906,6 +976,7 @@ pub async fn receive(
                 reason: None,
                 code: Some(WRITE_FAILED),
                 command: None,
+                immutable: false,
             };
             if let Err(e) = seal(pool, recorder, agent, session, &ending, now()).await {
                 tracing::warn!(event = "transcript.seal_failed", session = %session, code = e.code(), "{e}");
@@ -947,7 +1018,7 @@ pub async fn receive(
         let _ = send_offset(&mut channel, acked).await;
         let _ = channel.send.finish();
     }
-    let Some((sealed, code)) = finish(written, &path, session, code).await else {
+    let Some((sealed, code)) = finish(written, &path, store.worm, session, code).await else {
         // Left unsealed, sealed at the next start of the core (or the
         // start is refused): never a made-up digest.
         tracing::error!(
@@ -960,6 +1031,7 @@ pub async fn receive(
         return;
     };
     let ending = Ending {
+        immutable: sealed.is_some() && is_immutable(&path),
         sealed,
         output_bytes: read.output_bytes,
         reason: read.reason,
@@ -989,6 +1061,7 @@ pub async fn receive(
 async fn finish(
     written: Result<Sealed, RecorderError>,
     path: &Path,
+    worm: bool,
     session: Uuid,
     code: Option<&'static str>,
 ) -> Option<(Option<Sealed>, Option<&'static str>)> {
@@ -1000,7 +1073,7 @@ async fn finish(
             let on_disk = tokio::task::spawn_blocking(move || {
                 let on_disk = measure(&path)?;
                 if on_disk.is_some() {
-                    seal_rights(&path)?;
+                    seal_rights(&path, worm)?;
                 }
                 Ok::<_, std::io::Error>(on_disk)
             })
@@ -1053,7 +1126,7 @@ pub async fn recover(
         let on_disk =
             measure(&path).map_err(|e| CoreError::Startup(format!("{} : {e}", path.display())))?;
         if on_disk.is_some() {
-            seal_rights(&path)
+            seal_rights(&path, store.worm)
                 .map_err(|e| CoreError::Startup(format!("{} : {e}", path.display())))?;
         }
         let size = on_disk.map_or(0, |(size, _)| size);
@@ -1063,6 +1136,7 @@ pub async fn recover(
             reason: None,
             code: Some(INCOMPLETE),
             command,
+            immutable: on_disk.is_some() && is_immutable(&path),
         };
         seal(pool, recorder, agent, session, &ending, now).await?;
         tracing::warn!(
@@ -1128,14 +1202,16 @@ mod tests {
         let dir = dir("writer");
         let session = Uuid::random().unwrap();
         let path = dir.join(format!("{session}.cast"));
-        let file = create(&path).unwrap();
-        assert!(create(&path).is_err(), "never over another file");
+        let file = create(&path, false).unwrap();
+        assert!(create(&path, false).is_err(), "never over another file");
         let (acked, written_mark) = watch::channel(0u64);
         let sealed = rt.block_on(async {
             let (tx, rx) = mpsc::channel(1);
             let written = {
                 let path = path.clone();
-                tokio::task::spawn_blocking(move || write_file(file, &path, session, rx, &acked))
+                tokio::task::spawn_blocking(move || {
+                    write_file(file, &path, false, session, rx, &acked)
+                })
             };
             for (i, frame) in frames().into_iter().enumerate() {
                 tx.send(Item::Frame(frame)).await.unwrap();
@@ -1174,7 +1250,7 @@ mod tests {
         rt.block_on(async {
             let path = dir.join("partial.cast");
             std::fs::write(&path, b"{\"version\":2,").unwrap();
-            let (sealed, code) = finish(failed(), &path, session, None).await.unwrap();
+            let (sealed, code) = finish(failed(), &path, false, session, None).await.unwrap();
             let sealed = sealed.unwrap();
             assert_eq!(sealed.size, 13);
             assert_eq!(
@@ -1184,7 +1260,7 @@ mod tests {
             assert_eq!(code, Some(WRITE_FAILED));
 
             let absent = dir.join("absent.cast");
-            let (sealed, code) = finish(failed(), &absent, session, Some("REC-E001"))
+            let (sealed, code) = finish(failed(), &absent, false, session, Some("REC-E001"))
                 .await
                 .unwrap();
             assert!(sealed.is_none());
@@ -1192,8 +1268,81 @@ mod tests {
 
             // A directory cannot be read as a file: nothing is sealed.
             #[cfg(unix)]
-            assert!(finish(failed(), &dir, session, None).await.is_none());
+            assert!(finish(failed(), &dir, false, session, None).await.is_none());
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clears the attributes under `dir` and removes it.
+    fn remove(dir: &Path) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if let Ok(file) = File::open(entry.path()) {
+                let _ = worm::protect(&file, Protection::None);
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Under `core.audit.worm`, a transcript is append only while written,
+    /// immutable once sealed; a file left append only by a stop is sealed
+    /// immutable at recovery, or unprotected if the setting changed. Only
+    /// where the host allows the attributes (not on CI runners).
+    #[test]
+    fn write_once_transcripts_are_append_only_then_immutable() {
+        let dir = dir("worm");
+        if worm::probe(&dir).is_err() {
+            remove(&dir);
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let session = Uuid::random().unwrap();
+        let path = dir.join(format!("{session}.cast"));
+        let file = create(&path, true).unwrap();
+        assert_eq!(worm::protection(&file).unwrap(), Protection::AppendOnly);
+        assert!(std::fs::remove_file(&path).is_err());
+        let (acked, _mark) = watch::channel(0u64);
+        let sealed = rt.block_on(async {
+            let (tx, rx) = mpsc::channel(1);
+            let written = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    write_file(file, &path, true, session, rx, &acked)
+                })
+            };
+            for frame in frames() {
+                tx.send(Item::Frame(frame)).await.unwrap();
+            }
+            drop(tx);
+            written.await.unwrap().unwrap()
+        });
+        assert!(is_immutable(&path));
+        assert_eq!(measure(&path).unwrap(), Some((sealed.size, sealed.sha256)));
+        // Sealing again leaves it as it is.
+        seal_rights(&path, true).unwrap();
+        assert!(is_immutable(&path));
+
+        // Left append only by a stop: immutable at recovery.
+        let left = dir.join("left.cast");
+        drop(create(&left, true).unwrap());
+        seal_rights(&left, true).unwrap();
+        assert!(is_immutable(&left));
+        // Or unprotected, read-only, when the setting is now disabled.
+        let changed = dir.join("changed.cast");
+        drop(create(&changed, true).unwrap());
+        seal_rights(&changed, false).unwrap();
+        assert!(!is_immutable(&changed));
+        assert_eq!(
+            worm::protection(&File::open(&changed).unwrap()).unwrap(),
+            Protection::None
+        );
+        assert!(
+            std::fs::metadata(&changed)
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+        remove(&dir);
     }
 }

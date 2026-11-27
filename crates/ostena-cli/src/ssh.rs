@@ -181,15 +181,32 @@ impl Authorizer for TunnelAuthorizer {
     }
 
     fn closed(&self, summary: SessionSummary) {
+        let id = Uuid::from_bytes(summary.session_id);
+        // The encrypted queue keeps it until the core acknowledges it
+        // (ADR-0012).
+        if self.core.gateway.get().is_some_and(|gateway| {
+            gateway.queue_closed(
+                id,
+                summary.reason,
+                summary.bytes_to_target,
+                summary.bytes_from_target,
+            )
+        }) {
+            return;
+        }
         let Some(link) = self.core.link.get().cloned() else {
             return;
         };
-        let session_id = Uuid::from_bytes(summary.session_id).to_string();
+        let session_id = id.to_string();
         let message = AgentMessage::SessionClosed {
+            report_id: 0,
             session_id: session_id.clone(),
             reason: summary.reason.to_owned(),
             bytes_to_target: summary.bytes_to_target,
             bytes_from_target: summary.bytes_from_target,
+            closed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
         };
         let sending = self.reports.sending();
         let grace = self.grace;

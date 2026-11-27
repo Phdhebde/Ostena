@@ -245,7 +245,7 @@ impl SignatureVerificationAlgorithm for EcdsaP256Sha256 {
 
 static ECDSA_P256_SHA256: EcdsaP256Sha256 = EcdsaP256Sha256;
 
-static SIGNATURE_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
+pub(crate) static SIGNATURE_ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
     all: &[&ECDSA_P256_SHA256],
     mapping: &[(
         SignatureScheme::ECDSA_NISTP256_SHA256,
@@ -669,6 +669,7 @@ pub fn web_server_config(
 }
 
 pub mod directory;
+pub mod syslog;
 pub mod target;
 
 #[cfg(test)]

@@ -107,6 +107,8 @@ cleanup() {
   for account in "${accounts_made[@]}"; do
     $SUDO userdel "$account" 2>/dev/null || true
   done
+  # Sealed transcripts are immutable (core.audit.worm, ADR-0012).
+  [ -z "${core_dir:-}" ] || $SUDO chattr -R -i -a "$core_dir/transcripts" 2>/dev/null || true
   [ -z "${core_dir:-}" ] || $SUDO rm -rf "$core_dir"
   if [ "$status" -ne 0 ]; then
     for log in core agent; do
@@ -299,7 +301,12 @@ as_user "$db_super" "$cbin" core db init --superuser "$db_super" --config "$core
   | sed 's/^/      /'
 db_made=1
 as_user "$adm" "$cbin" core migrate --config "$core_dir/core.toml" | sed 's/^/      /'
-core run > "$work/core.log" 2>&1 &
+# The service holds one capability, as under systemd (AmbientCapabilities):
+# CAP_LINUX_IMMUTABLE, for write-once transcripts (core.audit.worm).
+$SUDO setpriv --reuid "$svc" --regid "$svc" --init-groups \
+  --inh-caps=+linux_immutable --ambient-caps=+linux_immutable -- \
+  env CREDENTIALS_DIRECTORY="$core_dir/credentials" \
+  "$cbin" core run --config "$core_dir/core.toml" > "$work/core.log" 2>&1 &
 pids+=($!)
 wait_log "$work/core.log" core.started
 grep -q core.database_role_weak "$work/core.log" && die "séparation des rôles affaiblie"

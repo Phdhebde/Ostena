@@ -232,7 +232,7 @@ fn concurrent_appends_are_contiguous_and_verify_online() {
         let signer = Fixture::new(store.pool(), store.recorder(), now_ms());
         let head = signer.signer.sign_now().await.unwrap().unwrap();
         assert_eq!((head.head_no(), head.record_seq()), (1, 17));
-        let report = audit::verify_online(store.pool(), signer.keys())
+        let report = audit::verify_online(store.pool(), signer.keys(), None)
             .await
             .unwrap();
         assert_eq!(codes(&report), Vec::<&str>::new());
@@ -516,7 +516,9 @@ fn heads_cover_the_tip_and_follow_the_heartbeat() {
         append(&pool, 9).await;
         let moved = signer.signer.sign_now().await.unwrap().unwrap();
         assert_eq!((moved.head_no(), moved.record_seq()), (3, 5));
-        let report = audit::verify_online(&pool, signer.keys()).await.unwrap();
+        let report = audit::verify_online(&pool, signer.keys(), None)
+            .await
+            .unwrap();
         assert_eq!(codes(&report), Vec::<&str>::new());
         // A new signer key (rotation) anchors on heads of the previous one,
         // announced by audit.signing_started.
@@ -832,7 +834,9 @@ fn best_effort_events_are_written_and_losses_reported() {
         writer.abort();
         let signer = Fixture::new(&pool, Arc::new(Recorder::new()), now_ms());
         signer.signer.sign_now().await.unwrap().unwrap();
-        let report = audit::verify_online(&pool, signer.keys()).await.unwrap();
+        let report = audit::verify_online(&pool, signer.keys(), None)
+            .await
+            .unwrap();
         assert_eq!(report.exit_code(), 0, "{:?}", codes(&report));
         drop(store);
         db.drop_database().await;

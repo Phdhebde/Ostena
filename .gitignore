@@ -26,3 +26,7 @@ Thumbs.db
 
 # Local Claude Code settings
 .claude/settings.local.json
+
+# Portal (ADR-0020): npm packages and build output, never versioned
+/portal/node_modules/
+/portal/dist/

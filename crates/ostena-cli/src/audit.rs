@@ -13,6 +13,7 @@ use std::process::ExitCode;
 use ostena_audit::head::TEXT_PREFIX;
 use ostena_audit::{Head, Options, Report, Severity, TrustedKeys, transcripts, verify_export};
 use ostena_crypto::pki;
+use ostena_crypto::tsp::TsaTrust;
 
 /// Exit code of a usage or input/output error.
 pub(crate) const USAGE_ERROR: u8 = 3;
@@ -23,6 +24,7 @@ pub(crate) struct VerifyArgs<'a> {
     pub(crate) keys: &'a [PathBuf],
     pub(crate) heads: &'a [String],
     pub(crate) transcripts: Option<&'a Path>,
+    pub(crate) tsa_ca: &'a [PathBuf],
     pub(crate) json: bool,
     pub(crate) clock_tolerance_ms: u64,
     pub(crate) head_gap_tolerance_secs: u64,
@@ -59,6 +61,21 @@ pub(crate) fn read_keys(paths: &[PathBuf]) -> Result<TrustedKeys, String> {
     Ok(keys)
 }
 
+/// The trusted certificates of the time-stamping authorities, from PEM
+/// files; `None` without any.
+pub(crate) fn read_tsa(paths: &[PathBuf]) -> Result<Option<TsaTrust>, String> {
+    let mut trust: Option<TsaTrust> = None;
+    for path in paths {
+        let pem = std::fs::read(path).map_err(|e| format!("{} : {e}", path.display()))?;
+        let more = TsaTrust::from_pem(&pem).map_err(|e| format!("{} : {e}", path.display()))?;
+        match &mut trust {
+            Some(trust) => trust.extend(more).map_err(|e| e.to_string())?,
+            None => trust = Some(more),
+        }
+    }
+    Ok(trust)
+}
+
 fn run(args: &VerifyArgs<'_>) -> Result<Report, String> {
     let keys = read_keys(args.keys)?;
     let mut external_heads = Vec::with_capacity(args.heads.len());
@@ -67,6 +84,7 @@ fn run(args: &VerifyArgs<'_>) -> Result<Report, String> {
     }
     let file = File::open(args.export).map_err(|e| format!("{} : {e}", args.export.display()))?;
     let options = Options {
+        tsa: read_tsa(args.tsa_ca)?,
         external_heads,
         clock_tolerance_ms: args.clock_tolerance_ms,
         head_gap_tolerance_secs: args.head_gap_tolerance_secs,
@@ -87,6 +105,30 @@ fn read_head(arg: &str) -> Result<Head, String> {
         std::fs::read_to_string(arg).map_err(|e| format!("--head {arg} : {e}"))?
     };
     Head::from_text(text.trim()).map_err(|e| format!("--head : {e}"))
+}
+
+/// `YYYY-MM-DD HH:MM:SS.mmm UTC` of Unix milliseconds.
+fn utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    // Civil date from days since 1970-01-01 (proleptic Gregorian).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}.{:03} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60,
+        ms % 1000
+    )
 }
 
 fn seq(value: Option<u64>) -> String {
@@ -112,6 +154,26 @@ pub(crate) fn summary(export: &Path, report: &Report) -> String {
     );
     if !report.transcripts.is_empty() {
         let _ = writeln!(out, "Transcripts scellés : {}", report.transcripts.len());
+    }
+    if report.timestamps > 0 {
+        let _ = writeln!(
+            out,
+            "Horodatages RFC 3161 : {} ({} vérifié(s){})",
+            report.timestamps,
+            report.timestamps_verified,
+            if report.timestamps_verified == 0 {
+                " ; --tsa-ca pour les vérifier"
+            } else {
+                ""
+            }
+        );
+    }
+    if let Some((head_no, ms)) = report.last_timestamp {
+        let _ = writeln!(
+            out,
+            "Dernière tête horodatée : n° {head_no}, existante au plus tard à {} (heure de l'autorité)",
+            utc(ms)
+        );
     }
     let _ = writeln!(
         out,
@@ -157,6 +219,12 @@ pub(crate) fn json(export: &Path, report: &Report) -> String {
         "last_seq": report.last_seq,
         "covered_seq": report.covered_seq,
         "transcripts": report.transcripts.len(),
+        "timestamps": report.timestamps,
+        "timestamps_verified": report.timestamps_verified,
+        "last_timestamp": report.last_timestamp.map(|(head_no, ms)| serde_json::json!({
+            "head_no": head_no,
+            "gen_time_ms": ms,
+        })),
         "errors": report.errors,
         "warnings": report.warnings,
         "dropped": report.dropped(),

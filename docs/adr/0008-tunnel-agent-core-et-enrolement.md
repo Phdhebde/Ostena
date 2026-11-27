@@ -126,8 +126,10 @@ Le flux d'enregistrement passe avant l'affichage et le transfert : une sortie n'
 
 | Sens | Messages |
 |---|---|
-| agent → core | `hello`, `ping`, `pong`, `session_request`, `session_closed`, `renew`, `ssh_host_key`, `ssh_grant_request` |
-| core → agent | `hello_ack`, `ping`, `pong`, `policy`, `key_set`, `session_params`, `session_refused`, `certificate`, `shutdown`, `ssh_trust`, `ssh_grant`, `login_revoked` |
+| agent → core | `hello`, `ping`, `pong`, `session_request`, `session_closed`, `reports_lost`, `renew`, `ssh_host_key`, `ssh_grant_request` |
+| core → agent | `hello_ack`, `ping`, `pong`, `policy`, `key_set`, `session_params`, `session_refused`, `certificate`, `shutdown`, `ssh_trust`, `ssh_grant`, `login_revoked`, `report_ack` |
+
+`session_closed` porte `report_id` et `closed_at` ; `reports_lost` (nombre de bilans écartés, premier et dernier instant, `unreadable`) et `report_ack` servent la file chiffrée des bilans de l'agent (ADR-0012, PR 11d).
 
 Les messages `ssh_*` et `login_revoked` sont décrits plus bas (« Accès SSH natif »).
 

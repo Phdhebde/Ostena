@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE access_session SET closed_at = GREATEST(opened_at, $3), close_reason = $4,\n                bytes_to_target = $5, bytes_from_target = $6\n         WHERE id = $1::text::uuid AND agent_id = $2::text::uuid AND closed_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0d5f11e5ddb4f1f4be427d314b64325dee0b87940d1aac5ace0537a118c0c6da"
+}

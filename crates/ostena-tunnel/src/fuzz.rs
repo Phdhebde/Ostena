@@ -13,13 +13,15 @@ use crate::limits::Limits;
 use crate::mux::frame;
 use crate::mux::state::{Side, State};
 
-/// Runs every decoder of the tunnel (control, channel header, enrolment) on
-/// untrusted input. Must never panic.
+/// Runs every decoder of the tunnel (control, channel header, enrolment,
+/// browser stream opening and answer) on untrusted input. Must never panic.
 pub fn decode(data: &[u8]) {
     let _ = control::decode::<CoreMessage>(data);
     let _ = control::decode::<AgentMessage>(data);
     let _ = enroll::decode_server(data);
     let _ = enroll::decode_client(data);
+    let _ = crate::browser::decode_open(data);
+    let _ = crate::browser::Answer::decode(data);
     if let Some(header) = data.first_chunk::<HEADER_LEN>() {
         let _ = channel::decode_header(header);
     }

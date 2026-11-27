@@ -6,6 +6,8 @@
 - **Révisé** : 2026-11-25 — `CFG-P016`, droits du répertoire des transcripts (ADR-0016)
 - **Révisé** : 2026-11-26 — `CFG-V020`, `CFG-P020` et `CFG-P021`, sources d'identités (ADR-0021)
 - **Révisé** : 2026-11-26 — `CFG-V013` couvre `core.database.migration_user` et les rôles de groupe du schéma (ADR-0011, rôles séparés)
+- **Révisé** : 2026-11-27 — `CFG-P024`, stockage en ajout seul des fichiers scellés désactivé (ADR-0012, suite)
+- **Révisé** : 2026-11-27 — `CFG-V021`, réglages TLS d'une destination syslog (ADR-0012, export syslog TLS)
 - **Révisé** : 2026-11-26 — `CFG-V019`, `CFG-P018` et `CFG-P019`, section `[core.web]` du portail (ADR-0020)
 - **Révisé** : 2026-11-27 — `CFG-P022`, sessions Windows des cibles RDP laissées déconnectées (ADR-0026)
 
@@ -81,6 +83,8 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P020` | production | fichier du mot de passe d'une source d'identités lisible au-delà du compte du service, ou son dossier modifiable par un autre compte (ADR-0021) |
 | `CFG-P021` | production, **écart accepté** | une source d'identités admet TLS 1.2 vers ses annuaires (`core.identity.ldap.tls_min_version = "1.2"`) : jamais refusé, journalisé (`config.waiver`) et écrit dans l'audit (`config.waiver`) à chaque démarrage, sans échéance (ADR-0009, amendement des annuaires LDAPS) ; chaque connexion en TLS 1.2 est en outre journalisée (`identity.tls12`) |
 | `CFG-P022` | production | `rdp.disconnected_sessions = "keep"` : les sessions Windows du compte cible restent déconnectées et une connexion suivante peut s'y rattacher (ADR-0026) |
+| `CFG-V021` | cohérence | réglages `tls` d'une destination syslog (`[[audit.outputs]]`, ADR-0012) : `tls` avec un transport en clair, `certificate` sans `private_key` ou l'inverse, `private_key` en fichier au lieu d'un credential systemd, chemin vide, `server_name` qui n'est ni un nom d'hôte ni une adresse IP |
+| `CFG-P024` | production | `core.audit.worm = "disabled"` : transcripts et enregistrements scellés sans les attributs « ajout seul » puis « immuable » (ADR-0012, stockage en ajout seul) |
 
 `CFG-P013` (credential non lié au TPM 2.0, ADR-0008) est réservé : il n'est pas encore contrôlé, ce qui sera fait avec la lecture des credentials chiffrés après M1.
 

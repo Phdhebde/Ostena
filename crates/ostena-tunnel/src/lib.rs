@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod browser;
 pub mod channel;
 pub mod control;
 pub mod enroll;
@@ -25,6 +26,7 @@ pub mod link;
 pub mod mux;
 pub mod recording;
 pub mod renewal;
+pub mod reports;
 pub mod ssh;
 pub mod transport;
 pub mod tunnel;

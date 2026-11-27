@@ -24,6 +24,7 @@ ostena-recorder = { path = "../crates/ostena-recorder" }
 ostena-scope = { path = "../crates/ostena-scope" }
 ostena-ssh = { path = "../crates/ostena-ssh", default-features = false }
 ostena-tunnel = { path = "../crates/ostena-tunnel" }
+ostena-ws = { path = "../crates/ostena-ws", features = ["client"] }
 
 [[bin]]
 name = "grant_decode"
@@ -70,6 +71,20 @@ bench = false
 [[bin]]
 name = "scope_policy"
 path = "fuzz_targets/scope_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "syslog_frame"
+path = "fuzz_targets/syslog_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tsp_response"
+path = "fuzz_targets/tsp_response.rs"
 test = false
 doc = false
 bench = false
@@ -202,6 +217,13 @@ bench = false
 [[bin]]
 name = "rdp_session"
 path = "fuzz_targets/rdp_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_frame"
+path = "fuzz_targets/ws_frame.rs"
 test = false
 doc = false
 bench = false
