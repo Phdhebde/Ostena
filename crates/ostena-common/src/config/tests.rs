@@ -1954,10 +1954,7 @@ fn identity_rules() {
 
 #[test]
 fn p024_worm_disabled_is_refused_in_production() {
-    assert_eq!(
-        parse(CORE).core.unwrap().audit.worm,
-        WormSetting::Required
-    );
+    assert_eq!(parse(CORE).core.unwrap().audit.worm, WormSetting::Required);
     let disabled = CORE.replace(
         "audit = { signing_key = { credential = \"audit.key\" } }",
         "audit = { signing_key = { credential = \"audit.key\" }, worm = \"disabled\" }",
