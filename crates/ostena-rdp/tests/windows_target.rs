@@ -200,6 +200,21 @@ fn summary(title: &str, report: &ConnectReport, total: Duration) {
     }
 }
 
+/// Pause after the logoff of a session, before the next logon of the same
+/// account. Observed on the Windows Server 2025 runners: a session opened
+/// less than a second after the logoff of the previous one of the account
+/// is sometimes ended by the target a second or two after the logon (TCP
+/// closed, reason `E_ABORT`, no error information), probably while the
+/// previous logon is still torn down.
+const SETTLE: Duration = Duration::from_secs(5);
+
+/// Waits until the account has no session left on the target (logged off,
+/// not disconnected), then lets the target settle.
+async fn logged_off(lab: &Lab, what: &str) {
+    wait_sessions(lab, what, <[TargetSession]>::is_empty).await;
+    tokio::time::sleep(SETTLE).await;
+}
+
 /// Connects, checks the budget and that the session holds 3 s; returns
 /// the connection, still open, and the sessions of the account meanwhile.
 async fn connect_and_hold_with(
@@ -256,7 +271,7 @@ async fn connect_and_hold(lab: &Lab, production: bool, mode: RdpMode, title: &st
     assert_eq!(during.len(), 1, "{during:?}");
     connection.close().await;
     assert!(connection.is_closed());
-    wait_sessions(lab, "session fermée à la fin", <[TargetSession]>::is_empty).await;
+    logged_off(lab, "session fermée à la fin").await;
 }
 
 /// Production: Restricted Admin with NTLM, no password delegated.
@@ -341,7 +356,7 @@ async fn same_account_delegation_then_restricted_admin_gets_a_new_session() {
     assert_eq!(during.len(), 1, "{during:?}");
     let delegated = during[0].id;
     first.close().await;
-    wait_sessions(&lab, "session déléguée fermée", <[TargetSession]>::is_empty).await;
+    logged_off(&lab, "session déléguée fermée").await;
 
     let (second, during) = connect_and_hold_with(
         &lab,
@@ -360,12 +375,7 @@ async fn same_account_delegation_then_restricted_admin_gets_a_new_session() {
         during[0].id
     );
     second.close().await;
-    wait_sessions(
-        &lab,
-        "session Restricted Admin fermée",
-        <[TargetSession]>::is_empty,
-    )
-    .await;
+    logged_off(&lab, "session Restricted Admin fermée").await;
 }
 
 /// ADR-0026, before a session: a disconnected session of the account (left
@@ -400,5 +410,5 @@ async fn disconnected_session_is_logged_off_before_the_next_connection() {
     assert_eq!(during.len(), 1, "{during:?}");
     assert!(during[0].state.is_live());
     next.close().await;
-    wait_sessions(&lab, "session fermée à la fin", <[TargetSession]>::is_empty).await;
+    logged_off(&lab, "session fermée à la fin").await;
 }
