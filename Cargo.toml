@@ -1,7 +1,9 @@
 [workspace]
 resolver = "3"
 # Fuzzing has its own workspace (nightly toolchain, libfuzzer-sys).
-exclude = ["fuzz"]
+# The tool that writes the JavaScript glue of ostena-web-client has its own
+# workspace and lockfile (build tool, never shipped).
+exclude = ["fuzz", "tools/wasm-bindgen"]
 members = [
     "crates/ostena-common",
     "crates/ostena-crypto",
@@ -10,6 +12,7 @@ members = [
     "crates/ostena-recorder",
     "crates/ostena-scope",
     "crates/ostena-frame",
+    "crates/ostena-web-client",
     "crates/ostena-ws",
     "crates/ostena-session",
     "crates/ostena-platform",
@@ -50,6 +53,10 @@ ostena-tunnel = { path = "crates/ostena-tunnel" }
 ostena-ws = { path = "crates/ostena-ws" }
 
 # Third-party dependencies. Each one is justified in the PR that adds it.
+# Bindings of ostena-web-client to JavaScript (ADR-0020). Exact version: the
+# same release as the glue tool (tools/wasm-bindgen). Without its default
+# "msrv" feature (rustversion).
+wasm-bindgen = { version = "=0.2.130", default-features = false, features = ["std"] }
 # Only ostena-crypto may depend on it (enforced by deny.toml). prebuilt-nasm: no
 # NASM needed on Windows, and it works offline.
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys", "alloc", "prebuilt-nasm"] }

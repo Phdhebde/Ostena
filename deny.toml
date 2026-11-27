@@ -8,10 +8,12 @@ targets = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
-    # wasm32-unknown-unknown is left out: the only wasm crate, ostena-frame,
-    # has no dependency, and native crates would show their wasm-only
-    # dependencies (quinn-proto pulls ring there). Add it back, scoped, with
-    # ostena-web-client.
+    # wasm32-unknown-unknown is left out: native crates would show their
+    # wasm-only dependencies (quinn-proto pulls ring there). The wasm
+    # crates are still covered: ostena-frame has no dependency, and
+    # wasm-bindgen is a normal (not target-specific) dependency of
+    # ostena-web-client, checked under the targets above. Its glue tool has
+    # its own lockfile and tools/wasm-bindgen/deny.toml.
 ]
 
 [advisories]
