@@ -17,8 +17,10 @@ Points soulevés par l'[ADR-0012](adr/0012-chaine-d-audit-du-core.md) (chaîne d
 
 **Situation en M1.** Les têtes sortent du core par le journal (`audit.head_signed`) et par `ostena core audit head`, relevée à la main ([procédure](exploitation/audit-verification.md)). Rien ne garantit qu'une copie existe hors du bastion.
 
+**Depuis M2 (PR 11b, 11c).** Les enregistrements partent vers le SIEM (syslog TLS, OCSF, `[[audit.outputs]]`) et les têtes peuvent être horodatées par l'autorité du site ; les têtes elles-mêmes ne sont pas envoyées au SIEM.
+
 **Pistes :**
-1. Envoyer chaque tête à un syslog distant ou à un SIEM (export OCSF prévu par l'architecture), et le documenter comme ancre : `ostena audit verify --head` lirait les têtes depuis l'export de ce SIEM.
+1. Envoyer aussi chaque tête au SIEM, et le documenter comme ancre : `ostena audit verify --head` lirait les têtes depuis l'export de ce SIEM.
 2. Compter les têtes envoyées et non acquittées, et alerter.
 
 ### Suivi d'une rotation de clé à la vérification (`--follow-rotation`)

@@ -6,6 +6,7 @@
 - **Révision** : 2026-11-25, événements des transcripts et codes `AUD-E017` à `AUD-E020`, `AUD-W005` à `AUD-W008` ; `transcript.refused` de classe protectrice (jalon M1, PR 8, ADR-0016)
 - **Révision** : 2026-11-27, suite du lot L6 (jalon M2, PR 11) : stockage en ajout seul des fichiers scellés (champ `immutable` de `transcript.sealed`, `REC-E006`, `CFG-P024`)
 - **Révision** : 2026-11-27, horodatage RFC 3161 des têtes (jalon M2, PR 11b) : `audit.head_timestamped`, `audit.timestamp_failed`, `AUD-E021`, `AUD-W009`, `TSP-E001` à `TSP-E007`
+- **Révision** : 2026-11-27, export syslog TLS en OCSF (jalon M2, PR 11c) : `audit.forwarded`, `audit.forward_failed`, `SYS-E001`, `SYS-E002`, `AUD-E022`, `CFG-V021`
 - **Révision** : 2026-11-26, événements du portail et classes (`web_session.*`, `user.role_granted`, `user.role_revoked`), champ `channel` des connexions (jalon M2, PR 8a, ADR-0020)
 - **Révision** : 2026-11-27, demande d'accès du portail : `access.web_granted` (accordant), `access.web_refused` (au mieux) (jalon M2, PR 8b, ADR-0020)
 - **Révision** : 2026-11-27, passerelle du portail : `gateway.opened` (accordant), `gateway.refused` et `gateway.closed` (au mieux) (jalon M2, PR 8b, ADR-0020)
@@ -257,6 +258,35 @@ Choix :
 - **En CI et hors ligne** : une autorité de test (`ostena_crypto::tsp::testing::TestTsa`, fonctionnalité `testing`) produit de vrais jetons ; le test du core la sert en HTTP sur la boucle locale. L'analyseur des réponses a ses tests `proptest` et sa cible de fuzzing `tsp_response`, dont le corpus est rejoué en test.
 
 Limites : l'autorité doit signer en ECDSA P-256 / SHA-256 ; une autorité RSA est refusée (`TSP-E003`). La révocation du certificat de l'autorité (CRL, OCSP) n'est pas contrôlée : l'auditeur choisit ses ancres et peut les retirer. Un horodatage prouve qu'une tête existait à une heure, pas qu'elle n'a pas été remplacée ensuite : il faut conserver les exports, ou les têtes horodatées, hors du bastion.
+
+#### Export syslog TLS en OCSF (PR 11c)
+
+La chaîne est la preuve ; un SIEM en reçoit une copie, en continu, pour la corrélation et l'alerte.
+
+- **Réglage** : chaque `[[audit.outputs]]` du fichier de configuration du core est un collecteur : `kind = "syslog"`, `address = "hôte:port"`, `transport = "tls"` (défaut), et une table `tls` : `ca` (lot PEM des autorités du collecteur, seule confiance), `server_name` (nom attendu dans son certificat, l'hôte de `address` par défaut), et pour l'authentification mutuelle `certificate` (chaîne PEM du core) avec `private_key` (clé ECDSA P-256, credential systemd seulement). Les incohérences de `tls` sont refusées à la validation (`CFG-V021`). Au démarrage, le core refuse toute autre sortie d'audit (fichier, sortie standard, syslog en clair ou sans `tls`) et lit les lots et clés avant d'écrire quoi que ce soit (`CORE-E007`, `CORE-E006` pour une clé illisible). Sans sortie, rien ne change.
+- **Transport** (RFC 5425) : TLS 1.3 sur TCP, profil figé du tunnel (`ostena_crypto::tls::syslog`, ADR-0009 : `TLS_AES_256_GCM_SHA384`, `SecP256r1MLKEM768`, ECDSA P-256), trames à comptage d'octets (`MSG-LEN SP SYSLOG-MSG`).
+- **Message** (RFC 5424) : facilité 13 (*log audit*), sévérité selon l'issue (succès : 6, refus : 5, échec : 4), heure de l'enregistrement (RFC 3339, millisecondes, UTC), `HOSTNAME` de la machine, `APP-NAME` `ostena`, `MSGID` `audit`, pas de données structurées, et l'événement OCSF en JSON comme `MSG`. Le JSON est en ASCII (tout autre caractère échappé en `\uXXXX`) : pas de BOM.
+- **Événement OCSF** (schéma 1.3.0), un par enregistrement, classe *Base Event* :
+
+| Champ OCSF | Valeur |
+|---|---|
+| `class_uid`, `category_uid`, `activity_id`, `type_uid` | 0, 0, 99 (*Other*), 99 |
+| `message`, `metadata.event_code` | nom de l'événement (`agent.enrolled`…) |
+| `metadata.uid` | `<chaîne>:<seq>`, unique : un collecteur écarte un doublon par ce champ |
+| `metadata.correlation_uid`, `metadata.sequence` | identifiant de chaîne, seq |
+| `metadata.product` | `Ostena`, version du binaire ; `metadata.log_name` : `audit` ; `metadata.version` : `1.3.0` |
+| `time` | heure de l'enregistrement (ms) |
+| `severity_id` | succès 1 (*Informational*), refus 3 (*Medium*), échec 4 (*High*) |
+| `status_id`, `status`, `status_detail` | 1 *Success* ou 2 *Failure* ; `success`, `refused` ou `failure` |
+| `actor.user.name`, `actor.user.type_id` | acteur ; utilisateur 1, administrateur 2, core 3 (*System*), agent et pair 99 (`type` : `Agent`, `Peer`) |
+| `unmapped` | tous les champs de l'enregistrement, sous leur nom ; binaires en hexadécimal, UUID en texte |
+
+  Les événements sont tous dans la classe générique : les classer par famille OCSF (authentification, activité d'API…) est une évolution possible, sans changement du transport.
+- **Livraison au moins une fois** : le core envoie la chaîne dans l'ordre, par lots de 256, et lit la suite chaque seconde. La **position** d'un collecteur (dernier seq écrit et vidé vers lui) est elle-même un enregistrement de la chaîne, `audit.forwarded` (champs `destination` et `last_seq`, au mieux), au plus une fois par minute et seulement si d'autres enregistrements ont été envoyés depuis. Au démarrage et après chaque connexion perdue, l'envoi reprend après la dernière position : au pire, une minute d'enregistrements arrive deux fois, rien ne manque. Une nouvelle destination reçoit toute la chaîne depuis le seq 1. Pas de migration : la position se relit dans `audit_record` par son index d'événement.
+- **Échecs** : un collecteur injoignable ou qui refuse la poignée de main (`SYS-E001`), une connexion perdue pendant l'envoi (`SYS-E002`) : journalisés à chaque tentative (`audit.forward_failed`), enregistrés une fois par série (`audit.forward_failed`, champs `destination`, `code`, `reason`), le retour journalisé (`audit.forward_restored`). Nouvelle tentative après 1 s, puis un délai doublé jusqu'à 60 s. L'export ne bloque aucune opération du core.
+- **Lecture des trames** : `ostena_audit::siem` écrit les messages et relit strictement trames et en-têtes RFC 5424 (`FrameDecoder`, `parse_message`, code `AUD-E022`), pour les tests et pour qui contrôle ce qu'un collecteur a reçu. Tests de propriétés et cible de fuzzing `syslog_frame`, dont le corpus est rejoué en test.
+
+Limites : RFC 5425 n'a pas d'accusé de réception applicatif ; « écrit et vidé » ne prouve pas la réception, d'où la reprise après la position et le dédoublonnage par `metadata.uid`. Un message peut dépasser 8 Kio (jusqu'à 64 Kio pour un enregistrement de 8 Kio aux champs binaires) : le collecteur doit accepter des messages de cette taille. Le collecteur doit proposer `SecP256r1MLKEM768` et un certificat ECDSA P-256 (par exemple OpenSSL 3.5 ou plus récent côté collecteur). Les têtes elles-mêmes ne sont pas envoyées au SIEM (elles restent dans le journal technique, `audit.head_signed`) ; la révocation du certificat du collecteur n'est pas contrôlée. Le débit est borné par la lecture (256 enregistrements par aller-retour) : largement au-dessus du rythme d'écriture de la chaîne.
 
 ## Conséquences
 
