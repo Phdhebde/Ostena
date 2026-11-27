@@ -1,0 +1,41 @@
+# cargo deny for the glue tool of ostena-web-client (build tool, never
+# shipped): the licences and bans of the workspace deny.toml.
+# Run with `cargo deny --manifest-path tools/wasm-bindgen/Cargo.toml check`.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Zlib", "MPL-2.0"]
+exceptions = [
+    # As in the workspace deny.toml: build-time dependency of the macros.
+    { crate = "unicode-ident", allow = ["Unicode-3.0"] },
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+# A build tool: duplicates are reported, not refused.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { crate = "openssl", reason = "OpenSSL is forbidden" },
+    { crate = "openssl-sys", reason = "OpenSSL is forbidden" },
+    { crate = "native-tls", reason = "no TLS in a build tool" },
+    { crate = "ring", reason = "no cryptography in a build tool" },
+    { crate = "webpki-roots", reason = "no network in a build tool" },
+    { crate = "ureq", reason = "no network in a build tool" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
