@@ -230,6 +230,17 @@ enum CoreCommand {
         #[command(subcommand)]
         command: CoreRightCommand,
     },
+    /// Access rules: users or groups, accounts or groups of accounts,
+    /// allowing or refusing (ADR-0022).
+    Rule {
+        #[command(subcommand)]
+        command: CoreRuleCommand,
+    },
+    /// Groups of target accounts (ADR-0022).
+    AccountGroup {
+        #[command(subcommand)]
+        command: CoreAccountGroupCommand,
+    },
     /// Login sessions (`ostena login`).
     Login {
         #[command(subcommand)]
@@ -368,7 +379,8 @@ enum CoreUserCommand {
         /// Login name.
         name: String,
     },
-    /// Give a role of the portal to a user (`admin`).
+    /// Give a role to a user: `admin`, `policy` or `audit` (incompatible
+    /// with the two others, ADR-0022).
     RoleGrant {
         /// Configuration file.
         #[arg(long, default_value = CORE_CONFIG)]
@@ -487,6 +499,119 @@ enum CoreRightCommand {
         config: PathBuf,
         /// Right identifier (UUID).
         right: String,
+    },
+}
+
+/// `ostena core rule create`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, clap::Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "mutually exclusive flags of clap"
+)]
+struct RuleCreate {
+    /// Configuration file.
+    #[arg(long, default_value = CORE_CONFIG)]
+    config: PathBuf,
+    /// One user (login name).
+    #[arg(
+        long,
+        conflicts_with = "user_group",
+        required_unless_present = "user_group"
+    )]
+    user: Option<String>,
+    /// The members of a group of users.
+    #[arg(long)]
+    user_group: Option<String>,
+    /// One account, `account@resource`.
+    #[arg(
+        long,
+        conflicts_with = "account_group",
+        required_unless_present = "account_group"
+    )]
+    account: Option<String>,
+    /// Every account of a group of accounts.
+    #[arg(long)]
+    account_group: Option<String>,
+    /// A protocol: ssh, rdp, vnc, web. Repeatable; ssh by default.
+    #[arg(long = "protocol", value_name = "PROTOCOL")]
+    protocols: Vec<String>,
+    /// Refuse the access, whatever the allowing rules.
+    #[arg(long, conflicts_with = "deny_function")]
+    deny: bool,
+    /// Take a function away, whatever the allowing rules. Repeatable.
+    #[arg(long = "deny-function", value_name = "FUNCTION")]
+    deny_function: Vec<String>,
+    /// Validity in days: 1 to 366, required for an allowing rule; a
+    /// refusal without it has no end.
+    #[arg(long)]
+    days: Option<u64>,
+    /// Longest session in minutes of an allowing rule, 1 to 720.
+    #[arg(long, default_value_t = 60)]
+    max_session_mins: u32,
+    /// A function granted by an allowing rule beyond the terminal and the
+    /// commands, none by default. Repeatable.
+    #[arg(long = "allow", value_name = "FUNCTION")]
+    allow: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreRuleCommand {
+    /// Create an access rule; prints its identifier.
+    Create(RuleCreate),
+    /// List the access rules.
+    List {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+    },
+    /// Revoke an access rule: no new grant under it.
+    Revoke {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Rule identifier (UUID).
+        rule: String,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Subcommand)]
+enum CoreAccountGroupCommand {
+    /// Create a group of accounts; prints its identifier.
+    Create {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Group name.
+        name: String,
+    },
+    /// Add an account (`account@resource`) to a group.
+    Add {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Group name.
+        group: String,
+        /// `account@resource`.
+        account: String,
+    },
+    /// Remove an account (`account@resource`) from a group.
+    Remove {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
+        /// Group name.
+        group: String,
+        /// `account@resource`.
+        account: String,
+    },
+    /// List the groups of accounts and their members.
+    List {
+        /// Configuration file.
+        #[arg(long, default_value = CORE_CONFIG)]
+        config: PathBuf,
     },
 }
 
@@ -1211,6 +1336,51 @@ fn run_core(command: CoreCommand) -> ExitCode {
     }
 }
 
+/// `ostena core rule`.
+#[cfg(target_os = "linux")]
+fn run_rule(command: CoreRuleCommand) -> ExitCode {
+    use core_inventory as inv;
+    match command {
+        CoreRuleCommand::Create(rule) => inv::rule_create(&inv::RuleArgs {
+            config: &rule.config,
+            user: rule.user.as_deref(),
+            user_group: rule.user_group.as_deref(),
+            account: rule.account.as_deref(),
+            account_group: rule.account_group.as_deref(),
+            protocols: &rule.protocols,
+            deny: rule.deny,
+            deny_functions: &rule.deny_function,
+            days: rule.days,
+            max_session_mins: rule.max_session_mins,
+            allow: &rule.allow,
+        }),
+        CoreRuleCommand::List { config } => inv::rule_list(&config),
+        CoreRuleCommand::Revoke { config, rule } => inv::rule_revoke(&config, &rule),
+    }
+}
+
+/// `ostena core account-group`.
+#[cfg(target_os = "linux")]
+fn run_account_group(command: CoreAccountGroupCommand) -> ExitCode {
+    use core_inventory as inv;
+    match command {
+        CoreAccountGroupCommand::Create { config, name } => {
+            inv::account_group_create(&config, &name)
+        }
+        CoreAccountGroupCommand::Add {
+            config,
+            group,
+            account,
+        } => inv::account_group_member(&config, &group, &account, true),
+        CoreAccountGroupCommand::Remove {
+            config,
+            group,
+            account,
+        } => inv::account_group_member(&config, &group, &account, false),
+        CoreAccountGroupCommand::List { config } => inv::account_group_list(&config),
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn run_core_inventory(command: CoreCommand) -> ExitCode {
     use core_inventory as inv;
@@ -1265,6 +1435,8 @@ fn run_core_inventory(command: CoreCommand) -> ExitCode {
             CoreRightCommand::List { config } => inv::right_list(&config),
             CoreRightCommand::Revoke { config, right } => inv::right_revoke(&config, &right),
         },
+        CoreCommand::Rule { command } => run_rule(command),
+        CoreCommand::AccountGroup { command } => run_account_group(command),
         CoreCommand::Login {
             command:
                 CoreLoginCommand::Revoke {

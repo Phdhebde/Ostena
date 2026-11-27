@@ -224,6 +224,19 @@ pub trait WebBackend: Send + Sync + 'static {
     /// Records an activity of `session` at `now`.
     fn touch(&self, session: Uuid, now: u64) -> impl Future<Output = Result<(), ApiError>> + Send;
 
+    /// `session`, whose user holds incompatible administration roles
+    /// (allowed by `core.admin.allow_role_cumulation`, ADR-0022), calls
+    /// `route` under `role`: recorded at best (`admin.role_cumulation_used`).
+    fn role_cumulation_used(
+        &self,
+        session: &SessionRecord,
+        role: Role,
+        route: &str,
+        peer: SocketAddr,
+    ) {
+        let _ = (session, role, route, peer);
+    }
+
     /// Revokes `session` for `end`, seen from `peer`, with its audit record.
     fn end(
         &self,

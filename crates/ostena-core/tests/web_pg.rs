@@ -509,6 +509,38 @@ fn administrators_revoke_and_disabling_ends_sessions() {
     });
 }
 
+#[test]
+fn cumulated_roles_are_refused_or_recorded_at_each_use() {
+    block_on(async {
+        let Some(f) = fixture("web_pg_cumulation").await else {
+            return;
+        };
+        // The audit role with admin: refused without the option (ADR-0022).
+        let refused = inventory::grant_role(&f.pool, "root", Role::Audit, Separation::Strict)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), "POL-E006");
+        assert!(
+            inventory::grant_role(&f.pool, "root", Role::Audit, Separation::CumulationAllowed)
+                .await
+                .unwrap()
+        );
+        let (root, root_info) = f.login("root", "127.0.0.1").await;
+        assert_eq!(root_info.roles, [Role::Admin, Role::Audit]);
+        let reply = f
+            .connect("127.0.0.1")
+            .await
+            .send(bare("GET", "/api/v1/login-sessions", Some(&root)))
+            .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        // A request that needs no role is not a use of the roles.
+        assert_eq!(f.get(&root, "127.0.0.1").await.status, StatusCode::OK);
+        f.flushed().await;
+        assert_eq!(audit_count(&f.pool, "admin.role_cumulation_used").await, 1);
+        f.end().await;
+    });
+}
+
 /// `POST /api/v1/access` of `account@srv-lab01` for `cookie`.
 async fn ask_access(f: &Fixture, cookie: &str, account: &str) -> web_stub::Reply {
     let body = format!(r#"{{"resource":"srv-lab01","account":"{account}","protocol":"ssh"}}"#);

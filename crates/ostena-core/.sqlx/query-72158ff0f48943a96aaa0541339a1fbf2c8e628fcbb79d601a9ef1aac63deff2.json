@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE access_rule SET revoked_at = now(), revoked_by = $2\n         WHERE id = $1::text::uuid AND revoked_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "72158ff0f48943a96aaa0541339a1fbf2c8e628fcbb79d601a9ef1aac63deff2"
+}

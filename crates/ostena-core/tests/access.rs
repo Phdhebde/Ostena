@@ -486,11 +486,10 @@ fn the_functions_of_the_right_are_signed_and_kept() {
         )
         .await
         .unwrap();
-        // The notice the core would follow: a wider right does not replace
-        // a valid one known to the policy until it is reloaded (ADR-0022).
-        let before = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
-        assert_eq!(before.content.claims.rights, Rights::NONE);
-        f.policies.reload(&f.pool, now()).await.unwrap();
+        // The version of the policy changed with it: the grant sees the
+        // policy behind the database, reloads it and retains the wider
+        // right, without the notice (ADR-0022).
+        let before = f.policies.version();
         let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
         assert_eq!(
             issued.content.claims.rights,
@@ -498,6 +497,7 @@ fn the_functions_of_the_right_are_signed_and_kept() {
                 .with(Rights::FILE_DOWNLOAD)
                 .with(Rights::SSH_PORT_FORWARDING)
         );
+        assert!(f.policies.version() > before);
         let stored: i32 = sqlx::query_scalar("SELECT rights FROM access_grant WHERE jti = $1")
             .bind(&issued.content.jti.to_bytes()[..])
             .fetch_one(&f.pool)
@@ -513,7 +513,8 @@ fn the_functions_of_the_right_are_signed_and_kept() {
         let checked = access::check(&f.pool, "alice", "srv-lab01", "root", now())
             .await
             .unwrap();
-        assert_eq!(checked.right, wider);
+        assert_eq!(checked.right, Some(wider));
+        assert_eq!(checked.rule, wider);
         // The wider right revoked before the opening: the right left does
         // not keep the functions of the grant.
         inventory::revoke_right(&f.pool, wider).await.unwrap();
@@ -1135,6 +1136,198 @@ fn administration_rules_and_dry_run() {
             .await
             .unwrap();
         assert_eq!(records, after);
+        f.db.drop_database().await;
+    });
+}
+
+/// The value of the UUID field `name` of `record`, if any.
+fn uuid_field(record: &Record, name: &str) -> Option<Vec<u8>> {
+    record
+        .fields
+        .iter()
+        .find(|f| f.name == name)
+        .map(|f| match &f.value {
+            ostena_audit::Value::Uuid(b) => b.to_vec(),
+            other => panic!("{name} : {other:?}"),
+        })
+}
+
+#[test]
+fn access_rules_on_groups_allow_refuse_and_narrow() {
+    use ostena_core::inventory::{NewRule, RuleEffect, RuleSubject, RuleTarget};
+    use ostena_policy::Protocol;
+
+    block_on(async {
+        let Some(f) = fixture("access_rules_on_groups_allow_refuse_and_narrow").await else {
+            return;
+        };
+        let backup = f.request("srv-lab01", "backup");
+        let root = f.request("srv-lab01", "root");
+        // No right on backup.
+        assert_eq!(f.code(&backup).await, access::NO_RIGHT);
+        // alice in the group ops, fed here as a source would.
+        let ops = Uuid::random().unwrap();
+        sqlx::query("INSERT INTO user_group (id, name) VALUES ($1::text::uuid, 'ops')")
+            .bind(ops.to_string())
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO user_group_member (group_id, user_id, source)
+             VALUES ($1::text::uuid, $2::text::uuid, 'local')",
+        )
+        .bind(ops.to_string())
+        .bind(f.user.to_string())
+        .execute(&f.pool)
+        .await
+        .unwrap();
+        inventory::create_account_group(&f.pool, "lab-backup")
+            .await
+            .unwrap();
+        assert!(
+            inventory::add_account_group_member(&f.pool, "lab-backup", "srv-lab01", "backup")
+                .await
+                .unwrap()
+        );
+        let allow = inventory::create_rule(
+            &f.pool,
+            &NewRule {
+                subject: RuleSubject::Group("ops"),
+                target: RuleTarget::Group("lab-backup"),
+                protocols: vec![Protocol::Ssh],
+                effect: RuleEffect::Allow {
+                    functions: Functions::parse(&["transfer"]).unwrap(),
+                    max_session_secs: 1800,
+                },
+                valid_until: Some(now() + 86_400),
+            },
+        )
+        .await
+        .unwrap();
+        // Seen at once: the version of the policy changed.
+        let issued = f.grant(&backup).await.unwrap();
+        assert_eq!(
+            issued.content.claims.rights,
+            Rights::FILE_UPLOAD.with(Rights::FILE_DOWNLOAD)
+        );
+        assert_eq!(issued.content.claims.max_session_secs, 1800);
+        let record = last_record(&f.pool, "access.ssh_granted").await;
+        assert_eq!(
+            uuid_field(&record, ostena_audit::field::RULE_ID),
+            Some(allow.to_bytes().to_vec())
+        );
+        assert_eq!(uuid_field(&record, ostena_audit::field::RIGHT_ID), None);
+        let rule_of_grant: Option<String> = sqlx::query_scalar(
+            "SELECT rule_id::text FROM access_grant WHERE jti = $1 AND right_id IS NULL",
+        )
+        .bind(&issued.content.jti.to_bytes()[..])
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(rule_of_grant, Some(allow.to_string()));
+        assert!(f.open(&issued.grant).await.is_ok());
+
+        // Transfers taken away from alice on backup: the access stays,
+        // narrowed, and the refusal is named.
+        let narrow = inventory::create_rule(
+            &f.pool,
+            &NewRule {
+                subject: RuleSubject::User("alice"),
+                target: RuleTarget::Account {
+                    resource: "srv-lab01",
+                    account: "backup",
+                },
+                protocols: vec![Protocol::Ssh],
+                effect: RuleEffect::DenyFunctions(Functions::parse(&["transfer"]).unwrap()),
+                valid_until: None,
+            },
+        )
+        .await
+        .unwrap();
+        let issued = f.grant(&backup).await.unwrap();
+        assert_eq!(issued.content.claims.rights, Rights::NONE);
+        let record = last_record(&f.pool, "access.ssh_granted").await;
+        assert_eq!(
+            uuid_field(&record, ostena_audit::field::RESTRICTED_BY),
+            Some(narrow.to_bytes().to_vec())
+        );
+
+        // A refusal of the group on root wins over the right of alice.
+        let deny = inventory::create_rule(
+            &f.pool,
+            &NewRule {
+                subject: RuleSubject::Group("ops"),
+                target: RuleTarget::Account {
+                    resource: "srv-lab01",
+                    account: "root",
+                },
+                protocols: vec![Protocol::Ssh],
+                effect: RuleEffect::Deny,
+                valid_until: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.code(&root).await, access::POLICY_DENIED);
+        // Revoked: the right applies again, at once.
+        inventory::revoke_rule(&f.pool, deny).await.unwrap();
+        inventory::revoke_rule(&f.pool, deny).await.unwrap();
+        assert!(f.grant(&root).await.is_ok());
+        assert!(matches!(
+            inventory::revoke_rule(&f.pool, Uuid::from_bytes([9; 16])).await,
+            Err(ostena_core::CoreError::NotFound(_))
+        ));
+
+        // backup out of the group: refused again.
+        assert!(
+            inventory::remove_account_group_member(&f.pool, "lab-backup", "srv-lab01", "backup")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !inventory::remove_account_group_member(&f.pool, "lab-backup", "srv-lab01", "backup")
+                .await
+                .unwrap()
+        );
+        assert_eq!(f.code(&backup).await, access::NO_RIGHT);
+
+        let rules = inventory::list_rules(&f.pool).await.unwrap();
+        assert_eq!(rules.len(), 3);
+        let listed = rules.iter().find(|r| r.id == deny).unwrap();
+        assert!(listed.revoked);
+        assert_eq!(listed.subject, "group:ops");
+        assert_eq!(listed.target, "root@srv-lab01");
+        assert_eq!(
+            inventory::list_account_groups(&f.pool).await.unwrap(),
+            [("lab-backup".to_owned(), Vec::<String>::new())]
+        );
+        for (event, count) in [
+            ("access_rule.created", 3),
+            ("access_rule.revoked", 1),
+            ("account_group.created", 1),
+            ("account_group.member_added", 1),
+            ("account_group.member_removed", 1),
+        ] {
+            assert_eq!(audit_count(&f.pool, event).await, count, "{event}");
+        }
+        // An allowing rule without an end, or on an unknown group.
+        let mut endless = NewRule {
+            subject: RuleSubject::Group("ops"),
+            target: RuleTarget::Group("lab-backup"),
+            protocols: vec![Protocol::Ssh],
+            effect: RuleEffect::Allow {
+                functions: Functions::NONE,
+                max_session_secs: 600,
+            },
+            valid_until: None,
+        };
+        assert!(inventory::create_rule(&f.pool, &endless).await.is_err());
+        endless.valid_until = Some(now() + 60);
+        endless.subject = RuleSubject::Group("nobody");
+        assert!(matches!(
+            inventory::create_rule(&f.pool, &endless).await,
+            Err(ostena_core::CoreError::NotFound(_))
+        ));
         f.db.drop_database().await;
     });
 }

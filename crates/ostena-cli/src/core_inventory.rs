@@ -333,6 +333,188 @@ pub(crate) fn right_revoke(path: &Path, right: &str) -> ExitCode {
     }))
 }
 
+/// `account@resource`, split at its last `@`.
+fn account_at(value: &str) -> Result<(&str, &str), String> {
+    value
+        .rsplit_once('@')
+        .filter(|(a, r)| !a.is_empty() && !r.is_empty())
+        .map(|(account, resource)| (resource, account))
+        .ok_or_else(|| format!("compte « {value} » : account@resource attendu"))
+}
+
+/// The arguments of `ostena core rule create`.
+pub(crate) struct RuleArgs<'a> {
+    pub(crate) config: &'a Path,
+    pub(crate) user: Option<&'a str>,
+    pub(crate) user_group: Option<&'a str>,
+    pub(crate) account: Option<&'a str>,
+    pub(crate) account_group: Option<&'a str>,
+    pub(crate) protocols: &'a [String],
+    pub(crate) deny: bool,
+    pub(crate) deny_functions: &'a [String],
+    pub(crate) days: Option<u64>,
+    pub(crate) max_session_mins: u32,
+    pub(crate) allow: &'a [String],
+}
+
+/// The rule asked by `args`, checked as far as the command line can.
+fn new_rule<'a>(args: &RuleArgs<'a>, now: u64) -> Result<inventory::NewRule<'a>, String> {
+    let subject = match (args.user, args.user_group) {
+        (Some(user), None) => inventory::RuleSubject::User(user),
+        (None, Some(group)) => inventory::RuleSubject::Group(group),
+        _ => return Err("--user ou --user-group, l'un des deux".into()),
+    };
+    let target = match (args.account, args.account_group) {
+        (Some(account), None) => {
+            let (resource, account) = account_at(account)?;
+            inventory::RuleTarget::Account { resource, account }
+        }
+        (None, Some(group)) => inventory::RuleTarget::Group(group),
+        _ => return Err("--account ou --account-group, l'un des deux".into()),
+    };
+    let protocols = if args.protocols.is_empty() {
+        vec![ostena_policy::Protocol::Ssh]
+    } else {
+        args.protocols
+            .iter()
+            .map(|p| {
+                ostena_policy::Protocol::parse(p)
+                    .ok_or_else(|| format!("--protocol « {p} » : ssh, rdp, vnc ou web"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let effect = if args.deny {
+        inventory::RuleEffect::Deny
+    } else if !args.deny_functions.is_empty() {
+        inventory::RuleEffect::DenyFunctions(
+            Functions::parse(args.deny_functions).map_err(|e| format!("--deny-function : {e}"))?,
+        )
+    } else {
+        inventory::RuleEffect::Allow {
+            functions: Functions::parse(args.allow).map_err(|e| format!("--allow : {e}"))?,
+            max_session_secs: args.max_session_mins.saturating_mul(60),
+        }
+    };
+    let valid_until = match args.days {
+        Some(days) if (1..=366).contains(&days) => Some(now + days * DAY),
+        Some(_) => return Err("--days : 1 à 366 jours".into()),
+        None => None,
+    };
+    Ok(inventory::NewRule {
+        subject,
+        target,
+        protocols,
+        effect,
+        valid_until,
+    })
+}
+
+/// `ostena core rule create`: prints the rule identifier.
+pub(crate) fn rule_create(args: &RuleArgs<'_>) -> ExitCode {
+    init_admin_logging(args.config);
+    let rule = match new_rule(args, now()) {
+        Ok(rule) => rule,
+        Err(e) => return fail(&e),
+    };
+    done(admin(args.config, async move |pool| {
+        inventory::create_rule(&pool, &rule)
+            .await
+            .map(|id| id.to_string())
+    }))
+}
+
+/// `ostena core rule list`.
+pub(crate) fn rule_list(path: &Path) -> ExitCode {
+    init_admin_logging(path);
+    done(
+        admin(path, async |pool| inventory::list_rules(&pool).await).map(|rules| {
+            let mut out = String::from(
+                "règle	sujet	cible	protocoles	effet	fonctions	session max (s)	fin	révoquée",
+            );
+            for r in rules {
+                let _ = write!(
+                    out,
+                    "\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    r.id,
+                    r.subject,
+                    r.target,
+                    r.protocols.join(","),
+                    r.effect,
+                    r.functions.label(),
+                    r.max_session_secs
+                        .map_or_else(|| "-".into(), |s| s.to_string()),
+                    r.valid_until.map_or_else(|| "-".into(), |u| u.to_string()),
+                    if r.revoked { "oui" } else { "non" }
+                );
+            }
+            out
+        }),
+    )
+}
+
+/// `ostena core rule revoke`.
+pub(crate) fn rule_revoke(path: &Path, rule: &str) -> ExitCode {
+    init_admin_logging(path);
+    let Some(rule) = Uuid::parse(rule) else {
+        return fail("identifiant de règle : UUID attendu (minuscules, forme canonique)");
+    };
+    done(admin(path, async move |pool| {
+        inventory::revoke_rule(&pool, rule)
+            .await
+            .map(|()| String::new())
+    }))
+}
+
+/// `ostena core account-group create`: prints the group identifier.
+pub(crate) fn account_group_create(path: &Path, name: &str) -> ExitCode {
+    init_admin_logging(path);
+    done(admin(path, async move |pool| {
+        inventory::create_account_group(&pool, name)
+            .await
+            .map(|id| id.to_string())
+    }))
+}
+
+/// `ostena core account-group add|remove`.
+pub(crate) fn account_group_member(path: &Path, group: &str, account: &str, add: bool) -> ExitCode {
+    init_admin_logging(path);
+    let (resource, account) = match account_at(account) {
+        Ok(parts) => parts,
+        Err(e) => return fail(&e),
+    };
+    done(admin(path, async move |pool| {
+        let changed = if add {
+            inventory::add_account_group_member(&pool, group, resource, account).await?
+        } else {
+            inventory::remove_account_group_member(&pool, group, resource, account).await?
+        };
+        Ok(if changed {
+            String::new()
+        } else if add {
+            "déjà membre".into()
+        } else {
+            "pas membre".into()
+        })
+    }))
+}
+
+/// `ostena core account-group list`.
+pub(crate) fn account_group_list(path: &Path) -> ExitCode {
+    init_admin_logging(path);
+    done(
+        admin(path, async |pool| {
+            inventory::list_account_groups(&pool).await
+        })
+        .map(|groups| {
+            let mut out = String::from("groupe	comptes");
+            for (name, members) in groups {
+                let _ = write!(out, "\n{name}\t{}", members.join(","));
+            }
+            out
+        }),
+    )
+}
+
 /// `ostena core login revoke`: the agents concerned cut its SSH sessions.
 pub(crate) fn login_revoke(path: &Path, session: &str, reason: &str) -> ExitCode {
     init_admin_logging(path);
@@ -358,8 +540,8 @@ pub(crate) fn access_check(path: &Path, user: &str, resource: &str, account: &st
         Ok(Ok(allowed)) => {
             let _ = writeln!(
                 io::stdout(),
-                "autorisé\tdroit {}\tgroupe {}\tcible {}:{}\tsession max {} s\tfonctions {}",
-                allowed.right,
+                "autorisé\trègle {}\tgroupe {}\tcible {}:{}\tsession max {} s\tfonctions {}",
+                allowed.rule,
                 allowed.group,
                 allowed.host,
                 allowed.port,

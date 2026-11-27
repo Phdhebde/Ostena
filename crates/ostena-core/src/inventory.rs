@@ -21,6 +21,14 @@ use crate::error::CoreError;
 use crate::functions::Functions;
 use crate::store::{Notice, i64_of, notify_audit, notify_notice, truncate, unix_now, uuid};
 
+mod rules;
+
+pub use rules::{
+    NewRule, RuleEffect, RuleRow, RuleSubject, RuleTarget, add_account_group_member,
+    create_account_group, create_rule, list_account_groups, list_rules,
+    remove_account_group_member, revoke_rule,
+};
+
 /// Longest validity of a right, seconds (366 days).
 pub const MAX_RIGHT_SECS: u64 = 366 * 86_400;
 /// Bounds of the session length of a right, seconds.

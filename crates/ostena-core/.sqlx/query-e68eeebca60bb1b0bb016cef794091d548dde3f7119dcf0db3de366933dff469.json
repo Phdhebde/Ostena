@@ -1,0 +1,123 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id::text AS \"id!\", user_id::text AS \"user?\", user_group_id::text AS \"user_group?\",\n                  account_id::text AS \"account?\", account_group_id::text AS \"account_group?\",\n                  protocols, effect, functions, max_session_secs, valid_from, valid_until\n           FROM access_rule\n           WHERE revoked_at IS NULL AND (valid_until IS NULL OR valid_until > $1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "user?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "user_group?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "account?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "account_group?",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "protocols",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "protocols"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "effect",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "effect"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "functions",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "functions"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "max_session_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "max_session_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "valid_from",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "valid_from"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "valid_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "valid_until"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "e68eeebca60bb1b0bb016cef794091d548dde3f7119dcf0db3de366933dff469"
+}

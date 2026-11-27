@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO access_rule (id, user_id, user_group_id, account_id, account_group_id,\n                                  protocols, effect, functions, max_session_secs, valid_from,\n                                  valid_until, created_by)\n         VALUES ($1::text::uuid, $2::text::uuid, $3::text::uuid, $4::text::uuid,\n                 $5::text::uuid, $6, $7, $8, $9, $10, $11, $12)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "TextArray",
+        "Text",
+        "TextArray",
+        "Int4",
+        "Int8",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9236d0cfad383fc8b662c7b24faa3476e647d4530a2548b7a8422d0a25499a35"
+}

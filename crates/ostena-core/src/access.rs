@@ -172,11 +172,15 @@ pub struct SshRequest {
     pub client_address: String,
 }
 
-/// What a right allows, after every check.
+/// What a right or an access rule allows, after every check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allowed {
-    /// The right used.
-    pub right: Uuid,
+    /// The rule the access policy retained: a right or an access rule.
+    pub rule: Uuid,
+    /// The same, when it is a right of ADR-0014.
+    pub right: Option<Uuid>,
+    /// The refusal of functions that narrowed the access, if any.
+    pub restricted_by: Option<Uuid>,
     /// The resource.
     pub resource: Uuid,
     /// Its gateway group.
@@ -198,8 +202,22 @@ pub struct Allowed {
     pub pdp_version: u64,
 }
 
-fn secs_until(end: i64, now: u64) -> u64 {
-    u64::try_from(end).unwrap_or(0).saturating_sub(now)
+impl Allowed {
+    /// `event` with the fields of the decision: the right (`right_id`, when
+    /// the rule is one), the rule, the version and the refusal of functions
+    /// that narrowed the access.
+    fn record(&self, event: Event) -> Event {
+        let event = match self.right {
+            Some(right) => event.uuid(field::RIGHT_ID, right.to_bytes()),
+            None => event,
+        }
+        .uuid(field::RULE_ID, self.rule.to_bytes())
+        .u64(field::PDP_VERSION, self.pdp_version);
+        match self.restricted_by {
+            Some(rule) => event.uuid(field::RESTRICTED_BY, rule.to_bytes()),
+            None => event,
+        }
+    }
 }
 
 /// The user, read with `FOR SHARE` before the login session (the lock
@@ -322,10 +340,12 @@ async fn allowed(
     )
     .await?;
     let max = u64::from(right.max_session_secs)
-        .min(secs_until(right.valid_until, now))
+        .min(right.valid_until.saturating_sub(now))
         .max(1);
     Ok(Allowed {
-        right: right.id,
+        rule: right.rule,
+        right: right.right.then_some(right.rule),
+        restricted_by: right.restricted_by,
         resource: uuid(&r.id)?,
         group: resource_group,
         account: account_uuid,
@@ -338,13 +358,16 @@ async fn allowed(
     })
 }
 
-/// The right the decision point retained, confirmed in the database.
+/// The rule the decision point retained, confirmed in the database.
 struct DecidedRight {
-    id: Uuid,
-    valid_until: i64,
+    rule: Uuid,
+    /// Whether the rule is a right of ADR-0014.
+    right: bool,
+    valid_until: u64,
     max_session_secs: u32,
     functions: Functions,
     pdp_version: u64,
+    restricted_by: Option<Uuid>,
 }
 
 /// What the database says of a decision.
@@ -356,11 +379,11 @@ enum Confirmed {
 }
 
 /// The decision of the access policy (ADR-0022) for `user` on `account`
-/// with SSH, confirmed in `tx`: the right retained is read again with
-/// `FOR SHARE` (a revocation waits for the grant, then finds it). A policy
-/// behind the database (a right granted or revoked, not yet reloaded) is
-/// reloaded once and asked again, so the decision is never older than the
-/// rights the transaction sees.
+/// with SSH, confirmed in `tx`: the version of the policy in the database
+/// is read with `FOR SHARE` and must be the one that decided. A change of
+/// the rules raises it, so it waits for the grant, then the next decision
+/// sees it. A policy behind the database is reloaded once and asked again,
+/// so the decision is never older than the rules the transaction sees.
 #[allow(clippy::too_many_arguments, reason = "one call site per caller")]
 async fn decided(
     tx: &mut Tx<'_>,
@@ -379,10 +402,14 @@ async fn decided(
         wanted: policy::functions(wanted),
         now,
     };
+    let stored = sqlx::query_scalar!("SELECT version FROM policy_version FOR SHARE")
+        .fetch_one(&mut **tx)
+        .await?;
+    let stored = u64::try_from(stored).unwrap_or(0);
     let mut reloaded = false;
     loop {
         let decision = policies.decide(&request);
-        match confirm(tx, decision, user, account, now, target).await? {
+        match confirm(tx, decision, stored, user, target).await? {
             Confirmed::Right(right) => return Ok(right),
             Confirmed::Refused(refusal) => return Err(refusal),
             Confirmed::Stale if !reloaded => {
@@ -393,7 +420,8 @@ async fn decided(
                 return Err(Refusal::new(
                     POLICY_UNAVAILABLE,
                     format!(
-                        "{} : politique d'accès en retard sur la base après rechargement",
+                        "{} : politique d'accès en retard sur la base après rechargement \
+                         (version {stored} attendue)",
                         Code::Unavailable.as_str()
                     ),
                 )
@@ -406,72 +434,46 @@ async fn decided(
 async fn confirm(
     tx: &mut Tx<'_>,
     decision: Decision,
+    stored: u64,
     user: Uuid,
-    account: Uuid,
-    now: u64,
     target: &str,
 ) -> Result<Confirmed, Refusal> {
+    // Another version than the one of the database: the policy in place is
+    // behind (or ahead of a change rolled back), or there is none.
+    if decision.version() != Some(stored) {
+        return Ok(Confirmed::Stale);
+    }
     match decision {
         Decision::Allow(a) => {
-            let right = policy::uuid_of(a.rule.0);
-            let row = sqlx::query!(
-                r#"SELECT valid_until, max_session_secs, functions FROM access_right
-                   WHERE id = $1::text::uuid AND user_id = $2::text::uuid
-                     AND account_id = $3::text::uuid AND protocol = 'ssh'
-                     AND revoked_at IS NULL AND valid_from <= $4 AND valid_until > $4
-                   FOR SHARE"#,
-                right.to_string(),
-                user.to_string(),
-                account.to_string(),
-                i64_of(now),
-            )
-            .fetch_optional(&mut **tx)
-            .await?;
-            let Some(row) = row else {
-                return Ok(Confirmed::Stale);
-            };
-            let stored = Functions::from_stored(&row.functions);
-            // Granted by the decision point, and still held by the right.
-            let granted =
-                functions_of(Rights::from_bits(a.functions.bits()).unwrap_or(Rights::NONE));
-            if !stored.rights().contains(granted.rights()) {
-                return Ok(Confirmed::Stale);
-            }
-            Ok(Confirmed::Right(DecidedRight {
-                id: right,
-                valid_until: row.valid_until,
-                max_session_secs: u32::try_from(row.max_session_secs).unwrap_or(0),
-                functions: granted,
-                pdp_version: a.version,
-            }))
-        }
-        Decision::Deny(d) if d.code == Code::NoRule => {
-            // A right the policy in place does not know yet.
-            let known = sqlx::query_scalar!(
-                r#"SELECT EXISTS (SELECT 1 FROM access_right
-                   WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid
-                     AND protocol = 'ssh' AND revoked_at IS NULL
-                     AND valid_from <= $3 AND valid_until > $3) AS "known!""#,
-                user.to_string(),
-                account.to_string(),
-                i64_of(now),
+            let rule = policy::uuid_of(a.rule.0);
+            let right = sqlx::query_scalar!(
+                r#"SELECT EXISTS (SELECT 1 FROM access_right WHERE id = $1::text::uuid) AS "right!""#,
+                rule.to_string(),
             )
             .fetch_one(&mut **tx)
             .await?;
-            if known {
-                return Ok(Confirmed::Stale);
-            }
-            Ok(Confirmed::Refused(
-                Refusal::new(
-                    NO_RIGHT,
-                    format!(
-                        "{} : aucun droit SSH valide de {user} sur « {target} »",
-                        d.code.as_str()
-                    ),
-                )
-                .version(d.version),
-            ))
+            Ok(Confirmed::Right(DecidedRight {
+                rule,
+                right,
+                valid_until: a.valid_until,
+                max_session_secs: a.max_session_secs,
+                functions: functions_of(
+                    Rights::from_bits(a.functions.bits()).unwrap_or(Rights::NONE),
+                ),
+                pdp_version: a.version,
+                restricted_by: a.restricted_by.map(|r| policy::uuid_of(r.0)),
+            }))
         }
+        Decision::Deny(d) if d.code == Code::NoRule => Ok(Confirmed::Refused(
+            Refusal::new(
+                NO_RIGHT,
+                format!(
+                    "{} : aucun droit SSH valide de {user} sur « {target} »",
+                    d.code.as_str()
+                ),
+            )
+            .version(d.version),
+        )),
         Decision::Deny(d) if d.code == Code::Unavailable => Ok(Confirmed::Stale),
         Decision::Deny(d) => Ok(Confirmed::Refused(
             Refusal::new(
@@ -694,12 +696,12 @@ pub async fn ssh_grant(
     sqlx::query!(
         "INSERT INTO access_grant (jti, login_session_id, right_id, agent_id, gateway_group,
                                    resource_id, account, protocol, max_session_secs,
-                                   issued_at, expires_at, rights)
+                                   issued_at, expires_at, rights, rule_id)
          VALUES ($1, $2::text::uuid, $3::text::uuid, $4::text::uuid, $5::text::uuid,
-                 $6::text::uuid, $7, 'ssh', $8, $9, $10, $11)",
+                 $6::text::uuid, $7, 'ssh', $8, $9, $10, $11, $12::text::uuid)",
         &content.jti.to_bytes()[..],
         request.login_session.to_string(),
-        allowed.right.to_string(),
+        allowed.right.map(|r| r.to_string()),
         agent.to_string(),
         group.to_string(),
         allowed.resource.to_string(),
@@ -708,6 +710,7 @@ pub async fn ssh_grant(
         i64_of(content.issued_at),
         i64_of(content.expires_at),
         i32::try_from(claims.rights.bits()).unwrap_or(0),
+        allowed.right.is_none().then(|| allowed.rule.to_string()),
     )
     .execute(&mut *tx)
     .await?;
@@ -718,15 +721,13 @@ pub async fn ssh_grant(
         request,
     )
     .bytes(field::JTI, content.jti.to_bytes())
-    .uuid(field::RIGHT_ID, allowed.right.to_bytes())
     .uuid(field::RESOURCE_ID, allowed.resource.to_bytes())
     .uuid(field::GROUP_ID, group.to_bytes())
     .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
     .u64(field::EXPIRES_AT, content.expires_at)
     .text(field::FUNCTIONS, allowed.functions.label())
-    .u64(field::RIGHTS, u64::from(claims.rights.bits()))
-    .uuid(field::RULE_ID, allowed.right.to_bytes())
-    .u64(field::PDP_VERSION, allowed.pdp_version);
+    .u64(field::RIGHTS, u64::from(claims.rights.bits()));
+    let event = allowed.record(event);
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()
@@ -857,12 +858,12 @@ pub async fn web_grant(
     sqlx::query!(
         "INSERT INTO access_grant (jti, login_session_id, right_id, agent_id, gateway_group,
                                    resource_id, account, protocol, max_session_secs,
-                                   issued_at, expires_at, channel)
+                                   issued_at, expires_at, channel, rule_id)
          VALUES ($1, $2::text::uuid, $3::text::uuid, $4::text::uuid, $5::text::uuid,
-                 $6::text::uuid, $7, 'ssh', $8, $9, $10, 'web')",
+                 $6::text::uuid, $7, 'ssh', $8, $9, $10, 'web', $11::text::uuid)",
         &content.jti.to_bytes()[..],
         request.login_session.to_string(),
-        allowed.right.to_string(),
+        allowed.right.map(|r| r.to_string()),
         agent.to_string(),
         group.to_string(),
         allowed.resource.to_string(),
@@ -870,20 +871,19 @@ pub async fn web_grant(
         i32::try_from(max_session_secs).unwrap_or(i32::MAX),
         i64_of(content.issued_at),
         i64_of(content.expires_at),
+        allowed.right.is_none().then(|| allowed.rule.to_string()),
     )
     .execute(&mut *tx)
     .await?;
     let event = web_event(EventKind::AccessWebGranted, Outcome::Success, request)
         .text(field::PROTOCOL, "ssh")
         .bytes(field::JTI, content.jti.to_bytes())
-        .uuid(field::RIGHT_ID, allowed.right.to_bytes())
         .uuid(field::RESOURCE_ID, allowed.resource.to_bytes())
         .uuid(field::GROUP_ID, group.to_bytes())
         .uuid(field::AGENT_ID, agent.to_bytes())
         .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
-        .u64(field::EXPIRES_AT, content.expires_at)
-        .uuid(field::RULE_ID, allowed.right.to_bytes())
-        .u64(field::PDP_VERSION, allowed.pdp_version);
+        .u64(field::EXPIRES_AT, content.expires_at);
+    let event = allowed.record(event);
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()
@@ -1251,7 +1251,6 @@ pub async fn open_session(
     .uuid(field::USER_ID, subject.to_bytes())
     .uuid(field::LOGIN_SESSION, login.to_bytes())
     .uuid(field::RESOURCE_ID, allowed.resource.to_bytes())
-    .uuid(field::RIGHT_ID, allowed.right.to_bytes())
     .text(field::PROTOCOL, "ssh")
     .text(field::ACCOUNT, truncate(&row.account))
     .text(field::HOST, truncate(&allowed.host))
@@ -1260,9 +1259,8 @@ pub async fn open_session(
     .text(
         field::FUNCTIONS,
         functions_of(checked.claims.rights).label(),
-    )
-    .uuid(field::RULE_ID, allowed.right.to_bytes())
-    .u64(field::PDP_VERSION, allowed.pdp_version);
+    );
+    let event = allowed.record(event);
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()

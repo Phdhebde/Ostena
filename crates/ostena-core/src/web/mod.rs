@@ -709,10 +709,15 @@ async fn handle<B: WebBackend>(
     if route.csrf && route.method != routes::Verb::Get {
         csrf(request.headers(), shared, peer)?;
     }
-    if let (Access::Role(role), Some(s)) = (route.access, &session)
-        && !s.roles.contains(&role)
-    {
-        return Err(WebCode::Role.into());
+    if let (Access::Role(role), Some(s)) = (route.access, &session) {
+        if !s.roles.contains(&role) {
+            return Err(WebCode::Role.into());
+        }
+        // Every use of a cumulated role is recorded (ADR-0022).
+        if cumulates(&s.roles) {
+            let used = format!("{} {}", route.method.method(), route.path);
+            shared.backend.role_cumulation_used(s, role, &used, peer);
+        }
     }
     if let Some(s) = &mut session {
         if route.fresh && now.saturating_sub(s.authenticated_at) > session::REAUTH_SECS {
@@ -1076,9 +1081,29 @@ fn csp_report<B>(c: &Context<'_, B>, body: &[u8]) -> Result<Response<Full<Bytes>
     Ok(empty(StatusCode::NO_CONTENT))
 }
 
+/// Whether `roles` hold incompatible administration roles (ADR-0022): the
+/// audit role with a role that widens accesses.
+fn cumulates(roles: &[ostena_common::api::web::Role]) -> bool {
+    let held: Vec<ostena_policy::roles::AdminRole> = roles
+        .iter()
+        .filter_map(|r| ostena_policy::roles::AdminRole::parse(r.as_str()))
+        .collect();
+    ostena_policy::roles::cumulation(&held).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_audit_with_a_widening_role_cumulates() {
+        use ostena_common::api::web::Role;
+        assert!(!cumulates(&[]));
+        assert!(!cumulates(&[Role::Admin, Role::Policy]));
+        assert!(!cumulates(&[Role::Audit]));
+        assert!(cumulates(&[Role::Admin, Role::Audit]));
+        assert!(cumulates(&[Role::Policy, Role::Audit]));
+    }
 
     #[test]
     fn codes_are_stable() {

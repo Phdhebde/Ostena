@@ -214,6 +214,20 @@ event_kinds! {
     /// The access policy could not be reloaded: the decision point refuses
     /// every access until the next installation (ADR-0022).
     PolicyInvalidated => "policy.invalidated",
+    /// An access rule was created (ADR-0022): granting for an allowing
+    /// rule, protective for a refusal.
+    AccessRuleCreated => "access_rule.created",
+    /// An access rule was revoked: protective.
+    AccessRuleRevoked => "access_rule.revoked",
+    /// A group of target accounts was created.
+    AccountGroupCreated => "account_group.created",
+    /// A target account joined a group of accounts: granting.
+    AccountGroupMemberAdded => "account_group.member_added",
+    /// A target account left a group of accounts: protective.
+    AccountGroupMemberRemoved => "account_group.member_removed",
+    /// An account that holds incompatible administration roles, allowed by
+    /// `core.admin.allow_role_cumulation`, used one of them (best effort).
+    AdminRoleCumulationUsed => "admin.role_cumulation_used",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -400,6 +414,22 @@ pub mod field {
     pub const RULES: &str = "rules";
     /// Compilation time of an access policy, microseconds.
     pub const COMPILE_MICROS: &str = "compile_micros";
+    /// The refusal of functions that narrowed an access (ADR-0022).
+    pub const RESTRICTED_BY: &str = "restricted_by";
+    /// Group of target accounts UUID.
+    pub const ACCOUNT_GROUP_ID: &str = "account_group_id";
+    /// Name of a group of target accounts.
+    pub const ACCOUNT_GROUP: &str = "account_group";
+    /// Group of users UUID.
+    pub const USER_GROUP_ID: &str = "user_group_id";
+    /// Effect of an access rule (`allow`, `deny`, `deny_functions`).
+    pub const EFFECT: &str = "effect";
+    /// Protocols of an access rule, comma separated.
+    pub const PROTOCOLS: &str = "protocols";
+    /// Every administration role held, comma separated.
+    pub const ROLES: &str = "roles";
+    /// The route of the API used, e.g. `DELETE /api/v1/login-sessions/{id}`.
+    pub const ROUTE: &str = "route";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -491,6 +521,14 @@ pub mod field {
         PREVIOUS_VERSION,
         RULES,
         COMPILE_MICROS,
+        RESTRICTED_BY,
+        ACCOUNT_GROUP_ID,
+        ACCOUNT_GROUP,
+        USER_GROUP_ID,
+        EFFECT,
+        PROTOCOLS,
+        ROLES,
+        ROUTE,
     ];
 }
 
@@ -660,7 +698,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 78);
+        assert_eq!(names.len(), 84);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())
