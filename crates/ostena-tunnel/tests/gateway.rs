@@ -503,6 +503,24 @@ fn a_browser_stream_opens_a_session_and_relays() {
         let mut back = vec![0u8; sent.len()];
         channel.recv.read_exact(&mut back).await.unwrap();
         assert_eq!(back, sent);
+        // Round trips on the stream alone (core → agent → core), the part
+        // of the tunnel in the gateway latency.
+        let mut rtts = Vec::with_capacity(500);
+        let mut small = [0u8; 24];
+        for i in 0..500u32 {
+            let started = std::time::Instant::now();
+            let sent = [(i % 251) as u8; 24];
+            channel.send.write_all(&sent).await.unwrap();
+            channel.recv.read_exact(&mut small).await.unwrap();
+            rtts.push(started.elapsed());
+            assert_eq!(small, sent);
+        }
+        rtts.sort();
+        eprintln!(
+            "browser_stream.rtt: 500 allers-retours core → agent → core, p50 {} µs, p99 {} µs",
+            rtts[250].as_micros(),
+            rtts[495].as_micros()
+        );
         // The core finishes its half: the session ends and is reported.
         channel.send.finish().unwrap();
         let mut rest = [0u8; 1];
