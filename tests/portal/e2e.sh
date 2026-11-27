@@ -129,6 +129,9 @@ origin = "$origin"
 
 [core.audit]
 signing_key = { credential = "audit.key" }
+# The runners cannot make files append-only (CAP_LINUX_IMMUTABLE):
+# tolerated in development, refused in production (CFG-P024).
+worm = "disabled"
 
 [core.database]
 socket_dir = "$db_socket"
