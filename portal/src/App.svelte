@@ -11,6 +11,22 @@
   let username = $state("");
   let password = $state("");
   let totp = $state("");
+  let clientVersion = $state<number | null>(null);
+  let clientError = $state(false);
+
+  // The WebAssembly client, loaded once a session is open.
+  $effect(() => {
+    if (session !== null && clientVersion === null && !clientError) {
+      import("./client")
+        .then((m) => m.loadClient())
+        .then((v) => {
+          clientVersion = v;
+        })
+        .catch(() => {
+          clientError = true;
+        });
+    }
+  });
 
   function codeOf(e: unknown): string {
     return e instanceof ApiError ? e.code : UNREACHABLE;
@@ -77,6 +93,15 @@
       <p>
         Vous êtes connecté en tant que <strong>{session.display_name}</strong>
         (<span class="mono">{session.username}</span>).
+      </p>
+      <p class="status" role="status">
+        {#if clientVersion !== null}
+          Client de session prêt (protocole ostena-frame v{clientVersion}).
+        {:else if clientError}
+          Client de session indisponible. <span class="code">(PORTAL-E002)</span>
+        {:else}
+          Chargement du client de session…
+        {/if}
       </p>
       <button type="button" onclick={signOut} disabled={busy}>Se déconnecter</button>
     </section>

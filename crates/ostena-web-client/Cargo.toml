@@ -1,0 +1,26 @@
+[package]
+name = "ostena-web-client"
+description = "Protocol core of the browser client, in WebAssembly: ostena-frame behind wasm-bindgen."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: the WebAssembly module of the portal; rlib: the native tests.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ostena-frame.workspace = true
+# The bindings to JavaScript (ADR-0020): no js-sys nor web-sys. Exact
+# version: the tool that writes the JavaScript glue (tools/wasm-bindgen)
+# must be the same release.
+wasm-bindgen.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

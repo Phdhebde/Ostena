@@ -1,0 +1,25 @@
+# Writes the JavaScript glue of ostena-web-client (ADR-0020): a build tool,
+# never shipped. Its own workspace and lockfile, checked by cargo deny with
+# deny.toml next to this file. It wraps the library of the official CLI
+# (wasm-bindgen-cli-support) at the exact release of the wasm-bindgen crate
+# of the workspace: the published wasm-bindgen-cli would also bring its test
+# runner, whose HTTP client and server pull ring, webpki-roots and Unicode
+# tables refused by deny.toml.
+[package]
+name = "ostena-wasm-bindgen"
+description = "Build tool: the JavaScript glue of ostena-web-client, by wasm-bindgen-cli-support."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99.1"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[workspace]
+
+[dependencies]
+wasm-bindgen-cli-support = "=0.2.130"
+
+[profile.release]
+# A tool run once per build: compile fast rather than optimise.
+opt-level = 1
+debug = false

@@ -2236,6 +2236,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostena-web-client"
+version = "0.0.0"
+dependencies = [
+ "ostena-frame",
+ "proptest",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "ostena-ws"
 version = "0.0.0"
 dependencies = [

@@ -99,9 +99,12 @@ jobs:
         with:
           tool: cargo-deny,cargo-cyclonedx
       - run: cargo fmt --all --check
+      - run: cargo fmt --manifest-path tools/wasm-bindgen/Cargo.toml --check
       - run: cargo xtask check-secrets
       - run: cargo deny --locked check
       - run: cargo deny --manifest-path fuzz/Cargo.toml --locked check
+      # The glue tool of ostena-web-client: its own lockfile (ADR-0020).
+      - run: cargo deny --manifest-path tools/wasm-bindgen/Cargo.toml --locked --config tools/wasm-bindgen/deny.toml check
       - run: cargo xtask sbom
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -139,8 +142,10 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      # ostena-frame is also the protocol core of the browser client.
-      - run: cargo build --locked --release -p ostena-frame --target wasm32-unknown-unknown
+      # The protocol core of the browser client (ADR-0020): ostena-frame and
+      # its WebAssembly binding; their tests run natively above.
+      - run: cargo build --locked --release -p ostena-frame -p ostena-web-client --target wasm32-unknown-unknown
+      - run: cargo clippy --locked -p ostena-web-client --target wasm32-unknown-unknown -- -D warnings
       # Displayed only: no regression gate yet (ADR-0005). On dev and main.
       # The SSH latency benches run in their own job (bench-ssh).
       - if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
@@ -148,16 +153,17 @@ jobs:
           cargo bench --locked -p ostena-scope
           cargo bench --locked -p ostena-frame
 
-  # The portal (ADR-0020, § 1): npm packages cached into vendor/npm/ while
-  # connected (cargo xtask vendor npm), then built twice, offline, in two
-  # clean copies of the sources: the manifests must be identical byte for
-  # byte, and the budget holds (shown in the summary). The build goes to
-  # the release jobs as an artifact, so both binaries embed the same portal.
+  # The portal (ADR-0020, § 1): npm packages cached into vendor/npm/ and
+  # crates fetched while connected (cargo xtask vendor npm, cargo fetch),
+  # then built twice, offline, in two clean copies of the sources, the
+  # WebAssembly client and its glue tool included: the manifests must be
+  # identical byte for byte, and the budget holds (shown in the summary).
+  # The build goes to the release job as an artifact.
   portal:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,6 +173,9 @@ jobs:
           node-version-file: portal/.node-version
       - run: rustup toolchain install
       - run: cargo xtask vendor npm
+      - run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path tools/wasm-bindgen/Cargo.toml
       - name: Two offline builds in clean copies, compared
         run: |
           for copy in a b; do

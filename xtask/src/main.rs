@@ -54,7 +54,7 @@ Tasks:
 /// Directory receiving vendored crates.
 const VENDOR_DIR: &str = "vendor";
 /// Cargo configuration snippet that redirects crates.io to `VENDOR_DIR`.
-const VENDOR_CONFIG: &str = ".cargo/vendor.toml";
+pub(crate) const VENDOR_CONFIG: &str = ".cargo/vendor.toml";
 
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
@@ -176,9 +176,21 @@ fn vendor(only: Option<&str>) -> Result<()> {
 
 fn vendor_cargo(root: &Path) -> Result<()> {
     let mut cmd = cargo();
-    cmd.args(["vendor", "--locked", "--versioned-dirs", VENDOR_DIR])
-        .current_dir(root);
-    eprintln!("$ cargo vendor --locked --versioned-dirs {VENDOR_DIR}");
+    // The glue tool of the portal has its own lockfile: vendored with the
+    // workspace, so that `cargo xtask portal --offline` builds it too.
+    cmd.args([
+        "vendor",
+        "--locked",
+        "--versioned-dirs",
+        "--sync",
+        portal::BINDGEN_MANIFEST,
+        VENDOR_DIR,
+    ])
+    .current_dir(root);
+    eprintln!(
+        "$ cargo vendor --locked --versioned-dirs --sync {} {VENDOR_DIR}",
+        portal::BINDGEN_MANIFEST
+    );
     let output = cmd.output()?;
     if !output.status.success() {
         return Err(format!(
