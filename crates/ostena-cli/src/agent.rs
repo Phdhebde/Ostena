@@ -716,3 +716,30 @@ async fn serve_until_stopped(
     drop(listener);
     true
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    /// A SIGTERM received after the handlers are armed but before the wait
+    /// is first polled (the agent has just logged `agent.started`) is not
+    /// lost and does not kill the process: the wait ends at once.
+    #[test]
+    fn a_signal_before_the_first_poll_is_not_lost() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let stopped = super::wait_for_signals();
+                let sent = std::process::Command::new("kill")
+                    .args(["-TERM", &std::process::id().to_string()])
+                    .status()
+                    .unwrap();
+                assert!(sent.success());
+                tokio::time::timeout(Duration::from_secs(10), stopped)
+                    .await
+                    .expect("SIGTERM seen by the armed wait");
+            });
+    }
+}
