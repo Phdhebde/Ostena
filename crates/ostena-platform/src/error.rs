@@ -24,6 +24,9 @@ pub enum Code {
     /// Remote Desktop sessions of a target cannot be listed or logged off
     /// (WTS API, ADR-0026).
     RemoteSessions,
+    /// Kerberos is required and impossible towards the session management
+    /// service of a target (ADR-0026).
+    Kerberos,
 }
 
 impl Code {
@@ -40,6 +43,7 @@ impl Code {
             Self::ControlIo => "AGT-E008",
             Self::ControlDenied => "AGT-E009",
             Self::RemoteSessions => "AGT-E013",
+            Self::Kerberos => "AGT-E014",
         }
     }
 }

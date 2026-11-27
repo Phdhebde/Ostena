@@ -2,16 +2,26 @@
 //! (ADR-0026): list the sessions of a target and log one off, from the
 //! Windows agent, under the network credentials of the target account.
 //!
-//! - [`RemoteServer::open`] opens the server by its pinned address. With
-//!   credentials, the calling thread first impersonates a
+//! - [`RemoteServer::open`] opens the server by its DNS name (which the
+//!   caller checked to resolve to the pinned address). With credentials,
+//!   the calling thread first impersonates a
 //!   `LOGON32_LOGON_NEW_CREDENTIALS` token: the credentials are used for
 //!   the outbound authentication only (RPC over the named pipes of the
 //!   target), never for a local logon of the agent.
+//! - Before the server is opened, a Kerberos service ticket for
+//!   `cifs/<server>` is asked through SSPI (Kerberos package only), in the
+//!   logon session of that token: the SMB client of Windows then
+//!   authenticates the channel with it. With [`Authentication::Kerberos`],
+//!   no ticket means no view (`AGT-E014`), so that NTLM is never left to
+//!   Windows to negotiate.
 //! - The impersonation is bound to the calling thread and reverted when the
 //!   [`RemoteServer`] is dropped; [`RemoteServer`] is therefore neither
 //!   `Send` nor `Sync`. Callers run it on a thread of their own, which ends
 //!   with the work: a failed revert never leaks the identity to another task.
 //! - Elsewhere than on Windows, every call fails with `AGT-E013`.
+//!
+//! SSPI is an authentication of the operating system, as `LogonUserW` is:
+//! no cryptographic primitive is called here.
 
 use std::marker::PhantomData;
 
@@ -98,9 +108,21 @@ impl std::fmt::Debug for NetworkCredentials<'_> {
     }
 }
 
+/// How the view authenticates to the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Authentication {
+    /// Kerberos only: without a service ticket for the server, no view
+    /// (`AGT-E014`).
+    Kerberos,
+    /// Kerberos attempted; without a ticket, Windows may negotiate NTLM
+    /// (development).
+    KerberosOrNtlm,
+}
+
 /// An open Remote Desktop server, under the given credentials.
 pub struct RemoteServer {
     inner: imp::Server,
+    kerberos: bool,
     /// Bound to the thread that impersonates.
     _thread: PhantomData<*const ()>,
 }
@@ -112,20 +134,31 @@ impl std::fmt::Debug for RemoteServer {
 }
 
 impl RemoteServer {
-    /// Opens `server` (an address or a name; `None`: this machine), the
-    /// calling thread impersonating `credentials` if given.
+    /// Opens `server` (a DNS name; `None`: this machine, without Kerberos),
+    /// the calling thread impersonating `credentials` if given.
     ///
     /// # Errors
     ///
-    /// `AGT-E013` when the credentials cannot be taken, or off Windows.
+    /// `AGT-E014` when Kerberos is required and no service ticket can be
+    /// had; `AGT-E013` when the credentials cannot be taken, or off
+    /// Windows.
     pub fn open(
         server: Option<&str>,
         credentials: Option<&NetworkCredentials<'_>>,
+        authentication: Authentication,
     ) -> Result<Self, PlatformError> {
+        let (inner, kerberos) = imp::Server::open(server, credentials, authentication)?;
         Ok(Self {
-            inner: imp::Server::open(server, credentials)?,
+            inner,
+            kerberos,
             _thread: PhantomData,
         })
+    }
+
+    /// Whether a Kerberos service ticket for the server was obtained
+    /// before it was opened.
+    pub fn kerberos(&self) -> bool {
+        self.kerberos
     }
 
     /// The sessions of the server.
@@ -151,6 +184,13 @@ fn failure(what: &str, detail: impl std::fmt::Display) -> PlatformError {
     PlatformError::new(Code::RemoteSessions, format!("{what} : {detail}"))
 }
 
+/// The service principal of the session management of `server`: RPC over
+/// its named pipes, that is SMB.
+#[cfg(any(windows, test))]
+fn service_principal(server: &str) -> String {
+    format!("cifs/{server}")
+}
+
 #[cfg(windows)]
 #[allow(
     unsafe_code,
@@ -160,6 +200,12 @@ mod imp {
     use std::ffi::c_void;
 
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+    use windows_sys::Win32::Security::Authentication::Identity::{
+        AcquireCredentialsHandleW, DeleteSecurityContext, FreeContextBuffer, FreeCredentialsHandle,
+        ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_MUTUAL_AUTH, InitializeSecurityContextW, SECBUFFER_TOKEN,
+        SECBUFFER_VERSION, SECPKG_CRED_OUTBOUND, SECURITY_NATIVE_DREP, SecBuffer, SecBufferDesc,
+    };
+    use windows_sys::Win32::Security::Credentials::SecHandle;
     use windows_sys::Win32::Security::{
         ImpersonateLoggedOnUser, LOGON32_LOGON_NEW_CREDENTIALS, LOGON32_PROVIDER_WINNT50,
         LogonUserW, RevertToSelf,
@@ -170,8 +216,10 @@ mod imp {
     };
     use zeroize::Zeroizing;
 
-    use super::{NetworkCredentials, RemoteSession, SessionState, failure};
-    use crate::error::PlatformError;
+    use super::{
+        Authentication, NetworkCredentials, RemoteSession, SessionState, failure, service_principal,
+    };
+    use crate::error::{Code, PlatformError};
 
     /// Longest string read from a WTS structure, in UTF-16 units.
     const MAX_NAME: usize = 1024;
@@ -295,6 +343,103 @@ mod imp {
         }
     }
 
+    /// A credentials handle of SSPI, freed once.
+    struct Credentials(SecHandle);
+
+    impl Drop for Credentials {
+        fn drop(&mut self) {
+            // SAFETY: a handle AcquireCredentialsHandleW returned, freed once.
+            unsafe { FreeCredentialsHandle(&raw const self.0) };
+        }
+    }
+
+    /// Asks a Kerberos service ticket for `spn` with the outbound
+    /// credentials of the calling thread (the impersonated token): the
+    /// ticket stays in the cache of that logon session, where the SMB
+    /// client of Windows takes it.
+    pub(super) fn service_ticket(spn: &str) -> Result<(), PlatformError> {
+        let kerberos = |what: &str, status: i32| {
+            PlatformError::new(
+                Code::Kerberos,
+                format!("{what} pour {spn} : 0x{:08x}", status.cast_unsigned()),
+            )
+        };
+        let package = wide("Kerberos");
+        let target = wide(spn);
+        let mut handle = SecHandle {
+            dwLower: 0,
+            dwUpper: 0,
+        };
+        let mut expiry = 0i64;
+        // SAFETY: the package name is a NUL-terminated buffer alive for the
+        // call; null principal, logon id, authentication data and key
+        // function select the credentials of the calling thread; `handle`
+        // and `expiry` are valid out pointers.
+        let status = unsafe {
+            AcquireCredentialsHandleW(
+                std::ptr::null(),
+                package.as_ptr(),
+                SECPKG_CRED_OUTBOUND,
+                std::ptr::null(),
+                std::ptr::null(),
+                None,
+                std::ptr::null(),
+                &raw mut handle,
+                &raw mut expiry,
+            )
+        };
+        if status < 0 {
+            return Err(kerberos("identifiants Kerberos indisponibles", status));
+        }
+        let credentials = Credentials(handle);
+        let mut token = SecBuffer {
+            cbBuffer: 0,
+            BufferType: SECBUFFER_TOKEN,
+            pvBuffer: std::ptr::null_mut(),
+        };
+        let mut output = SecBufferDesc {
+            ulVersion: SECBUFFER_VERSION,
+            cBuffers: 1,
+            pBuffers: &raw mut token,
+        };
+        let mut context = SecHandle {
+            dwLower: 0,
+            dwUpper: 0,
+        };
+        let mut attributes = 0u32;
+        // SAFETY: `credentials` holds a valid handle; no previous context
+        // nor input; the target name is a NUL-terminated buffer alive for
+        // the call; `output` describes one token buffer SSPI allocates
+        // (ISC_REQ_ALLOCATE_MEMORY); the other out pointers are valid.
+        let status = unsafe {
+            InitializeSecurityContextW(
+                &raw const credentials.0,
+                std::ptr::null(),
+                target.as_ptr(),
+                ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_MUTUAL_AUTH,
+                0,
+                SECURITY_NATIVE_DREP,
+                std::ptr::null(),
+                0,
+                &raw mut context,
+                &raw mut output,
+                &raw mut attributes,
+                &raw mut expiry,
+            )
+        };
+        if !token.pvBuffer.is_null() {
+            // SAFETY: the buffer SSPI allocated for the token, freed once.
+            unsafe { FreeContextBuffer(token.pvBuffer) };
+        }
+        if status < 0 {
+            return Err(kerberos("ticket de service Kerberos impossible", status));
+        }
+        // SAFETY: a successful call (complete or to be continued) created
+        // `context`, deleted once; the ticket stays in the cache.
+        unsafe { DeleteSecurityContext(&raw const context) };
+        Ok(())
+    }
+
     pub(super) struct Server {
         handle: HANDLE,
         // Dropped after the handle is closed (fields drop after `drop`).
@@ -305,8 +450,18 @@ mod imp {
         pub(super) fn open(
             server: Option<&str>,
             credentials: Option<&NetworkCredentials<'_>>,
-        ) -> Result<Self, PlatformError> {
+            authentication: Authentication,
+        ) -> Result<(Self, bool), PlatformError> {
             let impersonation = credentials.map(Impersonation::start).transpose()?;
+            let kerberos = match server.map(|s| service_ticket(&service_principal(s))) {
+                Some(Ok(())) => true,
+                Some(Err(e)) if authentication == Authentication::Kerberos => return Err(e),
+                Some(Err(e)) => {
+                    tracing::debug!(error = %e, "ticket Kerberos du canal de gestion impossible");
+                    false
+                }
+                None => false,
+            };
             let handle = match server {
                 None => WTS_CURRENT_SERVER_HANDLE,
                 Some(name) => {
@@ -316,10 +471,13 @@ mod imp {
                     unsafe { WTSOpenServerW(name.as_ptr()) }
                 }
             };
-            Ok(Self {
-                handle,
-                _impersonation: impersonation,
-            })
+            Ok((
+                Self {
+                    handle,
+                    _impersonation: impersonation,
+                },
+                kerberos,
+            ))
         }
 
         pub(super) fn sessions(&self) -> Result<Vec<RemoteSession>, PlatformError> {
@@ -390,7 +548,7 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::{NetworkCredentials, RemoteSession, failure};
+    use super::{Authentication, NetworkCredentials, RemoteSession, failure};
     use crate::error::PlatformError;
 
     pub(super) struct Server;
@@ -406,7 +564,8 @@ mod imp {
         pub(super) fn open(
             _: Option<&str>,
             _: Option<&NetworkCredentials<'_>>,
-        ) -> Result<Self, PlatformError> {
+            _: Authentication,
+        ) -> Result<(Self, bool), PlatformError> {
             Err(unsupported())
         }
 
@@ -448,7 +607,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unsupported_off_windows() {
-        let error = RemoteServer::open(Some("192.0.2.1"), None).unwrap_err();
+        let error = RemoteServer::open(Some("srv.corp.example"), None, Authentication::Kerberos)
+            .unwrap_err();
         assert_eq!(error.code, Code::RemoteSessions);
         assert!(error.to_string().starts_with("[AGT-E013]"));
     }
@@ -470,7 +630,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn local_sessions_listed_and_bad_logoff_refused() {
-        let local = RemoteServer::open(None, None).unwrap();
+        let local = RemoteServer::open(None, None, Authentication::Kerberos).unwrap();
+        assert!(!local.kerberos());
         let sessions = local.sessions().unwrap();
         assert!(sessions.iter().any(|s| s.id == 0), "{sessions:?}");
         let error = local.logoff(0xFFFF_FFF0).unwrap_err();
@@ -483,11 +644,45 @@ mod tests {
             domain: Some("."),
             password: &password,
         };
-        let impersonated = RemoteServer::open(None, Some(&credentials)).unwrap();
+        let impersonated =
+            RemoteServer::open(None, Some(&credentials), Authentication::Kerberos).unwrap();
         assert!(impersonated.sessions().unwrap().iter().any(|s| s.id == 0));
         drop(impersonated);
         // Reverted: the thread lists again under its own identity.
-        let again = RemoteServer::open(None, None).unwrap().sessions().unwrap();
+        let again = RemoteServer::open(None, None, Authentication::Kerberos)
+            .unwrap()
+            .sessions()
+            .unwrap();
         assert!(again.iter().any(|s| s.id == 0));
+    }
+
+    #[test]
+    fn the_principal_is_the_smb_service_of_the_name() {
+        assert_eq!(
+            service_principal("srv.corp.example"),
+            "cifs/srv.corp.example"
+        );
+    }
+
+    /// This machine by its name, from a runner outside any domain: no KDC,
+    /// so Kerberos only is refused (`AGT-E014`) before any RPC, and
+    /// Kerberos or NTLM opens the view without a ticket.
+    #[cfg(windows)]
+    #[test]
+    fn kerberos_without_a_kdc_is_refused_or_reported() {
+        let name = std::env::var("COMPUTERNAME").unwrap().to_lowercase();
+        let error = RemoteServer::open(Some(&name), None, Authentication::Kerberos).unwrap_err();
+        assert_eq!(error.code, Code::Kerberos, "{error}");
+        assert!(error.to_string().starts_with("[AGT-E014]"), "{error}");
+        assert!(
+            error.to_string().contains(&format!("cifs/{name}")),
+            "{error}"
+        );
+
+        let fallback =
+            RemoteServer::open(Some(&name), None, Authentication::KerberosOrNtlm).unwrap();
+        assert!(!fallback.kerberos());
+        let sessions = fallback.sessions().unwrap();
+        assert!(sessions.iter().any(|s| s.id == 0), "{sessions:?}");
     }
 }

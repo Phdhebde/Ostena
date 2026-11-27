@@ -115,7 +115,7 @@ vsss-rs = { version = "6.0.1", default-features = false, features = ["alloc"] }
 rand_core = { version = "0.10.1", default-features = false }
 # Windows only, in ostena-platform: ACLs, services, named pipes (unsafe FFI).
 windows-service = "0.8.1"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_RemoteDesktop", "Win32_System_Services", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }
 # Test only: proves the scope decision does not allocate.
 dhat = "0.3.3"
 # Unix only, in ostena-platform: terminal modes for hidden password input.
