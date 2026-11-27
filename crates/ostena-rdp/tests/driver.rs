@@ -64,7 +64,7 @@ impl SessionView for FakeView {
 impl SessionControl for FakeControl {
     fn open(&self, request: &ViewRequest) -> Result<Box<dyn SessionView>, String> {
         // SECRET-EXPOSURE: test checks the password given to the view.
-        #[allow(clippy::disallowed_methods)]
+        #[expect(clippy::disallowed_methods)]
         let password = request.password.expose_secret().to_owned();
         self.0
             .lock()

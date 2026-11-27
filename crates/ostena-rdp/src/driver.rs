@@ -615,6 +615,9 @@ impl RdpConnection {
                 Ok(done) => done,
                 Err(_) => (SessionEnd::Failed(RdpError::Internal), Counters::default()),
             };
+            // The RDP connection is over: closed from now on, while the
+            // Windows session is logged off.
+            flag.store(true, Ordering::Release);
             if let SessionEnd::Failed(e) = &end {
                 log_failure(&task_label, e);
             }
@@ -629,7 +632,6 @@ impl RdpConnection {
                 },
                 None => (Vec::new(), None),
             };
-            flag.store(true, Ordering::Release);
             Ended {
                 end,
                 counters,
