@@ -345,6 +345,23 @@ pub struct CoreAuditConfig {
     /// A head as soon as this many records are not covered, 1 to 100000.
     #[serde(default = "default_head_max_records")]
     pub head_max_records: u32,
+    /// Write-once storage of the sealed files (transcripts, recordings):
+    /// append only while written, immutable once sealed (ADR-0012,
+    /// « Stockage en ajout seul »).
+    #[serde(default)]
+    pub worm: WormSetting,
+}
+
+/// `core.audit.worm`: the write-once storage of the sealed files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WormSetting {
+    /// Every sealed file is append only, then immutable; the core refuses
+    /// to start if its directory does not allow it.
+    #[default]
+    Required,
+    /// Read-only rights only (`CFG-P024`, refused in production).
+    Disabled,
 }
 
 /// Where a private key of the core is read.
@@ -825,6 +842,14 @@ pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) 
     }
     if now >= KEY_FILE_WAIVER_END {
         key_files(core, out);
+    }
+    if core.audit.worm == WormSetting::Disabled {
+        out.push(Violation::new(
+            Code::WormDisabled,
+            "core.audit.worm = « disabled » : les transcripts et enregistrements scellés ne sont \
+             plus en ajout seul puis immuables ; le compte du service ou une erreur peut les \
+             tronquer, les réécrire ou les supprimer (la chaîne d'audit le révèle, sans l'empêcher).",
+        ));
     }
     if let Some(web) = &core.web {
         if !web.bind_source {

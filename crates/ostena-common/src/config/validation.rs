@@ -116,11 +116,14 @@ pub enum Code {
     /// accepted deviation (ADR-0009), logged at every start and never
     /// refused.
     DirectoryTls12,
+    /// Core: sealed files (transcripts, recordings) written without the
+    /// append-only then immutable attributes (`core.audit.worm = "disabled"`).
+    WormDisabled,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 42] = [
+    pub const ALL: [Self; 43] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -163,6 +166,7 @@ impl Code {
         Self::CoreIdentity,
         Self::IdentitySecretExposed,
         Self::DirectoryTls12,
+        Self::WormDisabled,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -210,6 +214,7 @@ impl Code {
             Self::CoreIdentity => "CFG-V020",
             Self::IdentitySecretExposed => "CFG-P020",
             Self::DirectoryTls12 => "CFG-P021",
+            Self::WormDisabled => "CFG-P024",
         }
     }
 
@@ -237,6 +242,7 @@ impl Code {
                 | Self::WebTlsClassic
                 | Self::IdentitySecretExposed
                 | Self::DirectoryTls12
+                | Self::WormDisabled
         )
     }
 }
