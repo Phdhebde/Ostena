@@ -2135,6 +2135,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostena-policy"
+version = "0.0.0"
+dependencies = [
+ "dhat",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "ostena-rdp"
 version = "0.0.0"
 dependencies = [
