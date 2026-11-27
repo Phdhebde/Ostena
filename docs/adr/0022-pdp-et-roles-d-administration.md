@@ -1,9 +1,9 @@
 # ADR-0022 : PDP compilé en mémoire et rôles d'administration séparés
 
-- **Statut** : Accepté en partie.
+- **Statut** : Accepté.
   - PR 10a : crate `ostena-policy` (modèle, compilation, décision, installation, rôles), banc.
   - PR 10b : le core décide des accès SSH par le PDP, chargé depuis les droits, avec le rechargement, l'invalidation et les événements d'audit. S'y ajoutent l'option de cumul des rôles (`CFG-P023`) et les contrôles de séparation, au démarrage et à l'attribution d'un rôle.
-  - Reste pour la PR 10c : les groupes de comptes, les règles sur des groupes, les interdictions et les rôles `policy` et `audit` en base (une migration).
+  - PR 10c : migration 11 (groupes de comptes, règles sur des groupes, interdictions, rôles `policy` et `audit`, ligne de version de la politique), commandes d'administration, `admin.role_cumulation_used` et le champ `restricted_by`.
 - **Date** : 2026-11-26
 
 ## Contexte
@@ -106,12 +106,18 @@ Un `Pdp` tient la politique en place derrière un verrou en lecture-écriture. U
   Une autorisation n'est donc jamais plus large que les droits que voit la transaction. Un droit **ajouté** alors qu'un autre droit valide sur le même compte est déjà connu ne sert qu'après le rechargement qui suit sa notification, de l'ordre de la milliseconde.
 - **Essai à blanc** (`access check`) : la commande, hors du core, charge la politique depuis la base et décide de la même façon.
 
-**PR 10c (migration à la suite de celles de la PR 9c et de la PR 8b).**
+**PR 10c (migration 11).**
 
-- Tables des groupes de comptes, de leurs membres et des règles. Les règles portent sur des groupes d'utilisateurs (`user_group`, PR 9c) et sur les interdictions.
-- Rôles `policy` et `audit` dans `user_role`.
-- Commandes d'administration des règles et des groupes de comptes.
-- Une **ligne de version** de la politique, relue par la transaction du grant. Elle remplace la détection du retard ci-dessus, qui ne vaut que pour les droits.
+- **Tables.** `account_group` et `account_group_member` (groupes de comptes, créés par les commandes d'administration, jamais modifiés ni supprimés ; un membre s'ajoute et se retire). `access_rule` : un sujet (un utilisateur, ou un groupe d'utilisateurs `user_group` de la PR 9c), une cible (un compte, ou un groupe de comptes), des protocoles, un effet (`allow`, `deny`, `deny_functions`), des fonctions et une fenêtre. Une règle qui autorise finit dans les 366 jours, comme un droit ; une interdiction peut n'avoir pas de fin. Une règle se révoque, ne se supprime pas.
+- **Rôles.** `user_role` admet `policy` et `audit`.
+- **Grant.** `access_grant` nomme le droit (`right_id`) **ou** la règle (`rule_id`) sous lequel il est émis, l'un des deux exactement.
+- **Ligne de version** (`policy_version`). Un déclencheur sur `access_right`, `access_rule`, `account_group_member` et `user_group_member` l'augmente dans la transaction de chaque changement, et notifie `policy`. Le chargement lit la version, les règles et les groupes dans une même transaction en lecture répétable : **la version du PDP est celle de la base**. La transaction d'un grant relit la ligne avec `FOR SHARE` et la compare à la version qui a décidé :
+  - égales : la décision vaut telle quelle, aucun droit n'est relu ;
+  - différentes (ou aucune politique) : la politique est en retard. Le core la recharge une fois et décide de nouveau ; encore en retard, il refuse (`POL-E003`).
+
+  Un changement doit poser un verrou exclusif sur cette ligne : il attend donc les grants en cours, qui l'attendent à leur tour. Cela remplace la détection du retard de la PR 10b, qui ne valait que pour les droits : un droit ajouté, une règle, un membre d'un groupe servent dès le grant suivant, sans attendre la notification.
+- **Commandes.** `ostena core rule create|list|revoke`, `ostena core account-group create|add|remove|list`. `ostena core user role-grant` admet `policy` et `audit`.
+- **Retour en arrière** (migration 10) : les règles, les groupes de comptes et la ligne de version disparaissent, les rôles `policy` et `audit` sont retirés. S'il existe un grant émis sous une règle, la migration échoue sans rien changer : son droit serait obligatoire dans le schéma 10.
 
 ### Codes
 
@@ -169,7 +175,7 @@ La règle d'incompatibilité est dans la crate (`roles`), testée seule. La PR 1
 - la vérification au démarrage (`ostena core run`), qui arrête le core en production sur `POL-E006` ;
 - le refus à l'attribution d'un rôle (`ostena core user role-grant`, `POL-E006`).
 
-Ces contrôles s'appliqueront dès que les rôles `policy` et `audit` existeront en base (PR 10c).
+Avec la PR 10c, les rôles `policy` et `audit` existent en base, et ces contrôles s'appliquent. Chaque requête du portail qui exige un rôle, faite par un compte qui cumule, est consignée (`admin.role_cumulation_used` : utilisateur, session de connexion, rôle exigé, rôles tenus, route, adresse). Les commandes d'administration sont faites sous le compte de la base (ADR-0011), pas sous un compte du produit : le cumul ne s'y applique pas.
 
 ### Hors du périmètre v0
 
@@ -182,5 +188,5 @@ Fenêtres horaires récurrentes, groupes de comptes imbriqués, conditions (adre
 - Un changement de politique s'applique en mémoire après un rechargement complet (36 ms de compilation à cette taille, plus la lecture de la base). Pour des politiques beaucoup plus grandes, un rechargement incrémental sera à étudier ; la version monotone le permet sans changer l'interface.
 - **Limites connues** :
   - comme un droit (ADR-0014), une règle retirée **ne coupe pas** les sessions ouvertes ; elle empêche tout nouveau grant et toute ouverture avec un grant déjà émis ;
-  - entre un changement et l'installation de la politique rechargée, l'ancienne décide encore (de l'ordre de la seconde) ;
+  - depuis la PR 10c, un grant ne décide jamais avec une politique plus ancienne que la base (ligne de version) ; en contrepartie, chaque changement attend les grants en cours, et le premier grant après un changement paie le rechargement (de l'ordre de 40 ms à 10 000 règles) s'il précède la notification ;
   - un compte inconnu du PDP est refusé par défaut : une ressource ajoutée n'est accessible qu'après le rechargement qui suit son ajout.
