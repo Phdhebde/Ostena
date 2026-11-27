@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
-use ostena_common::config::{CoreConfig, KeySource};
+use ostena_common::config::{CoreConfig, KeySource, Output};
 use ostena_common::secret::SecretBytes;
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::{IssuingAuthority, Validity};
@@ -40,6 +40,7 @@ use crate::authn::PgAuthenticator;
 use crate::cache::AgentCache;
 use crate::credential::TotpKey;
 use crate::error::CoreError;
+use crate::forwarding::Forwarder;
 use crate::grant_keys::GrantAuthority;
 use crate::identity::Directories;
 use crate::ssh_ca::SshAuthorities;
@@ -436,6 +437,41 @@ struct Shared {
 pub struct StartInfo {
     /// Weakening options and dated waivers in effect: (code, message).
     pub waivers: Vec<(String, String)>,
+    /// `[[audit.outputs]]`: the syslog collectors of the audit export.
+    pub audit_outputs: Vec<Output>,
+}
+
+/// What leaves the core besides the chain itself: the time-stamps of the
+/// heads and the SIEM export (ADR-0012).
+struct Exports {
+    timestamper: Option<Timestamper>,
+    forwarders: Vec<Forwarder>,
+}
+
+impl Exports {
+    /// Reads the anchors, bundles and keys of both.
+    fn load(config: &CoreConfig, info: &StartInfo) -> Result<Self, CoreError> {
+        Ok(Self {
+            timestamper: Timestamper::of(&config.audit)?,
+            forwarders: Forwarder::load_all(
+                &info.audit_outputs,
+                credentials_directory().as_deref(),
+            )?,
+        })
+    }
+
+    fn spawn(self, pool: &sqlx::PgPool, recorder: &Arc<Recorder>) -> Vec<JoinHandle<()>> {
+        let mut tasks: Vec<_> = self
+            .forwarders
+            .into_iter()
+            .map(|f| f.spawn(pool.clone(), recorder.clone()))
+            .collect();
+        tasks.extend(
+            self.timestamper
+                .map(|t| t.spawn(pool.clone(), recorder.clone())),
+        );
+        tasks
+    }
 }
 
 /// Time allowed at stop for the queue, `core.stopped` and the final head.
@@ -639,8 +675,9 @@ impl RunningCore {
         keys: &Keys,
         info: &StartInfo,
     ) -> Result<Self, CoreError> {
-        // Unreadable anchors refuse the start before anything is written.
-        let timestamper = Timestamper::of(&config.audit)?;
+        // Unreadable anchors, bundles or keys refuse the start before
+        // anything is written.
+        let exports = Exports::load(config, info)?;
         let cache = store.cache();
         store.reload().await?;
         let recorder = store.recorder();
@@ -707,10 +744,10 @@ impl RunningCore {
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
         let notices = listen(shared.store.pool()).await?;
-        let stamping = timestamper.map(|t| t.spawn(shared.store.pool().clone(), recorder.clone()));
+        let exporting = exports.spawn(shared.store.pool(), &recorder);
         let writer = tokio::spawn(audit::run_writer(shared.store.pool().clone(), recorder));
         let mut tasks = background(&listener, notices, &shared, &signer, identity.as_ref());
-        tasks.extend(stamping);
+        tasks.extend(exporting);
         tracing::info!(
             event = "core.started",
             tunnel = %tunnel_addr,
