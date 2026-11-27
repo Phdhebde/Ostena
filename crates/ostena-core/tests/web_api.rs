@@ -11,6 +11,7 @@ use std::net::IpAddr;
 
 use hyper::StatusCode;
 use ostena_common::api::web::{LoginSessionList, SessionInfo};
+use ostena_core::web::portal::{Asset, Portal, Variant};
 use ostena_core::web::routes::{Access, ROUTES, Verb};
 use ostena_core::web::session::SessionEnd;
 use ostena_core::web::{OPENAPI, SECURITY_HEADERS, WebSettings};
@@ -573,7 +574,65 @@ fn public_routes_health_reports_and_portal() {
             .send(report("application/csp-report", "x".repeat(8 * 1024 + 1)))
             .await;
         assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
-        // No portal in this binary yet.
+        f.listener.close();
+    });
+}
+
+/// No portal in the binary (built without `portal/dist/`).
+static NO_PORTAL: Portal = Portal::new(None, &[]);
+
+/// A small portal: an index, a hashed asset with a brotli variant, a file
+/// outside `assets/`.
+static TEST_PORTAL: Portal = Portal::new(
+    Some("test sums"),
+    &[
+        Asset {
+            path: "index.html",
+            content_type: "text/html; charset=utf-8",
+            sha256: "0",
+            raw: Variant {
+                bytes: b"<!doctype html>",
+                etag: "\"index\"",
+            },
+            brotli: None,
+        },
+        Asset {
+            path: "assets/app-1a2b.js",
+            content_type: "text/javascript; charset=utf-8",
+            sha256: "1",
+            raw: Variant {
+                bytes: b"console.log(1)",
+                etag: "\"app\"",
+            },
+            brotli: Some(Variant {
+                bytes: b"BR",
+                etag: "\"br-app\"",
+            }),
+        },
+        Asset {
+            path: "theme.js",
+            content_type: "text/javascript; charset=utf-8",
+            sha256: "2",
+            raw: Variant {
+                bytes: b"theme",
+                etag: "\"theme\"",
+            },
+            brotli: None,
+        },
+    ],
+);
+
+#[test]
+fn the_portal_is_served_or_absent() {
+    runtime().block_on(async {
+        let f = Fixture::start(
+            WebSettings {
+                portal: &NO_PORTAL,
+                ..settings()
+            },
+            600,
+        )
+        .await;
         for path in ["/", "/index.html", "/assets/app.js"] {
             let reply = f.send(bare("GET", path, None)).await;
             assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
@@ -582,6 +641,90 @@ fn public_routes_health_reports_and_portal() {
         }
         let reply = f.send(request("POST", "/", None, "")).await;
         assert_eq!(reply.code(), "WEB-E005");
+        f.listener.close();
+
+        let f = Fixture::start(
+            WebSettings {
+                portal: &TEST_PORTAL,
+                ..settings()
+            },
+            600,
+        )
+        .await;
+        let header = |reply: &Reply, name: &str| {
+            reply
+                .headers
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        for path in ["/", "/index.html"] {
+            let reply = f.send(bare("GET", path, None)).await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            assert_eq!(reply.body, b"<!doctype html>");
+            assert_eq!(
+                header(&reply, "content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+            assert_eq!(header(&reply, "cache-control").unwrap(), "no-store");
+            assert_eq!(header(&reply, "etag").unwrap(), "\"index\"");
+            assert!(header(&reply, "content-encoding").is_none());
+            assert_secured(&reply, path);
+        }
+        // Brotli to a browser that accepts it, the file itself otherwise.
+        let get = |encoding: Option<&str>, etag: Option<&str>| {
+            let mut r = bare("GET", "/assets/app-1a2b.js", None);
+            if let Some(e) = encoding {
+                r.headers_mut()
+                    .insert("accept-encoding", e.parse().unwrap());
+            }
+            if let Some(e) = etag {
+                r.headers_mut().insert("if-none-match", e.parse().unwrap());
+            }
+            r
+        };
+        let reply = f.send(get(Some("gzip, deflate, br"), None)).await;
+        assert_eq!(reply.body, b"BR");
+        assert_eq!(header(&reply, "content-encoding").unwrap(), "br");
+        assert_eq!(header(&reply, "vary").unwrap(), "Accept-Encoding");
+        assert_eq!(
+            header(&reply, "cache-control").unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(header(&reply, "etag").unwrap(), "\"br-app\"");
+        assert!(header(&reply, "content-security-policy").is_some());
+        let reply = f.send(get(Some("gzip"), None)).await;
+        assert_secured(&reply, "/assets/app-1a2b.js");
+        assert_eq!(reply.body, b"console.log(1)");
+        assert!(header(&reply, "content-encoding").is_none());
+        assert_eq!(header(&reply, "vary").unwrap(), "Accept-Encoding");
+        // Revalidation by ETag.
+        let reply = f.send(get(Some("br"), Some("\"br-app\""))).await;
+        assert_eq!(reply.status, StatusCode::NOT_MODIFIED);
+        assert_eq!(reply.body, b"");
+        let reply = f.send(get(None, Some("\"br-app\""))).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let reply = f.send(bare("GET", "/theme.js", None)).await;
+        assert_eq!(header(&reply, "cache-control").unwrap(), "no-cache");
+        // Unknown files, other methods, paths that are not files.
+        for path in [
+            "/missing.js",
+            "/assets/",
+            "/assets",
+            "/../index.html",
+            "//index.html",
+        ] {
+            let reply = f.send(bare("GET", path, None)).await;
+            assert_eq!(reply.status, StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(reply.code(), "WEB-E005");
+            assert_secured(&reply, path);
+        }
+        let reply = f.send(request("POST", "/", None, "")).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND);
+        let reply = f.send(request("DELETE", "/theme.js", None, "")).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND);
+        // The API is unchanged by the portal.
+        let reply = f.send(bare("GET", "/api/v1/unknown", None)).await;
+        assert_eq!(reply.code(), "WEB-E001");
         f.listener.close();
     });
 }

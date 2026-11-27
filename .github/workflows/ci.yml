@@ -314,12 +314,12 @@ jobs:
           cargo sqlx migrate run
           cargo sqlx prepare --check -- --all-targets
 
-  # Static release binary, then the agent service lifecycle under systemd
+  # Static release binary, with the portal, then the agent service lifecycle under systemd
   # (install, status, permissions, hardening score, clean stop, bounded
   # restarts, uninstall), the unit on systemd 252 (Debian 12), and the idle
   # footprint. Needs a full VM with systemd.
   release-linux:
-    needs: changes
+    needs: [changes, portal]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -327,6 +327,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The portal built (twice, compared) by the job portal: the release
+      # binary embeds it (ADR-0020), check-release refuses one without it.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: portal-dist
+          path: portal/dist
       - run: rustup toolchain install
       # aws-lc-sys compiles C for the musl target with musl-gcc.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
@@ -342,6 +348,18 @@ jobs:
           "$bin" --version
       # The release binary must not contain the test core (feature `testing`).
       - run: cargo xtask check-release target/x86_64-unknown-linux-musl/release/ostena
+      - name: The binary embeds the portal built by the job portal
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/ostena
+          "$bin" core portal-manifest > "$RUNNER_TEMP/portal-manifest.txt"
+          grep -Fq "$(sha256sum portal/dist/SHA256SUMS | cut -d' ' -f1)" "$RUNNER_TEMP/portal-manifest.txt"
+          {
+            echo "## Binaire Linux (musl)"
+            echo
+            echo "Taille : $(stat -c %s "$bin") octets"
+            echo
+            head -2 "$RUNNER_TEMP/portal-manifest.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ostena-x86_64-unknown-linux-musl

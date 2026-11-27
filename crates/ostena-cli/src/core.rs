@@ -530,3 +530,23 @@ pub(crate) fn audit_acknowledge_break(path: &Path, seq: u64) -> ExitCode {
         Err(e) => fail(&e),
     }
 }
+
+/// `ostena core portal-manifest`: the embedded portal, each file checked
+/// against its SHA-256 (ADR-0020). Prints the digest of `SHA256SUMS`, then
+/// `SHA256SUMS`; `sha256sum SHA256SUMS` on a rebuild gives the same digest.
+pub(crate) fn portal_manifest() -> ExitCode {
+    match ostena_core::web::portal::EMBEDDED.manifest() {
+        Ok(m) => {
+            let _ = write!(
+                io::stdout(),
+                "portail embarqué : {} fichiers, vérifiés\n\
+                 empreinte du manifeste (SHA-256 de SHA256SUMS) : {}\n\n{}",
+                m.files,
+                m.digest,
+                m.sums
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&format!("ostena core portal-manifest : {e}")),
+    }
+}

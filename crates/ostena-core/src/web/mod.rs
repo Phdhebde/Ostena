@@ -1,5 +1,5 @@
-//! The web listener of the core: the REST API of the portal and, from
-//! PR 8c, the portal itself (ADR-0020).
+//! The web listener of the core: the REST API of the portal and the portal
+//! itself, embedded in the binary ([`portal`], ADR-0020).
 //!
 //! HTTP/1.1 on hyper, persistent connections, over TLS 1.3 built by
 //! `ostena_crypto::tls::web_server_config` (hybrid groups only in
@@ -28,6 +28,7 @@
 
 pub mod gateway;
 pub mod pg;
+pub mod portal;
 pub mod routes;
 pub mod session;
 
@@ -264,6 +265,8 @@ pub struct WebSettings {
     pub gateway_stall: Duration,
     /// How often the idle browser sessions are revoked.
     pub sweep_interval: Duration,
+    /// The files of the portal: the ones embedded in the binary.
+    pub portal: &'static portal::Portal,
 }
 
 impl WebSettings {
@@ -294,6 +297,7 @@ impl WebSettings {
             connection_timeout: Duration::from_secs(300),
             gateway_stall: gateway::STALL,
             sweep_interval: Duration::from_secs(30),
+            portal: &portal::EMBEDDED,
         }
     }
 }
@@ -652,13 +656,29 @@ async fn read_body(body: Incoming, max: usize, secrets: bool) -> Result<Vec<u8>,
     Ok(out)
 }
 
-/// The portal outside the route table (its files, from PR 8c).
-fn portal(method: &Method) -> Result<Response<Full<Bytes>>, WebError> {
-    if method == Method::GET {
-        Err(WebCode::NoPortal.into())
-    } else {
-        Err(WebCode::NotFound.into())
+/// A file of the portal, outside the route table: public, `GET` only;
+/// `503` `WEB-E008` without a portal in the binary.
+fn serve_portal(
+    settings: &WebSettings,
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<Response<Full<Bytes>>, WebError> {
+    if method != Method::GET {
+        return Err(WebCode::NotFound.into());
     }
+    if !settings.portal.is_present() {
+        return Err(WebCode::NoPortal.into());
+    }
+    settings
+        .portal
+        .find(path)
+        .map(|asset| portal::serve(asset, headers))
+        .ok_or_else(|| WebError {
+            status: StatusCode::NOT_FOUND,
+            code: WebCode::NotFound.as_str(),
+            message: "fichier du portail inconnu".into(),
+        })
 }
 
 async fn handle<B: WebBackend>(
@@ -671,7 +691,7 @@ async fn handle<B: WebBackend>(
     let path = request.uri().path();
     let Some((route, params)) = routes::find(request.method(), path) else {
         if !path.starts_with("/api/") {
-            return portal(request.method());
+            return serve_portal(&shared.settings, request.method(), path, request.headers());
         }
         // An anonymous client cannot tell an unknown route from a known one.
         authenticate(request.headers(), shared, peer, now).await?;
@@ -939,7 +959,7 @@ async fn run<B: WebBackend>(
 ) -> Result<Response<Full<Bytes>>, WebError> {
     let idle = c.shared.settings.idle_secs;
     match route.handler {
-        Handler::Portal => Err(WebCode::NoPortal.into()),
+        Handler::Portal => serve_portal(&c.shared.settings, &Method::GET, "/", c.headers),
         Handler::Health => Ok(empty(StatusCode::NO_CONTENT)),
         Handler::CspReport => csp_report(&c, body),
         Handler::Login => {

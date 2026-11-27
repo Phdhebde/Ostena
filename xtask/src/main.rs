@@ -840,9 +840,32 @@ fn check_release(binary: Option<&str>) -> Result<()> {
         eprintln!("{path}: SSH server linked");
         if pe::is_pe(&bytes) {
             check_windows_imports(path, &bytes)?;
+        } else {
+            // The core, and so the portal, is in the Linux binary only.
+            if !has_portal(&bytes) {
+                return Err(format!(
+                    "{path} has no portal (built without portal/dist/: run `cargo xtask \
+                     portal` first, ADR-0020)"
+                )
+                .into());
+            }
+            eprintln!("{path}: portal embedded");
         }
     }
     Ok(())
+}
+
+/// Whether `bytes` embed the `SHA256SUMS` of a portal: a line naming
+/// `index.html` after a SHA-256 in hex (ADR-0020).
+fn has_portal(bytes: &[u8]) -> bool {
+    const LINE: &[u8] = b"  index.html\n";
+    bytes.windows(LINE.len()).enumerate().any(|(i, w)| {
+        w == LINE
+            && i >= 64
+            && bytes[i - 64..i]
+                .iter()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// ADR-0009: no GUI or COM DLL in the static imports of the Windows binary;
@@ -1186,6 +1209,20 @@ mod tests {
                       Private_Dirty:  900 kB\n";
         assert_eq!(private_kib(rollup), Some(1200));
         assert_eq!(private_kib("Rss: 1 kB\n"), None);
+    }
+
+    #[test]
+    fn finds_the_embedded_portal() {
+        let digest = "c79c91a47385aff07aa1e70194de6f5f98d641f488f72f7861eb500c2d34b16b";
+        let with = format!("\0\0{digest}  index.html\n{digest}  theme.js\n");
+        assert!(has_portal(with.as_bytes()));
+        assert!(!has_portal(b"index.html"));
+        assert!(!has_portal(
+            format!("{}  index.html\n", &digest[1..]).as_bytes()
+        ));
+        assert!(!has_portal(
+            format!("{}X  index.html\n", &digest[1..]).as_bytes()
+        ));
     }
 
     #[test]
