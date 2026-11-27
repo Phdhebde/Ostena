@@ -106,7 +106,7 @@ Les événements qui engagent une décision du core sont écrits dans la chaîne
 - **registre** : `core.registry_unavailable`, `core.registry_restored`, `core.registry_error`, `core.notices_interrupted` ;
 - **agents** : `tunnel.agent_connected`, `tunnel.refused`, `agent.certificate_renewed`, `agent.renewal_refused`, `agent.revoked`, `agent.revocation_applied` (tunnels fermés) ;
 - **enrôlement** (ADR-0008) : `enroll.token_issued`, `enroll.listener_opened`, `enroll.listener_closed`, `enroll.accepted`, `enroll.refused`, `enroll.store_unavailable` ;
-- **chaîne d'audit** (ADR-0012) : `audit.chain_started`, `audit.head_signed` (tête sous forme texte), `audit.chain_broken`, `audit.break_accepted`, `audit.break_acknowledged`, `audit.append_failed`, `audit.event_dropped`, `audit.events_lost`, `audit.head_failed` ;
+- **chaîne d'audit** (ADR-0012) : `audit.chain_started`, `audit.head_signed` (tête sous forme texte), `audit.chain_broken`, `audit.break_accepted`, `audit.break_acknowledged`, `audit.append_failed`, `audit.event_dropped`, `audit.events_lost`, `audit.head_failed`, `audit.head_timestamped`, `audit.timestamp_failed`, `audit.timestamp_restored` (horodatage RFC 3161, ADR-0012) ;
 - **accès SSH et inventaire** (ADR-0014) : `grant.key_activated`, `access.ssh_granted`, `access.ssh_refused`, `access.session_opened`, `access.session_refused`, `access.session_closed`, `ssh.host_certified`, `ssh.host_key_refused`, `login_session.revoked`, `login_session.revocation_applied`, et les changements d'inventaire.
 
 ### Écarts

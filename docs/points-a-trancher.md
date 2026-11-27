@@ -27,12 +27,6 @@ Points soulevés par l'[ADR-0012](adr/0012-chaine-d-audit-du-core.md) (chaîne d
 
 **Piste :** une option `--follow-rotation` qui accepte une nouvelle clé annoncée par un `audit.signing_started` lui-même couvert par une tête d'une clé déjà de confiance. À trancher : une clé annoncée ainsi vaut-elle une clé remise par un canal sûr ?
 
-### Horodatage RFC 3161
-
-**Situation en M1.** La trame d'export de type 3 est réservée et refusée par le vérificateur v1. Sans tiers horodateur, un core compromis peut réécrire ce qu'aucune tête externe ne couvre encore.
-
-**Pistes :** horodater périodiquement le hash de tête auprès d'une autorité interne du client (fonctionne hors ligne si elle est sur site), stocker les jetons en base et les placer dans l'export ; le vérificateur v2 les contrôle avec la chaîne de l'autorité.
-
 ### État de la chaîne hors de la base
 
 **Situation en M1.** Si les deux tables d'audit sont vidées par le propriétaire de la base, le redémarrage du core crée une nouvelle chaîne ; seuls les têtes conservées hors du bastion et l'identifiant de chaîne noté par l'auditeur le révèlent.
