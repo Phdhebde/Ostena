@@ -669,6 +669,7 @@ pub fn web_server_config(
 }
 
 pub mod directory;
+pub mod syslog;
 pub mod target;
 
 #[cfg(test)]
