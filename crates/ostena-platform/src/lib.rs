@@ -15,6 +15,7 @@ pub mod memory;
 pub mod private_file;
 pub mod service;
 pub mod tty;
+pub mod wts;
 
 pub use error::{Code, PlatformError};
 

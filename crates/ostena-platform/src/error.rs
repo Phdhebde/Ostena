@@ -21,6 +21,9 @@ pub enum Code {
     ControlIo,
     /// Control plane access refused to the caller.
     ControlDenied,
+    /// Remote Desktop sessions of a target cannot be listed or logged off
+    /// (WTS API, ADR-0026).
+    RemoteSessions,
 }
 
 impl Code {
@@ -36,6 +39,7 @@ impl Code {
             Self::ControlNotAuthentic => "AGT-E007",
             Self::ControlIo => "AGT-E008",
             Self::ControlDenied => "AGT-E009",
+            Self::RemoteSessions => "AGT-E013",
         }
     }
 }
