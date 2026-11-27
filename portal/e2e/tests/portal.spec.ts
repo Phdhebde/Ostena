@@ -102,16 +102,20 @@ for (const scheme of ["light", "dark"] as const) {
 
     test("connexion, client WebAssembly et déconnexion", async ({ page }, info) => {
       const user = userFor(info, scheme === "light" ? 1 : 2);
+      // The portal is cross-origin isolated (COOP same-origin, COEP
+      // require-corp): Firefox opens it in a new browsing context, which
+      // does not inherit the colour scheme emulated on the blank page. The
+      // scheme is set again on the portal's context, then the reload
+      // (same origin, same context) shows the first paint in that scheme.
+      await page.goto("/");
       await page.emulateMedia({ colorScheme: scheme });
-      const response = await page.goto("/");
+      const response = await page.reload();
       expect(response?.status()).toBe(200);
       expect(response?.headers()["content-security-policy"]).toContain("default-src 'none'");
+      expect(await page.evaluate((s) => matchMedia(`(prefers-color-scheme: ${s})`).matches, scheme)).toBe(true);
       await expect(page.getByRole("heading", { name: "Connexion au bastion" })).toBeVisible();
-      // Polled: Firefox may apply the emulated colour scheme after the
-      // first style computation.
-      await expect
-        .poll(() => page.evaluate(() => getComputedStyle(document.body).backgroundColor))
-        .toBe(scheme === "light" ? "rgb(250, 247, 248)" : "rgb(21, 16, 18)");
+      const background = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+      expect(background).toBe(scheme === "light" ? "rgb(250, 247, 248)" : "rgb(21, 16, 18)");
       await axe(page);
 
       await login(page, user);
