@@ -1,6 +1,6 @@
 # ADR-0022 : PDP compilé en mémoire et rôles d'administration séparés
 
-- **Statut** : Accepté en partie. Jalon M2, PR 10a : crate `ostena-policy` (modèle, compilation, décision, installation, rôles), banc. L'intégration au core (chargement depuis PostgreSQL, migration `0010`, événements d'audit, rôles en base, option de cumul) est la PR 10b.
+- **Statut** : Accepté en partie. Jalon M2, PR 10a : crate `ostena-policy` (modèle, compilation, décision, installation, rôles), banc. L'intégration au core (chargement depuis PostgreSQL, migration propre, événements d'audit, rôles en base, option de cumul) est la PR 10b.
 - **Date** : 2026-11-26
 
 ## Contexte
@@ -139,7 +139,11 @@ Trois rôles (la PR 10b étend la contrainte de `user_role`) :
 
 - À l'attribution d'un rôle, le cumul est refusé (`POL-E006`, au même titre que `CORE-E012`).
 - Au démarrage, les rôles déjà donnés sont vérifiés : un cumul **arrête le core en production** (`POL-E006`), et n'est qu'averti en développement.
-- **Option explicite** pour les petites équipes qui ne peuvent pas séparer : `[core.admin] allow_role_cumulation = true`, refusée en production sans `role_cumulation_justification` (20 caractères au moins) et `role_cumulation_expires` (date ISO 8601, 366 jours au plus), sur le modèle des noms courts du périmètre (ADR-0005). L'option est journalisée à chaque démarrage (`config.waiver`) et chaque attribution d'un rôle cumulé reste auditée (`user.role_granted`). Justification : la règle générale refuse en production toute option qui affaiblit ; ici, l'interdire sans recours pousserait ces équipes à partager un compte, ce qui détruit l'imputabilité, pire que le cumul. La dérogation est datée, motivée et visible dans l'audit.
+- **Option explicite** (décision du mainteneur du 2026-11-27), pour les petites équipes qui ne peuvent pas séparer : `[core.admin] allow_role_cumulation = true`, avec `role_cumulation_justification`, **obligatoire en production** (20 caractères au moins, espaces de début et de fin non comptés ; sinon la configuration est refusée par un code `CFG-V…`, attribué par la PR 10b). Sans l'option, le cumul est refusé en production. Avec elle :
+  - elle est journalisée **à chaque démarrage**, avec sa justification (`config.waiver`) ;
+  - elle est journalisée **à chaque usage** : chaque attribution d'un rôle cumulé (`user.role_granted`, champ `cumulation`) et chaque action d'administration faite par un compte qui cumule (`admin.role_cumulation_used`, au mieux).
+
+  Justification : la règle générale refuse en production toute option qui affaiblit ; ici, l'interdire sans recours pousserait ces équipes à partager un compte, ce qui détruit l'imputabilité, pire que le cumul. La dérogation est motivée et visible dans l'audit.
 
 La règle d'incompatibilité est dans la crate (`roles`), testée seule ; l'option, la vérification au démarrage et la base sont dans la PR 10b.
 
