@@ -388,6 +388,55 @@ jobs:
 
   # All targets in one job, 30 s each: the fuzz build is shared. Longer runs:
   # fuzz-nightly.yml.
+  # The portal end to end (ADR-0020, § 6): the release binary, which embeds
+  # the portal of the job portal, as a core with PostgreSQL; Playwright on
+  # Chromium and Firefox: login (password and TOTP), WebAssembly client,
+  # logout, refusal, themes; zero request elsewhere, zero CSP violation
+  # (browser and core), no console error, axe (WCAG 2.0/2.1 A and AA).
+  # Connected: the browsers are downloaded here and cached, never part of
+  # the offline build.
+  portal-e2e:
+    needs: [changes, release-linux]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      OSTENA_TEST_DB_SOCKET: /var/run/postgresql
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ostena-x86_64-unknown-linux-musl
+          path: bin
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: portal/.node-version
+      - name: PostgreSQL 16, local connections by peer only
+        run: |
+          sudo systemctl start postgresql.service
+          psql --version | grep -q ' 16\.'
+          sudo -u postgres createuser --createdb --createrole "$USER"
+          echo "OSTENA_TEST_DB_USER=$USER" >> "$GITHUB_ENV"
+      - working-directory: portal/e2e
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('portal/e2e/package-lock.json') }}
+      - working-directory: portal/e2e
+        run: npx --no-install playwright install --with-deps chromium firefox
+      - run: |
+          chmod +x bin/ostena
+          OSTENA_BIN="$PWD/bin/ostena" bash tests/portal/e2e.sh
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: portal-e2e-traces
+          path: portal/e2e/test-results/
+          retention-days: 7
+
   fuzz-smoke:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -853,6 +902,7 @@ jobs:
       - ssh-interop
       - core-db
       - release-linux
+      - portal-e2e
       - fuzz-smoke
       - windows
       - rdp-windows

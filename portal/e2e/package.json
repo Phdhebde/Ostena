@@ -1,0 +1,21 @@
+{
+  "name": "ostena-portal-e2e",
+  "private": true,
+  "version": "0.0.0",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.63.0"
+  },
+  "overrides": {
+    "axe-core": "4.14.0",
+    "playwright-core": "1.63.0"
+  }
+}

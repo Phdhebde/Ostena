@@ -32,9 +32,33 @@
     return e instanceof ApiError ? e.code : UNREACHABLE;
   }
 
+  // A hint that a session may be open (never the session itself, which is
+  // an HttpOnly cookie): without it, a first visit does not ask the core and
+  // gets no 401. The logout clears it (Clear-Site-Data clears it too).
+  const HINT = "ostena.session";
+  function hint(open: boolean) {
+    try {
+      if (open) {
+        window.sessionStorage.setItem(HINT, "1");
+      } else {
+        window.sessionStorage.removeItem(HINT);
+      }
+    } catch {
+      // Storage refused: the portal works without the hint.
+    }
+  }
+  function hinted(): boolean {
+    try {
+      return window.sessionStorage.getItem(HINT) === "1";
+    } catch {
+      return false;
+    }
+  }
+
   onMount(async () => {
     try {
-      session = await currentSession();
+      session = hinted() ? await currentSession() : null;
+      hint(session !== null);
     } catch (e) {
       error = codeOf(e);
     } finally {
@@ -51,6 +75,7 @@
     error = null;
     try {
       session = await login(username.trim(), password, totp.trim());
+      hint(true);
     } catch (e) {
       error = codeOf(e);
     } finally {
@@ -66,6 +91,7 @@
     error = null;
     try {
       await logout();
+      hint(false);
       session = null;
     } catch (e) {
       error = codeOf(e);
