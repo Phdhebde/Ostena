@@ -40,6 +40,36 @@ impl std::fmt::Debug for Transport {
     }
 }
 
+/// A PDU is at most `MAX_PDU`; more pending bytes than a few PDUs means
+/// the reader is not consuming: refuse rather than grow.
+fn bounded(pending: &[u8]) -> Result<(), RdpError> {
+    if pending.len() > 4 * MAX_PDU {
+        return Err(RdpError::Protocol("données en attente hors bornes".into()));
+    }
+    Ok(())
+}
+
+/// Moves the plain bytes TLS holds to `pending`, counting them in `plain`;
+/// `true` once the target sent its close notification.
+fn drain_plain(
+    tls: &mut ClientConnection,
+    pending: &mut Vec<u8>,
+    plain: &mut usize,
+) -> Result<bool, RdpError> {
+    let mut chunk = [0u8; CHUNK];
+    loop {
+        match tls.reader().read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(n) => {
+                *plain += n;
+                pending.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) => return Err(io_error(&e)),
+        }
+    }
+}
+
 fn io_error(e: &io::Error) -> RdpError {
     RdpError::Unreachable(e.kind().to_string())
 }
@@ -129,43 +159,32 @@ impl Transport {
             return self.check_pending();
         };
         let mut slice = bytes;
+        let mut plain = 0usize;
         while !slice.is_empty() {
             tls.read_tls(&mut slice).map_err(|e| io_error(&e))?;
             tls.process_new_packets()
                 .map_err(|e| RdpError::Tls(e.to_string()))?;
-        }
-        let mut chunk = [0u8; CHUNK];
-        let mut plain = 0usize;
-        loop {
-            match tls.reader().read(&mut chunk) {
+            // Drained after each batch of records: TLS keeps at most 16 KiB
+            // of plain bytes and refuses to read more until they are taken
+            // (a graphics burst after the logon fills one TCP read).
+            let closed = drain_plain(tls, &mut self.pending, &mut plain)?;
+            bounded(&self.pending)?;
+            if closed {
                 // The close notification may come in the same read as the
                 // last PDUs (error information, disconnection): they are
                 // kept, and the end reported by the next fill.
-                Ok(0) if plain > 0 => {
-                    self.closed = true;
-                    break;
-                }
-                Ok(0) => {
+                if plain == 0 {
                     return Err(RdpError::Unreachable("TLS fermée par la cible".into()));
                 }
-                Ok(n) => {
-                    plain += n;
-                    self.pending.extend_from_slice(&chunk[..n]);
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(io_error(&e)),
+                self.closed = true;
+                break;
             }
         }
         self.check_pending()
     }
 
     fn check_pending(&self) -> Result<(), RdpError> {
-        // A PDU is at most MAX_PDU; more pending bytes than a few PDUs
-        // means the reader is not consuming: refuse rather than grow.
-        if self.pending.len() > 4 * MAX_PDU {
-            return Err(RdpError::Protocol("données en attente hors bornes".into()));
-        }
-        Ok(())
+        bounded(&self.pending)
     }
 
     /// The plain bytes received and not consumed.
@@ -290,5 +309,65 @@ pub async fn read_pdu(
             }
         }
         transport.fill().await?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests")]
+
+    use ostena_crypto::tls::ServerConnection;
+    use ostena_crypto::tls::target::testing::{KeyKind, Versions, self_signed, server_config};
+    use ostena_crypto::tls::target::{TargetTrust, target_client_config};
+
+    use super::*;
+
+    const NAME: &str = "target.example.test";
+    const SMALL: usize = 1024;
+    const SMALLS: usize = 8;
+
+    /// A full record (16 KiB of plain bytes) whose end comes in the same
+    /// TCP read as smaller records: more than TLS keeps before it is
+    /// drained, all read (a graphics burst after the logon).
+    #[tokio::test]
+    async fn a_burst_beyond_the_tls_plain_buffer_is_read() {
+        let identity = self_signed(KeyKind::EcdsaP256, NAME).unwrap();
+        let pin = identity.fingerprint();
+        // TLS 1.2: no ticket after the handshake, every record below is
+        // the next one the client expects.
+        let config = server_config(&identity, Versions::Tls12).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().unwrap();
+            let mut tls = ServerConnection::new(config).unwrap();
+            while tls.is_handshaking() {
+                tls.complete_io(&mut tcp).unwrap();
+            }
+            tls.writer().write_all(&[1u8; CHUNK]).unwrap();
+            for _ in 0..SMALLS {
+                tls.writer().write_all(&[2u8; SMALL]).unwrap();
+            }
+            let mut records = Vec::new();
+            while tls.wants_write() {
+                tls.write_tls(&mut records).unwrap();
+            }
+            records
+        });
+        let mut transport = Transport::new(TcpStream::connect(addr).await.unwrap());
+        let (client, check) = target_client_config(&TargetTrust::Pinned(pin)).unwrap();
+        transport
+            .start_tls(client, ServerName::try_from(NAME).unwrap(), &check)
+            .await
+            .unwrap();
+        let records = server.join().unwrap();
+        // The first read ends inside the full record, the second brings
+        // its end and every small record.
+        let cut = records.len() - SMALLS * (SMALL + 64) - 256;
+        transport.absorb(&records[..cut]).unwrap();
+        transport.absorb(&records[cut..]).unwrap();
+        assert_eq!(transport.pending().len(), CHUNK + SMALLS * SMALL);
+        assert!(transport.pending()[..CHUNK].iter().all(|b| *b == 1));
+        assert!(transport.pending()[CHUNK..].iter().all(|b| *b == 2));
     }
 }
