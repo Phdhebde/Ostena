@@ -29,7 +29,7 @@ use crate::transport::{ChannelRecv, ChannelSend, Conn, Transport, TransportMode}
 pub const ALPN: &[u8] = b"ostena-tunnel/1";
 
 /// QUIC application close code when a side closes on an error.
-const CLOSE_ERROR: u32 = 1;
+pub(crate) const CLOSE_ERROR: u32 = 1;
 /// Messages buffered for the application before the reader waits.
 const INBOX: usize = 64;
 /// TLS handshakes over TCP the core runs at once; more connections wait.

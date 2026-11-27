@@ -13,11 +13,13 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hyper::header::{COOKIE, HeaderMap};
 use ostena_common::api::web::{
-    LoginSessionList, ReauthenticateRequest, Role, SessionInfo, SessionRequest,
+    AccessGrant, AccessRequest, LoginSessionList, ReauthenticateRequest, Role, SessionInfo,
+    SessionRequest,
 };
 use ostena_tunnel::Uuid;
 use zeroize::Zeroizing;
 
+use super::WebError;
 use crate::api::ApiError;
 
 /// Name of the session cookie. The `__Host-` prefix makes the browser
@@ -241,6 +243,23 @@ pub trait WebBackend: Send + Sync + 'static {
         id: Uuid,
         reason: &str,
     ) -> impl Future<Output = Result<bool, ApiError>> + Send;
+
+    /// Decides an access to `account@resource` for `session`, asked from
+    /// `peer` (`POST /api/v1/access`): a grant for the browser gateway. A
+    /// store without access decision refuses (`GTW-E003`).
+    fn grant_access(
+        &self,
+        session: &SessionRecord,
+        request: AccessRequest,
+        peer: SocketAddr,
+    ) -> impl Future<Output = Result<AccessGrant, WebError>> + Send {
+        let _ = (session, request, peer);
+        std::future::ready(Err(WebError::refused(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            crate::access::NO_AGENT,
+            crate::access::label(crate::access::NO_AGENT),
+        )))
+    }
 }
 
 #[cfg(test)]

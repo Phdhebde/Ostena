@@ -550,6 +550,40 @@ async fn start_core_link(
     true
 }
 
+/// Serves the browser streams the core opens (ADR-0020, § 4): each grant
+/// is verified and consumed in the journal, then refused with `GTW-E006`
+/// as long as no browser driver ships (the SSH terminal and the RDP display
+/// come with PR 13). `None` without link to the core.
+fn serve_browser_streams(
+    gateway: Arc<std::sync::OnceLock<ostena_tunnel::gateway::Gateway>>,
+    journal: Arc<FileReplayStore>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use ostena_tunnel::browser::{self, NoDriver};
+    let mut incoming = gateway.get()?.link().take_incoming()?;
+    Some(tokio::spawn(async move {
+        while let Some((_, class, channel)) = incoming.recv().await {
+            // Only the core opens channels, and only browser streams.
+            if class != ostena_tunnel::StreamClass::Interactive {
+                tracing::warn!(event = "agent.channel_refused", class = ?class);
+                continue;
+            }
+            let (gateway, journal) = (gateway.clone(), journal.clone());
+            tokio::spawn(async move {
+                if let Some(gateway) = gateway.get() {
+                    browser::serve(
+                        gateway,
+                        channel,
+                        &*journal,
+                        &NoDriver,
+                        ostena_grant::unix_now(),
+                    )
+                    .await;
+                }
+            });
+        }
+    }))
+}
+
 /// Starts the native SSH server when configured (ADR-0010): its keys and its
 /// addresses must be usable, or the agent does not start (`Err`).
 #[cfg(feature = "ssh")]
@@ -592,8 +626,6 @@ async fn serve_until_stopped(
     ready: Box<dyn FnOnce() + Send>,
 ) -> bool {
     let Running { info, journal } = running;
-    #[cfg(not(feature = "ssh"))]
-    let _ = journal;
     let listener = match ControlListener::bind(endpoint) {
         Ok(l) => Arc::new(l),
         Err(e) => {
@@ -614,11 +646,17 @@ async fn serve_until_stopped(
         refresher.abort();
         return false;
     }
+    let browsers = serve_browser_streams(info.gateway.clone(), journal.clone());
     #[cfg(feature = "ssh")]
     let Ok(ssh) = start_ssh(agent, &info, journal).await else {
         refresher.abort();
+        if let Some(browsers) = browsers {
+            browsers.abort();
+        }
         return false;
     };
+    #[cfg(not(feature = "ssh"))]
+    drop(journal);
     let server = tokio::spawn(control::serve(Arc::clone(&listener), Arc::clone(&info)));
     let footprint = tokio::spawn(async {
         tokio::time::sleep(IDLE_FOOTPRINT_DELAY).await;
@@ -668,6 +706,9 @@ async fn serve_until_stopped(
         link.stop().await;
     }
     refresher.abort();
+    if let Some(browsers) = browsers {
+        browsers.abort();
+    }
     footprint.abort();
     server.abort();
     let _ = server.await;

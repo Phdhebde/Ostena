@@ -9,31 +9,90 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use hyper::StatusCode;
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
 use ostena_common::api::web::{
-    Channel, LoginSessionItem, LoginSessionList, MAX_LISTED_SESSIONS, ReauthenticateRequest, Role,
-    SessionRequest,
+    AccessGrant, AccessProtocol, AccessRequest, Channel, LoginSessionItem, LoginSessionList,
+    MAX_LISTED_SESSIONS, ReauthenticateRequest, Role, SessionRequest,
 };
 use ostena_tunnel::Uuid;
 
+use super::WebError;
 use super::session::{SessionEnd, SessionRecord, WebBackend};
+use crate::access::{self, Refusal, WebRequest};
 use crate::api::ApiError;
 use crate::audit::{self, CORE_ACTOR};
 use crate::authn::{Opening, PgAuthenticator};
 use crate::error::CoreError;
+use crate::grant_keys::GrantAuthority;
+use crate::rate;
 use crate::store::{Notice, i64_of, notify_notice, truncate, unix_now, uuid};
+
+/// The agents connected to the core, as the web listener sees them; the
+/// running core implements it on its tunnels.
+pub trait Agents: Send + Sync + 'static {
+    /// A connected agent of `group`, the least busy; `None` if none is.
+    fn pick(&self, group: Uuid) -> Option<Uuid>;
+}
+
+/// What the access decisions of the portal need (ADR-0020, § 4).
+pub struct WebAccess {
+    /// The grant signing key of the core.
+    pub grants: Arc<GrantAuthority>,
+    /// The connected agents.
+    pub agents: Arc<dyn Agents>,
+}
+
+impl std::fmt::Debug for WebAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebAccess").finish_non_exhaustive()
+    }
+}
+
+/// Access requests of one browser session: 10 at once, then one every
+/// six seconds.
+pub const ACCESS_REQUESTS: rate::Rate = rate::Rate {
+    burst: 10,
+    refill: std::time::Duration::from_secs(6),
+};
 
 /// The browser sessions in PostgreSQL.
 #[derive(Debug)]
 pub struct PgWebBackend {
     auth: Arc<PgAuthenticator>,
+    access: Option<WebAccess>,
+    requests: rate::Limiter,
 }
 
 impl PgWebBackend {
-    /// The store behind `auth`, the authenticator of `[core.login]`.
+    /// The store behind `auth`, the authenticator of `[core.login]`,
+    /// without access decision (`POST /api/v1/access` answers `GTW-E003`).
     pub fn new(auth: Arc<PgAuthenticator>) -> Self {
-        Self { auth }
+        Self {
+            auth,
+            access: None,
+            requests: rate::Limiter::new(ACCESS_REQUESTS),
+        }
     }
+
+    /// The same store, deciding the accesses of the portal with `access`.
+    #[must_use]
+    pub fn with_access(mut self, access: WebAccess) -> Self {
+        self.access = Some(access);
+        self
+    }
+}
+
+/// The answer to a refused access: the stable code and its generic label;
+/// the reason goes to the audit chain only.
+fn access_refused(refusal: &Refusal) -> WebError {
+    let status = match refusal.code {
+        access::NO_AGENT => StatusCode::SERVICE_UNAVAILABLE,
+        access::RATE_LIMITED => StatusCode::TOO_MANY_REQUESTS,
+        code if code.starts_with("ACC-") || code.starts_with("INV-") => StatusCode::FORBIDDEN,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    WebError::refused(status, refusal.code, access::label(refusal.code))
 }
 
 fn broken(e: &CoreError) -> ApiError {
@@ -319,5 +378,81 @@ impl WebBackend for PgWebBackend {
         self.revoke_with(id, revocation)
             .await
             .map_err(|e| broken(&e))
+    }
+
+    async fn grant_access(
+        &self,
+        session: &SessionRecord,
+        request: AccessRequest,
+        peer: SocketAddr,
+    ) -> Result<AccessGrant, WebError> {
+        let request_of = WebRequest {
+            subject: session.user,
+            login_session: session.login_session,
+            account: request.account,
+            resource: request.resource,
+            client_address: peer.to_string(),
+        };
+        let decided = match &self.access {
+            None => Err(Refusal {
+                code: access::NO_AGENT,
+                reason: "décision d'accès du portail non configurée".into(),
+            }),
+            Some(_)
+                if self
+                    .requests
+                    .check(session.login_session, std::time::Instant::now())
+                    != rate::Decision::Allowed =>
+            {
+                Err(Refusal {
+                    code: access::RATE_LIMITED,
+                    reason: "demandes d'accès de la session au-delà de la limite".into(),
+                })
+            }
+            Some(web) => {
+                access::web_grant(
+                    self.auth.pool(),
+                    &web.grants,
+                    &request_of,
+                    |group| web.agents.pick(group),
+                    unix_now(),
+                )
+                .await
+            }
+        };
+        match decided {
+            Ok(issued) => {
+                self.auth.recorder().critical(&[issued.appended]);
+                tracing::info!(
+                    event = "access.web_granted",
+                    login_session = %session.login_session,
+                    jti = %issued.content.jti,
+                    agent = %issued.agent,
+                );
+                Ok(AccessGrant {
+                    grant: issued.grant,
+                    resource: request_of.resource,
+                    account: request_of.account,
+                    protocol: AccessProtocol::Ssh,
+                    expires_at: issued.content.expires_at,
+                    max_session_secs: issued.content.claims.max_session_secs,
+                })
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    event = "access.web_refused",
+                    login_session = %session.login_session,
+                    code = refusal.code,
+                    "{}",
+                    refusal.reason
+                );
+                if refusal.code != access::RATE_LIMITED {
+                    self.auth
+                        .recorder()
+                        .emit(access::web_refused_event(&request_of, &refusal));
+                }
+                Err(access_refused(&refusal))
+            }
+        }
     }
 }

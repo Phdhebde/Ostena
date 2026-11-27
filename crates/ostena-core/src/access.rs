@@ -95,6 +95,7 @@ pub fn label(code: &str) -> &'static str {
         NO_HOST_NAME => "aucun nom d'hôte SSH pour le groupe",
         RATE_LIMITED => "trop de demandes de cet agent",
         FUNCTIONS_REDUCED => "fonctions du droit réduites depuis le grant",
+        NO_AGENT => "aucun agent du groupe joignable",
         _ => "accès refusé",
     }
 }
@@ -120,6 +121,8 @@ pub const RATE_LIMITED: &str = "ACC-E009";
 /// `ACC-E010`: no valid right keeps every function the grant carries (a
 /// right revoked or replaced by one with fewer functions since the grant).
 pub const FUNCTIONS_REDUCED: &str = "ACC-E010";
+/// `GTW-E003`: no agent of the group connected to the core (ADR-0020).
+pub const NO_AGENT: &str = "GTW-E003";
 /// `INV-E001`: resource unknown (or disabled).
 pub const RESOURCE_UNKNOWN: &str = "INV-E001";
 /// `INV-E002`: resource of another gateway group.
@@ -541,6 +544,155 @@ pub async fn ssh_grant(
     })
 }
 
+/// What a browser session asks (`POST /api/v1/access`, ADR-0020): the
+/// user and the login session come from the session cookie, checked by the
+/// web listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebRequest {
+    /// The user of the browser session.
+    pub subject: Uuid,
+    /// Its login session (channel `web`).
+    pub login_session: Uuid,
+    /// Account on the target.
+    pub account: String,
+    /// Resource name.
+    pub resource: String,
+    /// Address of the browser.
+    pub client_address: String,
+}
+
+/// A grant issued for a browser session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebIssued {
+    /// The grant, text form.
+    pub grant: String,
+    /// Its content.
+    pub content: Grant,
+    /// The agent chosen to open the session (another agent of the group
+    /// may open it if this one is gone).
+    pub agent: Uuid,
+    /// The audit record, for the head signer.
+    pub appended: Appended,
+}
+
+fn web_event(kind: EventKind, outcome: Outcome, request: &WebRequest) -> Event {
+    Event::new(kind, outcome, ActorKind::User, request.subject.to_string())
+        .uuid(field::USER_ID, request.subject.to_bytes())
+        .uuid(field::LOGIN_SESSION, request.login_session.to_bytes())
+        .text(field::CHANNEL, "web")
+        .text(field::RESOURCE, truncate(&request.resource))
+        .text(field::ACCOUNT, truncate(&request.account))
+        .text(field::CLIENT_ADDR, truncate(&request.client_address))
+}
+
+/// The `access.web_refused` record of a refused browser request.
+pub fn web_refused_event(request: &WebRequest, refusal: &Refusal) -> Event {
+    web_event(EventKind::AccessWebRefused, Outcome::Refused, request)
+        .text(field::CODE, refusal.code)
+        .text(field::REASON, truncate(&refusal.reason))
+}
+
+/// Decides `request` at `now` as for native SSH ([`ssh_grant`]): the user,
+/// its login session, the resource, the account and a valid SSH right are
+/// read and locked in one transaction. On success, a grant for the group of
+/// the resource, bound to the login session and the account, is recorded
+/// by jti with channel `web` and its granting `access.web_granted` record.
+/// `pick` chooses a connected agent of the group: without one, nothing is
+/// issued (`GTW-E003`).
+///
+/// # Errors
+///
+/// The refusal; the caller records `access.web_refused`
+/// ([`web_refused_event`]).
+pub async fn web_grant(
+    pool: &PgPool,
+    authority: &GrantAuthority,
+    request: &WebRequest,
+    pick: impl FnOnce(Uuid) -> Option<Uuid>,
+    now: u64,
+) -> Result<WebIssued, Refusal> {
+    let mut tx = pool.begin().await?;
+    // Lock order (ADR-0014): the user, then the login session.
+    let user = UserLock::take(&mut tx, request.subject).await?;
+    let login_expires =
+        login_session(&mut tx, request.login_session, request.subject, None, now).await?;
+    user.active()?;
+    let allowed = allowed(
+        &mut tx,
+        request.subject,
+        &request.resource,
+        &request.account,
+        None,
+        // The browser gateway carries no function beyond the terminal yet.
+        Functions::NONE,
+        now,
+    )
+    .await?;
+    let group = allowed.group;
+    let agent = pick(group).ok_or_else(|| {
+        Refusal::new(
+            NO_AGENT,
+            format!("aucun agent du groupe {group} connecté au core"),
+        )
+    })?;
+    let max_session_secs = session_secs(
+        &[u64::from(allowed.max_session_secs)],
+        login_expires.saturating_sub(now),
+    );
+    let claims = Claims {
+        subject: SubjectId::from_bytes(request.subject.to_bytes()),
+        resource: ResourceId::from_bytes(allowed.resource.to_bytes()),
+        audience: GatewayGroupId::from_bytes(group.to_bytes()),
+        protocol: Protocol::Ssh,
+        rights: Rights::NONE,
+        max_session_secs,
+        binding: Binding::of(request.login_session.to_bytes(), &request.account),
+    };
+    let (content, signed) = authority
+        .issuer()
+        .issue_grant(&claims, now)
+        .map_err(|e| Refusal::new("CORE-E006", format!("signature du grant : {e}")))?;
+    sqlx::query!(
+        "INSERT INTO access_grant (jti, login_session_id, right_id, agent_id, gateway_group,
+                                   resource_id, account, protocol, max_session_secs,
+                                   issued_at, expires_at, channel)
+         VALUES ($1, $2::text::uuid, $3::text::uuid, $4::text::uuid, $5::text::uuid,
+                 $6::text::uuid, $7, 'ssh', $8, $9, $10, 'web')",
+        &content.jti.to_bytes()[..],
+        request.login_session.to_string(),
+        allowed.right.to_string(),
+        agent.to_string(),
+        group.to_string(),
+        allowed.resource.to_string(),
+        request.account,
+        i32::try_from(max_session_secs).unwrap_or(i32::MAX),
+        i64_of(content.issued_at),
+        i64_of(content.expires_at),
+    )
+    .execute(&mut *tx)
+    .await?;
+    let event = web_event(EventKind::AccessWebGranted, Outcome::Success, request)
+        .text(field::PROTOCOL, "ssh")
+        .bytes(field::JTI, content.jti.to_bytes())
+        .uuid(field::RIGHT_ID, allowed.right.to_bytes())
+        .uuid(field::RESOURCE_ID, allowed.resource.to_bytes())
+        .uuid(field::GROUP_ID, group.to_bytes())
+        .uuid(field::AGENT_ID, agent.to_bytes())
+        .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
+        .u64(field::EXPIRES_AT, content.expires_at);
+    // Granting, last statement before the commit.
+    let appended = audit::append(&mut tx, event).await?;
+    tx.commit()
+        .await
+        .map_err(|e| Refusal::new("CORE-E010", e.to_string()))?;
+    Ok(WebIssued {
+        grant: signed.to_text(),
+        content,
+        agent,
+        appended,
+    })
+}
+
 /// The parameters of an opened session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opened {
@@ -856,6 +1008,7 @@ mod tests {
             GRANT_UNKNOWN,
             RATE_LIMITED,
             FUNCTIONS_REDUCED,
+            NO_AGENT,
             RESOURCE_UNKNOWN,
             OTHER_GROUP,
             ACCOUNT_UNKNOWN,

@@ -15,32 +15,51 @@ mod web_stub;
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use common::{TestDb, block_on};
 use hyper::StatusCode;
-use ostena_common::api::web::{LoginSessionList, Role, SessionInfo};
+use ostena_common::api::web::{AccessGrant, LoginSessionList, Role, SessionInfo};
 use ostena_common::config::CoreLoginConfig;
 use ostena_common::secret::{SecretBytes, SecretString};
 use ostena_core::api::Attempts;
 use ostena_core::audit::{self, Recorder};
 use ostena_core::authn::PgAuthenticator;
+use ostena_core::cache::AgentCache;
 use ostena_core::credential::{self, TotpKey};
+use ostena_core::functions::Functions;
+use ostena_core::grant_keys::GrantAuthority;
 use ostena_core::inventory;
 use ostena_core::ssh_ca::SshAuthorities;
-use ostena_core::web::pg::PgWebBackend;
+use ostena_core::store::PgStore;
+use ostena_core::web::pg::{Agents, PgWebBackend, WebAccess};
 use ostena_core::web::{WebListener, WebSettings};
 use ostena_crypto::p256::SigningKey;
 use ostena_crypto::pki::testing::TestPki;
 use ostena_crypto::tls::testing::{Offer, browser_client_config};
 use ostena_crypto::tls::{self, WebGroups};
 use ostena_crypto::totp::{TotpAlgorithm, TotpSecret, step_at};
+use ostena_grant::{Binding, GatewayGroupId, Issuer, SignedGrant, Verifier};
+use ostena_tunnel::Uuid;
+use ostena_tunnel::enroll::AgentRegistry;
 use sqlx::PgPool;
 use web_stub::{Connection, ORIGIN, bare, request};
 
 const PASSWORD: &str = "correct horse battery";
+const GROUP: Uuid = Uuid::from_bytes([0x2f; 16]);
+const AGENT: Uuid = Uuid::from_bytes([0xa1; 16]);
+
+/// The agents of the test: `AGENT` of `GROUP`, connected or not.
+struct FakeAgents(AtomicBool);
+
+impl Agents for FakeAgents {
+    fn pick(&self, group: Uuid) -> Option<Uuid> {
+        (group == GROUP && self.0.load(Ordering::Relaxed)).then_some(AGENT)
+    }
+}
 
 fn now() -> u64 {
     ostena_grant::unix_now()
@@ -69,6 +88,8 @@ struct Fixture {
     pki: TestPki,
     listener: WebListener,
     totp: Vec<(String, TotpSecret)>,
+    agents: Arc<FakeAgents>,
+    grants: Arc<GrantAuthority>,
 }
 
 async fn enroll(pool: &PgPool, key: &TotpKey, name: &str) -> TotpSecret {
@@ -118,13 +139,47 @@ async fn fixture(test: &str) -> Option<Fixture> {
     );
     let auth = PgAuthenticator::new(pool.clone(), recorder.clone(), ssh, key, &settings())
         .with_refusal_floor(Duration::ZERO);
+    // The inventory of the access requests: alice has a right on
+    // root@srv-lab01, none on backup@srv-lab01.
+    let store = PgStore::new(pool.clone(), Arc::new(AgentCache::default()));
+    store.register([1; 32], GROUP, AGENT).await.unwrap();
+    inventory::create_group(&pool, Some(GROUP), "lab", &["bastion.lab".into()])
+        .await
+        .unwrap();
+    let target = SigningKey::generate().unwrap().0.verifying_key();
+    inventory::add_resource(&pool, "srv-lab01", "10.20.0.5", 22, "lab", &target)
+        .await
+        .unwrap();
+    for account in ["root", "backup"] {
+        inventory::add_account(&pool, "srv-lab01", account)
+            .await
+            .unwrap();
+    }
+    inventory::grant_right(
+        &pool,
+        "alice",
+        "srv-lab01",
+        "root",
+        now() + 86_400,
+        3600,
+        Functions::NONE,
+    )
+    .await
+    .unwrap();
+    let issuer = Arc::new(Issuer::new(SigningKey::generate().unwrap().0));
+    let grants = Arc::new(GrantAuthority::load(&pool, issuer).await.unwrap().0);
+    let agents = Arc::new(FakeAgents(AtomicBool::new(true)));
+    let access = WebAccess {
+        grants: grants.clone(),
+        agents: agents.clone(),
+    };
     let pki = TestPki::new("web-pg").unwrap();
     let server = pki.server(&["core.test"]).unwrap();
     let listener = WebListener::bind(
         "127.0.0.1:0".parse().unwrap(),
         tls::web_server_config(&server, WebGroups::Hybrid).unwrap(),
         WebSettings::new(ORIGIN.into()),
-        Arc::new(PgWebBackend::new(Arc::new(auth))),
+        Arc::new(PgWebBackend::new(Arc::new(auth)).with_access(access)),
         Arc::new(Attempts::new(600)),
     )
     .await
@@ -136,6 +191,8 @@ async fn fixture(test: &str) -> Option<Fixture> {
         pki,
         listener,
         totp,
+        agents,
+        grants,
     })
 }
 
@@ -433,6 +490,123 @@ fn administrators_revoke_and_disabling_ends_sessions() {
         f.flushed().await;
         assert_eq!(audit_count(&f.pool, "user.role_granted").await, 1);
         assert_eq!(audit_count(&f.pool, "user.role_revoked").await, 1);
+        f.end().await;
+    });
+}
+
+/// `POST /api/v1/access` of `account@srv-lab01` for `cookie`.
+async fn ask_access(f: &Fixture, cookie: &str, account: &str) -> web_stub::Reply {
+    let body = format!(r#"{{"resource":"srv-lab01","account":"{account}","protocol":"ssh"}}"#);
+    f.connect("127.0.0.1")
+        .await
+        .send(request("POST", "/api/v1/access", Some(cookie), &body))
+        .await
+}
+
+#[test]
+fn an_access_of_the_portal_issues_a_web_grant() {
+    block_on(async {
+        let Some(f) = fixture("web_pg_access").await else {
+            return;
+        };
+        let (cookie, info) = f.login("alice", "127.0.0.1").await;
+        let reply = ask_access(&f, &cookie, "root").await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.code());
+        let granted = AccessGrant::parse(&reply.body).unwrap();
+        assert_eq!(granted.grant.len(), ostena_grant::TEXT_LEN);
+        assert_eq!(
+            (granted.max_session_secs, granted.account.as_str()),
+            (3600, "root")
+        );
+        // A grant of the group, bound to the browser session and the account.
+        let verifier = Verifier::new(
+            f.grants.keys().clone(),
+            GatewayGroupId::from_bytes(GROUP.to_bytes()),
+            ostena_grant::Policy::default(),
+        );
+        let signed = SignedGrant::from_text(&granted.grant).unwrap();
+        let grant = verifier.check(signed.as_bytes(), now()).unwrap();
+        let login = Uuid::parse(&info.login_session).unwrap();
+        assert_eq!(grant.claims.binding, Binding::of(login.to_bytes(), "root"));
+        assert_eq!(grant.expires_at, granted.expires_at);
+        // Recorded with channel web, for the agent chosen, not presented.
+        let (channel, agent, presented): (String, String, Option<i64>) = sqlx::query_as(
+            "SELECT channel, agent_id::text, presented_at FROM access_grant WHERE jti = $1",
+        )
+        .bind(&grant.jti.to_bytes()[..])
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!((channel.as_str(), presented), ("web", None));
+        assert_eq!(agent, AGENT.to_string());
+        f.flushed().await;
+        assert_eq!(audit_count(&f.pool, "access.web_granted").await, 1);
+
+        // The agent opens the session as for native SSH: the web grant
+        // goes the common way (ADR-0014).
+        let opened = ostena_core::access::open_session(
+            &f.pool,
+            &f.grants,
+            AGENT,
+            GROUP,
+            1,
+            &granted.grant,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            opened.params,
+            ostena_tunnel::control::CoreMessage::SessionParams { .. }
+        ));
+
+        // Refusals: a code and its generic label, the reason in the audit.
+        let reply = ask_access(&f, &cookie, "backup").await;
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (StatusCode::FORBIDDEN, "ACC-E006")
+        );
+        assert!(!String::from_utf8_lossy(&reply.body).contains("backup"));
+        let body = r#"{"resource":"srv-absent","account":"root","protocol":"ssh"}"#;
+        let reply = f
+            .connect("127.0.0.1")
+            .await
+            .send(request("POST", "/api/v1/access", Some(&cookie), body))
+            .await;
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (StatusCode::FORBIDDEN, "INV-E001")
+        );
+        f.agents.0.store(false, Ordering::Relaxed);
+        let reply = ask_access(&f, &cookie, "root").await;
+        assert_eq!(
+            (reply.status, reply.code().as_str()),
+            (StatusCode::SERVICE_UNAVAILABLE, "GTW-E003")
+        );
+        f.flushed().await;
+        assert_eq!(audit_count(&f.pool, "access.web_refused").await, 3);
+        // Without a session, nothing is decided.
+        let reply = f
+            .connect("127.0.0.1")
+            .await
+            .send(request(
+                "POST",
+                "/api/v1/access",
+                None,
+                r#"{"resource":"srv-lab01","account":"root","protocol":"ssh"}"#,
+            ))
+            .await;
+        assert_eq!(reply.code(), "WEB-E001");
+        // The requests of one session are limited.
+        f.agents.0.store(true, Ordering::Relaxed);
+        let mut limited = false;
+        for _ in 0..12 {
+            if ask_access(&f, &cookie, "root").await.status == StatusCode::TOO_MANY_REQUESTS {
+                limited = true;
+                break;
+            }
+        }
+        assert!(limited, "no limit on the access requests");
         f.end().await;
     });
 }

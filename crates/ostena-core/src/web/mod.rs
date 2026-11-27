@@ -43,7 +43,7 @@ use hyper::header::{
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use ostena_common::api::web::{
-    ErrorBody, ReauthenticateRequest, RevokeRequest, SessionRequest, WireError,
+    AccessRequest, ErrorBody, ReauthenticateRequest, RevokeRequest, SessionRequest, WireError,
 };
 use ostena_common::config::CoreWebConfig;
 use ostena_crypto::tls::ServerConfig;
@@ -179,6 +179,21 @@ pub struct WebError {
 }
 
 impl WebError {
+    /// A refusal with its status, stable code and message (generic: the
+    /// reason, if any, is for the audit chain).
+    pub fn refused(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The stable code.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
     fn body(error: &WireError) -> Self {
         let status = if *error == WireError::TooLarge {
             StatusCode::PAYLOAD_TOO_LARGE
@@ -759,6 +774,15 @@ async fn run<B: WebBackend>(
         Handler::ListLoginSessions => {
             let list = c.shared.backend.login_sessions().await?;
             Ok(json(StatusCode::OK, &list))
+        }
+        Handler::Access => {
+            let request = AccessRequest::parse(body).map_err(|e| WebError::body(&e))?;
+            let grant = c
+                .shared
+                .backend
+                .grant_access(c.session()?, request, c.peer)
+                .await?;
+            Ok(json(StatusCode::OK, &grant))
         }
         Handler::RevokeLoginSession => {
             let request = RevokeRequest::parse(body).map_err(|e| WebError::body(&e))?;

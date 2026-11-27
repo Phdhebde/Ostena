@@ -1,5 +1,5 @@
-//! ostena-tunnel: control message and channel header decoding on arbitrary
-//! input (messages from the peer are untrusted).
+//! ostena-tunnel: control message, channel header and browser stream
+//! decoding on arbitrary input (messages from the peer are untrusted).
 
 #![no_main]
 

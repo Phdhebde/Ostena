@@ -444,6 +444,10 @@ pub enum SessionError {
     /// The core answered parameters that do not match the grant.
     #[error("[TUN-E010] réponse du core incohérente avec le grant : {0}")]
     Mismatch(&'static str),
+    /// A browser session of a protocol that this agent does not serve in
+    /// the browser (ADR-0020).
+    #[error("[GTW-E006] protocole non servi dans le navigateur par cet agent")]
+    Unsupported,
 }
 
 impl SessionError {
@@ -455,6 +459,7 @@ impl SessionError {
             Self::Tunnel(e) => e.code().to_owned(),
             Self::Core { code, .. } => code.clone(),
             Self::Mismatch(_) => "TUN-E010".to_owned(),
+            Self::Unsupported => "GTW-E006".to_owned(),
         }
     }
 }
@@ -702,6 +707,32 @@ impl Gateway {
         Ok(self.request(grant, verified).await?.session)
     }
 
+    /// Opens a browser session (ADR-0020, § 4) for `grant`, presented by the
+    /// core on a browser stream: verified here and its jti consumed in
+    /// `store`; a protocol that `serves` refuses stops there (`GTW-E006`),
+    /// before the core is asked; then the common path of
+    /// [`Gateway::open_session`].
+    ///
+    /// # Errors
+    ///
+    /// The first refusal, see [`SessionError`].
+    pub async fn open_browser_session<S: ReplayStore>(
+        &self,
+        grant: &str,
+        now: u64,
+        store: &S,
+        serves: impl Fn(ostena_grant::Protocol) -> bool,
+    ) -> Result<Session, SessionError> {
+        self.ready()?;
+        // Verified and consumed even if the protocol is not served: a grant
+        // presented once is burned.
+        let verified = self.state.verify_grant(grant, now, store).await?;
+        if !serves(verified.claims.protocol) {
+            return Err(SessionError::Unsupported);
+        }
+        Ok(self.request(grant, verified).await?.session)
+    }
+
     /// Opens a native SSH session (ADR-0010): asks the core for a grant for
     /// `access` (`ssh_grant_request`), which must name the subject of the
     /// certificate and SSH and be bound to its login session and the account
@@ -797,11 +828,25 @@ impl Gateway {
     /// Reports to the core that session `session_id`, which it opened, ends
     /// before it started (best effort: on a lost tunnel, the report is lost too).
     async fn abandon(&self, session_id: Uuid, error: &SessionError) {
+        self.report_closed(session_id, format!("ouverture interrompue : {error}"), 0, 0)
+            .await;
+    }
+
+    /// Reports to the core the end of session `session_id`, with its reason
+    /// and the bytes sent to and received from the target (best effort: on
+    /// a lost tunnel, the report is lost too).
+    pub async fn report_closed(
+        &self,
+        session_id: Uuid,
+        reason: String,
+        bytes_to_target: u64,
+        bytes_from_target: u64,
+    ) {
         let message = AgentMessage::SessionClosed {
             session_id: session_id.to_string(),
-            reason: format!("ouverture interrompue : {error}"),
-            bytes_to_target: 0,
-            bytes_from_target: 0,
+            reason,
+            bytes_to_target,
+            bytes_from_target,
         };
         if let Err(e) = self.link.send(&message).await {
             tracing::warn!(
