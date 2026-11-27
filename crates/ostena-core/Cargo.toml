@@ -36,6 +36,9 @@ ostena-scope.workspace = true
 # core never runs (ADR-0014).
 ostena-ssh = { path = "../ostena-ssh", default-features = false }
 ostena-tunnel.workspace = true
+# The browser gateway: the WebSocket codec and the frames it checks.
+ostena-frame.workspace = true
+ostena-ws.workspace = true
 # The responses of the portal API (ADR-0020).
 serde.workspace = true
 # The stored scope policy (JSON) and the digest of a pushed SSH trust.
@@ -60,6 +63,8 @@ toml.workspace = true
 hyper = { workspace = true, features = ["client"] }
 # The property test of the login rate limiter.
 proptest.workspace = true
+# The gateway end-to-end test: a WebSocket client.
+ostena-ws = { workspace = true, features = ["client"] }
 
 [[bench]]
 # Cost of one authenticated request on the portal API.
