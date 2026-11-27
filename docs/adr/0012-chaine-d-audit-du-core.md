@@ -4,6 +4,7 @@
 - **Révisé** : 2026-11-26 — rôles séparés de la base (ADR-0011) : insertion seule pour le service ; `core.migration_reverted`.
 - **Date** : 2026-11-15
 - **Révision** : 2026-11-25, événements des transcripts et codes `AUD-E017` à `AUD-E020`, `AUD-W005` à `AUD-W008` ; `transcript.refused` de classe protectrice (jalon M1, PR 8, ADR-0016)
+- **Révision** : 2026-11-27, suite du lot L6 (jalon M2, PR 11) : stockage en ajout seul des fichiers scellés (champ `immutable` de `transcript.sealed`, `REC-E006`, `CFG-P024`)
 - **Révision** : 2026-11-26, événements du portail et classes (`web_session.*`, `user.role_granted`, `user.role_revoked`), champ `channel` des connexions (jalon M2, PR 8a, ADR-0020)
 
 ## Contexte
@@ -200,6 +201,23 @@ Procédure d'exploitation : [vérification de l'audit](../exploitation/audit-ver
 #### Codes du core
 
 `CORE-E010` (écriture d'audit impossible) et `CORE-E011` (chaîne d'audit incohérente), dans la table de l'ADR-0011.
+
+### Suite : audit scellé (jalon M2, lot L6)
+
+Le lot L6 complète la chaîne : stockage en ajout seul des fichiers qu'elle scelle, horodatage des têtes, export vers un SIEM, file de l'agent quand le core est injoignable. Chaque partie arrive dans sa PR (11a, 11b…) et s'ajoute ici.
+
+#### Stockage en ajout seul des fichiers scellés (PR 11a)
+
+Jusqu'ici, un transcript scellé n'était protégé que par ses droits (0400) et par son empreinte dans la chaîne : le compte du service, ou une erreur, pouvait le tronquer, le réécrire ou le supprimer, ce que seule la vérification révélait.
+
+- **Attributs Linux** (`ostena_platform::worm`) : à sa création, le fichier est ouvert en ajout (`O_APPEND`), avec ses droits définitifs (0400 : le descripteur reste inscriptible), puis marqué **ajout seul** (`chattr +a`) : il ne peut plus être tronqué, réécrit, renommé ni supprimé, seulement allongé par le descripteur du core. Au scellement, après la synchronisation, il devient **immuable** (`chattr +i`) : plus aucune modification, ni contenu, ni droits, ni nom.
+- **Réglage** : `[core.audit] worm`, `"required"` par défaut ; il vaut pour tous les fichiers scellés (transcripts, puis enregistrements RDP, PR 14). Au démarrage, le core vérifie avec un fichier sonde que le répertoire des transcripts le permet (Linux, système de fichiers qui gère ces attributs : ext4, XFS, Btrfs, tmpfs ; capacité `CAP_LINUX_IMMUTABLE` du service) ; sinon il refuse de démarrer (`REC-E006`). `"disabled"` revient aux seuls droits : affaiblissement `CFG-P024`, refusé en production, journalisé en développement.
+- **Sceau** : `transcript.sealed` porte le champ booléen `immutable`, lu sur le disque après le scellement (jamais supposé). Un auditeur sait ainsi quels fichiers étaient protégés.
+- **Reprise** : un fichier laissé en ajout seul par un arrêt du core est scellé immuable au démarrage suivant ; si le réglage est passé à `"disabled"` entre-temps, l'attribut est retiré et le fichier passe en lecture seule.
+- **Pas de nouvelle dépendance** : les appels `FS_IOC_GETFLAGS` et `FS_IOC_SETFLAGS` passent par `libc`, déjà utilisée par `ostena-platform`, seule crate où le code `unsafe` est admis (commentaires `// SAFETY:` et tests).
+- **Hors Linux** : pas d'équivalent ; le core ne tourne que sous Linux.
+
+Limites : ces attributs n'arrêtent pas un compte qui détient lui-même `CAP_LINUX_IMMUTABLE` (root, ou le service, qui en a besoin pour les poser) : il peut les retirer. Ils protègent contre tout autre compte et contre les erreurs, et la chaîne d'audit reste la preuve d'intégrité. Un stockage WORM matériel ou un objet verrouillé hors du bastion reste le moyen d'une protection contre root. La rétention n'est pas automatisée : supprimer un transcript demande de retirer l'attribut à la main (procédure d'exploitation).
 
 ## Conséquences
 
