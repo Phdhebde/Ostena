@@ -20,6 +20,7 @@ use ostena_core::access::{self, Refusal, SshRequest};
 use ostena_core::cache::AgentCache;
 use ostena_core::functions::Functions;
 use ostena_core::grant_keys::GrantAuthority;
+use ostena_core::policy::Policies;
 use ostena_core::ssh_ca::SshAuthorities;
 use ostena_core::store::PgStore;
 use ostena_core::{inventory, login, pushes};
@@ -48,6 +49,9 @@ struct Fixture {
     db: TestDb,
     pool: PgPool,
     authority: GrantAuthority,
+    /// Never reloaded by the fixture: the first decision finds it empty and
+    /// reloads it (ADR-0022).
+    policies: Arc<Policies>,
     user: Uuid,
     login: Uuid,
     target_key: [u8; 65],
@@ -153,6 +157,7 @@ async fn fixture(test: &str) -> Option<Fixture> {
         db,
         pool,
         authority,
+        policies: Policies::new(),
         user,
         login,
         target_key: target.to_bytes(),
@@ -172,7 +177,16 @@ impl Fixture {
     }
 
     async fn grant(&self, request: &SshRequest) -> Result<access::Issued, Refusal> {
-        access::ssh_grant(&self.pool, &self.authority, AGENT, GROUP, request, now()).await
+        access::ssh_grant(
+            &self.pool,
+            &self.policies,
+            &self.authority,
+            AGENT,
+            GROUP,
+            request,
+            now(),
+        )
+        .await
     }
 
     async fn code(&self, request: &SshRequest) -> &'static str {
@@ -180,7 +194,17 @@ impl Fixture {
     }
 
     async fn open(&self, grant: &str) -> Result<access::Opened, Refusal> {
-        access::open_session(&self.pool, &self.authority, AGENT, GROUP, 7, grant, now()).await
+        access::open_session(
+            &self.pool,
+            &self.policies,
+            &self.authority,
+            AGENT,
+            GROUP,
+            7,
+            grant,
+            now(),
+        )
+        .await
     }
 }
 
@@ -350,6 +374,16 @@ fn a_grant_opens_one_session_once() {
                     .any(|field| field.name == ostena_audit::field::AGENT_ID),
                 "{event}"
             );
+            // The access policy that decided and its rule (ADR-0022).
+            for name in [
+                ostena_audit::field::PDP_VERSION,
+                ostena_audit::field::RULE_ID,
+            ] {
+                assert!(
+                    record.fields.iter().any(|field| field.name == name),
+                    "{event} {name}"
+                );
+            }
         }
 
         // Once only, for the whole group.
@@ -357,6 +391,7 @@ fn a_grant_opens_one_session_once() {
         // Not for another group.
         let refused = access::open_session(
             &f.pool,
+            &f.policies,
             &f.authority,
             OTHER_AGENT,
             OTHER_GROUP,
@@ -451,6 +486,11 @@ fn the_functions_of_the_right_are_signed_and_kept() {
         )
         .await
         .unwrap();
+        // The notice the core would follow: a wider right does not replace
+        // a valid one known to the policy until it is reloaded (ADR-0022).
+        let before = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
+        assert_eq!(before.content.claims.rights, Rights::NONE);
+        f.policies.reload(&f.pool, now()).await.unwrap();
         let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
         assert_eq!(
             issued.content.claims.rights,
@@ -773,6 +813,7 @@ fn revocations_reach_the_agent_that_consumed_the_grant() {
         let issued = f.grant(&f.request("srv-lab01", "root")).await.unwrap();
         access::open_session(
             &f.pool,
+            &f.policies,
             &f.authority,
             SIBLING,
             GROUP,

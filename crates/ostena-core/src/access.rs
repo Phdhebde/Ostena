@@ -34,7 +34,9 @@ use crate::audit::{self, Appended, Tx};
 use crate::error::CoreError;
 use crate::functions::{Function, Functions};
 use crate::grant_keys::GrantAuthority;
+use crate::policy::{self, Policies};
 use crate::store::{i64_of, truncate, uuid};
+use ostena_policy::{AccountId, Code, Decision, Protocol as PolicyProtocol, Request, UserId};
 
 /// Why an access is refused: a stable code for the agent, the reason for
 /// the audit chain.
@@ -44,6 +46,8 @@ pub struct Refusal {
     pub code: &'static str,
     /// Full reason (audit only).
     pub reason: String,
+    /// Version of the access policy that decided, when it did (ADR-0022).
+    pub pdp_version: Option<u64>,
 }
 
 impl Refusal {
@@ -51,7 +55,13 @@ impl Refusal {
         Self {
             code,
             reason: reason.into(),
+            pdp_version: None,
         }
+    }
+
+    fn version(mut self, version: Option<u64>) -> Self {
+        self.pdp_version = version;
+        self
     }
 
     /// The message sent to the agent: the code and its generic label, not
@@ -97,6 +107,8 @@ pub fn label(code: &str) -> &'static str {
         FUNCTIONS_REDUCED => "fonctions du droit réduites depuis le grant",
         NO_AGENT => "aucun agent du groupe joignable",
         GATEWAY_GRANT => "grant refusé",
+        POLICY_DENIED => "accès interdit par une règle",
+        POLICY_UNAVAILABLE => "politique d'accès indisponible",
         _ => "accès refusé",
     }
 }
@@ -127,6 +139,11 @@ pub const NO_AGENT: &str = "GTW-E003";
 /// `GTW-E001`: grant presented on the gateway absent, unknown, expired,
 /// already presented or issued for another session (ADR-0020).
 pub const GATEWAY_GRANT: &str = "GTW-E001";
+/// `POL-E002`: a refusing rule of the access policy applies (ADR-0022).
+pub const POLICY_DENIED: &str = "POL-E002";
+/// `POL-E003`: no access policy in place, or it could not be reloaded
+/// (ADR-0022).
+pub const POLICY_UNAVAILABLE: &str = "POL-E003";
 /// `INV-E001`: resource unknown (or disabled).
 pub const RESOURCE_UNKNOWN: &str = "INV-E001";
 /// `INV-E002`: resource of another gateway group.
@@ -177,6 +194,8 @@ pub struct Allowed {
     pub max_session_secs: u32,
     /// Functions of the right beyond the terminal and the commands.
     pub functions: Functions,
+    /// Version of the access policy that decided (ADR-0022).
+    pub pdp_version: u64,
 }
 
 fn secs_until(end: i64, now: u64) -> u64 {
@@ -220,11 +239,15 @@ impl UserLock {
 
 /// The resource, the account and a valid right of `user` (already locked
 /// and checked), read with `FOR SHARE` in `tx`. `group` is the group of the
-/// asking agent (`None`: any, for the dry run). Among several valid rights,
-/// one that has every function of `wanted` comes first, then the one that
-/// lasts longest.
+/// asking agent (`None`: any, for the dry run). The right is the one the
+/// access policy retains (ADR-0022): among several valid rights, one that
+/// has every function of `wanted` comes first, then the one that lasts
+/// longest.
+#[allow(clippy::too_many_arguments, reason = "one call site per caller")]
 async fn allowed(
     tx: &mut Tx<'_>,
+    policies: &Policies,
+    pool: &PgPool,
     user: Uuid,
     resource: &str,
     account: &str,
@@ -286,44 +309,183 @@ async fn allowed(
             ),
         ));
     };
-    // One with the functions wanted, then the one that lasts longest.
-    let Some(right) = sqlx::query!(
-        r#"SELECT id::text AS "id!", valid_until, max_session_secs, functions FROM access_right
-           WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid AND protocol = 'ssh'
-             AND revoked_at IS NULL AND valid_from <= $3 AND valid_until > $3
-           ORDER BY functions @> $4 DESC, valid_until DESC, max_session_secs DESC
-           LIMIT 1 FOR SHARE"#,
-        user.to_string(),
-        account_id,
-        i64_of(now),
-        &wanted.names(),
+    let account_uuid = uuid(&account_id)?;
+    let right = decided(
+        tx,
+        policies,
+        pool,
+        user,
+        account_uuid,
+        wanted,
+        now,
+        &format!("{}@{resource}", truncate(account)),
     )
-    .fetch_optional(&mut **tx)
-    .await?
-    else {
-        return Err(Refusal::new(
-            NO_RIGHT,
-            format!(
-                "aucun droit SSH valide de {user} sur « {}@{resource} »",
-                truncate(account)
-            ),
-        ));
-    };
-    let max = u64::try_from(right.max_session_secs)
-        .unwrap_or(0)
+    .await?;
+    let max = u64::from(right.max_session_secs)
         .min(secs_until(right.valid_until, now))
         .max(1);
     Ok(Allowed {
-        right: uuid(&right.id)?,
+        right: right.id,
         resource: uuid(&r.id)?,
         group: resource_group,
-        account: uuid(&account_id)?,
+        account: account_uuid,
         host: r.host,
         port: u16::try_from(r.port).unwrap_or(0),
         target_p256_public,
         max_session_secs: u32::try_from(max).unwrap_or(u32::MAX),
-        functions: Functions::from_stored(&right.functions),
+        functions: right.functions,
+        pdp_version: right.pdp_version,
     })
+}
+
+/// The right the decision point retained, confirmed in the database.
+struct DecidedRight {
+    id: Uuid,
+    valid_until: i64,
+    max_session_secs: u32,
+    functions: Functions,
+    pdp_version: u64,
+}
+
+/// What the database says of a decision.
+enum Confirmed {
+    Right(DecidedRight),
+    /// The policy in place is behind the database: reload, then decide again.
+    Stale,
+    Refused(Refusal),
+}
+
+/// The decision of the access policy (ADR-0022) for `user` on `account`
+/// with SSH, confirmed in `tx`: the right retained is read again with
+/// `FOR SHARE` (a revocation waits for the grant, then finds it). A policy
+/// behind the database (a right granted or revoked, not yet reloaded) is
+/// reloaded once and asked again, so the decision is never older than the
+/// rights the transaction sees.
+#[allow(clippy::too_many_arguments, reason = "one call site per caller")]
+async fn decided(
+    tx: &mut Tx<'_>,
+    policies: &Policies,
+    pool: &PgPool,
+    user: Uuid,
+    account: Uuid,
+    wanted: Functions,
+    now: u64,
+    target: &str,
+) -> Result<DecidedRight, Refusal> {
+    let request = Request {
+        user: UserId(policy::id128(user)),
+        account: AccountId(policy::id128(account)),
+        protocol: PolicyProtocol::Ssh,
+        wanted: policy::functions(wanted),
+        now,
+    };
+    let mut reloaded = false;
+    loop {
+        let decision = policies.decide(&request);
+        match confirm(tx, decision, user, account, now, target).await? {
+            Confirmed::Right(right) => return Ok(right),
+            Confirmed::Refused(refusal) => return Err(refusal),
+            Confirmed::Stale if !reloaded => {
+                reloaded = true;
+                policies.reload(pool, now).await?;
+            }
+            Confirmed::Stale => {
+                return Err(Refusal::new(
+                    POLICY_UNAVAILABLE,
+                    format!(
+                        "{} : politique d'accès en retard sur la base après rechargement",
+                        Code::Unavailable.as_str()
+                    ),
+                )
+                .version(decision.version()));
+            }
+        }
+    }
+}
+
+async fn confirm(
+    tx: &mut Tx<'_>,
+    decision: Decision,
+    user: Uuid,
+    account: Uuid,
+    now: u64,
+    target: &str,
+) -> Result<Confirmed, Refusal> {
+    match decision {
+        Decision::Allow(a) => {
+            let right = policy::uuid_of(a.rule.0);
+            let row = sqlx::query!(
+                r#"SELECT valid_until, max_session_secs, functions FROM access_right
+                   WHERE id = $1::text::uuid AND user_id = $2::text::uuid
+                     AND account_id = $3::text::uuid AND protocol = 'ssh'
+                     AND revoked_at IS NULL AND valid_from <= $4 AND valid_until > $4
+                   FOR SHARE"#,
+                right.to_string(),
+                user.to_string(),
+                account.to_string(),
+                i64_of(now),
+            )
+            .fetch_optional(&mut **tx)
+            .await?;
+            let Some(row) = row else {
+                return Ok(Confirmed::Stale);
+            };
+            let stored = Functions::from_stored(&row.functions);
+            // Granted by the decision point, and still held by the right.
+            let granted =
+                functions_of(Rights::from_bits(a.functions.bits()).unwrap_or(Rights::NONE));
+            if !stored.rights().contains(granted.rights()) {
+                return Ok(Confirmed::Stale);
+            }
+            Ok(Confirmed::Right(DecidedRight {
+                id: right,
+                valid_until: row.valid_until,
+                max_session_secs: u32::try_from(row.max_session_secs).unwrap_or(0),
+                functions: granted,
+                pdp_version: a.version,
+            }))
+        }
+        Decision::Deny(d) if d.code == Code::NoRule => {
+            // A right the policy in place does not know yet.
+            let known = sqlx::query_scalar!(
+                r#"SELECT EXISTS (SELECT 1 FROM access_right
+                   WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid
+                     AND protocol = 'ssh' AND revoked_at IS NULL
+                     AND valid_from <= $3 AND valid_until > $3) AS "known!""#,
+                user.to_string(),
+                account.to_string(),
+                i64_of(now),
+            )
+            .fetch_one(&mut **tx)
+            .await?;
+            if known {
+                return Ok(Confirmed::Stale);
+            }
+            Ok(Confirmed::Refused(
+                Refusal::new(
+                    NO_RIGHT,
+                    format!(
+                        "{} : aucun droit SSH valide de {user} sur « {target} »",
+                        d.code.as_str()
+                    ),
+                )
+                .version(d.version),
+            ))
+        }
+        Decision::Deny(d) if d.code == Code::Unavailable => Ok(Confirmed::Stale),
+        Decision::Deny(d) => Ok(Confirmed::Refused(
+            Refusal::new(
+                POLICY_DENIED,
+                format!(
+                    "{} : accès SSH de {user} sur « {target} » interdit par la règle {}",
+                    d.code.as_str(),
+                    d.rule
+                        .map_or_else(|| "?".to_owned(), |r| policy::uuid_of(r.0).to_string())
+                ),
+            )
+            .version(d.version),
+        )),
+    }
 }
 
 /// The login session, read with `FOR SHARE`: it must exist, name the
@@ -402,7 +564,23 @@ pub async fn check(
     })?;
     let user = uuid(&user)?;
     let found = match UserLock::take(&mut tx, user).await?.active() {
-        Ok(()) => allowed(&mut tx, user, resource, account, None, Functions::NONE, now).await,
+        Ok(()) => {
+            // The command runs outside the core: the policy is read here.
+            let policies = Policies::new();
+            policies.reload(pool, now).await?;
+            allowed(
+                &mut tx,
+                &policies,
+                pool,
+                user,
+                resource,
+                account,
+                None,
+                Functions::NONE,
+                now,
+            )
+            .await
+        }
         Err(refusal) => Err(refusal),
     };
     tx.rollback().await?;
@@ -436,14 +614,18 @@ fn access_event(kind: EventKind, outcome: Outcome, agent: Uuid, request: &SshReq
 
 /// The `access.ssh_refused` record of a refused request.
 pub fn ssh_refused_event(agent: Uuid, request: &SshRequest, refusal: &Refusal) -> Event {
-    access_event(
+    let event = access_event(
         EventKind::AccessSshRefused,
         Outcome::Refused,
         agent,
         request,
     )
     .text(field::CODE, refusal.code)
-    .text(field::REASON, truncate(&refusal.reason))
+    .text(field::REASON, truncate(&refusal.reason));
+    match refusal.pdp_version {
+        Some(version) => event.u64(field::PDP_VERSION, version),
+        None => event,
+    }
 }
 
 /// Decides `request` from `agent` of `group` at `now`; on success, a grant
@@ -454,8 +636,13 @@ pub fn ssh_refused_event(agent: Uuid, request: &SshRequest, refusal: &Refusal) -
 ///
 /// The refusal; the caller records `access.ssh_refused`
 /// ([`ssh_refused_event`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the state of the core, then the request"
+)]
 pub async fn ssh_grant(
     pool: &PgPool,
+    policies: &Policies,
     authority: &GrantAuthority,
     agent: Uuid,
     group: Uuid,
@@ -476,6 +663,8 @@ pub async fn ssh_grant(
     user.active()?;
     let allowed = allowed(
         &mut tx,
+        policies,
+        pool,
         request.subject,
         &request.resource,
         &request.account,
@@ -535,7 +724,9 @@ pub async fn ssh_grant(
     .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
     .u64(field::EXPIRES_AT, content.expires_at)
     .text(field::FUNCTIONS, allowed.functions.label())
-    .u64(field::RIGHTS, u64::from(claims.rights.bits()));
+    .u64(field::RIGHTS, u64::from(claims.rights.bits()))
+    .uuid(field::RULE_ID, allowed.right.to_bytes())
+    .u64(field::PDP_VERSION, allowed.pdp_version);
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()
@@ -591,9 +782,13 @@ fn web_event(kind: EventKind, outcome: Outcome, request: &WebRequest) -> Event {
 
 /// The `access.web_refused` record of a refused browser request.
 pub fn web_refused_event(request: &WebRequest, refusal: &Refusal) -> Event {
-    web_event(EventKind::AccessWebRefused, Outcome::Refused, request)
+    let event = web_event(EventKind::AccessWebRefused, Outcome::Refused, request)
         .text(field::CODE, refusal.code)
-        .text(field::REASON, truncate(&refusal.reason))
+        .text(field::REASON, truncate(&refusal.reason));
+    match refusal.pdp_version {
+        Some(version) => event.u64(field::PDP_VERSION, version),
+        None => event,
+    }
 }
 
 /// Decides `request` at `now` as for native SSH ([`ssh_grant`]): the user,
@@ -610,6 +805,7 @@ pub fn web_refused_event(request: &WebRequest, refusal: &Refusal) -> Event {
 /// ([`web_refused_event`]).
 pub async fn web_grant(
     pool: &PgPool,
+    policies: &Policies,
     authority: &GrantAuthority,
     request: &WebRequest,
     pick: impl FnOnce(Uuid) -> Option<Uuid>,
@@ -623,6 +819,8 @@ pub async fn web_grant(
     user.active()?;
     let allowed = allowed(
         &mut tx,
+        policies,
+        pool,
         request.subject,
         &request.resource,
         &request.account,
@@ -683,7 +881,9 @@ pub async fn web_grant(
         .uuid(field::GROUP_ID, group.to_bytes())
         .uuid(field::AGENT_ID, agent.to_bytes())
         .u64(field::MAX_SESSION_SECS, u64::from(max_session_secs))
-        .u64(field::EXPIRES_AT, content.expires_at);
+        .u64(field::EXPIRES_AT, content.expires_at)
+        .uuid(field::RULE_ID, allowed.right.to_bytes())
+        .u64(field::PDP_VERSION, allowed.pdp_version);
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()
@@ -939,6 +1139,18 @@ async fn consume(tx: &mut Tx<'_>, jti: [u8; 16], agent: Uuid, now: u64) -> Resul
     Ok(session)
 }
 
+/// A grant of the portal opens a session only once presented by its
+/// browser session on the gateway (ADR-0020, § 4).
+fn presented_if_web(unpresented: bool, checked: &Grant) -> Result<(), Refusal> {
+    if unpresented {
+        return Err(Refusal::new(
+            GRANT_UNKNOWN,
+            format!("grant {} du portail jamais présenté", checked.jti),
+        ));
+    }
+    Ok(())
+}
+
 /// Opens the session of `grant` presented by `agent` of `group` at `now`:
 /// verified with the keys of the core, its jti consumed once for the whole
 /// group, its login session, user, resource and account checked again, and
@@ -950,8 +1162,13 @@ async fn consume(tx: &mut Tx<'_>, jti: [u8; 16], agent: Uuid, now: u64) -> Resul
 ///
 /// The refusal; the caller records `access.session_refused`
 /// ([`session_refused_event`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the state of the core, then the request"
+)]
 pub async fn open_session(
     pool: &PgPool,
+    policies: &Policies,
     authority: &GrantAuthority,
     agent: Uuid,
     group: Uuid,
@@ -980,14 +1197,7 @@ pub async fn open_session(
         ));
     };
     unused_ssh_grant(row.consumed, &row.protocol, &checked)?;
-    // A grant of the portal opens a session only once presented by its
-    // browser session on the gateway (ADR-0020, § 4).
-    if row.unpresented {
-        return Err(Refusal::new(
-            GRANT_UNKNOWN,
-            format!("grant {} du portail jamais présenté", checked.jti),
-        ));
-    }
+    presented_if_web(row.unpresented, &checked)?;
     let subject = Uuid::from_bytes(checked.claims.subject.to_bytes());
     let login = uuid(&row.login)?;
     // Lock order (ADR-0014): the grant, the user, then the login session.
@@ -1004,6 +1214,8 @@ pub async fn open_session(
     // may have been replaced since (a longer one); none: `ACC-E006`.
     let allowed = allowed(
         &mut tx,
+        policies,
+        pool,
         subject,
         &resource_name,
         &row.account,
@@ -1048,7 +1260,9 @@ pub async fn open_session(
     .text(
         field::FUNCTIONS,
         functions_of(checked.claims.rights).label(),
-    );
+    )
+    .uuid(field::RULE_ID, allowed.right.to_bytes())
+    .u64(field::PDP_VERSION, allowed.pdp_version);
     // Granting, last statement before the commit.
     let appended = audit::append(&mut tx, event).await?;
     tx.commit()

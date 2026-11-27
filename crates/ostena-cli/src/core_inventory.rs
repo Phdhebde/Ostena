@@ -15,7 +15,7 @@ use ostena_core::functions::Functions;
 use ostena_core::{access, credential, inventory, login};
 use ostena_tunnel::Uuid;
 
-use crate::core::{admin, fail, init_admin_logging};
+use crate::core::{admin, admin_core, fail, init_admin_logging};
 
 const DAY: u64 = 86_400;
 
@@ -181,9 +181,10 @@ pub(crate) fn user_role(path: &Path, name: &str, role: &str, grant: bool) -> Exi
             role.escape_debug()
         ));
     };
-    done(admin(path, async move |pool| {
+    done(admin_core(path, async move |pool, core| {
         let changed = if grant {
-            inventory::grant_role(&pool, name, role).await?
+            let separation = ostena_core::policy::separation(&core.admin);
+            inventory::grant_role(&pool, name, role, separation).await?
         } else {
             inventory::revoke_role(&pool, name, role).await?
         };

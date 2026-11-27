@@ -43,6 +43,7 @@ use crate::error::CoreError;
 use crate::forwarding::Forwarder;
 use crate::grant_keys::GrantAuthority;
 use crate::identity::Directories;
+use crate::policy::Policies;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
 use crate::timestamping::Timestamper;
@@ -422,6 +423,8 @@ struct Shared {
     grants: Arc<GrantAuthority>,
     ssh: Option<Arc<SshAuthorities>>,
     transcripts: Option<Arc<Transcripts>>,
+    /// The decision point of the accesses (ADR-0022).
+    policies: Arc<Policies>,
     /// Asks for a replay of what lost notices would have applied.
     resync: tokio::sync::Notify,
     /// Per-agent limits of `ssh_grant_request` and `ssh_host_key`.
@@ -478,6 +481,22 @@ impl Exports {
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Writes granting events in one transaction and tells the signer.
+/// The grant key, activated (granting record) if new, and the access
+/// policy, compiled before any agent connects (ADR-0022).
+async fn load_authorities(
+    store: &PgStore,
+    keys: &Keys,
+    recorder: &Arc<Recorder>,
+) -> Result<(GrantAuthority, Arc<Policies>), CoreError> {
+    let (grants, activated) = GrantAuthority::load(store.pool(), keys.grant.clone()).await?;
+    if let Some(appended) = activated {
+        recorder.critical(&[appended]);
+    }
+    let policies = Policies::recorded(recorder.clone());
+    policies.reload(store.pool(), unix_now()).await?;
+    Ok((grants, policies))
+}
+
 async fn write_granting(store: &PgStore, events: Vec<Event>) -> Result<(), CoreError> {
     let mut tx = store
         .pool()
@@ -641,11 +660,12 @@ impl std::fmt::Debug for RunningCore {
     }
 }
 
-/// What the access decisions of the portal need: the grant key and the
-/// connected agents.
+/// What the access decisions of the portal need: the grant key, the
+/// access decision point and the connected agents.
 fn web_access(shared: &Shared) -> WebAccess {
     WebAccess {
         grants: shared.grants.clone(),
+        policies: shared.policies.clone(),
         agents: Arc::new(Directory {
             tunnels: shared.tunnels.clone(),
             cache: shared.cache.clone(),
@@ -693,11 +713,7 @@ impl RunningCore {
         signer.sign_now().await?;
         write_granting(&store, start_events(&signer, info)).await?;
         recover_transcripts(keys, &store, &recorder).await?;
-        // The grant key: activated (granting record) if new.
-        let (grants, activated) = GrantAuthority::load(store.pool(), keys.grant.clone()).await?;
-        if let Some(appended) = activated {
-            recorder.critical(&[appended]);
-        }
+        let (grants, policies) = load_authorities(&store, keys, &recorder).await?;
         let startup = |e: TunnelError| CoreError::Startup(e.to_string());
         let limits = Limits::default();
         let (listener, tunnel_addr) = bind_tunnel(config, keys, &cache, limits)?;
@@ -725,6 +741,7 @@ impl RunningCore {
             grants: Arc::new(grants),
             ssh: keys.ssh.clone(),
             transcripts: keys.transcripts.clone(),
+            policies,
             resync: tokio::sync::Notify::new(),
             grant_requests: rate::Limiter::new(rate::GRANT_REQUESTS),
             host_keys: rate::Limiter::new(rate::HOST_KEYS),
@@ -1132,6 +1149,7 @@ async fn certify_host(
 ) {
     let Some(ssh) = &shared.ssh else {
         let refusal = Refusal {
+            pdp_version: None,
             code: access::SSH_DISABLED,
             reason: "clé d'hôte SSH reçue, mais [core.ssh] n'est pas configuré".into(),
         };
@@ -1214,12 +1232,14 @@ async fn answer_ssh_grant(
     };
     let decided = if shared.ssh.is_none() {
         Err(Refusal {
+            pdp_version: None,
             code: access::SSH_DISABLED,
             reason: "[core.ssh] n'est pas configuré".into(),
         })
     } else {
         access::ssh_grant(
             shared.store.pool(),
+            &shared.policies,
             &shared.grants,
             agent,
             group,
@@ -1269,6 +1289,7 @@ async fn answer_session(
 ) {
     let opened = access::open_session(
         shared.store.pool(),
+        &shared.policies,
         &shared.grants,
         agent,
         group,
@@ -1465,6 +1486,7 @@ async fn control(
                 if !within_limit(&shared.grant_requests, agent, "ssh_grant_request") =>
             {
                 let refusal = Refusal {
+                    pdp_version: None,
                     code: access::RATE_LIMITED,
                     reason: String::new(),
                 };
@@ -1475,6 +1497,7 @@ async fn control(
                     Ok(key) => certify_host(&tunnel, agent, group, &key, &shared).await,
                     Err(e) => {
                         let refusal = Refusal {
+                            pdp_version: None,
                             code: e.code(),
                             reason: e.to_string(),
                         };
@@ -1652,6 +1675,14 @@ async fn apply_notice(shared: &Arc<Shared>, payload: &str) {
                 }
             });
         }
+        Some(Notice::Policy) => {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                if !reload_policy(&shared).await {
+                    shared.resync.notify_one();
+                }
+            });
+        }
         Some(Notice::Registered | Notice::Audit) | None => {}
     }
 }
@@ -1674,6 +1705,7 @@ async fn resync_on_request(shared: Arc<Shared>) {
 /// failed: the whole is replayed again, each part being idempotent.
 async fn replay(shared: &Shared) -> bool {
     let mut done = reload(shared).await;
+    done &= reload_policy(shared).await;
     if let Err(e) = shared.enrollment.wake().await {
         tracing::warn!(event = "enroll.wake_failed", code = e.code(), "{e}");
         done = false;
@@ -1715,6 +1747,16 @@ async fn reload(shared: &Shared) -> bool {
         );
     }
     true
+}
+
+/// Reloads the access policy (ADR-0022); `false` if it failed, the policy
+/// then refusing every access until a reload succeeds (the replay retries).
+async fn reload_policy(shared: &Shared) -> bool {
+    shared
+        .policies
+        .reload(shared.store.pool(), unix_now())
+        .await
+        .is_ok()
 }
 
 async fn reload_periodically(shared: Arc<Shared>) {

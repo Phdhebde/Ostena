@@ -19,6 +19,7 @@ pub mod grant_keys;
 pub mod identity;
 pub mod inventory;
 pub mod login;
+pub mod policy;
 pub mod pushes;
 pub mod rate;
 pub mod roles;

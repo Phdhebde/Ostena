@@ -1,16 +1,10 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id::text AS \"id!\", valid_until, max_session_secs, functions FROM access_right\n           WHERE user_id = $1::text::uuid AND account_id = $2::text::uuid AND protocol = 'ssh'\n             AND revoked_at IS NULL AND valid_from <= $3 AND valid_until > $3\n           ORDER BY functions @> $4 DESC, valid_until DESC, max_session_secs DESC\n           LIMIT 1 FOR SHARE",
+  "query": "SELECT valid_until, max_session_secs, functions FROM access_right\n                   WHERE id = $1::text::uuid AND user_id = $2::text::uuid\n                     AND account_id = $3::text::uuid AND protocol = 'ssh'\n                     AND revoked_at IS NULL AND valid_from <= $4 AND valid_until > $4\n                   FOR SHARE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id!",
-        "type_info": "Text",
-        "origin": "Expression"
-      },
-      {
-        "ordinal": 1,
         "name": "valid_until",
         "type_info": "Int8",
         "origin": {
@@ -21,7 +15,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 1,
         "name": "max_session_secs",
         "type_info": "Int4",
         "origin": {
@@ -32,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "functions",
         "type_info": "TextArray",
         "origin": {
@@ -47,16 +41,15 @@
       "Left": [
         "Text",
         "Text",
-        "Int8",
-        "TextArray"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
-      null,
       false,
       false,
       false
     ]
   },
-  "hash": "fe2c234dd593aff0d9599a72a18713e6f30b75f8ee687d36ec98eca84c36ebab"
+  "hash": "4cc1a51bb6ce97dd324d866e5e9f6748ea2a0422d8bb049b9ae35c1f0f7eba6e"
 }

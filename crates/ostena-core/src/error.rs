@@ -74,6 +74,16 @@ pub enum CoreError {
     /// message starts with the `IDN-` code of the cause.
     #[error("[CORE-E015] source d'identités inutilisable : {0}")]
     Directory(String),
+    /// The access policy cannot be compiled or installed, or a rule of the
+    /// separate administration roles is broken (ADR-0022): the code is the
+    /// one of the decision point (`POL-E004` to `POL-E006`).
+    #[error("[{code}] {message}")]
+    Policy {
+        /// Stable code of the decision point.
+        code: &'static str,
+        /// Explanation.
+        message: String,
+    },
 }
 
 impl CoreError {
@@ -95,6 +105,16 @@ impl CoreError {
             Self::Roles(_) => "CORE-E013",
             Self::RolesWeak(_) => "CORE-E014",
             Self::Directory(_) => "CORE-E015",
+            Self::Policy { code, .. } => code,
+        }
+    }
+}
+
+impl From<ostena_policy::PolicyError> for CoreError {
+    fn from(e: ostena_policy::PolicyError) -> Self {
+        Self::Policy {
+            code: e.code().as_str(),
+            message: e.to_string(),
         }
     }
 }
@@ -133,5 +153,11 @@ mod tests {
             assert_eq!(e.code(), code);
             assert!(e.to_string().starts_with(&format!("[{code}]")), "{e}");
         }
+        let policy = CoreError::from(ostena_policy::PolicyError::Stale {
+            installed: 2,
+            offered: 1,
+        });
+        assert_eq!(policy.code(), "POL-E005");
+        assert!(policy.to_string().starts_with("[POL-E005]"), "{policy}");
     }
 }

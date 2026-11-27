@@ -29,6 +29,8 @@ ostena-crypto.workspace = true
 ostena-grant.workspace = true
 # Identity sources (ADR-0021): the minimal LDAPv3 client.
 ostena-ldap.workspace = true
+# The decision point of the accesses (ADR-0022): pure, thiserror only.
+ostena-policy.workspace = true
 # Session transcripts (ADR-0016): strict decoder and asciicast writer.
 ostena-recorder.workspace = true
 # Write-once sealed files: append-only then immutable attributes (ADR-0012).
