@@ -2142,6 +2142,7 @@ dependencies = [
  "ironrdp-svc",
  "ostena-common",
  "ostena-crypto",
+ "ostena-platform",
  "ostena-scope",
  "ostena-session",
  "proptest",

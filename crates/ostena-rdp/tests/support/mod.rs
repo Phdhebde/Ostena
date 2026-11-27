@@ -91,7 +91,13 @@ pub enum Script {
     ServerErrorThenClose,
     /// Waits for the client to disconnect.
     WaitClient,
+    /// Logon notification for session [`LOGON_SESSION`] (Save Session
+    /// Info PDU), then waits for the client to disconnect.
+    LogonThenWait,
 }
+
+/// The session the target names in its logon notification.
+pub const LOGON_SESSION: u32 = 7;
 
 /// Options of the target.
 #[derive(Debug, Clone, Copy)]
@@ -592,6 +598,34 @@ fn serve(
 
     match options.script {
         Script::WaitClient => {
+            while stream.read_frame().is_ok() {}
+            return Ok(());
+        }
+        Script::LogonThenWait => {
+            use ironrdp_pdu::rdp::session_info::{
+                InfoData, InfoType, LogonInfo, LogonInfoVersion2, SaveSessionInfoPdu,
+            };
+            let logon = encode_vec(&ShareControlHeader {
+                share_control_pdu: ShareControlPdu::Data(ShareDataHeader {
+                    share_data_pdu: ShareDataPdu::SaveSessionInfo(SaveSessionInfoPdu {
+                        info_type: InfoType::LogonLong,
+                        info_data: InfoData::LogonInfoV2(LogonInfoVersion2 {
+                            logon_info: LogonInfo {
+                                session_id: LOGON_SESSION,
+                                user_name: USER.into(),
+                                domain_name: String::new(),
+                            },
+                        }),
+                    }),
+                    stream_priority: StreamPriority::Undefined,
+                    compression_flags: CompressionFlags::empty(),
+                    compression_type: ironrdp_pdu::rdp::client_info::CompressionType::K8,
+                }),
+                pdu_source: user,
+                share_id: 0,
+            })
+            .unwrap();
+            send(stream, io, logon)?;
             while stream.read_frame().is_ok() {}
             return Ok(());
         }

@@ -30,6 +30,11 @@ tokio = { workspace = true, features = ["macros"] }
 tracing.workspace = true
 url.workspace = true
 
+# Windows sessions of the target account through the WTS API (ADR-0026):
+# the unsafe FFI stays in ostena-platform.
+[target.'cfg(windows)'.dependencies]
+ostena-platform.workspace = true
+
 [dev-dependencies]
 ironrdp-acceptor.workspace = true
 ostena-crypto = { workspace = true, features = ["testing"] }

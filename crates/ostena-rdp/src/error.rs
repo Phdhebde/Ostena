@@ -59,6 +59,14 @@ pub enum RdpError {
     /// The session parameters sent by the core are invalid.
     #[error("[RDP-E017] paramètres de session invalides : {0}")]
     Params(String),
+    /// Another connection holds a session of the same account on the
+    /// target: a new connection would take it over (ADR-0026).
+    #[error("[RDP-E018] session {0} du même compte ouverte sur la cible : connexion refusée")]
+    SessionInUse(u32),
+    /// The Windows sessions of the account cannot be listed or logged off
+    /// on the target, or the option that keeps them is refused (ADR-0026).
+    #[error("[RDP-E019] fermeture des sessions du compte sur la cible impossible : {0}")]
+    SessionCleanup(String),
     /// A dependency panicked; the session is cut, the agent goes on.
     #[error("[RDP-E099] erreur interne du driver RDP : session coupée")]
     Internal,
@@ -85,6 +93,8 @@ impl RdpError {
             Self::Timeout => "RDP-E015",
             Self::Secret(_) => "RDP-E016",
             Self::Params(_) => "RDP-E017",
+            Self::SessionInUse(_) => "RDP-E018",
+            Self::SessionCleanup(_) => "RDP-E019",
             Self::Internal => "RDP-E099",
         }
     }
@@ -108,6 +118,8 @@ impl RdpError {
             Self::License(_) => "rdp.license_failed",
             Self::ServerError(_) => "rdp.session_error",
             Self::Params(_) => "rdp.params_refused",
+            Self::SessionInUse(_) => "rdp.session_in_use",
+            Self::SessionCleanup(_) => "rdp.session_cleanup_failed",
             Self::Internal => "rdp.internal_error",
         }
     }
@@ -137,6 +149,8 @@ mod tests {
             RdpError::Timeout,
             RdpError::Secret("x".into()),
             RdpError::Params("x".into()),
+            RdpError::SessionInUse(2),
+            RdpError::SessionCleanup("x".into()),
             RdpError::Internal,
         ];
         let mut codes = std::collections::HashSet::new();

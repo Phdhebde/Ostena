@@ -101,6 +101,9 @@ pub struct ConnectReport {
     /// Early capability bits removed by the guard from the connector's
     /// Connect Initial.
     pub early_capabilities_removed: u32,
+    /// Windows sessions of the account the driver logged off on the target
+    /// before this connection (ADR-0026).
+    pub sessions_logged_off: Vec<u32>,
 }
 
 /// An established connection, ready for the session loop.
@@ -425,6 +428,7 @@ pub async fn establish(addr: SocketAddr, params: ConnectParams) -> Result<Establ
         ntlm_used: outcome.ntlm_used,
         kdc_exchanges: outcome.kdc_exchanges,
         early_capabilities_removed: observed.removed,
+        sessions_logged_off: Vec::new(),
     };
     log_report(&params.label, &report);
     Ok(Established {
