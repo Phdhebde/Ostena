@@ -952,7 +952,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Fuzz target run by `cargo xtask fuzz`.
-const FUZZ_TARGETS: [&str; 28] = [
+const FUZZ_TARGETS: [&str; 29] = [
     "grant_decode",
     "scope_target",
     "scope_policy",
@@ -976,6 +976,7 @@ const FUZZ_TARGETS: [&str; 28] = [
     "rdp_tsrequest",
     "rdp_license",
     "rdp_session",
+    "rdp_smb_negotiate",
     "ldap_message",
     "ldap_filter",
     "ws_frame",

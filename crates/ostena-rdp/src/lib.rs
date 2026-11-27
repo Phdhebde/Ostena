@@ -13,6 +13,7 @@ pub mod fuzz;
 pub mod guard;
 pub mod profile;
 pub mod session;
+pub mod smb;
 pub mod target_sessions;
 pub mod transport;
 

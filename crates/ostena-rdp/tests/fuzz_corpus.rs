@@ -26,6 +26,11 @@ fn replay(target: &str, run: fn(&[u8])) {
 }
 
 #[test]
+fn replay_rdp_smb_negotiate_corpus() {
+    replay("rdp_smb_negotiate", ostena_rdp::fuzz::smb_negotiate);
+}
+
+#[test]
 fn replay_rdp_x224_corpus() {
     replay("rdp_x224", ostena_rdp::fuzz::x224);
 }
