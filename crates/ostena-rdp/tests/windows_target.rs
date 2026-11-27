@@ -63,6 +63,14 @@ fn lab() -> Option<Lab> {
             sha256: var("OSTENA_RDP_TARGET_SHA256")?.to_ascii_lowercase(),
         })
     })();
+    if found.is_some() {
+        // The events of the driver (logoffs, end of the connection), as
+        // JSON lines among the output of the job; once per process.
+        let _ = ostena_common::logging::init(&ostena_common::config::LoggingConfig {
+            level: ostena_common::config::LogLevel::Debug,
+            ..Default::default()
+        });
+    }
     if found.is_none() {
         assert!(
             var("OSTENA_REQUIRE_RDP_TARGET").is_none(),

@@ -230,7 +230,14 @@ impl SessionLoop {
                 filled = self.transport.fill() => {
                     if let Err(e) = filled {
                         break match (e, self.demux.counters.error_info) {
-                            (RdpError::Unreachable(_), None) => SessionEnd::Closed,
+                            (RdpError::Unreachable(reason), None) => {
+                                tracing::debug!(
+                                    event = "rdp.session_closed",
+                                    %reason,
+                                    "connexion RDP fermée"
+                                );
+                                SessionEnd::Closed
+                            }
                             (_, Some(code)) => end_of(code),
                             (e, None) => SessionEnd::Failed(e),
                         };
