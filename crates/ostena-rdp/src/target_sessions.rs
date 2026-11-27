@@ -379,7 +379,13 @@ mod wts {
                 password: &request.password,
             };
             let server = request.address.to_string();
-            RemoteServer::open(Some(&server), Some(&credentials))
+            // A target on the loopback is this machine, which the scope
+            // control never admits in production (the CI only): its
+            // sessions are read under the identity of the agent, without a
+            // second logon of the account in the same LSA (observed on the
+            // CI runners to end RDP sessions of that account being opened).
+            let credentials = (!request.address.is_loopback()).then_some(&credentials);
+            RemoteServer::open(Some(&server), credentials)
                 .map(|s| Box::new(View(s)) as Box<dyn SessionView>)
                 .map_err(|e| e.to_string())
         }
