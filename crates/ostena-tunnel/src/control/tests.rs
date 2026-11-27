@@ -106,10 +106,19 @@ fn every_valid_agent_message_round_trips() {
             grant,
         },
         AgentMessage::SessionClosed {
+            report_id: 7,
             session_id: GROUP.into(),
             reason: "fin normale".into(),
             bytes_to_target: 10,
             bytes_from_target: 20,
+            closed_at: 1_800_000_000,
+        },
+        AgentMessage::ReportsLost {
+            report_id: 8,
+            count: 3,
+            first_at: 1_800_000_000,
+            last_at: 1_800_000_060,
+            unreadable: false,
         },
         AgentMessage::Renew {
             request: URL_SAFE_NO_PAD.encode([1u8; 100]),
@@ -417,6 +426,7 @@ fn ssh_messages_round_trip() {
         CoreMessage::LoginRevoked {
             login_session: GROUP.into(),
         },
+        CoreMessage::ReportAck { report_id: 7 },
         CoreMessage::SessionParams {
             request_id: 3,
             session_id: GROUP.into(),

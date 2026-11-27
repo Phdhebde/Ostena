@@ -62,8 +62,11 @@ pub enum AgentMessage {
         /// The grant, text form.
         grant: String,
     },
-    /// A session ended.
+    /// A session ended. Kept in the encrypted queue of the agent until the
+    /// core acknowledges it ([`CoreMessage::ReportAck`], ADR-0012).
     SessionClosed {
+        /// Identifies the report in the queue of the agent.
+        report_id: u64,
         /// Session (UUID).
         session_id: String,
         /// Why.
@@ -72,6 +75,24 @@ pub enum AgentMessage {
         bytes_to_target: u64,
         /// Bytes received from the target.
         bytes_from_target: u64,
+        /// When it ended, Unix seconds (clock of the agent): the report may
+        /// arrive later.
+        closed_at: u64,
+    },
+    /// Reports dropped because the queue of the agent was full, or lost
+    /// with an unreadable queue file (ADR-0012).
+    ReportsLost {
+        /// Identifies this notice in the queue of the agent.
+        report_id: u64,
+        /// Reports dropped (0 when unknown: unreadable queue).
+        count: u64,
+        /// First and last drop, Unix seconds (clock of the agent).
+        first_at: u64,
+        /// Last drop.
+        last_at: u64,
+        /// The queue file could not be read back: an unknown number of
+        /// reports was lost.
+        unreadable: bool,
     },
     /// Certificate renewal request (signed request, base64url).
     Renew {
@@ -244,6 +265,13 @@ pub enum CoreMessage {
         /// The login session (UUID).
         login_session: String,
     },
+    /// A report of the agent ([`AgentMessage::SessionClosed`],
+    /// [`AgentMessage::ReportsLost`]) is written: the agent drops it from
+    /// its queue.
+    ReportAck {
+        /// The report.
+        report_id: u64,
+    },
 }
 
 /// Most user certificate authorities pushed at once (rotation).
@@ -376,6 +404,14 @@ impl AgentMessage {
                 Ok(())
             }
             Self::Ping { .. } | Self::Pong { .. } => Ok(()),
+            Self::ReportsLost {
+                first_at, last_at, ..
+            } => {
+                if last_at < first_at {
+                    return Err(invalid("last_at antérieur à first_at"));
+                }
+                Ok(())
+            }
             Self::SessionRequest { grant, .. } => SignedGrant::from_text(grant)
                 .map(|_| ())
                 .map_err(|e| invalid(format!("grant : {e}"))),
@@ -472,7 +508,7 @@ impl CoreMessage {
                 }
                 Ok(())
             }
-            Self::Ping { .. } | Self::Pong { .. } => Ok(()),
+            Self::Ping { .. } | Self::Pong { .. } | Self::ReportAck { .. } => Ok(()),
             Self::Policy { policy, .. } => {
                 if !policy.floor_exceptions.is_empty() {
                     return Err(invalid(

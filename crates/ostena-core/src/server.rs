@@ -1302,12 +1302,18 @@ async fn answer_session(
     send(tunnel, agent, &reply).await;
 }
 
-async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
+/// Records a session report of the agent, then acknowledges it so that
+/// the agent drops it from its queue (ADR-0012). A report already applied
+/// (sent again after a lost link) is acknowledged without a second record;
+/// one that cannot be written is not acknowledged, and comes back.
+async fn close_session(tunnel: &CoreTunnel, agent: Uuid, message: AgentMessage, shared: &Shared) {
     let AgentMessage::SessionClosed {
+        report_id,
         session_id,
         reason,
         bytes_to_target,
         bytes_from_target,
+        closed_at,
     } = message
     else {
         return;
@@ -1322,12 +1328,16 @@ async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
         &reason,
         bytes_to_target,
         bytes_from_target,
-        unix_now(),
+        closed_at.min(unix_now()),
     )
     .await
     {
-        Ok(Some(event)) => shared.recorder.emit(event),
-        Ok(None) => {}
+        Ok(event) => {
+            if let Some(event) = event {
+                shared.recorder.emit(event);
+            }
+            send(tunnel, agent, &CoreMessage::ReportAck { report_id }).await;
+        }
         Err(e) => tracing::warn!(
             event = "access.session_close_failed",
             agent = %agent,
@@ -1335,6 +1345,60 @@ async fn close_session(agent: Uuid, message: AgentMessage, shared: &Shared) {
             "{e}"
         ),
     }
+}
+
+/// Records the reports an agent dropped (full or unreadable queue), then
+/// acknowledges the notice.
+async fn reports_lost(tunnel: &CoreTunnel, agent: Uuid, message: &AgentMessage, shared: &Shared) {
+    let &AgentMessage::ReportsLost {
+        report_id,
+        count,
+        first_at,
+        last_at,
+        unreadable,
+    } = message
+    else {
+        return;
+    };
+    tracing::error!(
+        event = "agent.reports_lost",
+        agent = %agent,
+        count,
+        unreadable,
+        "bilans de session perdus par l'agent (file pleine ou illisible)"
+    );
+    let event = Event::new(
+        EventKind::AgentReportsLost,
+        Outcome::Failure,
+        ActorKind::Agent,
+        agent.to_string(),
+    )
+    .uuid(field::AGENT_ID, agent.to_bytes())
+    .u64(field::LOST_COUNT, count)
+    .u64(field::FIRST_MS, first_at.saturating_mul(1000))
+    .u64(field::LAST_MS, last_at.saturating_mul(1000))
+    .bool(field::COMPLETE, !unreadable);
+    let mut tx = match shared.store.pool().begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(event = "agent.reports_lost", agent = %agent, "{e}");
+            return;
+        }
+    };
+    // Written before the acknowledgement: a notice is never dropped unseen.
+    let appended = match audit::append(&mut tx, event).await {
+        Ok(appended) => appended,
+        Err(e) => {
+            tracing::warn!(event = "agent.reports_lost", agent = %agent, code = e.code(), "{e}");
+            return;
+        }
+    };
+    if let Err(e) = tx.commit().await {
+        tracing::warn!(event = "agent.reports_lost", agent = %agent, "{e}");
+        return;
+    }
+    shared.recorder.critical(&[appended]);
+    send(tunnel, agent, &CoreMessage::ReportAck { report_id }).await;
 }
 
 /// Binds the tunnel listener: agents authenticated by a certificate of the
@@ -1429,7 +1493,10 @@ async fn control(
                 answer_session(&tunnel, agent, group, request_id, &grant, &shared).await;
             }
             message @ AgentMessage::SessionClosed { .. } => {
-                close_session(agent, message, &shared).await;
+                close_session(&tunnel, agent, message, &shared).await;
+            }
+            message @ AgentMessage::ReportsLost { .. } => {
+                reports_lost(&tunnel, agent, &message, &shared).await;
             }
             _ => {}
         }

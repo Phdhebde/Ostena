@@ -171,10 +171,12 @@ fn tells_each_connection_with_its_certificate() {
         assert_eq!(first.certificate_sha256, expected);
         // Usable at once: the message goes on the connection just told.
         link.send(&ostena_tunnel::control::AgentMessage::SessionClosed {
+            report_id: 1,
             session_id: "2f6c9a4e-1b2c-4d5e-8f90-a1b2c3d4e5f6".into(),
             reason: "test".into(),
             bytes_to_target: 0,
             bytes_from_target: 0,
+            closed_at: 1_800_000_000,
         })
         .await
         .unwrap();

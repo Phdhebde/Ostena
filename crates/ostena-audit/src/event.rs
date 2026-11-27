@@ -53,6 +53,10 @@ event_kinds! {
     /// The export to a syslog collector stopped (destination, code,
     /// reason); written once per run of failures.
     AuditForwardFailed => "audit.forward_failed",
+    /// An agent dropped session reports: its encrypted queue was full
+    /// (`lost_count`, first and last drop) or could not be read back
+    /// (`complete` false: the number is unknown) (ADR-0012).
+    AgentReportsLost => "agent.reports_lost",
     /// The core started.
     CoreStarted => "core.started",
     /// The core stopped.
@@ -635,7 +639,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 75);
+        assert_eq!(names.len(), 76);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

@@ -43,6 +43,7 @@ use ostena_ssh::transcript::Transcript;
 use ostena_tunnel::enroll::AgentRegistry;
 use ostena_tunnel::gateway::{Gateway, GatewayParams, GatewayState, SshAccess};
 use ostena_tunnel::link::{AgentLink, Backoff, LinkParams, SystemClock};
+use ostena_tunnel::reports::ReportQueue;
 use ostena_tunnel::{Hello, Limits, Uuid};
 use tokio::sync::broadcast;
 
@@ -263,7 +264,17 @@ fn agent_via(
         grant_policy: ostena_grant::Policy::default(),
     })
     .unwrap();
-    (Gateway::start(Arc::new(state), link.clone()).unwrap(), link)
+    // A queue of one report: the second one overflows (ADR-0012).
+    let reports = ReportQueue::open_bounded(
+        dir,
+        |path, bytes| private_file::create(path, bytes, Reader::CurrentProcess),
+        1,
+    )
+    .unwrap();
+    (
+        Gateway::start_with(Arc::new(state), link.clone(), Some(Arc::new(reports))).unwrap(),
+        link,
+    )
 }
 
 async fn until(what: &str, check: impl Fn() -> bool) {
@@ -442,6 +453,42 @@ fn ssh_access_and_login_revocation_end_to_end() {
         drop(transcript);
         pumped.await.unwrap().unwrap();
         assert_eq!(until_sealed(&pool, session_id).await, "sealed");
+
+        // The report of the session goes through the encrypted queue; the
+        // next one overflows it and is reported lost. The core records both
+        // and acknowledges them: the queue empties.
+        assert!(gateway.queue_closed(session_id, "fin normale", 10, 20));
+        assert!(gateway.queue_closed(Uuid::random().unwrap(), "x", 0, 0));
+        let queue = gateway.reports().unwrap().clone();
+        until("bilans acquittés", || {
+            queue.pending() == 0 && queue.lost().is_none()
+        })
+        .await;
+        let (reason, to_target, from_target): (String, i64, i64) = sqlx::query_as(
+            "SELECT close_reason, bytes_to_target, bytes_from_target FROM access_session
+             WHERE id = $1::uuid AND closed_at IS NOT NULL",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (reason.as_str(), to_target, from_target),
+            ("fin normale", 10, 20)
+        );
+        let lost: Vec<u8> =
+            sqlx::query_scalar("SELECT body FROM audit_record WHERE event = 'agent.reports_lost'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let lost = ostena_audit::Record::decode(&lost).unwrap();
+        assert!(
+            lost.fields
+                .iter()
+                .any(|f| f.name == "lost_count" && f.value == ostena_audit::Value::U64(1)),
+            "{lost:?}"
+        );
+
         let file = keys.transcripts.as_ref().unwrap().path(session_id);
         let written = std::fs::read(&file).unwrap();
         let text = String::from_utf8(written.clone()).unwrap();

@@ -81,7 +81,7 @@ Mise en œuvre :
 
   L'erreur dit combien d'octets le core n'a jamais accusés.
 - **fin normale** : l'agent termine le flux et attend 5 s au plus que le core accuse tous les octets, synchronisés sur le disque. Cela ne dit **pas** que le core les a scellés : le sceau se lit dans la chaîne d'audit (`transcript.sealed`).
-- **gestionnaire SSH** : il n'attend jamais le core. Un changement de taille est gardé et enregistré avant la sortie suivante. La fin du transcript est attendue 40 s au plus ; le permis de session et le bilan sont toujours rendus. Le bilan (`session_closed`) attend lui aussi le retour du lien pendant la grâce.
+- **gestionnaire SSH** : il n'attend jamais le core. Un changement de taille est gardé et enregistré avant la sortie suivante. La fin du transcript est attendue 40 s au plus ; le permis de session et le bilan sont toujours rendus. Le bilan (`session_closed`) passe par la file chiffrée de l'agent, gardé jusqu'à l'accusé du core, au-delà de la grâce et d'un redémarrage (ADR-0012, PR 11d).
 - **ouverture interrompue** : si l'agent ne peut pas commencer une session que le core a ouverte (compte ou clé d'hôte de la cible différents, flux `Recording` impossible à ouvrir), il envoie aussitôt son bilan (`session_closed`, raison « ouverture interrompue »).
 - **raison de fin** scellée : `closed`, `revoked`, `expired`, `shutdown` ou `error` (transcript perdu).
 
