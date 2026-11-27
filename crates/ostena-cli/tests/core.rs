@@ -323,7 +323,22 @@ fn lab(db: &TestDb) -> Lab {
         database.user,
         database.migration_user,
     );
-    std::fs::write(&core_config, format!("mode = \"development\"\n\n{text}")).unwrap();
+    // Development: write-once files only where the host allows them (CI
+    // runners do not have CAP_LINUX_IMMUTABLE), logged as CFG-P024.
+    let worm = if ostena_platform::worm::probe(&dir).is_ok() {
+        "required"
+    } else {
+        "disabled"
+    };
+    let development = text.replace(
+        "heartbeat_secs = 60\n",
+        &format!("heartbeat_secs = 60\nworm = \"{worm}\"\n"),
+    );
+    std::fs::write(
+        &core_config,
+        format!("mode = \"development\"\n\n{development}"),
+    )
+    .unwrap();
     let production_config = (db.mode == Mode::Production).then(|| {
         let path = dir.join("core-production.toml");
         std::fs::write(&path, format!("mode = \"production\"\n\n{text}")).unwrap();

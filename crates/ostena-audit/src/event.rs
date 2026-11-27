@@ -310,6 +310,8 @@ pub mod field {
     pub const LENGTH: &str = "length";
     /// Whether a transcript is complete (ended by its end frame).
     pub const COMPLETE: &str = "complete";
+    /// Whether a sealed file is immutable on disk (write-once storage).
+    pub const IMMUTABLE: &str = "immutable";
     /// How a login session is opened: `cli` (`ostena login`) or `web` (the
     /// portal).
     pub const CHANNEL: &str = "channel";
@@ -410,6 +412,7 @@ pub mod field {
         COMMAND_HMAC,
         LENGTH,
         COMPLETE,
+        IMMUTABLE,
         CHANNEL,
         ROLE,
         SOURCE,

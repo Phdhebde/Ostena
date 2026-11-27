@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use common::{TestDb, block_on};
 use ostena_common::config::scope::{AllowRuleSpec, PolicySpec};
-use ostena_common::config::{CoreConfig, Mode};
+use ostena_common::config::{CoreConfig, Mode, WormSetting};
 use ostena_core::cache::AgentCache;
 use ostena_core::functions::Functions;
 use ostena_core::server::{Keys, RunningCore, StartInfo};
@@ -65,7 +65,23 @@ struct Dir(PathBuf);
 
 impl Drop for Dir {
     fn drop(&mut self) {
+        unprotect(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Clears the write-once attributes under `dir`, so that it can be removed.
+fn unprotect(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            unprotect(&path);
+        } else if let Ok(file) = std::fs::File::open(&path) {
+            let _ = ostena_platform::worm::protect(&file, ostena_platform::worm::Protection::None);
+        }
     }
 }
 
@@ -84,6 +100,17 @@ fn config(port: u16) -> CoreConfig {
         free_port()
     ))
     .unwrap()
+}
+
+/// Write-once files where this host allows them (root with
+/// `CAP_LINUX_IMMUTABLE`), read-only rights elsewhere (CI runners).
+fn worm_setting(transcripts: &Path) -> WormSetting {
+    std::fs::create_dir_all(transcripts).unwrap();
+    if ostena_platform::worm::probe(transcripts).is_ok() {
+        WormSetting::Required
+    } else {
+        WormSetting::Disabled
+    }
 }
 
 fn keys(pki: TestPki, transcripts: &Path) -> Keys {
@@ -111,6 +138,7 @@ fn keys(pki: TestPki, transcripts: &Path) -> Keys {
             Transcripts::open(
                 transcripts,
                 HmacKey::new(&HmacKey::generate().unwrap()).unwrap(),
+                worm_setting(transcripts),
             )
             .unwrap(),
         )),
@@ -278,6 +306,7 @@ fn ssh_access_and_login_revocation_end_to_end() {
         let pool = db.pool().await;
         let dir =
             Dir(std::env::temp_dir().join(format!("ostena-core-ssh-e2e-{}", std::process::id())));
+        unprotect(&dir.0);
         let _ = std::fs::remove_dir_all(&dir.0);
         std::fs::create_dir_all(&dir.0).unwrap();
 
@@ -493,6 +522,15 @@ fn ssh_access_and_login_revocation_end_to_end() {
             get("kid"),
             Some(ostena_audit::Value::Text(key_id.to_owned()))
         );
+        // Immutable on disk exactly when the store is write-once.
+        let immutable = std::fs::File::open(&file)
+            .and_then(|f| ostena_platform::worm::protection(&f))
+            .is_ok_and(|p| p == ostena_platform::worm::Protection::Immutable);
+        assert_eq!(get("immutable"), Some(ostena_audit::Value::Bool(immutable)));
+        assert_eq!(
+            immutable,
+            worm_setting(file.parent().unwrap()) == WormSetting::Required
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -669,6 +707,7 @@ fn notices_lost_while_the_listener_is_cut_are_replayed() {
         let dir = Dir(
             std::env::temp_dir().join(format!("ostena-core-ssh-replay-{}", std::process::id()))
         );
+        unprotect(&dir.0);
         let _ = std::fs::remove_dir_all(&dir.0);
         std::fs::create_dir_all(&dir.0).unwrap();
         let pki = TestPki::new("Ostena replay").unwrap();
@@ -931,6 +970,7 @@ fn a_network_cut_shorter_than_the_grace_keeps_the_ssh_sessions() {
         let pool = db.pool().await;
         let dir =
             Dir(std::env::temp_dir().join(format!("ostena-core-ssh-grace-{}", std::process::id())));
+        unprotect(&dir.0);
         let _ = std::fs::remove_dir_all(&dir.0);
         std::fs::create_dir_all(&dir.0).unwrap();
         let pki = TestPki::new("Ostena grace").unwrap();
