@@ -102,12 +102,16 @@ for (const scheme of ["light", "dark"] as const) {
 
     test("connexion, client WebAssembly et déconnexion", async ({ page }, info) => {
       const user = userFor(info, scheme === "light" ? 1 : 2);
+      await page.emulateMedia({ colorScheme: scheme });
       const response = await page.goto("/");
       expect(response?.status()).toBe(200);
       expect(response?.headers()["content-security-policy"]).toContain("default-src 'none'");
       await expect(page.getByRole("heading", { name: "Connexion au bastion" })).toBeVisible();
-      const background = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
-      expect(background).toBe(scheme === "light" ? "rgb(250, 247, 248)" : "rgb(21, 16, 18)");
+      // Polled: Firefox may apply the emulated colour scheme after the
+      // first style computation.
+      await expect
+        .poll(() => page.evaluate(() => getComputedStyle(document.body).backgroundColor))
+        .toBe(scheme === "light" ? "rgb(250, 247, 248)" : "rgb(21, 16, 18)");
       await axe(page);
 
       await login(page, user);
