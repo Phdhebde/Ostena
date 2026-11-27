@@ -2104,6 +2104,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostena-ldap"
+version = "0.0.0"
+dependencies = [
+ "ostena-common",
+ "ostena-ldap",
+ "proptest",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "ostena-platform"
 version = "0.0.0"
 dependencies = [

@@ -18,6 +18,7 @@ ostena-common = { path = "../crates/ostena-common" }
 ostena-crypto = { path = "../crates/ostena-crypto" }
 ostena-frame = { path = "../crates/ostena-frame" }
 ostena-grant = { path = "../crates/ostena-grant" }
+ostena-ldap = { path = "../crates/ostena-ldap" }
 ostena-rdp = { path = "../crates/ostena-rdp" }
 ostena-recorder = { path = "../crates/ostena-recorder" }
 ostena-scope = { path = "../crates/ostena-scope" }
@@ -76,6 +77,20 @@ bench = false
 [[bin]]
 name = "release_manifest"
 path = "fuzz_targets/release_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ldap_message"
+path = "fuzz_targets/ldap_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ldap_filter"
+path = "fuzz_targets/ldap_filter.rs"
 test = false
 doc = false
 bench = false

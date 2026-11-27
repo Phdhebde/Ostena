@@ -1,0 +1,30 @@
+[package]
+name = "ostena-ldap"
+description = "Minimal LDAPv3 client over any byte stream: strict BER subset, simple bind, paged search (ADR-0021)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+# An in-memory directory that answers the requests of this client (tests of
+# the core, never in a release binary).
+testing = []
+
+# No TLS here: the core opens the LDAPS connection with the directory profile
+# of ostena-crypto and hands the stream over (ADR-0021).
+[dependencies]
+ostena-common.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+# Wipes the encoded bind request, which carries the password.
+zeroize.workspace = true
+
+[dev-dependencies]
+ostena-ldap = { path = ".", features = ["testing"] }
+proptest.workspace = true
+
+[lints]
+workspace = true
