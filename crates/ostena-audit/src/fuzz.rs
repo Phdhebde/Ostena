@@ -65,3 +65,39 @@ pub fn verify(data: &[u8]) {
         }
     }
 }
+
+/// Reads untrusted bytes as a syslog stream (RFC 5425 frames of RFC 5424
+/// messages) and as one message. Must never panic; a stream read whole or
+/// byte by byte gives the same messages.
+pub fn syslog(data: &[u8]) {
+    use crate::siem::{FrameDecoder, frame, parse_message};
+
+    let _ = parse_message(data);
+    let mut whole = FrameDecoder::new();
+    whole.push(data);
+    let mut messages = Vec::new();
+    while let Ok(Some(message)) = whole.next_message() {
+        if let Ok(parsed) = parse_message(&message) {
+            assert!(parsed.facility <= 23 && parsed.severity <= 7);
+        }
+        messages.push(message);
+    }
+    let mut bytewise = FrameDecoder::new();
+    let mut again = Vec::new();
+    'bytes: for b in data {
+        bytewise.push(std::slice::from_ref(b));
+        loop {
+            match bytewise.next_message() {
+                Ok(Some(message)) => again.push(message),
+                Ok(None) => break,
+                Err(_) => break 'bytes,
+            }
+        }
+    }
+    assert_eq!(messages, again, "the chunks change nothing");
+    let framed: Vec<u8> = messages.iter().flat_map(|m| frame(m)).collect();
+    assert!(
+        data.starts_with(&framed),
+        "frames re-encode to the same bytes"
+    );
+}
