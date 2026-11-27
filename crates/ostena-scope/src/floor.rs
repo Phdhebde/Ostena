@@ -3,6 +3,8 @@
 //! Only a development-mode exception can lift it. Sources for each cloud
 //! metadata address are listed in ADR-0005.
 
+use std::net::IpAddr;
+
 use crate::net::{Family, prefix_range};
 
 /// Why an address belongs to the floor.
@@ -168,6 +170,18 @@ pub(crate) fn static_floor(family: Family, key: u128) -> Option<FloorCause> {
     }
 }
 
+/// Floor cause of any address, IPv4 hidden in IPv6 judged as IPv4 (static
+/// part only: the addresses of the host are not known here).
+///
+/// For the connections that bypass the scope policy, such as the core
+/// towards its LDAPS directories, which refuse the cloud metadata services
+/// only (ADR-0021).
+pub fn floor_cause(ip: IpAddr) -> Option<FloorCause> {
+    let (ip, _) = crate::net::normalize(ip);
+    let (family, key) = crate::net::key(ip);
+    static_floor(family, key)
+}
+
 /// Every static floor range, for tests and property generators.
 #[doc(hidden)]
 pub fn static_ranges() -> impl Iterator<Item = (bool, u128, u128, FloorCause)> {
@@ -229,6 +243,7 @@ mod tests {
         ];
         for (addr, expected) in cases {
             assert_eq!(cause(addr), Some(expected), "{addr}");
+            assert_eq!(floor_cause(addr.parse().unwrap()), Some(expected), "{addr}");
         }
         for ok in [
             "10.0.0.1",

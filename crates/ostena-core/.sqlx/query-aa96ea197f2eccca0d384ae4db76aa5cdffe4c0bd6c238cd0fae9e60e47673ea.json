@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE app_user SET name = $2, display_name = $3, directory_dn = $4, synced_at = $5\n             WHERE id = $1::text::uuid",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aa96ea197f2eccca0d384ae4db76aa5cdffe4c0bd6c238cd0fae9e60e47673ea"
+}

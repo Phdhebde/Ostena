@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO user_group (id, name) VALUES ($1::text::uuid, $2)\n                   ON CONFLICT (name) DO NOTHING RETURNING id::text AS \"id!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1b3520eb0f663ad6e1ff1563734bf4c936bab08e4f52cb6dda2d1cf7a573f420"
+}

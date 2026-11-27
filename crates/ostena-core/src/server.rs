@@ -41,6 +41,7 @@ use crate::cache::AgentCache;
 use crate::credential::TotpKey;
 use crate::error::CoreError;
 use crate::grant_keys::GrantAuthority;
+use crate::identity::Directories;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
 use crate::transcripts::{self, Transcripts};
@@ -94,6 +95,8 @@ pub struct Keys {
     /// The transcript directory and the command key, with `[core.ssh]`
     /// (ADR-0016): no SSH without them.
     pub transcripts: Option<Arc<Transcripts>>,
+    /// The LDAPS identity sources of `[core.identity]` (ADR-0021).
+    pub directories: Option<Arc<Directories>>,
 }
 
 impl std::fmt::Debug for Keys {
@@ -131,7 +134,7 @@ fn load_transcripts(
     )?)))
 }
 
-fn read_key(
+pub(crate) fn read_key(
     field: &str,
     source: &KeySource,
     credentials: Option<&Path>,
@@ -248,6 +251,7 @@ impl Keys {
             }
             None => None,
         };
+        let directories = load_directories(config, credentials)?;
         Ok(Self {
             root,
             server,
@@ -257,6 +261,7 @@ impl Keys {
             ssh: ssh.map(Arc::new),
             totp,
             transcripts,
+            directories,
         })
     }
 }
@@ -436,6 +441,31 @@ fn start_events(signer: &HeadSigner, info: &StartInfo) -> Vec<Event> {
     events
 }
 
+/// The identity sources of `[core.identity]` (ADR-0021).
+fn load_directories(
+    config: &CoreConfig,
+    credentials: Option<&Path>,
+) -> Result<Option<Arc<Directories>>, CoreError> {
+    let Some(identity) = &config.identity else {
+        return Ok(None);
+    };
+    Directories::load(identity, credentials).map(|d| Some(Arc::new(d)))
+}
+
+/// The synchronisation of the identity sources of `keys`, if any.
+fn identity_of(
+    keys: &Keys,
+    store: &PgStore,
+    recorder: &Arc<Recorder>,
+) -> Option<Arc<crate::identity::Identity>> {
+    let directories = keys.directories.clone()?;
+    Some(Arc::new(crate::identity::Identity::new(
+        directories,
+        store.pool().clone(),
+        recorder.clone(),
+    )))
+}
+
 /// The listeners of `[core.login]` (ADR-0010, ADR-0015) and of
 /// `[core.web]` (ADR-0020): one authenticator and one attempt limiter for
 /// both.
@@ -444,6 +474,7 @@ async fn start_login(
     keys: &Keys,
     store: &PgStore,
     recorder: &Arc<Recorder>,
+    identity: Option<Arc<crate::identity::Identity>>,
 ) -> Result<(Option<LoginListener>, Option<WebListener>), CoreError> {
     let Some(settings) = &config.login else {
         return Ok((None, None));
@@ -455,13 +486,12 @@ async fn start_login(
     };
     let tls = tls::server_config(&keys.server, ClientAuth::None, &[b"http/1.1"])
         .map_err(|e| CoreError::Startup(e.to_string()))?;
-    let authenticator = Arc::new(PgAuthenticator::new(
-        store.pool().clone(),
-        recorder.clone(),
-        ssh,
-        totp,
-        settings,
-    ));
+    let mut authenticator =
+        PgAuthenticator::new(store.pool().clone(), recorder.clone(), ssh, totp, settings);
+    if let Some(identity) = identity {
+        authenticator = authenticator.with_identity(identity);
+    }
+    let authenticator = Arc::new(authenticator);
     let limits = LoginLimits::from_config(settings);
     let attempts = Arc::new(Attempts::new(limits.attempts_per_minute));
     let login = LoginListener::bind_sharing(
@@ -600,12 +630,14 @@ impl RunningCore {
             ],
         )
         .await?;
-        let (login, web) = start_login(config, keys, &shared.store, &recorder).await?;
+        let identity = identity_of(keys, &shared.store, &recorder);
+        let (login, web) =
+            start_login(config, keys, &shared.store, &recorder, identity.clone()).await?;
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
         let notices = listen(shared.store.pool()).await?;
         let writer = tokio::spawn(audit::run_writer(shared.store.pool().clone(), recorder));
-        let tasks = vec![
+        let mut tasks = vec![
             tokio::spawn(accept(listener.clone(), shared.clone())),
             tokio::spawn(follow_notices(notices, shared.clone())),
             tokio::spawn(resync_on_request(shared.clone())),
@@ -613,6 +645,10 @@ impl RunningCore {
             tokio::spawn(signer.clone().run()),
             tokio::spawn(renew_host_certificates(shared.clone())),
         ];
+        // The synchronisation of the identity sources (ADR-0021).
+        if let Some(identity) = &identity {
+            tasks.extend(identity.spawn());
+        }
         tracing::info!(
             event = "core.started",
             tunnel = %tunnel_addr,

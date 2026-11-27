@@ -1,0 +1,29 @@
+name: Identities lab
+
+# Nightly end-to-end test of the LDAPS identity sources (ADR-0021) against
+# the Active Directory of the lab (ADR-0025), reusing lab.yml: users and
+# groups read over TLS 1.3, a password checked by a bind, an account
+# disabled in the directory seen within 60 s, plain LDAP and foreign
+# certificates refused. Not on pull requests: the lab takes hours.
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ldaps:
+    uses: ./.github/workflows/lab.yml
+    with:
+      # The name of the domain controller resolved by the runner, as its
+      # LDAPS certificate names it.
+      command: |
+        set -euo pipefail
+        dc=$(jq -r '.domain.dc' "$LAB_JSON")
+        fqdn=$(jq -r --arg dc "$dc" '.machines[$dc].fqdn' "$LAB_JSON")
+        ip=$(jq -r '.domain.dc_ip' "$LAB_JSON")
+        echo "$ip $fqdn" | sudo tee -a /etc/hosts >/dev/null
+        rustup toolchain install
+        cargo test --locked -p ostena-core --test identity_lab -- --ignored --nocapture

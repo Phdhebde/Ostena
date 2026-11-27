@@ -16,6 +16,14 @@
 //!    the one derived against (else refused, not counted), then the TOTP
 //!    code (one step of tolerance, a step never accepted twice).
 //!
+//! A login name is routed first ([`Directories::route`], ADR-0021): a
+//! local account follows the steps above; for a user of a directory,
+//! phase 1 reads the user from the directory (created, updated or disabled
+//! in the core as it says) and checks the password by a bind as the user,
+//! holding a hashing slot too, so that the binds in flight are bounded;
+//! phase 2 is the same, without a stored digest. An unknown source or
+//! suffix is an unknown name.
+//!
 //! A failure counts; at `max_failures` failures, each within
 //! `lockout_minutes` of the previous one, the account is locked for
 //! `lockout_minutes` (`login.locked`, protective); an older count starts
@@ -61,6 +69,7 @@ use crate::api::{ApiCode, ApiError, Authenticator};
 use crate::audit::{self, Recorder, Tx};
 use crate::credential::TotpKey;
 use crate::error::CoreError;
+use crate::identity::{Directories, Identity, Route};
 use crate::login as sessions;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{Notice, i64_of, notify_notice, truncate, unix_now, uuid};
@@ -217,6 +226,10 @@ pub struct PgAuthenticator {
     settings: Settings,
     hashing: Semaphore,
     refusal_floor: Duration,
+    /// The identity sources, if any (ADR-0021).
+    identity: Option<Arc<Identity>>,
+    /// The routing without sources: local accounts only.
+    local_only: Directories,
 }
 
 impl std::fmt::Debug for PgAuthenticator {
@@ -255,23 +268,25 @@ async fn lock_user(tx: &mut Tx<'_>, name: &str) -> Result<Option<(Uuid, bool)>, 
         .transpose()
 }
 
-/// The stored password digest, sealed TOTP secret and its HMAC, if the
-/// user is fully enrolled.
+/// The sealed TOTP secret and its algorithm, if the user is fully
+/// enrolled: a confirmed TOTP secret, and a password digest unless the
+/// password is the one of a directory (`directory`).
 fn enrolled(
     user: Uuid,
+    directory: bool,
     digest: Option<String>,
     sealed: Option<Vec<u8>>,
     algorithm: Option<String>,
     pending: bool,
-) -> Option<(PasswordHash, Vec<u8>, TotpAlgorithm)> {
-    let (Some(digest), Some(sealed), Some(algorithm), false) = (digest, sealed, algorithm, pending)
-    else {
+) -> Option<(Vec<u8>, TotpAlgorithm)> {
+    let (Some(sealed), Some(algorithm), false) = (sealed, algorithm, pending) else {
         return None;
     };
-    let (Ok(digest), Some(algorithm)) = (
-        PasswordHash::parse(&digest),
-        TotpAlgorithm::parse(&algorithm),
-    ) else {
+    let digest_ok = match digest {
+        Some(digest) => !directory && PasswordHash::parse(&digest).is_ok(),
+        None => directory,
+    };
+    let (true, Some(algorithm)) = (digest_ok, TotpAlgorithm::parse(&algorithm)) else {
         tracing::error!(
             event = "login.credential_invalid",
             user = %user,
@@ -279,7 +294,7 @@ fn enrolled(
         );
         return None;
     };
-    Some((digest, sealed, algorithm))
+    Some((sealed, algorithm))
 }
 
 fn decode_public(text: &str) -> Option<VerifyingKey> {
@@ -311,7 +326,62 @@ impl PgAuthenticator {
             },
             hashing: Semaphore::new(HASHING_SLOTS),
             refusal_floor: REFUSAL_FLOOR,
+            identity: None,
+            local_only: Directories::local_only(),
         }
+    }
+
+    /// The identity sources whose users may log in (ADR-0021).
+    #[must_use]
+    pub fn with_identity(mut self, identity: Arc<Identity>) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Where `username` goes.
+    fn route(&self, username: &str) -> Route {
+        self.identity
+            .as_ref()
+            .map_or(&self.local_only, |i| i.directories())
+            .route(username)
+    }
+
+    /// Phase 1, without a lock, for the login name `username`, routed.
+    ///
+    /// A local account: its digest read, then PBKDF2. A user of a
+    /// directory: the user read from the source and applied to the core,
+    /// then a bind as the user, holding a hashing slot. An unknown source
+    /// or user is refused.
+    async fn phase_one(&self, username: &str, password: SecretString) -> Result<PhaseOne, Failure> {
+        let unknown = || Failure::Refused(Cause::UnknownUser, None);
+        let route = self.route(username);
+        let name = route.user_name().ok_or_else(unknown)?;
+        let Route::Directory(source, login) = &route else {
+            let (user, digest) = self.read_digest(&name).await?;
+            let stored = digest.as_deref().and_then(|d| PasswordHash::parse(d).ok());
+            let (password_ok, rehash) = self.derive(password, stored).await?;
+            return Ok(PhaseOne {
+                name,
+                directory: false,
+                user: user.ok_or_else(unknown)?,
+                digest,
+                password_ok,
+                rehash,
+            });
+        };
+        let identity = self.identity.as_ref().ok_or_else(unknown)?;
+        let _slot = self.hashing.acquire().await.map_err(|e| {
+            Failure::Broken(CoreError::Keys(format!("vérification indisponible : {e}")))
+        })?;
+        let found = identity.authenticate(source, login, &password).await?;
+        Ok(PhaseOne {
+            name,
+            directory: true,
+            user: found.user.ok_or_else(unknown)?,
+            digest: None,
+            password_ok: found.password_ok,
+            rehash: None,
+        })
     }
 
     /// Another floor for the refusals than [`REFUSAL_FLOOR`] (tests).
@@ -380,12 +450,15 @@ impl PgAuthenticator {
     ) -> Result<Opened, Failure> {
         let channel = opening.channel();
         // Phase 1, no lock.
-        let (user, digest) = self.read_digest(username).await?;
-        let stored = digest.as_deref().and_then(|d| PasswordHash::parse(d).ok());
-        let (password_ok, rehash) = self.derive(password, stored).await?;
-        let Some(user) = user else {
-            return Err(Failure::Refused(Cause::UnknownUser, None));
-        };
+        let PhaseOne {
+            name,
+            directory,
+            user,
+            digest,
+            password_ok,
+            rehash,
+        } = self.phase_one(username, password).await?;
+        let username = name.as_str();
         let attempt = Attempt {
             user,
             name: username,
@@ -423,6 +496,7 @@ impl PgAuthenticator {
         let unchanged = row.password_hash == digest;
         let enrolled = enrolled(
             user,
+            directory,
             row.password_hash,
             row.totp_secret,
             row.totp_algorithm,
@@ -439,7 +513,7 @@ impl PgAuthenticator {
         } else {
             None
         };
-        let (Some((_, sealed, algorithm)), None) = (enrolled, early) else {
+        let (Some((sealed, algorithm)), None) = (enrolled, early) else {
             let cause = early.unwrap_or(Cause::NotEnrolled);
             return Err(self.refuse(tx, cause, &attempt).await);
         };
@@ -1019,6 +1093,19 @@ impl PgAuthenticator {
             "connexion refusée"
         );
     }
+}
+
+/// What phase 1 learnt, without a lock.
+struct PhaseOne {
+    /// The canonical name: `alice`, `corp/jdupont`.
+    name: String,
+    /// Whether the password is the one of a directory.
+    directory: bool,
+    user: Uuid,
+    /// The stored digest derived against (local accounts).
+    digest: Option<String>,
+    password_ok: bool,
+    rehash: Option<String>,
 }
 
 struct Success {

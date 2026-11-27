@@ -24,7 +24,7 @@ pub mod target;
 pub mod fuzz;
 
 pub use error::{Code, Refusal, Rule, ScopeError};
-pub use floor::FloorCause;
+pub use floor::{FloorCause, floor_cause};
 pub use local::{LocalAddresses, Refresher, SharedLocalAddresses};
 pub use net::{Network, PortRange, normalize};
 pub use policy::{

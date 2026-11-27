@@ -82,19 +82,44 @@ async fn rows_of(pool: &PgPool) -> Vec<String> {
     out
 }
 
-/// The lines of `rows` (from [`rows_of`]) whose table exists in `schema`
-/// (from [`schema_of`]): a table created by migration N goes with its down
-/// migration, and so do its rows, which N-1 does not know.
-fn known_at(rows: &[String], schema: &[String]) -> Vec<String> {
-    rows.iter()
-        .filter(|line| {
-            let table = line.split(' ').next().unwrap_or_default();
-            schema
-                .iter()
-                .any(|s| s.starts_with(&format!("relation {table} ")))
-        })
-        .cloned()
-        .collect()
+/// The rows of the tables and columns of `schema` (from [`schema_of`]),
+/// and its sequences, as text: the tables and columns that migration N
+/// adds go with its down migration, and so do their values.
+async fn rows_known(pool: &PgPool, schema: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in rows_of(pool).await {
+        let table = line.split(' ').next().unwrap_or_default().to_owned();
+        if !schema
+            .iter()
+            .any(|s| s.starts_with(&format!("relation {table} ")))
+        {
+            continue;
+        }
+        let prefix = format!("column {table}.");
+        let columns: Vec<String> = schema
+            .iter()
+            .filter_map(|s| s.strip_prefix(&prefix))
+            .filter_map(|rest| rest.split(' ').next())
+            .map(|c| format!("t.\"{c}\""))
+            .collect();
+        if columns.is_empty() {
+            // A sequence.
+            out.push(line);
+            continue;
+        }
+        // Names read from the catalog of the schema, quoted.
+        let row = format!("ROW({})::text", columns.join(", "));
+        let sql = format!(
+            "SELECT count(*) || ' ' || md5(coalesce(string_agg({row}, '|' ORDER BY {row}), '')) \
+             FROM \"{table}\" t"
+        );
+        let hashed: String = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        out.push(format!("{table} {hashed}"));
+    }
+    out
 }
 
 /// Rows in the tables of M1, written as the owner (before migration 6 the
@@ -148,16 +173,18 @@ fn every_reversible_migration_goes_down_and_up_without_loss() {
                 seed(&owner, 2).await;
             }
             let rows = rows_of(&owner).await;
+            let known = rows_known(&owner, &before).await;
 
-            // N -> N-1: the schema of N-1 exactly, every row it knows kept.
+            // N -> N-1: the schema of N-1 exactly, every row kept with the
+            // columns N-1 knows.
             assert_eq!(
                 schema::revert(&owner, version - 1).await.unwrap(),
                 [version]
             );
             assert_eq!(schema_of(&owner).await, before, "retour de {version}");
             assert_eq!(
-                rows_of(&owner).await,
-                known_at(&rows, &before),
+                rows_known(&owner, &before).await,
+                known,
                 "lignes après retour de {version}"
             );
             // Nothing left to revert down to the same version.
@@ -243,14 +270,71 @@ fn reverting_the_portal_removes_only_the_browser_sessions() {
         ] {
             sqlx::query(sql).execute(&owner).await.unwrap();
         }
-        // Migration 7 (the portal) goes: its tables and the login sessions of
-        // channel web; the session of `ostena login` stays.
-        assert_eq!(schema::revert(&owner, 6).await.unwrap(), [7]);
+        // Migration 7 (the portal) goes, after the later ones: its tables and
+        // the login sessions of channel web; the session of `ostena login`
+        // stays.
+        let reverted = schema::revert(&owner, 6).await.unwrap();
+        assert_eq!(reverted.last(), Some(&7), "{reverted:?}");
         let left: Vec<String> = sqlx::query_scalar("SELECT id::text FROM login_session")
             .fetch_all(&owner)
             .await
             .unwrap();
         assert_eq!(left, ["22222222-2222-2222-2222-222222222222"]);
+        owner.close().await;
+        db.drop_database().await;
+    });
+}
+
+#[test]
+fn reverting_identity_sources_keeps_directory_users_disabled() {
+    block_on(async {
+        let Some(db) =
+            TestDb::create("reverting_identity_sources_keeps_directory_users_disabled").await
+        else {
+            return;
+        };
+        db.migrate().await;
+        let owner = db.owner_pool().await;
+        for sql in [
+            "INSERT INTO app_user (id, name, display_name)
+             VALUES ('11111111-1111-1111-1111-111111111111', 'jdupont', 'Local')",
+            "INSERT INTO app_user (id, name, display_name, source, external_id, directory_dn)
+             VALUES ('22222222-2222-2222-2222-222222222222', 'corp/jdupont', 'Jean Dupont',
+                     'corp', '0101', 'CN=Jean Dupont,DC=corp')",
+            "INSERT INTO user_group (id, name)
+             VALUES ('33333333-3333-3333-3333-333333333333', 'admins')",
+            "INSERT INTO user_group_member (group_id, user_id, source)
+             VALUES ('33333333-3333-3333-3333-333333333333',
+                     '22222222-2222-2222-2222-222222222222', 'corp')",
+        ] {
+            sqlx::query(sql).execute(&owner).await.unwrap();
+        }
+        // A name outside the prefix of its source is refused.
+        assert!(
+            sqlx::query(
+                "INSERT INTO app_user (id, name, display_name, source, external_id, directory_dn)
+                 VALUES ('44444444-4444-4444-4444-444444444444', 'lab/jdupont', 'J',
+                         'corp', '0202', 'CN=J')"
+            )
+            .execute(&owner)
+            .await
+            .is_err()
+        );
+        // Migration 9 goes: the directory user stays, disabled, as a local
+        // account; the local account is untouched.
+        assert_eq!(schema::revert(&owner, 8).await.unwrap(), [9]);
+        let users: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, state FROM app_user ORDER BY name")
+                .fetch_all(&owner)
+                .await
+                .unwrap();
+        assert_eq!(
+            users,
+            [
+                ("corp.jdupont".into(), "disabled".into()),
+                ("jdupont".into(), "active".into()),
+            ]
+        );
         owner.close().await;
         db.drop_database().await;
     });

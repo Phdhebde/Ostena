@@ -178,6 +178,13 @@ pub async fn set_password(
     name: &str,
     password: SecretString,
 ) -> Result<(), CoreError> {
+    // A user of a directory (`source/identifier`, ADR-0021) has the
+    // password of the directory, checked by a bind.
+    if name.contains('/') {
+        return Err(CoreError::Invalid(
+            "utilisateur d'annuaire : son mot de passe est celui de l'annuaire".into(),
+        ));
+    }
     check_password(&password)?;
     let digest = tokio::task::spawn_blocking(move || password::hash(&password))
         .await

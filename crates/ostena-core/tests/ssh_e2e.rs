@@ -114,6 +114,7 @@ fn keys(pki: TestPki, transcripts: &Path) -> Keys {
             )
             .unwrap(),
         )),
+        directories: None,
     }
 }
 
