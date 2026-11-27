@@ -26,8 +26,8 @@ use serde::Deserialize;
 
 pub use self::core::{
     APP_ROLE, CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, CoreWebConfig,
-    DatabaseConfig, DatabaseTcp, GROUP_ROLES, KeySource, OWNER_ROLE, TotpAlgorithmSetting,
-    WormSetting, is_web_origin,
+    DatabaseConfig, DatabaseTcp, GROUP_ROLES, HttpTarget, KeySource, OWNER_ROLE,
+    TimestampingConfig, TotpAlgorithmSetting, WormSetting, is_web_origin,
 };
 pub use agent::{
     AgentConfig, AgentSessionsConfig, AgentSshConfig, InfrastructureEndpoint, SessionBounds,

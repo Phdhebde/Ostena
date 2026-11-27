@@ -44,6 +44,7 @@ use crate::grant_keys::GrantAuthority;
 use crate::identity::Directories;
 use crate::ssh_ca::SshAuthorities;
 use crate::store::{CHANNEL, Notice, PgStore, agent_event, truncate};
+use crate::timestamping::Timestamper;
 use crate::transcripts::{self, Transcripts};
 use crate::web::gateway::Relays;
 use crate::web::pg::{Agents, PgWebBackend, WebAccess};
@@ -497,6 +498,29 @@ fn identity_of(
     )))
 }
 
+/// The background tasks of a started core.
+fn background(
+    listener: &Arc<CoreListener>,
+    notices: PgListener,
+    shared: &Arc<Shared>,
+    signer: &Arc<HeadSigner>,
+    identity: Option<&Arc<crate::identity::Identity>>,
+) -> Vec<JoinHandle<()>> {
+    let mut tasks = vec![
+        tokio::spawn(accept(listener.clone(), shared.clone())),
+        tokio::spawn(follow_notices(notices, shared.clone())),
+        tokio::spawn(resync_on_request(shared.clone())),
+        tokio::spawn(reload_periodically(shared.clone())),
+        tokio::spawn(signer.clone().run()),
+        tokio::spawn(renew_host_certificates(shared.clone())),
+    ];
+    // The synchronisation of the identity sources (ADR-0021).
+    if let Some(identity) = identity {
+        tasks.extend(identity.spawn());
+    }
+    tasks
+}
+
 /// The listeners of `[core.login]` (ADR-0010, ADR-0015) and of
 /// `[core.web]` (ADR-0020): one authenticator and one attempt limiter for
 /// both.
@@ -615,6 +639,8 @@ impl RunningCore {
         keys: &Keys,
         info: &StartInfo,
     ) -> Result<Self, CoreError> {
+        // Unreadable anchors refuse the start before anything is written.
+        let timestamper = Timestamper::of(&config.audit)?;
         let cache = store.cache();
         store.reload().await?;
         let recorder = store.recorder();
@@ -681,19 +707,10 @@ impl RunningCore {
         // Tokens issued while the core was stopped.
         shared.enrollment.wake().await.map_err(startup)?;
         let notices = listen(shared.store.pool()).await?;
+        let stamping = timestamper.map(|t| t.spawn(shared.store.pool().clone(), recorder.clone()));
         let writer = tokio::spawn(audit::run_writer(shared.store.pool().clone(), recorder));
-        let mut tasks = vec![
-            tokio::spawn(accept(listener.clone(), shared.clone())),
-            tokio::spawn(follow_notices(notices, shared.clone())),
-            tokio::spawn(resync_on_request(shared.clone())),
-            tokio::spawn(reload_periodically(shared.clone())),
-            tokio::spawn(signer.clone().run()),
-            tokio::spawn(renew_host_certificates(shared.clone())),
-        ];
-        // The synchronisation of the identity sources (ADR-0021).
-        if let Some(identity) = &identity {
-            tasks.extend(identity.spawn());
-        }
+        let mut tasks = background(&listener, notices, &shared, &signer, identity.as_ref());
+        tasks.extend(stamping);
         tracing::info!(
             event = "core.started",
             tunnel = %tunnel_addr,

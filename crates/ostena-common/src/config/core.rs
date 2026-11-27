@@ -350,6 +350,96 @@ pub struct CoreAuditConfig {
     /// « Stockage en ajout seul »).
     #[serde(default)]
     pub worm: WormSetting,
+    /// RFC 3161 time-stamps of the heads by an authority of the site
+    /// (ADR-0012); none without this section.
+    pub timestamping: Option<TimestampingConfig>,
+}
+
+/// Default interval between two time-stamps, seconds.
+pub const DEFAULT_TIMESTAMP_INTERVAL_SECS: u32 = 600;
+/// Default timeout of a time-stamp request, seconds.
+pub const DEFAULT_TIMESTAMP_TIMEOUT_SECS: u32 = 10;
+
+const fn default_timestamp_interval() -> u32 {
+    DEFAULT_TIMESTAMP_INTERVAL_SECS
+}
+
+const fn default_timestamp_timeout() -> u32 {
+    DEFAULT_TIMESTAMP_TIMEOUT_SECS
+}
+
+/// `[core.audit.timestamping]`: the time-stamping authority (RFC 3161
+/// over HTTP, section 3.4 of the RFC). The tokens are signed: their
+/// integrity does not rest on the transport, which carries only a hash.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimestampingConfig {
+    /// `http://host[:port]/path` of the authority.
+    pub url: String,
+    /// PEM file of the trusted certificates of the authority (its root or
+    /// intermediate), absolute.
+    pub ca: PathBuf,
+    /// A time-stamp of the last head at most this often, if it changed:
+    /// 60 to 86400 s.
+    #[serde(default = "default_timestamp_interval")]
+    pub interval_secs: u32,
+    /// Timeout of one request, 1 to 60 s.
+    #[serde(default = "default_timestamp_timeout")]
+    pub timeout_secs: u32,
+}
+
+/// Host, port and path of an `http://` URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpTarget {
+    /// Host name, IPv4 address, or IPv6 address without brackets.
+    pub host: String,
+    /// Port, 80 by default.
+    pub port: u16,
+    /// Path and query, `/` at least.
+    pub path: String,
+}
+
+impl TimestampingConfig {
+    /// The parsed `url`; `None` if it is not a plain `http://` URL with a
+    /// host (no user information, no fragment, no control character).
+    pub fn target(&self) -> Option<HttpTarget> {
+        let rest = self.url.strip_prefix("http://")?;
+        if rest.chars().any(|c| c.is_control() || c.is_whitespace()) || rest.contains(['@', '#']) {
+            return None;
+        }
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+            let (host, after) = v6.split_once(']')?;
+            host.parse::<std::net::Ipv6Addr>().ok()?;
+            (host, after.strip_prefix(':'))
+        } else {
+            match authority.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (authority, None),
+            }
+        };
+        let host_ok = !host.is_empty()
+            && host.len() <= 253
+            && (host.contains(':')
+                || host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'));
+        if !host_ok {
+            return None;
+        }
+        let port = match port {
+            None => 80,
+            Some(p) => p.parse::<u16>().ok().filter(|p| *p != 0)?,
+        };
+        Some(HttpTarget {
+            host: host.to_owned(),
+            port,
+            path: path.to_owned(),
+        })
+    }
 }
 
 /// `core.audit.worm`: the write-once storage of the sealed files.
@@ -529,6 +619,33 @@ fn audit_bounds(audit: &CoreAuditConfig, out: &mut Vec<Violation>) {
         1,
         100_000,
     );
+    if let Some(ts) = &audit.timestamping {
+        if ts.target().is_none() {
+            out.push(Violation::new(
+                Code::CoreBounds,
+                format!(
+                    "core.audit.timestamping.url = « {} » : URL http://hôte[:port]/chemin \
+                     attendue (RFC 3161 sur HTTP ; le jeton est signé).",
+                    ts.url
+                ),
+            ));
+        }
+        path_rule(out, "core.audit.timestamping.ca", &ts.ca);
+        bounds(
+            out,
+            "core.audit.timestamping.interval_secs",
+            u64::from(ts.interval_secs),
+            60,
+            86_400,
+        );
+        bounds(
+            out,
+            "core.audit.timestamping.timeout_secs",
+            u64::from(ts.timeout_secs),
+            1,
+            60,
+        );
+    }
 }
 
 fn login_violation(out: &mut Vec<Violation>, message: String) {
