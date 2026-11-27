@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use self::core::{
-    APP_ROLE, CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig, CoreWebConfig,
-    DatabaseConfig, DatabaseTcp, GROUP_ROLES, HttpTarget, KeySource, OWNER_ROLE,
+    APP_ROLE, CoreAdminConfig, CoreAuditConfig, CoreConfig, CoreLoginConfig, CoreSshConfig,
+    CoreWebConfig, DatabaseConfig, DatabaseTcp, GROUP_ROLES, HttpTarget, KeySource, OWNER_ROLE,
     TimestampingConfig, TotpAlgorithmSetting, WormSetting, is_web_origin,
 };
 pub use agent::{

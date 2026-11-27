@@ -130,11 +130,14 @@ pub enum Code {
     /// file instead of a systemd credential, empty path, invalid server
     /// name).
     SyslogTls,
+    /// Core: one account may hold the audit role and a role that widens
+    /// accesses (`core.admin.allow_role_cumulation`, ADR-0022).
+    RoleCumulation,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 46] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -180,6 +183,7 @@ impl Code {
         Self::RdpSessionsKept,
         Self::WormDisabled,
         Self::SyslogTls,
+        Self::RoleCumulation,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -230,6 +234,7 @@ impl Code {
             Self::RdpSessionsKept => "CFG-P022",
             Self::WormDisabled => "CFG-P024",
             Self::SyslogTls => "CFG-V021",
+            Self::RoleCumulation => "CFG-P023",
         }
     }
 
@@ -259,6 +264,7 @@ impl Code {
                 | Self::DirectoryTls12
                 | Self::RdpSessionsKept
                 | Self::WormDisabled
+                | Self::RoleCumulation
         )
     }
 }
