@@ -95,6 +95,7 @@ La plus petite durée proposée par la stratégie est 1 minute : c'est une fenê
 - La connexion ajoute une liste des sessions par RPC (quelques allers-retours vers la cible) ; la fermeture d'une session laissée, rare, prend une à quelques secondes.
 - **Agent Debian : plus de RDP en production** tant qu'un mécanisme de fermeture n'existe pas pour lui (point à trancher ci-dessous).
 - L'agent Windows a besoin d'un flux vers le port 445 des cibles, en plus de 3389.
+- Le test sur un seul compte a révélé un défaut du transport, corrigé avec cette décision : les octets clairs de TLS n'étaient vidés qu'après toute une lecture TCP ; au-delà de 16 Kio retenus, la lecture suivante échouait et la boucle prenait l'erreur pour une fin de session par la cible. La rafale graphique qui suit l'ouverture de session suffisait à fermer une session sur deux en CI. Ils sont désormais vidés après chaque lot d'enregistrements (test unitaire du transport).
 
 ### Limites connues
 
