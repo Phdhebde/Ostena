@@ -127,7 +127,7 @@ fn generate(dist: &Path, sums: &Path) -> Result<String, String> {
         let file = path_string(&dist.join(path))?;
         let brotli = match digests.get(&format!("{path}.br")) {
             Some(br_digest) => format!(
-                "Some(Variant {{ bytes: include_bytes!({:?}), etag: \"\\\"br-{br_digest}\\\"\" }})",
+                "Some(super::Variant {{ bytes: include_bytes!({:?}), etag: \"\\\"br-{br_digest}\\\"\" }})",
                 path_string(&dist.join(format!("{path}.br")))?
             ),
             None => "None".to_owned(),
@@ -135,7 +135,7 @@ fn generate(dist: &Path, sums: &Path) -> Result<String, String> {
         let _ = writeln!(
             code,
             "    Asset {{ path: {path:?}, content_type: {content_type:?}, sha256: {digest:?}, \
-             raw: Variant {{ bytes: include_bytes!({file:?}), etag: \"\\\"{digest}\\\"\" }}, \
+             raw: super::Variant {{ bytes: include_bytes!({file:?}), etag: \"\\\"{digest}\\\"\" }}, \
              brotli: {brotli} }},"
         );
     }

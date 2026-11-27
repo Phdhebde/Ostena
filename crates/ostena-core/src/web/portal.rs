@@ -47,7 +47,7 @@ pub struct Asset {
 }
 
 mod embedded {
-    use super::{Asset, Variant};
+    use super::Asset;
     include!(concat!(env!("OUT_DIR"), "/portal.rs"));
 }
 
