@@ -132,6 +132,7 @@ fn load_transcripts(
     Ok(Some(Arc::new(Transcripts::open(
         &ssh.transcripts_dir,
         mac,
+        config.audit.worm,
     )?)))
 }
 

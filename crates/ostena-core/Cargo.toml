@@ -30,6 +30,8 @@ ostena-grant.workspace = true
 ostena-ldap.workspace = true
 # Session transcripts (ADR-0016): strict decoder and asciicast writer.
 ostena-recorder.workspace = true
+# Write-once sealed files: append-only then immutable attributes (ADR-0012).
+ostena-platform.workspace = true
 # The scope policy of a group, compiled before it is stored and pushed.
 ostena-scope.workspace = true
 # SSH certificates only (cert, keys): without the SSH library, which the
@@ -57,7 +59,6 @@ ostena-core = { path = ".", features = ["testing"] }
 ostena-crypto = { workspace = true, features = ["testing"] }
 # The identity tests: a directory served by the test LDAP server.
 ostena-ldap = { workspace = true, features = ["testing"] }
-ostena-platform.workspace = true
 toml.workspace = true
 # The login API tests: foreign TLS clients, an HTTP client.
 hyper = { workspace = true, features = ["client"] }

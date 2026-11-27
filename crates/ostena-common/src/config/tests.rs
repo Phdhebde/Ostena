@@ -127,6 +127,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
         "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
         "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019", "CFG-V020", "CFG-P020", "CFG-P021",
+        "CFG-P024",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -1947,4 +1948,28 @@ fn identity_rules() {
         "require_group = false\nsuffixes = [\"CORP.example\"]",
     );
     assert_eq!(core_codes(&core_with(&text)), vec![Code::CoreIdentity]);
+}
+
+// ---------------------------------------------------------------- write-once files
+
+#[test]
+fn p024_worm_disabled_is_refused_in_production() {
+    assert_eq!(parse(CORE).core.unwrap().audit.worm, WormSetting::Required);
+    let disabled = CORE.replace(
+        "audit = { signing_key = { credential = \"audit.key\" } }",
+        "audit = { signing_key = { credential = \"audit.key\" }, worm = \"disabled\" }",
+    );
+    let c = parse(&disabled);
+    assert_eq!(core_codes(&c), Vec::new());
+    assert_eq!(production_codes(&c), vec![Code::WormDisabled]);
+    let dev = parse(&format!("mode = \"development\"\n{disabled}"));
+    assert_eq!(
+        dev.weakenings().iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::WormDisabled]
+    );
+    let unknown = CORE.replace(
+        "audit = { signing_key = { credential = \"audit.key\" } }",
+        "audit = { signing_key = { credential = \"audit.key\" }, worm = \"maybe\" }",
+    );
+    assert!(Config::from_toml_str(&unknown).is_err());
 }

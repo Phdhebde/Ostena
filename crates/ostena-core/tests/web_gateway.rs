@@ -28,7 +28,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use ostena_common::api::web::{AccessGrant, SessionInfo};
 use ostena_common::config::scope::{AllowRuleSpec, PolicySpec};
-use ostena_common::config::{CoreConfig, Mode};
+use ostena_common::config::{CoreConfig, Mode, WormSetting};
 use ostena_common::secret::{SecretBytes, SecretString};
 use ostena_core::cache::AgentCache;
 use ostena_core::credential::{self, TotpKey};
@@ -128,9 +128,12 @@ fn keys(pki: TestPki, totp: Arc<TotpKey>, transcripts: &Path) -> Keys {
         )),
         totp: Some(totp),
         transcripts: Some(Arc::new(
+            // Browser streams write no transcript: rights only, so that the
+            // temporary directory can be removed (ADR-0012, PR 11a).
             Transcripts::open(
                 transcripts,
                 HmacKey::new(&HmacKey::generate().unwrap()).unwrap(),
+                WormSetting::Disabled,
             )
             .unwrap(),
         )),

@@ -186,6 +186,10 @@ struct Lab {
     /// reached as in production (socket, peer): the single test account
     /// plays both login roles, which production refuses (`CORE-E014`).
     production_config: Option<PathBuf>,
+    /// Whether the host allows write-once files: the production
+    /// configuration requires them, so without them the service refuses to
+    /// start (`REC-E006`) before it reads the database.
+    worm_available: bool,
     agent_config: PathBuf,
     login_port: u16,
 }
@@ -323,7 +327,23 @@ fn lab(db: &TestDb) -> Lab {
         database.user,
         database.migration_user,
     );
-    std::fs::write(&core_config, format!("mode = \"development\"\n\n{text}")).unwrap();
+    // Development: write-once files only where the host allows them (CI
+    // runners do not have CAP_LINUX_IMMUTABLE), logged as CFG-P024.
+    let worm_available = ostena_platform::worm::probe(&dir).is_ok();
+    let worm = if worm_available {
+        "required"
+    } else {
+        "disabled"
+    };
+    let development = text.replace(
+        "heartbeat_secs = 60\n",
+        &format!("heartbeat_secs = 60\nworm = \"{worm}\"\n"),
+    );
+    std::fs::write(
+        &core_config,
+        format!("mode = \"development\"\n\n{development}"),
+    )
+    .unwrap();
     let production_config = (db.mode == Mode::Production).then(|| {
         let path = dir.join("core-production.toml");
         std::fs::write(&path, format!("mode = \"production\"\n\n{text}")).unwrap();
@@ -349,6 +369,7 @@ fn lab(db: &TestDb) -> Lab {
         dir,
         core_config,
         production_config,
+        worm_available,
         agent_config,
         login_port,
     }
@@ -390,7 +411,12 @@ fn the_agent_enrols_survives_core_restarts_and_is_cut_off_once_revoked() {
     // Migrated, the service and the administration commands still refuse
     // these roles in production; development tolerates them, logged.
     if let Some(production) = &lab.production_config {
-        refused(&lab, &["core", "run"], production, "CORE-E014");
+        let code = if lab.worm_available {
+            "CORE-E014"
+        } else {
+            "REC-E006"
+        };
+        refused(&lab, &["core", "run"], production, code);
         refused(&lab, &["core", "user", "list"], production, "CORE-E014");
     }
     let mut core = Process::spawn(&["core", "run"], &lab.core_config);
