@@ -17,7 +17,10 @@
 //! here; no other crate depends on rustls directly (`deny.toml`).
 //!
 //! The RDP targets have their own profile, confined to the RDP driver
-//! ([`target`], ADR-0009 « écart RDP »): it is the only use of TLS 1.2.
+//! ([`target`], ADR-0009 « écart RDP »). The LDAPS directories of the
+//! identity sources have theirs: TLS 1.3 with classic groups and RSA
+//! certificates, TLS 1.2 only if a source admits it ([`directory`],
+//! ADR-0009 « Annuaires LDAPS »). These two are the only uses of TLS 1.2.
 
 use std::fmt;
 use std::sync::Arc;
@@ -665,6 +668,7 @@ pub fn web_server_config(
     Ok(Arc::new(config))
 }
 
+pub mod directory;
 pub mod target;
 
 #[cfg(test)]

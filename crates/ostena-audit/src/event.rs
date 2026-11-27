@@ -162,6 +162,23 @@ event_kinds! {
     /// A port forwarding channel (`direct-tcpip`: `-L`, `-W`, `ProxyJump`)
     /// relayed under the port forwarding function of the right (ADR-0010).
     AccessSshForward => "access.ssh_forward",
+    /// A synchronisation of an identity source ended (counts, duration;
+    /// ADR-0021).
+    IdentitySyncCompleted => "identity.sync_completed",
+    /// No server of an identity source answers (code, reason).
+    IdentitySourceUnavailable => "identity.source_unavailable",
+    /// A server of an identity source answers again.
+    IdentitySourceRestored => "identity.source_restored",
+    /// A user of an identity source was created in the core.
+    IdentityUserProvisioned => "identity.user_provisioned",
+    /// A user disabled by its identity source was enabled again by it.
+    IdentityUserReenabled => "identity.user_reenabled",
+    /// A group of users was created for a group rule of a source.
+    UserGroupCreated => "user_group.created",
+    /// A user joined a group of users (rule of a source).
+    UserGroupMemberAdded => "user_group.member_added",
+    /// A user left a group of users.
+    UserGroupMemberRemoved => "user_group.member_removed",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -309,6 +326,25 @@ pub mod field {
     pub const TRANSFER: &str = "transfer";
     /// A refused request, as the agent names it.
     pub const REQUEST: &str = "request";
+    /// Identity source of a user (`local` or the name of a directory;
+    /// ADR-0021).
+    pub const IDENTITY_SOURCE: &str = "identity_source";
+    /// Name of a group of users.
+    pub const USER_GROUP: &str = "user_group";
+    /// DN of an entry in a directory.
+    pub const DIRECTORY_DN: &str = "directory_dn";
+    /// A directory server, `host:port`.
+    pub const SERVER: &str = "server";
+    /// Users read from a source.
+    pub const USERS_SEEN: &str = "users_seen";
+    /// Users created.
+    pub const USERS_CREATED: &str = "users_created";
+    /// Users updated (name, display name, groups, enabled again).
+    pub const USERS_UPDATED: &str = "users_updated";
+    /// Users disabled.
+    pub const USERS_DISABLED: &str = "users_disabled";
+    /// Duration, milliseconds.
+    pub const DURATION_MS: &str = "duration_ms";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -381,6 +417,15 @@ pub mod field {
         RIGHTS,
         TRANSFER,
         REQUEST,
+        IDENTITY_SOURCE,
+        USER_GROUP,
+        DIRECTORY_DN,
+        SERVER,
+        USERS_SEEN,
+        USERS_CREATED,
+        USERS_UPDATED,
+        USERS_DISABLED,
+        DURATION_MS,
     ];
 }
 
@@ -550,7 +595,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 58);
+        assert_eq!(names.len(), 66);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

@@ -4,7 +4,7 @@ allow-panic-in-tests = true
 allow-print-in-tests = true
 
 # Protocol and standard names that are not code identifiers.
-doc-valid-idents = ["TSRequest", "CycloneDX", "RustSec", "NetBIOS", "LLMNR", "NAT64", "IPv4", "IPv6", "HelloAck", "WebSocket", "WebAssembly", "CredSSP", "ChaCha20", "IronRDP", "DRDYNVC", "NTLMv2", ".."]
+doc-valid-idents = ["TSRequest", "CycloneDX", "RustSec", "NetBIOS", "LLMNR", "NAT64", "IPv4", "IPv6", "HelloAck", "WebSocket", "WebAssembly", "CredSSP", "ChaCha20", "IronRDP", "DRDYNVC", "NTLMv2", "OpenLDAP", "FreeIPA", "StartTLS", "LDAPv3", ".."]
 
 # Reading a secret must be visible in review: every call needs
 # `#[expect(clippy::disallowed_methods)]` under a `// SECRET-EXPOSURE: <reason>`

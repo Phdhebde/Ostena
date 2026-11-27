@@ -92,6 +92,7 @@ En M1, le core se connectait avec un seul rôle, propriétaire du schéma : un c
 | `CORE-E012` | requête d'administration invalide (ADR-0014) |
 | `CORE-E013` | rôles de la base absents ou mal attribués : rôle de groupe inaccessible au rôle de connexion, migration hors d'`ostena_owner`, objet du schéma possédé par le compte du service, ou droit de modification d'`ostena_app` sur la chaîne d'audit |
 | `CORE-E014` | séparation des rôles de la base affaiblie, refusée en production : rôle de connexion du service superutilisateur, membre d'`ostena_owner`, capable de créer des rôles, ou identique au rôle des migrations |
+| `CORE-E015` | source d'identités inutilisable : aucun serveur ne répond, TLS ou compte de service refusé, recherche en échec ; le message porte le code `IDN-…` de la cause (ADR-0021) |
 
 Les refus d'accès (`ACC-E001` à `ACC-E009`) et d'inventaire (`INV-E001` à `INV-E005`) sont décrits dans l'ADR-0014.
 

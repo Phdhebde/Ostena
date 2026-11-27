@@ -14,6 +14,7 @@
 
 pub mod agent;
 pub mod core;
+pub mod identity;
 mod permissions;
 pub mod scope;
 mod validation;
@@ -31,6 +32,10 @@ pub use self::core::{
 pub use agent::{
     AgentConfig, AgentSessionsConfig, AgentSshConfig, InfrastructureEndpoint, SessionBounds,
     SshPaths, TunnelTransport,
+};
+pub use identity::{
+    CoreIdentityConfig, DirectoryKind, DirectoryTlsVersion, GroupRule, LOCAL_SOURCE,
+    LdapSourceConfig, LdapsServer,
 };
 pub use permissions::{DefaultPermissions, PermissionChecker};
 pub use validation::{
@@ -292,7 +297,8 @@ impl Config {
     }
 
     /// Weakenings tolerated in production, logged at every start:
-    /// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) always.
+    /// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) and
+    /// `CFG-P021` (TLS 1.2 towards a directory) always.
     pub fn tolerated(&self) -> Vec<Violation> {
         self.tolerated_at(unix_now())
     }
@@ -526,6 +532,17 @@ fn file_rules(
                     Code::CoreKeyExposed,
                     format!("{field} {} : {reason}", key.display()),
                 ));
+            }
+        }
+        // The password files of the identity sources (ADR-0021).
+        if let Some(identity) = &core.identity {
+            for (field, file) in identity::secret_paths(identity) {
+                if let Err(reason) = checker.private(file) {
+                    out.push(Violation::new(
+                        Code::IdentitySecretExposed,
+                        format!("{field} {} : {reason}", file.display()),
+                    ));
+                }
             }
         }
         // The transcripts (ADR-0016): the directory is private (0700, owner

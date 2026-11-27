@@ -373,7 +373,9 @@ fn resolve(
         .user
         .clone()
         .or_else(|| saved.as_ref().map(|s| s.user.clone()))
-        .ok_or_else(|| LoginError::Usage("précisez --user".into()))?;
+        .ok_or_else(|| LoginError::Usage("précisez --user".into()))?
+        // Directory names are typed as they are written there (ADR-0021).
+        .to_ascii_lowercase();
     if !login::is_username(&user) {
         return Err(LoginError::Usage(format!(
             "nom d'utilisateur invalide : « {user} »"

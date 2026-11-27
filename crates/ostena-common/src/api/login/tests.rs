@@ -161,10 +161,38 @@ fn error_and_logout_messages() {
 
 #[test]
 fn names() {
-    for ok in ["a", "jdupont", "j.dupont", "j_dupont-2", "0ps"] {
+    for ok in [
+        "a",
+        "jdupont",
+        "j.dupont",
+        "j_dupont-2",
+        "0ps",
+        "corp/jdupont",
+        "local/admin",
+        "jdupont@corp.example",
+    ] {
         assert!(is_username(ok), "{ok}");
     }
-    for bad in ["", ".a", "_a", "A", "a b", "a@b", "é"] {
+    let long = "a".repeat(65);
+    for bad in [
+        "",
+        ".a",
+        "_a",
+        "A",
+        "a b",
+        "é",
+        "Corp/jdupont",
+        "/jdupont",
+        "corp/",
+        "corp/a/b",
+        "corp.x/a",
+        "a@",
+        "@corp",
+        "a@b@c",
+        "a@Corp.example",
+        "a@b/c",
+        long.as_str(),
+    ] {
         assert!(!is_username(bad), "{bad}");
     }
     assert!(is_uuid("0b8f4c1e-7a52-4d0e-9f3b-2c6d1a9e8f70"));
