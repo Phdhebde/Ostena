@@ -10,6 +10,7 @@ members = [
     "crates/ostena-recorder",
     "crates/ostena-scope",
     "crates/ostena-frame",
+    "crates/ostena-ws",
     "crates/ostena-session",
     "crates/ostena-platform",
     "crates/ostena-tunnel",
@@ -46,6 +47,7 @@ ostena-scope = { path = "crates/ostena-scope" }
 ostena-session = { path = "crates/ostena-session" }
 ostena-ssh = { path = "crates/ostena-ssh" }
 ostena-tunnel = { path = "crates/ostena-tunnel" }
+ostena-ws = { path = "crates/ostena-ws" }
 
 # Third-party dependencies. Each one is justified in the PR that adds it.
 # Only ostena-crypto may depend on it (enforced by deny.toml). prebuilt-nasm: no
