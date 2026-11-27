@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::json::{self, Value};
-use crate::{Result, run_in, workspace_root};
+use crate::{Result, VENDOR_CONFIG, cargo, run_in, workspace_root};
 
 /// The npm cache produced by `cargo xtask vendor`, next to `vendor/`.
 pub(crate) const NPM_VENDOR_DIR: &str = "vendor/npm";
@@ -77,6 +77,7 @@ pub(crate) fn portal(args: &[String]) -> Result<()> {
         eprintln!("{NPM_VENDOR_DIR}/ absent: installing from the registry (not an offline build)");
     }
     run_in(install, &dir)?;
+    web_client(&root, offline)?;
     let mut check = npm();
     check.args(["run", "check"]);
     run_in(check, &dir)?;
@@ -104,6 +105,98 @@ pub(crate) fn portal(args: &[String]) -> Result<()> {
         )
         .into())
     }
+}
+
+/// The glue tool of `ostena-web-client`, its own workspace (ADR-0020).
+pub(crate) const BINDGEN_MANIFEST: &str = "tools/wasm-bindgen/Cargo.toml";
+/// Where the WebAssembly client and its glue are written for Vite.
+const WASM_OUT: &str = "portal/src/wasm";
+
+/// The arguments that make cargo build without network: `--offline`, and
+/// the vendored sources when `cargo xtask vendor` wrote them.
+fn cargo_offline(root: &Path, offline: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if offline {
+        args.push("--offline".to_owned());
+        if root.join(VENDOR_CONFIG).is_file() {
+            args.extend(["--config".to_owned(), VENDOR_CONFIG.to_owned()]);
+        }
+    }
+    args
+}
+
+/// Builds `ostena-web-client` for `wasm32-unknown-unknown` and writes its
+/// JavaScript glue into `portal/src/wasm/`, by the tool of
+/// `tools/wasm-bindgen` built from its own lockfile.
+///
+/// The paths of the build machine are remapped (`/ostena`, `/cargo`), so
+/// that the module is the same whatever the directory of the sources; the
+/// module keeps its custom sections for the glue tool (`strip` off), which
+/// removes the names and producers sections itself.
+fn web_client(root: &Path, offline: bool) -> Result<()> {
+    let target_dir = root.join("target").join("portal");
+    let cargo_home = std::env::var_os("CARGO_HOME").map_or_else(
+        || {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| Path::new(&h).join(".cargo"))
+                .unwrap_or_default()
+        },
+        std::path::PathBuf::from,
+    );
+    let flags = format!(
+        "--remap-path-prefix={}=/ostena\x1f--remap-path-prefix={}=/cargo",
+        root.display(),
+        cargo_home.display()
+    );
+    let mut build = cargo();
+    build
+        .args([
+            "build",
+            "--release",
+            "--locked",
+            "--package",
+            "ostena-web-client",
+            "--target",
+            "wasm32-unknown-unknown",
+        ])
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .args(cargo_offline(root, offline))
+        .env("CARGO_ENCODED_RUSTFLAGS", flags)
+        .env("CARGO_PROFILE_RELEASE_STRIP", "false");
+    run_in(build, root)?;
+
+    let tools_dir = root.join("target").join("tools");
+    let mut tool = cargo();
+    tool.args([
+        "build",
+        "--release",
+        "--locked",
+        "--manifest-path",
+        BINDGEN_MANIFEST,
+    ])
+    .arg("--target-dir")
+    .arg(&tools_dir)
+    .args(cargo_offline(root, offline));
+    run_in(tool, root)?;
+
+    let out = root.join(WASM_OUT);
+    if out.exists() {
+        fs::remove_dir_all(&out)?;
+    }
+    let mut glue = Command::new(tools_dir.join("release").join(format!(
+        "ostena-wasm-bindgen{}",
+        std::env::consts::EXE_SUFFIX
+    )));
+    glue.arg(
+        target_dir
+            .join("wasm32-unknown-unknown")
+            .join("release")
+            .join("ostena_web_client.wasm"),
+    )
+    .arg(&out);
+    run_in(glue, root)
 }
 
 /// `.node-version` holds the exact version of Node, which must be the one
