@@ -50,7 +50,9 @@ async function call(
   background = false,
 ): Promise<Response> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (body !== undefined) {
+  // Every method that changes state declares JSON, body or not: the core
+  // refuses it otherwise (CSRF, WEB-E003), and the browser preflights it.
+  if (method !== "GET") {
     headers["Content-Type"] = "application/json";
   }
   if (background) {
