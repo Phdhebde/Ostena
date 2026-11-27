@@ -78,6 +78,7 @@ fn full_example_parses() {
         Output::Syslog {
             address: "siem.example:6514".to_owned(),
             transport: Transport::Tls,
+            tls: None,
         }
     );
     assert!(config.validate().is_ok());
@@ -127,7 +128,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
         "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
         "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019", "CFG-V020", "CFG-P020", "CFG-P021",
-        "CFG-P024",
+        "CFG-P024", "CFG-V021",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -197,6 +198,7 @@ fn v005_invalid_syslog_address() {
                 outputs: vec![Output::Syslog {
                     address: address.to_owned(),
                     transport: Transport::Tls,
+                    tls: None,
                 }],
             },
             ..Config::default()
@@ -507,8 +509,11 @@ fn output() -> impl Strategy<Value = Output> {
     prop_oneof![
         Just(Output::Stdout {}),
         path().prop_map(|path| Output::File { path }),
-        (address(), transport())
-            .prop_map(|(address, transport)| Output::Syslog { address, transport }),
+        (address(), transport()).prop_map(|(address, transport)| Output::Syslog {
+            address,
+            transport,
+            tls: None,
+        }),
         path().prop_map(|path| Output::SyslogUnix { path }),
     ]
 }
@@ -593,7 +598,7 @@ proptest! {
     fn prop_p005_iff_clear_text_remote_syslog(c in config()) {
         let expected = all_outputs(&c).any(|o| matches!(
             o,
-            Output::Syslog { address, transport }
+            Output::Syslog { address, transport, .. }
                 if *transport != Transport::Tls && !is_local_address(address)
         ));
         prop_assert_eq!(has(&c, Code::UnencryptedRemoteOutput), expected);
@@ -2018,4 +2023,38 @@ fn timestamping_is_checked() {
         core_codes(&c),
         vec![Code::RelativePath, Code::CoreBounds, Code::CoreBounds]
     );
+}
+
+#[test]
+fn v021_syslog_tls_settings_are_checked() {
+    let output = |rest: &str| {
+        parse(&format!(
+            "[[audit.outputs]]\nkind = \"syslog\"\naddress = \"siem.example:6514\"\n{rest}"
+        ))
+    };
+    let good = output(
+        "tls = { ca = \"/etc/ostena/siem-ca.pem\", server_name = \"siem.example\", \
+         certificate = \"/etc/ostena/core-siem.pem\", private_key = { credential = \"siem.key\" } }",
+    );
+    assert!(good.validate().is_ok());
+    let Output::Syslog { tls: Some(tls), .. } = &good.audit.outputs[0] else {
+        panic!("tls attendu");
+    };
+    assert_eq!(tls.server_name.as_deref(), Some("siem.example"));
+    assert!(output("tls = { ca = \"/ca.pem\" }").validate().is_ok());
+    for bad in [
+        "transport = \"tcp\"\ntls = { ca = \"/ca.pem\" }",
+        "tls = { ca = \"\" }",
+        "tls = { ca = \"/ca.pem\", certificate = \"/c.pem\" }",
+        "tls = { ca = \"/ca.pem\", private_key = { credential = \"k\" } }",
+        "tls = { ca = \"/ca.pem\", certificate = \"/c.pem\", private_key = { file = \"/k.pem\" } }",
+        "tls = { ca = \"/ca.pem\", server_name = \"a b\" }",
+    ] {
+        let codes = output(bad).validate().unwrap_err().codes();
+        assert!(codes.contains(&Code::SyslogTls), "{bad} : {codes:?}");
+    }
+    assert!(Config::from_toml_str(
+        "[[audit.outputs]]\nkind = \"syslog\"\naddress = \"a:1\"\ntls = { ca = \"/c\", unknown = 1 }"
+    )
+    .is_err());
 }

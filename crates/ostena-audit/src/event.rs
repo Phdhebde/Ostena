@@ -47,6 +47,12 @@ event_kinds! {
     /// A head could not be time-stamped (code, reason); written once per
     /// run of failures.
     AuditTimestampFailed => "audit.timestamp_failed",
+    /// Everything up to `last_seq` was written to the syslog collector
+    /// `destination` (its position, ADR-0012); at most every minute.
+    AuditForwarded => "audit.forwarded",
+    /// The export to a syslog collector stopped (destination, code,
+    /// reason); written once per run of failures.
+    AuditForwardFailed => "audit.forward_failed",
     /// The core started.
     CoreStarted => "core.started",
     /// The core stopped.
@@ -241,6 +247,8 @@ pub mod field {
     pub const STAMPED_AT: &str = "stamped_at";
     /// Policy of a time-stamping authority (dotted OID).
     pub const POLICY: &str = "policy";
+    /// The `address` of a syslog collector of the audit export.
+    pub const DESTINATION: &str = "destination";
     /// Heartbeat of the head signer, in seconds.
     pub const HEARTBEAT_SECS: &str = "heartbeat_secs";
     /// Schema version after migration.
@@ -378,6 +386,7 @@ pub mod field {
         HEAD_HASH,
         STAMPED_AT,
         POLICY,
+        DESTINATION,
         AGENT_ID,
         GROUP_ID,
         ENROLLMENT_ID,
@@ -626,7 +635,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 73);
+        assert_eq!(names.len(), 75);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())

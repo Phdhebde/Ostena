@@ -76,6 +76,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "syslog_frame"
+path = "fuzz_targets/syslog_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tsp_response"
 path = "fuzz_targets/tsp_response.rs"
 test = false

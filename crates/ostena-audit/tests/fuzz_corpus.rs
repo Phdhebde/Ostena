@@ -1,5 +1,5 @@
-//! Replays the cargo-fuzz corpora (`fuzz/corpus/audit_decode` and
-//! `fuzz/corpus/audit_verify`) on the stable toolchain, so that every input
+//! Replays the cargo-fuzz corpora (`fuzz/corpus/audit_decode`,
+//! `fuzz/corpus/audit_verify` and `fuzz/corpus/syslog_frame`) on the stable toolchain, so that every input
 //! the fuzzer kept is a regression test.
 
 #![allow(
@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use ostena_audit::{
-    ActorKind, ChainId, ChainTip, Event, EventKind, ExportWriter, Head, Options, Outcome,
+    ActorKind, ChainId, ChainTip, Event, EventKind, ExportWriter, Head, Options, Outcome, Record,
     UnsignedHead, field, verify_export,
 };
 use ostena_common::secret::SecretBytes;
@@ -40,6 +40,40 @@ fn replay_decode_corpus() {
 #[test]
 fn replay_verify_corpus() {
     replay("audit_verify", ostena_audit::fuzz::verify);
+}
+
+#[test]
+fn replay_syslog_corpus() {
+    replay("syslog_frame", ostena_audit::fuzz::syslog);
+}
+
+/// Regenerates the seeds of `syslog_frame`:
+/// `cargo test -p ostena-audit --test fuzz_corpus write_syslog_seeds -- --ignored`.
+#[test]
+#[ignore = "writes files; run on demand"]
+fn write_syslog_seeds() {
+    use ostena_audit::siem::{frame, message};
+
+    let dir = corpus_dir("syslog_frame");
+    std::fs::create_dir_all(&dir).unwrap();
+    let records: Vec<_> = seeds()
+        .records
+        .iter()
+        .map(|body| Record::decode(body).unwrap())
+        .collect();
+    let messages: Vec<_> = records
+        .iter()
+        .map(|r| message(r, "core.example", "0.1.0"))
+        .collect();
+    std::fs::write(dir.join("seed-message.txt"), &messages[1]).unwrap();
+    let stream: Vec<u8> = messages.iter().flat_map(|m| frame(m)).collect();
+    std::fs::write(dir.join("seed-stream.txt"), &stream).unwrap();
+    std::fs::write(dir.join("seed-cut.txt"), &stream[..stream.len() - 7]).unwrap();
+    std::fs::write(
+        dir.join("seed-sd.txt"),
+        frame(b"<165>1 2026-11-27T12:00:00.000Z h app 12 ID47 [x@1 a=\"b\\\"]\"][y] m"),
+    )
+    .unwrap();
 }
 
 /// The RFC 6979 appendix A.2.5 P-256 test key (public test vector), whose

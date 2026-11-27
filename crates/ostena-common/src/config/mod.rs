@@ -198,12 +198,36 @@ pub enum Output {
         /// Transport, TLS by default.
         #[serde(default)]
         transport: Transport,
+        /// TLS settings of the collector (RFC 5425): required for an audit
+        /// export of the core over TLS.
+        #[serde(default)]
+        tls: Option<SyslogTls>,
     },
     /// The local syslog Unix socket.
     SyslogUnix {
         /// Socket path, usually `/dev/log`.
         path: PathBuf,
     },
+}
+
+/// How the core authenticates a syslog collector over TLS, and is
+/// authenticated by it (RFC 5425 section 5; ADR-0012).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyslogTls {
+    /// CA bundle (PEM) of the collector certificate: the only trust.
+    pub ca: PathBuf,
+    /// Name checked in the collector certificate, the host of `address` by
+    /// default.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    /// Certificate chain (PEM) presented by the core, with `private_key`
+    /// (mutual authentication).
+    #[serde(default)]
+    pub certificate: Option<PathBuf>,
+    /// Its ECDSA P-256 private key: a systemd credential only.
+    #[serde(default)]
+    pub private_key: Option<KeySource>,
 }
 
 /// Network transport of a syslog destination.

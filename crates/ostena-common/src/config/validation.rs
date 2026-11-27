@@ -4,7 +4,7 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
-use super::{CertificateValidation, Config, HostKeyVerification, Output, Transport};
+use super::{CertificateValidation, Config, HostKeyVerification, Output, SyslogTls, Transport};
 
 /// The only grant signature algorithm accepted in production (ADR-0004).
 pub const GRANT_SIGNATURE_ALGORITHM: &str = "ecdsa-p256-sha256";
@@ -119,11 +119,16 @@ pub enum Code {
     /// Core: sealed files (transcripts, recordings) written without the
     /// append-only then immutable attributes (`core.audit.worm = "disabled"`).
     WormDisabled,
+    /// Invalid TLS settings of a syslog output (`tls` with a clear-text
+    /// transport, certificate without its key or the reverse, key in a
+    /// file instead of a systemd credential, empty path, invalid server
+    /// name).
+    SyslogTls,
 }
 
 impl Code {
     /// Every code, in numbering order.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::Read,
         Self::Parse,
         Self::PkiWithoutCaBundle,
@@ -167,6 +172,7 @@ impl Code {
         Self::IdentitySecretExposed,
         Self::DirectoryTls12,
         Self::WormDisabled,
+        Self::SyslogTls,
     ];
 
     /// The code as written in messages and logs, e.g. `CFG-P001`.
@@ -215,6 +221,7 @@ impl Code {
             Self::IdentitySecretExposed => "CFG-P020",
             Self::DirectoryTls12 => "CFG-P021",
             Self::WormDisabled => "CFG-P024",
+            Self::SyslogTls => "CFG-V021",
         }
     }
 
@@ -359,7 +366,14 @@ pub(crate) fn consistency(config: &Config) -> Vec<Violation> {
             Output::File { path } | Output::SyslogUnix { path } => {
                 check_path(&mut out, &format!("{field}.path"), path);
             }
-            Output::Syslog { address, .. } => {
+            Output::Syslog {
+                address,
+                transport,
+                tls,
+            } => {
+                if let Some(tls) = tls {
+                    check_syslog_tls(&mut out, &field, *transport, tls);
+                }
                 if parse_host_port(address).is_none() {
                     out.push(Violation::new(
                         Code::InvalidSyslogAddress,
@@ -422,7 +436,9 @@ pub(crate) fn weakenings(config: &Config, now: u64) -> Vec<Violation> {
     }
 
     for (field, output) in outputs(config) {
-        if let Output::Syslog { address, transport } = output
+        if let Output::Syslog {
+            address, transport, ..
+        } = output
             && *transport != Transport::Tls
             && !is_local_address(address)
         {
@@ -446,6 +462,43 @@ fn outputs(config: &Config) -> impl Iterator<Item = (String, &Output)> {
     logging
         .map(|(i, o)| (format!("logging.outputs[{i}]"), o))
         .chain(audit.map(|(i, o)| (format!("audit.outputs[{i}]"), o)))
+}
+
+fn check_syslog_tls(out: &mut Vec<Violation>, field: &str, transport: Transport, tls: &SyslogTls) {
+    let mut refuse = |why: String| {
+        out.push(Violation::new(
+            Code::SyslogTls,
+            format!("{field}.tls : {why}"),
+        ));
+    };
+    if transport != Transport::Tls {
+        refuse(format!(
+            "réglages TLS avec transport = \"{transport}\" ; retirez-les ou passez à \"tls\"."
+        ));
+    }
+    if tls.ca.as_os_str().is_empty()
+        || tls
+            .certificate
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+    {
+        refuse("chemin vide.".into());
+    }
+    if matches!(tls.private_key, Some(super::KeySource::File(_))) {
+        refuse(
+            "private_key en clair dans un fichier : credential systemd chiffré seulement.".into(),
+        );
+    }
+    if tls.certificate.is_some() != tls.private_key.is_some() {
+        refuse("certificate et private_key vont ensemble (authentification mutuelle).".into());
+    }
+    if let Some(name) = &tls.server_name
+        && parse_host_port(&format!("{name}:1")).is_none()
+    {
+        refuse(format!(
+            "server_name = \"{name}\" n'est pas un nom d'hôte ni une adresse IP."
+        ));
+    }
 }
 
 fn check_path(out: &mut Vec<Violation>, field: &str, path: &Path) {
