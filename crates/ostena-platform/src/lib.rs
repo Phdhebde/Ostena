@@ -2,7 +2,8 @@
 //! next lots services and local IPC.
 //!
 //! This is the only crate allowed to contain `unsafe` code, confined to the
-//! Windows FFI modules and the terminal modes ([`tty`]). Every `unsafe`
+//! Windows FFI modules, the terminal modes ([`tty`]) and the file
+//! attributes of [`worm`]. Every `unsafe`
 //! block carries a `// SAFETY:` comment (enforced by
 //! `clippy::undocumented_unsafe_blocks`) and is exercised by a test.
 
@@ -15,6 +16,7 @@ pub mod memory;
 pub mod private_file;
 pub mod service;
 pub mod tty;
+pub mod worm;
 
 pub use error::{Code, PlatformError};
 
