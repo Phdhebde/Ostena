@@ -128,7 +128,7 @@ fn codes_are_stable_and_unique() {
         "CFG-P010", "CFG-V011", "CFG-V012", "CFG-V013", "CFG-V014", "CFG-P011", "CFG-P012",
         "CFG-P014", "CFG-V015", "CFG-V016", "CFG-V017", "CFG-P015", "CFG-P016", "CFG-V018",
         "CFG-P017", "CFG-V019", "CFG-P018", "CFG-P019", "CFG-V020", "CFG-P020", "CFG-P021",
-        "CFG-P022", "CFG-P024", "CFG-V021",
+        "CFG-P022", "CFG-P024", "CFG-V021", "CFG-P023",
     ];
     let actual: Vec<_> = Code::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(actual, expected);
@@ -2084,4 +2084,51 @@ fn v021_syslog_tls_settings_are_checked() {
         "[[audit.outputs]]\nkind = \"syslog\"\naddress = \"a:1\"\ntls = { ca = \"/c\", unknown = 1 }"
     )
     .is_err());
+}
+
+#[test]
+fn p023_role_cumulation_needs_a_justification_in_production() {
+    // Default: separate roles, nothing to log.
+    let c = parse(CORE);
+    assert!(!c.core.as_ref().unwrap().admin.allow_role_cumulation);
+    // Without a justification, or too short: refused in production, logged
+    // in development.
+    for extra in [
+        "\n[core.admin]\nallow_role_cumulation = true\n",
+        "\n[core.admin]\nallow_role_cumulation = true\n\
+         role_cumulation_justification = \"  équipe de deux     \"\n",
+    ] {
+        let c = core_with(extra);
+        assert_eq!(core_codes(&c), Vec::new());
+        assert_eq!(production_codes(&c), vec![Code::RoleCumulation], "{extra}");
+        assert_eq!(c.tolerated(), Vec::new());
+        let dev = parse(&format!("mode = \"development\"\n{CORE}{extra}"));
+        assert_eq!(
+            dev.weakenings().iter().map(|v| v.code).collect::<Vec<_>>(),
+            vec![Code::RoleCumulation]
+        );
+    }
+    // Justified: accepted in production, logged at every start with its
+    // justification.
+    let c = core_with(
+        "\n[core.admin]\nallow_role_cumulation = true\n\
+         role_cumulation_justification = \"Deux administrateurs seulement sur ce site\"\n",
+    );
+    assert_eq!(production_codes(&c), Vec::new());
+    let waived = c.tolerated();
+    assert_eq!(
+        waived.iter().map(|v| v.code).collect::<Vec<_>>(),
+        vec![Code::RoleCumulation]
+    );
+    assert!(waived[0].message.contains("Deux administrateurs"));
+    assert_eq!(Code::RoleCumulation.as_str(), "CFG-P023");
+    assert!(Code::RoleCumulation.is_weakening());
+    // A justification alone changes nothing.
+    let c = core_with(
+        "\n[core.admin]\nrole_cumulation_justification = \"Deux administrateurs seulement\"\n",
+    );
+    assert_eq!(production_codes(&c), Vec::new());
+    assert_eq!(c.tolerated(), Vec::new());
+    // An unknown field is refused.
+    assert!(Config::from_toml_str(&format!("{CORE}\n[core.admin]\nallow = true\n")).is_err());
 }

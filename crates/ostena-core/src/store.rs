@@ -46,6 +46,9 @@ pub enum Notice {
     /// A gateway group changed (SSH host names, scope policy): push again
     /// to its agents.
     Group(Uuid),
+    /// The access policy changed (a right granted or revoked): reload it
+    /// (ADR-0022).
+    Policy,
 }
 
 impl Notice {
@@ -58,6 +61,7 @@ impl Notice {
             Self::Audit => "audit".into(),
             Self::LoginRevoked(session) => format!("login_revoked:{session}"),
             Self::Group(group) => format!("group:{group}"),
+            Self::Policy => "policy".into(),
         }
     }
 
@@ -67,6 +71,7 @@ impl Notice {
             "token" => Some(Self::Token),
             "registered" => Some(Self::Registered),
             "audit" => Some(Self::Audit),
+            "policy" => Some(Self::Policy),
             _ => {
                 let (kind, id) = payload.split_once(':')?;
                 let id = Uuid::parse(id)?;
@@ -613,6 +618,7 @@ mod tests {
             Notice::Audit,
             Notice::LoginRevoked(agent),
             Notice::Group(agent),
+            Notice::Policy,
         ] {
             assert_eq!(Notice::parse(&n.payload()), Some(n));
         }

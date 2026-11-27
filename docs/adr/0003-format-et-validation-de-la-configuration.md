@@ -10,6 +10,7 @@
 - **Révisé** : 2026-11-27 — `CFG-V021`, réglages TLS d'une destination syslog (ADR-0012, export syslog TLS)
 - **Révisé** : 2026-11-26 — `CFG-V019`, `CFG-P018` et `CFG-P019`, section `[core.web]` du portail (ADR-0020)
 - **Révisé** : 2026-11-27 — `CFG-P022`, sessions Windows des cibles RDP laissées déconnectées (ADR-0026)
+- **Révisé** : 2026-11-27 — `CFG-P023`, cumul des rôles d'administration (`[core.admin]`, ADR-0022)
 
 ## Contexte
 
@@ -84,6 +85,7 @@ Les codes font partie de l'interface du produit. Ils ne sont jamais renuméroté
 | `CFG-P021` | production, **écart accepté** | une source d'identités admet TLS 1.2 vers ses annuaires (`core.identity.ldap.tls_min_version = "1.2"`) : jamais refusé, journalisé (`config.waiver`) et écrit dans l'audit (`config.waiver`) à chaque démarrage, sans échéance (ADR-0009, amendement des annuaires LDAPS) ; chaque connexion en TLS 1.2 est en outre journalisée (`identity.tls12`) |
 | `CFG-P022` | production | `rdp.disconnected_sessions = "keep"` : les sessions Windows du compte cible restent déconnectées et une connexion suivante peut s'y rattacher (ADR-0026) |
 | `CFG-V021` | cohérence | réglages `tls` d'une destination syslog (`[[audit.outputs]]`, ADR-0012) : `tls` avec un transport en clair, `certificate` sans `private_key` ou l'inverse, `private_key` en fichier au lieu d'un credential systemd, chemin vide, `server_name` qui n'est ni un nom d'hôte ni une adresse IP |
+| `CFG-P023` | production, **toléré avec justification** | `core.admin.allow_role_cumulation = true` : un même compte peut cumuler le rôle d'audit et un rôle qui élargit les accès (ADR-0022). Refusé en production sans `core.admin.role_cumulation_justification` d'au moins 20 caractères. Avec elle, accepté, journalisé et écrit dans l'audit (`config.waiver`) à chaque démarrage, avec la justification |
 | `CFG-P024` | production | `core.audit.worm = "disabled"` : transcripts et enregistrements scellés sans les attributs « ajout seul » puis « immuable » (ADR-0012, stockage en ajout seul) |
 
 `CFG-P013` (credential non lié au TPM 2.0, ADR-0008) est réservé : il n'est pas encore contrôlé, ce qui sera fait avec la lecture des credentials chiffrés après M1.

@@ -82,6 +82,39 @@ pub struct CoreConfig {
     /// only local accounts exist.
     #[serde(default)]
     pub identity: Option<super::identity::CoreIdentityConfig>,
+    /// The separate administration roles (ADR-0022).
+    #[serde(default)]
+    pub admin: CoreAdminConfig,
+}
+
+/// Shortest justification of `core.admin.allow_role_cumulation`, in
+/// characters, leading and trailing white space not counted.
+pub const MIN_ROLE_CUMULATION_JUSTIFICATION: usize = 20;
+
+/// `[core.admin]`: the separate administration roles (ADR-0022).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoreAdminConfig {
+    /// One account may hold the audit role together with a role that
+    /// widens accesses (`admin`, `policy`). A weakening: in production it
+    /// needs [`Self::role_cumulation_justification`] (`CFG-P023`), and it is
+    /// logged at every start and at every use.
+    #[serde(default)]
+    pub allow_role_cumulation: bool,
+    /// Why the separation cannot be kept: at least
+    /// [`MIN_ROLE_CUMULATION_JUSTIFICATION`] characters.
+    #[serde(default)]
+    pub role_cumulation_justification: Option<String>,
+}
+
+impl CoreAdminConfig {
+    /// The justification, trimmed, if it is long enough.
+    pub fn justification(&self) -> Option<&str> {
+        self.role_cumulation_justification
+            .as_deref()
+            .map(str::trim)
+            .filter(|j| j.chars().count() >= MIN_ROLE_CUMULATION_JUSTIFICATION)
+    }
 }
 
 /// `[core.ssh]`: the SSH certificate authorities of the core (ADR-0014).
@@ -950,6 +983,17 @@ pub(crate) fn consistency(core: &CoreConfig, out: &mut Vec<Violation>) {
 /// system: `CFG-P014`, `CFG-P018`, `CFG-P019`, and `CFG-P012` once the waiver has ended (`now`, Unix
 /// seconds).
 pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
+    if core.admin.allow_role_cumulation && core.admin.justification().is_none() {
+        out.push(Violation::new(
+            Code::RoleCumulation,
+            format!(
+                "core.admin.allow_role_cumulation = true sans \
+                 core.admin.role_cumulation_justification d'au moins \
+                 {MIN_ROLE_CUMULATION_JUSTIFICATION} caractères : un même compte pourrait \
+                 cumuler le rôle d'audit et un rôle qui élargit les accès (ADR-0022)."
+            ),
+        ));
+    }
     if core.database.tcp.is_some() {
         out.push(Violation::new(
             Code::DatabaseOverTcp,
@@ -990,8 +1034,21 @@ pub(crate) fn weakenings(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) 
 /// Weakenings tolerated in production and logged at every start:
 /// `CFG-P012` until 2027-04-30, `CFG-P015` (TOTP HMAC-SHA-1) and
 /// `CFG-P021` (TLS 1.2 towards a directory), accepted deviations of
-/// ADR-0009, without end.
+/// ADR-0009, without end, and `CFG-P023` (cumulation of administration
+/// roles) with its justification (ADR-0022).
 pub(crate) fn tolerated(core: &CoreConfig, now: u64, out: &mut Vec<Violation>) {
+    if core.admin.allow_role_cumulation
+        && let Some(justification) = core.admin.justification()
+    {
+        out.push(Violation::new(
+            Code::RoleCumulation,
+            format!(
+                "core.admin.allow_role_cumulation = true : un même compte peut cumuler le rôle \
+                 d'audit et un rôle qui élargit les accès (ADR-0022) ; justification : « {} »",
+                justification.chars().take(200).collect::<String>()
+            ),
+        ));
+    }
     if now < KEY_FILE_WAIVER_END {
         key_files(core, out);
     }

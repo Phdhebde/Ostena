@@ -711,12 +711,14 @@ fn ssh_access_and_login_revocation_end_to_end() {
         let events: Vec<String> = sqlx::query_scalar(
             "SELECT event FROM audit_record WHERE event LIKE 'access.%'
                 OR event LIKE 'ssh.%' OR event LIKE 'login_session.%'
-                OR event LIKE 'transcript.%' ORDER BY seq",
+                OR event LIKE 'transcript.%' OR event LIKE 'policy.%' ORDER BY seq",
         )
         .fetch_all(&pool)
         .await
         .unwrap();
         for expected in [
+            // Loaded at start (ADR-0022).
+            "policy.installed",
             "ssh.host_certified",
             "access.ssh_granted",
             "access.session_opened",

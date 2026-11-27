@@ -595,6 +595,24 @@ impl TokenStore for MemoryTokenStore {
     }
 }
 
+/// Discards what reached the kept socket while the listener was closed:
+/// handshakes of agents that have given up since. At most 1024 datagrams, so
+/// that a flood cannot hold the caller.
+fn drain(socket: &std::net::UdpSocket) {
+    if socket.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut buf = [0u8; 1500];
+    for _ in 0..1024 {
+        match socket.recv_from(&mut buf) {
+            Ok(_) => {}
+            // Windows reports an ICMP "port unreachable" on the next read.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(_) => break,
+        }
+    }
+}
+
 /// Counts a failed attempt on a known token, whatever its cause, and burns
 /// the token at the third; raises `tunnel.enrollment_suspicious` for a token
 /// of another group, an invalid proof or a burned token. Never logs the
@@ -641,6 +659,10 @@ struct Inner {
     tokens: Arc<dyn TokenStore>,
     listener: Mutex<Option<(Endpoint, JoinHandle<()>)>>,
     clock: Arc<dyn Clock>,
+    /// A socket bound once for the life of the service: the listener opens
+    /// on a copy of it instead of binding `addr` again, so no other socket
+    /// can take the port while the listener is closed.
+    socket: Option<std::net::UdpSocket>,
 }
 
 /// The core enrolment service: tokens, listener lifecycle, issuance.
@@ -705,6 +727,7 @@ impl EnrollmentService {
                 tokens,
                 listener: Mutex::new(None),
                 clock: Arc::new(SystemClock),
+                socket: None,
             }),
         })
     }
@@ -717,6 +740,27 @@ impl EnrollmentService {
             inner.clock = clock;
         }
         self
+    }
+
+    /// The same service on `socket`, kept bound for the life of the
+    /// service: the listener opens on it and its address replaces the one
+    /// given to [`EnrollmentService::new`]. Binding a port, releasing it and
+    /// binding it again when the first token is issued lets another socket
+    /// take it in between (tests on an ephemeral port). Call it before any
+    /// token is issued.
+    ///
+    /// # Errors
+    ///
+    /// [`TunnelError::Io`] if the address of `socket` cannot be read.
+    pub fn with_socket(mut self, socket: std::net::UdpSocket) -> Result<Self, TunnelError> {
+        let addr = socket
+            .local_addr()
+            .map_err(|e| TunnelError::Io(e.to_string()))?;
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.addr = addr;
+            inner.socket = Some(socket);
+        }
+        Ok(self)
     }
 
     fn now(&self) -> u64 {
@@ -825,8 +869,22 @@ impl EnrollmentService {
             ..Limits::default()
         };
         server.transport_config(limits.transport()?);
-        let endpoint = Endpoint::server(server, self.inner.addr)
-            .map_err(|e| TunnelError::Io(e.to_string()))?;
+        let io = |e: std::io::Error| TunnelError::Io(e.to_string());
+        let endpoint = match &self.inner.socket {
+            Some(socket) => {
+                drain(socket);
+                let runtime = quinn::default_runtime()
+                    .ok_or_else(|| TunnelError::Io("pas de moteur Tokio".into()))?;
+                Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(server),
+                    socket.try_clone().map_err(io)?,
+                    runtime,
+                )
+                .map_err(io)?
+            }
+            None => Endpoint::server(server, self.inner.addr).map_err(io)?,
+        };
         let service = self.clone();
         let accepting = endpoint.clone();
         let task = tokio::spawn(async move {

@@ -1,0 +1,97 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id::text AS \"id!\", user_id::text AS \"user!\", account_id::text AS \"account!\",\n                  protocol, valid_from, valid_until, max_session_secs, functions\n           FROM access_right WHERE revoked_at IS NULL AND valid_until > $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "user!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "account!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "protocol",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "protocol"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "valid_from",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "valid_from"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "valid_until"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "max_session_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "max_session_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "functions",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "access_right",
+            "name": "functions"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e364d08736a203f8f3730b6c4292906ca3b615924934bc4cd1e98a1152e7a1f2"
+}

@@ -208,6 +208,12 @@ event_kinds! {
     GatewayRefused => "gateway.refused",
     /// A WebSocket of the gateway ended (reason, bytes in each direction).
     GatewayClosed => "gateway.closed",
+    /// A version of the access policy was compiled and installed in the
+    /// decision point (ADR-0022).
+    PolicyInstalled => "policy.installed",
+    /// The access policy could not be reloaded: the decision point refuses
+    /// every access until the next installation (ADR-0022).
+    PolicyInvalidated => "policy.invalidated",
 }
 
 /// Field names of the documented events. None contains a fragment that the
@@ -384,6 +390,16 @@ pub mod field {
     pub const USERS_DISABLED: &str = "users_disabled";
     /// Duration, milliseconds.
     pub const DURATION_MS: &str = "duration_ms";
+    /// Version of the access policy that decided (ADR-0022).
+    pub const PDP_VERSION: &str = "pdp_version";
+    /// The rule of the access policy retained or in cause (ADR-0022).
+    pub const RULE_ID: &str = "rule_id";
+    /// Version of the access policy replaced at an installation.
+    pub const PREVIOUS_VERSION: &str = "previous_version";
+    /// Number of rules of an access policy.
+    pub const RULES: &str = "rules";
+    /// Compilation time of an access policy, microseconds.
+    pub const COMPILE_MICROS: &str = "compile_micros";
 
     /// Every name above.
     pub const ALL: &[&str] = &[
@@ -470,6 +486,11 @@ pub mod field {
         USERS_UPDATED,
         USERS_DISABLED,
         DURATION_MS,
+        PDP_VERSION,
+        RULE_ID,
+        PREVIOUS_VERSION,
+        RULES,
+        COMPILE_MICROS,
     ];
 }
 
@@ -639,7 +660,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 76);
+        assert_eq!(names.len(), 78);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())
