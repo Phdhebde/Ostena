@@ -1,10 +1,13 @@
 //! The access policy of the core in its decision point (ADR-0022).
 //!
 //! The policy is read from PostgreSQL as a whole, compiled and installed in
-//! a [`Pdp`]. Today its rules are the rights of ADR-0014 (one user, one
-//! account, one protocol, functions, until a date). A reload is asked after
-//! each change (notice `policy`), when lost notices are replayed, and when
-//! a decision finds the policy behind the database ([`crate::access`]).
+//! a [`Pdp`]. Its rules are the rights of ADR-0014 (one user, one account,
+//! SSH, functions, until a date) and the access rules (users or groups of
+//! users, accounts or groups of accounts, protocols, allowing or refusing).
+//! Its version is the one of the database (`policy_version`), raised by
+//! every change of what it reads. A reload is asked after each change
+//! (notice `policy`), when lost notices are replayed, and when a decision
+//! finds the policy behind the database ([`crate::access`]).
 //! Reloads are serialized and merged: a reload asked while another one
 //! reads the database runs once more after it, never in parallel, so a
 //! slower reload never installs older rules.
@@ -19,8 +22,9 @@ use std::time::Instant;
 use ostena_audit::{ActorKind, Event, EventKind, Outcome, field};
 use ostena_policy::roles::{self, AdminRole, Separation};
 use ostena_policy::{
-    AccountId, CompiledPolicy, Decision, Effect, Functions, Installed, Pdp, Protocol, Protocols,
-    Request, Rule, RuleId, Snapshot, Stats, Subject, Target, UserId,
+    AccountGroupId, AccountId, CompiledPolicy, Decision, Effect, Functions, Installed, Pdp,
+    Protocol, Protocols, Request, Rule, RuleId, Snapshot, Stats, Subject, Target, UserGroupId,
+    UserId,
 };
 use ostena_tunnel::Uuid;
 use sqlx::PgPool;
@@ -46,18 +50,76 @@ pub fn functions(right: crate::functions::Functions) -> Functions {
     Functions::from_bits(right.rights().bits()).unwrap_or(Functions::NONE)
 }
 
-/// The rules valid at `now` or later, read in one statement: today the
-/// rights that are neither revoked nor ended. `version` names the
-/// snapshot.
+/// The version of the policy in the database (`policy_version`).
 ///
 /// # Errors
 ///
 /// [`CoreError::Database`].
-pub async fn snapshot(
-    conn: &mut sqlx::PgConnection,
-    version: u64,
-    now: u64,
-) -> Result<Snapshot, CoreError> {
+pub async fn stored_version(conn: &mut sqlx::PgConnection) -> Result<u64, CoreError> {
+    let version = sqlx::query_scalar!("SELECT version FROM policy_version")
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(u64::try_from(version).unwrap_or(0))
+}
+
+/// The protocols named by a rule; an unknown name is left out.
+fn protocols(names: &[String]) -> Protocols {
+    names.iter().filter_map(|n| Protocol::parse(n)).collect()
+}
+
+/// The policy valid at `now` or later and its version, read in one
+/// repeatable-read transaction: the rights neither revoked nor ended, the
+/// access rules likewise, and the members of the groups.
+///
+/// # Errors
+///
+/// [`CoreError::Database`].
+pub async fn snapshot(pool: &PgPool, now: u64) -> Result<Snapshot, CoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let version = stored_version(&mut tx).await?;
+    let mut rules = rights(&mut tx, now).await?;
+    rules.extend(access_rules(&mut tx, now).await?);
+    let user_groups = sqlx::query!(
+        r#"SELECT group_id::text AS "group!", user_id::text AS "user!" FROM user_group_member"#
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|r| {
+        Ok((
+            UserGroupId(id128(uuid(&r.group)?)),
+            UserId(id128(uuid(&r.user)?)),
+        ))
+    })
+    .collect::<Result<Vec<_>, CoreError>>()?;
+    let account_groups = sqlx::query!(
+        r#"SELECT group_id::text AS "group!", account_id::text AS "account!"
+           FROM account_group_member"#
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|r| {
+        Ok((
+            AccountGroupId(id128(uuid(&r.group)?)),
+            AccountId(id128(uuid(&r.account)?)),
+        ))
+    })
+    .collect::<Result<Vec<_>, CoreError>>()?;
+    tx.commit().await?;
+    Ok(Snapshot {
+        version,
+        user_groups,
+        account_groups,
+        rules,
+    })
+}
+
+/// The rights valid at `now` or later, as rules.
+async fn rights(conn: &mut sqlx::PgConnection, now: u64) -> Result<Vec<Rule>, CoreError> {
     let rows = sqlx::query!(
         r#"SELECT id::text AS "id!", user_id::text AS "user!", account_id::text AS "account!",
                   protocol, valid_from, valid_until, max_session_secs, functions
@@ -93,12 +155,69 @@ pub async fn snapshot(
             valid_until,
         });
     }
-    Ok(Snapshot {
-        version,
-        user_groups: Vec::new(),
-        account_groups: Vec::new(),
-        rules,
-    })
+    Ok(rules)
+}
+
+/// The access rules valid at `now` or later. A refusal without an end
+/// lasts until `u64::MAX`.
+async fn access_rules(conn: &mut sqlx::PgConnection, now: u64) -> Result<Vec<Rule>, CoreError> {
+    let rows = sqlx::query!(
+        r#"SELECT id::text AS "id!", user_id::text AS "user?", user_group_id::text AS "user_group?",
+                  account_id::text AS "account?", account_group_id::text AS "account_group?",
+                  protocols, effect, functions, max_session_secs, valid_from, valid_until
+           FROM access_rule
+           WHERE revoked_at IS NULL AND (valid_until IS NULL OR valid_until > $1)"#,
+        crate::store::i64_of(now),
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut rules = Vec::with_capacity(rows.len());
+    for r in rows {
+        let subject = match (&r.user, &r.user_group) {
+            (Some(u), None) => Subject::User(UserId(id128(uuid(u)?))),
+            (None, Some(g)) => Subject::Group(UserGroupId(id128(uuid(g)?))),
+            _ => continue,
+        };
+        let target = match (&r.account, &r.account_group) {
+            (Some(a), None) => Target::Account(AccountId(id128(uuid(a)?))),
+            (None, Some(g)) => Target::AccountGroup(AccountGroupId(id128(uuid(g)?))),
+            _ => continue,
+        };
+        let named = functions(crate::functions::Functions::from_stored(&r.functions));
+        let effect = match (r.effect.as_str(), r.max_session_secs) {
+            ("allow", Some(secs)) => {
+                let Ok(max_session_secs) = u32::try_from(secs) else {
+                    continue;
+                };
+                Effect::Allow {
+                    functions: named,
+                    max_session_secs,
+                }
+            }
+            ("deny_functions", None) => Effect::DenyFunctions(named),
+            // Out of the CHECK constraints: an allowing rule is left out.
+            ("allow", None) | ("deny" | "deny_functions", Some(_)) => continue,
+            // `deny`, and a refusal of an unknown kind: refuses everything.
+            _ => Effect::Deny,
+        };
+        let Ok(valid_from) = u64::try_from(r.valid_from) else {
+            continue;
+        };
+        let valid_until = match r.valid_until {
+            None => u64::MAX,
+            Some(until) => u64::try_from(until).unwrap_or(0),
+        };
+        rules.push(Rule {
+            id: RuleId(id128(uuid(&r.id)?)),
+            subject,
+            target,
+            protocols: protocols(&r.protocols),
+            effect,
+            valid_from,
+            valid_until,
+        });
+    }
+    Ok(rules)
 }
 
 /// What a reload installed.
@@ -118,9 +237,8 @@ pub struct Policies {
     pdp: Pdp,
     /// Reloads asked so far.
     asked: AtomicU64,
-    /// Under the lock: the last reload asked that a finished reload covers,
-    /// and the last version given.
-    state: tokio::sync::Mutex<(u64, u64)>,
+    /// Under the lock: the last reload asked that a finished reload covers.
+    state: tokio::sync::Mutex<u64>,
     /// Where the installations and invalidations are recorded (the core);
     /// none for a dry run.
     recorder: Option<Arc<Recorder>>,
@@ -164,20 +282,19 @@ impl Policies {
     pub async fn reload(&self, pool: &PgPool, now: u64) -> Result<Option<Reloaded>, CoreError> {
         let ticket = self.asked.fetch_add(1, Ordering::AcqRel) + 1;
         let mut state = self.state.lock().await;
-        if state.0 >= ticket {
+        if *state >= ticket {
             return Ok(None);
         }
         // Every reload asked until now is covered by this one: they asked
         // before it reads.
         let covers = self.asked.load(Ordering::Acquire);
-        let version = state.1 + 1;
-        let result = self.read_and_install(pool, version, now).await;
+        let result = self.read_and_install(pool, now).await;
         match result {
             Ok(reloaded) => {
-                *state = (covers, version);
+                *state = covers;
                 tracing::info!(
                     event = "policy.installed",
-                    pdp_version = version,
+                    pdp_version = reloaded.installed.version,
                     rules = reloaded.stats.rules,
                     compile_micros = reloaded.compile_micros,
                 );
@@ -187,7 +304,6 @@ impl Policies {
                 Ok(Some(reloaded))
             }
             Err(e) => {
-                state.1 = version;
                 let dropped = self.pdp.invalidate();
                 tracing::error!(
                     event = "policy.invalidated",
@@ -203,15 +319,8 @@ impl Policies {
         }
     }
 
-    async fn read_and_install(
-        &self,
-        pool: &PgPool,
-        version: u64,
-        now: u64,
-    ) -> Result<Reloaded, CoreError> {
-        let mut conn = pool.acquire().await?;
-        let snapshot = snapshot(&mut conn, version, now).await?;
-        drop(conn);
+    async fn read_and_install(&self, pool: &PgPool, now: u64) -> Result<Reloaded, CoreError> {
+        let snapshot = snapshot(pool, now).await?;
         let start = Instant::now();
         let compiled = CompiledPolicy::compile(&snapshot)?;
         let compile_micros = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);

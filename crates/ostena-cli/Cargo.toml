@@ -51,6 +51,8 @@ zeroize.workspace = true
 # which only runs the agent, does not link it nor PostgreSQL.
 [target.'cfg(target_os = "linux")'.dependencies]
 ostena-core.workspace = true
+# The protocols of an access rule (ADR-0022), with the core.
+ostena-policy.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The demonstration test creates its own database.

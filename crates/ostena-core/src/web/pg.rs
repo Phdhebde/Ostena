@@ -297,6 +297,42 @@ impl WebBackend for PgWebBackend {
             .map_err(|e| broken(&e))
     }
 
+    fn role_cumulation_used(
+        &self,
+        session: &SessionRecord,
+        role: Role,
+        route: &str,
+        peer: SocketAddr,
+    ) {
+        let roles = session
+            .roles
+            .iter()
+            .map(|r| r.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            event = "admin.role_cumulation_used",
+            user = %session.user,
+            role = role.as_str(),
+            roles = %roles,
+            route,
+        );
+        self.auth.recorder().emit(
+            Event::new(
+                EventKind::AdminRoleCumulationUsed,
+                Outcome::Success,
+                ActorKind::User,
+                session.user.to_string(),
+            )
+            .uuid(field::USER_ID, session.user.to_bytes())
+            .uuid(field::LOGIN_SESSION, session.login_session.to_bytes())
+            .text(field::ROLE, role.as_str())
+            .text(field::ROLES, roles)
+            .text(field::ROUTE, truncate(route))
+            .text(field::CLIENT_ADDR, peer.to_string()),
+        );
+    }
+
     async fn touch(&self, session: Uuid, now: u64) -> Result<(), ApiError> {
         sqlx::query!(
             "UPDATE web_session SET last_activity_at = $2

@@ -144,18 +144,25 @@ impl ReauthenticateRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// Administration of the users, the inventory and the rights.
+    /// Administration of the users, the groups and the inventory.
     Admin,
+    /// Administration of the access rules and the rights (ADR-0022).
+    Policy,
+    /// Reading of the audit chain, the sessions and their transcripts;
+    /// incompatible with the two others (ADR-0022).
+    Audit,
 }
 
 impl Role {
     /// Every role.
-    pub const ALL: [Self; 1] = [Self::Admin];
+    pub const ALL: [Self; 3] = [Self::Admin, Self::Policy, Self::Audit];
 
     /// The name stored and sent, e.g. `admin`.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Admin => "admin",
+            Self::Policy => "policy",
+            Self::Audit => "audit",
         }
     }
 
@@ -643,6 +650,15 @@ mod tests {
     #[test]
     fn names_are_stable() {
         assert_eq!(Role::parse("admin"), Some(Role::Admin));
+        assert_eq!(Role::parse("policy"), Some(Role::Policy));
+        assert_eq!(Role::parse("audit"), Some(Role::Audit));
+        for role in Role::ALL {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+            assert_eq!(
+                serde_json::to_string(&role).unwrap(),
+                format!("\"{}\"", role.as_str())
+            );
+        }
         assert_eq!(Role::parse("root"), None);
         assert_eq!(Channel::parse(Channel::Web.as_str()), Some(Channel::Web));
         assert_eq!(Channel::parse(Channel::Cli.as_str()), Some(Channel::Cli));

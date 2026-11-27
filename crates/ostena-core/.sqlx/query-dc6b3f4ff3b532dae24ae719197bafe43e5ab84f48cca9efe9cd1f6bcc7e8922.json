@@ -1,0 +1,102 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT ar.id::text AS \"id!\",\n                  coalesce('user:' || u.name, 'group:' || ug.name) AS \"subject!\",\n                  coalesce(a.name || '@' || r.name, 'group:' || ag.name) AS \"target!\",\n                  ar.protocols, ar.effect, ar.functions, ar.max_session_secs, ar.valid_until,\n                  ar.revoked_at IS NOT NULL AS \"revoked!\"\n           FROM access_rule ar\n           LEFT JOIN app_user u ON u.id = ar.user_id\n           LEFT JOIN user_group ug ON ug.id = ar.user_group_id\n           LEFT JOIN target_account a ON a.id = ar.account_id\n           LEFT JOIN resource r ON r.id = a.resource_id\n           LEFT JOIN account_group ag ON ag.id = ar.account_group_id\n           ORDER BY ar.created_at DESC, ar.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "subject!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "target!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 3,
+        "name": "protocols",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "protocols"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "effect",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "effect"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "functions",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "functions"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "max_session_secs",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "max_session_secs"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "valid_until",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "access_rule",
+            "name": "valid_until"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "revoked!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      false,
+      false,
+      false,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "dc6b3f4ff3b532dae24ae719197bafe43e5ab84f48cca9efe9cd1f6bcc7e8922"
+}

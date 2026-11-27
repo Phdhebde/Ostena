@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM access_right WHERE id = $1::text::uuid) AS \"right!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "right!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a5bcf8613b6444ac4579ea736ca9a2f6397cd597a694ad4c0a565116ee0a6ce2"
+}

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT group_id::text AS \"group!\", account_id::text AS \"account!\"\n           FROM account_group_member",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "group!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "account!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "a27d7eccfa38cad5814fa85db27b33ea367470e6c0ac884b231bef4042943618"
+}
