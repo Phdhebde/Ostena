@@ -32,6 +32,7 @@ pub mod sealed;
 pub mod sha256;
 pub mod tls;
 pub mod totp;
+pub mod tsp;
 pub mod websocket;
 
 /// Errors raised by this crate. Deliberately coarse: callers must not be able

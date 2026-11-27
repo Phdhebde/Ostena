@@ -56,6 +56,9 @@ aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 # TLS 1.3 for the agent-core tunnel; the provider is built from aws-lc-rs in ostena-crypto (ADR-0009).
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std"] }
+# Certificate path validation of the time-stamping authorities (RFC 3161,
+# ADR-0012), in ostena-crypto only; already in the tree through rustls.
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["alloc"] }
 # X.509 issuance (core CA, agent certificates); no parser (no x509-parser).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 time = { version = "0.3.55", default-features = false }

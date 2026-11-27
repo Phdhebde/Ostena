@@ -2080,6 +2080,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rcgen",
  "rustls",
+ "rustls-webpki",
  "thiserror",
  "time",
  "vsss-rs",
