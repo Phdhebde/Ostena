@@ -29,5 +29,8 @@ Thumbs.db
 
 # Portal (ADR-0020): npm packages and build output, never versioned
 /portal/node_modules/
+/portal/e2e/node_modules/
+/portal/e2e/test-results/
+/portal/e2e/playwright-report/
 /portal/dist/
 /portal/src/wasm/

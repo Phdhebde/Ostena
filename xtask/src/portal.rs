@@ -14,6 +14,9 @@ use crate::{Result, VENDOR_CONFIG, cargo, run_in, workspace_root};
 /// The npm cache produced by `cargo xtask vendor`, next to `vendor/`.
 pub(crate) const NPM_VENDOR_DIR: &str = "vendor/npm";
 
+/// The package of the end-to-end tests, under `portal/`.
+const E2E_DIR: &str = "e2e";
+
 /// Licences allowed for npm packages: the list of CLAUDE.md, plus 0BSD (BSD
 /// family).
 const ALLOWED_LICENSES: &[&str] = &[
@@ -61,7 +64,15 @@ pub(crate) fn portal(args: &[String]) -> Result<()> {
     check_node(&dir)?;
     check_manifest(&dir)?;
     check_lockfile(&dir)?;
-    eprintln!("package.json and package-lock.json: exact versions, registry, integrity, licences");
+    // The end-to-end tests: their own package, never installed by the
+    // offline build, checked by the same rules (ADR-0020, § 6).
+    let e2e = dir.join(E2E_DIR);
+    check_manifest(&e2e)?;
+    check_lockfile(&e2e)?;
+    eprintln!(
+        "package.json and package-lock.json (portal and {E2E_DIR}/): exact versions, registry, \
+         integrity, licences"
+    );
 
     let cache = root.join(NPM_VENDOR_DIR);
     let mut install = npm();
@@ -551,6 +562,9 @@ mod tests {
             Vec::<String>::new()
         );
         check_manifest(&root.join("portal")).unwrap();
+        let e2e = root.join("portal").join(E2E_DIR);
+        check_lockfile(&e2e).unwrap();
+        check_manifest(&e2e).unwrap();
     }
 
     #[test]
