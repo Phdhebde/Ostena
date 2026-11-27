@@ -217,6 +217,15 @@ impl SignedGrant {
     pub fn to_text(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.0)
     }
+
+    /// The audience written in the grant, **not verified**: it only tells
+    /// which group to verify the grant for (a holder of grants of several
+    /// groups, the core). Never trust it before [`crate::Verifier::check`].
+    pub fn claimed_audience(&self) -> GatewayGroupId {
+        let mut audience = [0u8; 16];
+        audience.copy_from_slice(&self.0[64..80]);
+        GatewayGroupId::from_bytes(audience)
+    }
 }
 
 /// Header fields checked before the key lookup.
