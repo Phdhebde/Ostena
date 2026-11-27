@@ -52,7 +52,8 @@ cargo fmt --all --check
 cargo deny check
 cargo xtask ci        # tout ce qui précède, dans l'ordre de la CI
 cargo xtask check-secrets  # justification de chaque exposition de secret
-cargo xtask vendor    # vendorise les dépendances dans vendor/
+cargo xtask vendor    # vendorise les crates dans vendor/ et les paquets npm dans vendor/npm/
+cargo xtask portal    # construit le portail dans portal/dist/ (Node épinglé, ADR-0020)
 cargo xtask sbom      # SBOM CycloneDX dans target/sbom/
 cargo xtask fuzz 60   # 60 s par cible de fuzz (Linux, cargo-fuzz)
 cargo xtask footprint # mémoire au repos de l'agent (version optimisée)
@@ -76,13 +77,16 @@ Fuzzing : le dossier `fuzz/` est hors du workspace et utilise le nightly épingl
 Sur une machine connectée :
 
 ```bash
-cargo xtask vendor    # remplit vendor/ et écrit .cargo/vendor.toml
+cargo xtask vendor    # remplit vendor/ et vendor/npm/, et écrit .cargo/vendor.toml
 ```
 
 Transférez le dépôt avec `vendor/` et `.cargo/vendor.toml`, puis sur la machine isolée :
 
 ```bash
+cargo xtask portal --offline   # le portail, depuis vendor/npm/ seulement
 cargo build --offline --locked --config .cargo/vendor.toml
 ```
+
+Le portail se construit avec la version de Node épinglée dans `portal/.node-version`, à transférer comme la toolchain Rust (Linux x86-64). Node ne sert qu'à la construction : le binaire n'embarque que des fichiers statiques. Sans `portal/dist/`, le binaire se construit quand même, sans portail ([ADR-0020](docs/adr/0020-portail-web-et-passerelle-navigateur.md)).
 
 La toolchain épinglée doit aussi être transférée (archive `rustup` ou installateur autonome de la même version). Pour `cargo deny check advisories`, copiez la base d'avis RustSec et lancez `cargo deny check --disable-fetch`.

@@ -1,0 +1,214 @@
+/* Ostena charter (ADR-0020, § 5): bordeaux palette, light and dark themes of
+   equal rank. prefers-color-scheme decides unless theme.js forced one. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("@fontsource-variable/inter/files/inter-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304,
+    U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  color-scheme: light;
+  --bg: #faf7f8;
+  --surface: #ffffff;
+  --text: #1a1214;
+  --muted: #5c4f53;
+  --accent: #8c1d40;
+  --accent-text: #ffffff;
+  --border: #8a7b80;
+  --focus: #8c1d40;
+  --error: #a3122a;
+  --error-bg: #fbe9ec;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #151012;
+    --surface: #211a1c;
+    --text: #f3eef0;
+    --muted: #c4b6bb;
+    --accent: #e07a98;
+    --accent-text: #1a1214;
+    --border: #9a8a90;
+    --focus: #f0a3ba;
+    --error: #ff9aac;
+    --error-bg: #3a1a21;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #151012;
+  --surface: #211a1c;
+  --text: #f3eef0;
+  --muted: #c4b6bb;
+  --accent: #e07a98;
+  --accent-text: #1a1214;
+  --border: #9a8a90;
+  --focus: #f0a3ba;
+  --error: #ff9aac;
+  --error-bg: #3a1a21;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-family: "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  font-size: 100%;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.skip {
+  position: absolute;
+  left: 1rem;
+  top: -3rem;
+  padding: 0.5rem 1rem;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.skip:focus {
+  top: 1rem;
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem 1.5rem;
+}
+
+.symbol {
+  width: 2.5rem;
+  height: 2.5rem;
+}
+
+.symbol .arc {
+  fill: none;
+  stroke: var(--text);
+  stroke-width: 10;
+  stroke-linecap: round;
+}
+
+.symbol .bar {
+  fill: var(--accent);
+}
+
+.name {
+  font-size: 1.5rem;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+}
+
+main {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2rem 1rem;
+}
+
+main:focus {
+  outline: none;
+}
+
+.card {
+  width: 100%;
+  max-width: 26rem;
+  padding: 2rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+h1 {
+  margin: 0 0 1.5rem;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.field {
+  margin-bottom: 1.25rem;
+}
+
+label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-weight: 500;
+}
+
+input {
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  font: inherit;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+}
+
+.hint {
+  margin: 0.25rem 0 0;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+button {
+  width: 100%;
+  padding: 0.7rem 1rem;
+  font: inherit;
+  font-weight: 600;
+  color: var(--accent-text);
+  background: var(--accent);
+  border: 2px solid var(--accent);
+  border-radius: 0.375rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+.error {
+  margin: 0 0 1.25rem;
+  padding: 0.75rem;
+  color: var(--error);
+  background: var(--error-bg);
+  border-left: 4px solid var(--error);
+}
+
+.code,
+.mono {
+  font-family: ui-monospace, "Cascadia Mono", "Liberation Mono", monospace;
+}
+
+.status {
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

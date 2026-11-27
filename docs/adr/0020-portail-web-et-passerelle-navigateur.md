@@ -6,6 +6,7 @@
 - **Révision** : 2026-11-26, PR 8b (1/3) : crate `ostena-ws` et module `ostena-crypto::websocket` (« Mise en œuvre de la PR 8b »)
 - **Révision** : 2026-11-26, PR 8b (2/3) : `POST /api/v1/access`, flux navigateur du tunnel côté agent, code `GTW-E006`
 - **Révision** : 2026-11-27, PR 8b (3/3) : WebSocket `/api/v1/gateway`, relais du core, événements `gateway.*`, balayage des sessions inactives, latence mesurée ; section 4 acceptée ; le grant présenté est vérifié par sa signature ECDSA (arbitrage du 2026-11-27)
+- **Révision** : 2026-11-27, PR 8c (1/4) : `portal/` minimal, `cargo xtask portal`, vendorisation npm, contrôles du lockfile et des licences, budget, double construction hors ligne en CI (« Mise en œuvre de la PR 8c »)
 
 ## Contexte
 
@@ -405,6 +406,35 @@ L'agent remet chaque session à un driver navigateur (trait `BrowserDriver`) pui
 - le flux navigateur du tunnel seul, core → agent → core (`ostena-tunnel`, `tests/gateway.rs`) : p50 0,36 ms, p99 0,98 ms.
 
 La part du relais WebSocket (TLS, décodage, contrôle des trames, file) est donc d'environ 0,3 à 0,5 ms au p50 et 1 ms au p99, pour un aller-retour : bien sous l'objectif de 10 ms au p99 pour le navigateur.
+
+### Mise en œuvre de la PR 8c
+
+La PR 8c est livrée en quatre parties : la chaîne de build du portail (1/4) ; son embarquement dans le binaire et `ostena core portal-manifest` (2/4) ; `ostena-web-client` (3/4) ; le premier E2E Playwright (4/4).
+
+**Chaîne de build (1/4).**
+- **Paquets** (`portal/package.json`, versions exactes, toutes publiées depuis plus de deux semaines) :
+  - livrés au navigateur (`dependencies`) : `svelte` 5.57.3 (MIT) et `@fontsource-variable/inter` 5.3.0 (OFL-1.1, police) ;
+  - outils (`devDependencies`) : `vite` 8.3.8 (MIT, qui tire `rolldown` 1.2.19 et `lightningcss` 1.33.0, MPL-2.0), `@sveltejs/vite-plugin-svelte` 7.3.1, `typescript` 6.0.3 (Apache-2.0) et `svelte-check` 4.7.8 (vérification stricte des types, composants Svelte compris).
+  - Le lockfile compte 79 entrées (variantes des autres plateformes comprises) : MIT (59), MPL-2.0 (12), Apache-2.0 (4), ISC, BSD-3-Clause, 0BSD et OFL-1.1 (la police).
+- **Reportés** : JetBrains Mono arrive avec le terminal (PR 12) ; `openapi-typescript` avec le portail complet (PR 16). Les trois appels de la page de connexion sont typés à la main dans `src/api.ts`.
+- **Contrôles d'`xtask`** (`cargo xtask portal`, sans dépendance : un petit lecteur JSON strict) :
+  - Node : la version qui tourne est exactement celle de `portal/.node-version` (22.23.5) ;
+  - `package.json` : versions exactes, ni `optionalDependencies`, ni `peerDependencies`, ni `bundleDependencies` ; `.npmrc` fixe `ignore-scripts=true` ;
+  - lockfile : format 3 ; chaque entrée vient de `registry.npmjs.org` (archive `.tgz`), porte une seule intégrité SHA-512, une version exacte et une licence admise (expression SPDX : une alternative dont tous les termes sont admis). OFL-1.1 n'est admise que pour les polices d'une liste fermée, et seulement parmi les `dependencies` ;
+  - un paquet qui déclare un script d'installation doit figurer dans une liste fermée, relue en revue (`fsevents`, macOS seulement, jamais installé sur les plateformes de construction). Aucun script ne s'exécute de toute façon.
+- **Construction** : `npm ci --ignore-scripts` (avec `--offline --cache vendor/npm` dès que `vendor/npm/` existe ; `cargo xtask portal --offline` l'exige), `svelte-check`, `vite build`, puis `scripts/pack.mjs` (modules de Node seulement) :
+  - refuse toute URL absolue dans ce que le navigateur interprète (HTML, JS, CSS, SVG, JSON), hors de la liste fermée (espaces de noms XML, documentation des erreurs de Svelte) ;
+  - écrit `licenses.txt`, les licences des paquets livrés (dont l'OFL de la police), servi avec le portail ;
+  - compresse chaque fichier texte en brotli (qualité 11), gardé seulement s'il est plus petit ; les `woff2` ne sont pas recompressés ;
+  - écrit `SHA256SUMS`, au format de `sha256sum`, trié par chemin : chaque fichier servi, variantes brotli comprises. **L'empreinte du manifeste** est le SHA-256 de ce fichier. Un évaluateur la recalcule sans outil d'Ostena : `sha256sum --check SHA256SUMS && sha256sum SHA256SUMS` ;
+  - écrit `manifest.json` : chemin, type, taille et SHA-256 de chaque fichier et de sa variante brotli, l'empreinte, la liste des fichiers de la page de connexion et les trois mesures du budget.
+- **Budget** : en octets (1 Ko = 1 000 o), 400 000 pour le total et 150 000 pour la page de connexion, mesurés sur ce qui part compressé. La page de connexion est `index.html`, `theme.js`, l'icône, et le morceau d'entrée de Vite avec ses imports statiques, ses feuilles de style et leurs fichiers (manifeste de Vite, retiré ensuite). `xtask portal` échoue au-delà et écrit les mesures dans le résumé du job.
+- **Vendorisation** : `cargo xtask vendor` remplit aussi `vendor/npm/` (cache npm, archives adressées par leur intégrité) ; `cargo xtask vendor npm` ne fait que cette partie.
+- **SBOM** : `cargo xtask sbom` écrit `ostena-portal.cdx.json` (CycloneDX 1.5) depuis le lockfile : les paquets livrés, avec licence, URL et SHA-512. Il n'utilise pas `npm sbom`, dont `--omit dev` retire un paquet livré dès qu'un outil en dépend aussi (`svelte`, dépendance de `@sveltejs/vite-plugin-svelte`).
+- **CI** (job `portal`) : `cargo xtask vendor npm` (connecté), puis deux constructions `--offline` dans deux copies propres des sources, avec un registre injoignable ; `manifest.json` doit être identique octet pour octet, et les deux arbres aussi. Le portail construit est un artefact, pour que les binaires Linux et Windows embarquent le même.
+- **Mesures** (2026-11-27) : page de connexion 62,9 Ko, total 68,2 Ko (brotli, police comprise), soit 17 % du budget. Deux constructions, en ligne et hors ligne, dans deux dossiers différents : même empreinte.
+
+**Page de connexion.** Un formulaire natif (identifiant, mot de passe, code à usage unique) envoie `POST /api/v1/session` ; l'erreur est annoncée (`role="alert"`), liée aux champs, et affiche toujours le code stable. Lien d'évitement, repères `header` et `main`, focus visible, `prefers-reduced-motion` respecté. Les jetons de couleur de la charte sont des propriétés CSS ; le thème clair et le thème sombre sont de même rang, le système décide, et `theme.js` applique avant l'affichage un thème imposé par l'utilisateur. Une session ouverte affiche l'utilisateur et un bouton de déconnexion (`DELETE /api/v1/session`). Le français seul en attendant l'i18n de la PR 16.
 
 ## Conséquences
 

@@ -7,7 +7,9 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod bench;
+mod json;
 mod pe;
+mod portal;
 mod secrets;
 
 use std::error::Error;
@@ -24,7 +26,14 @@ Usage: cargo xtask <TASK>
 Tasks:
   ci             Run fmt, clippy, tests, cargo-deny and check-secrets like the CI
   check-secrets  Check that every secret exposure is justified
-  vendor         Vendor all dependencies into vendor/ for offline builds
+  vendor [cargo|npm]
+                 Vendor the dependencies for offline builds: crates into vendor/,
+                 npm packages of the portal into vendor/npm/ (needs Node); both
+                 unless one is named
+  portal [--offline]
+                 Check the pinned Node and the npm lockfile, install (offline from
+                 vendor/npm/ when present; --offline requires it), type-check, build
+                 and pack the portal into portal/dist/, and enforce its budget
   sbom           Generate CycloneDX SBOMs into target/sbom/ (needs cargo-cyclonedx)
   footprint [--target TRIPLE]
                  Measure the idle memory of the agent, with and without SSH (release
@@ -52,7 +61,8 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("ci") => ci(),
         Some("check-secrets") => check_secrets(),
-        Some("vendor") => vendor(),
+        Some("vendor") => vendor(std::env::args().nth(2).as_deref()),
+        Some("portal") => portal::portal(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("sbom") => sbom(),
         Some("footprint") => footprint(&std::env::args().skip(2).collect::<Vec<_>>()),
         Some("bench-ssh") => bench_ssh(),
@@ -86,8 +96,13 @@ fn cargo() -> Command {
 }
 
 /// Runs a command in the workspace root and fails if it does not succeed.
-fn run(mut cmd: Command) -> Result<()> {
-    cmd.current_dir(workspace_root()?);
+fn run(cmd: Command) -> Result<()> {
+    run_in(cmd, &workspace_root()?)
+}
+
+/// Runs a command in `dir` and fails if it does not succeed.
+fn run_in(mut cmd: Command, dir: &Path) -> Result<()> {
+    cmd.current_dir(dir);
     let shown = format!(
         "{} {}",
         cmd.get_program().to_string_lossy(),
@@ -146,11 +161,23 @@ fn check_secrets() -> Result<()> {
     }
 }
 
-fn vendor() -> Result<()> {
+fn vendor(only: Option<&str>) -> Result<()> {
     let root = workspace_root()?;
+    match only {
+        None | Some("cargo") => vendor_cargo(&root)?,
+        Some("npm") => {}
+        Some(other) => return Err(format!("vendor takes [cargo|npm], not {other}").into()),
+    }
+    if only == Some("cargo") {
+        return Ok(());
+    }
+    portal::vendor_npm(&root)
+}
+
+fn vendor_cargo(root: &Path) -> Result<()> {
     let mut cmd = cargo();
     cmd.args(["vendor", "--locked", "--versioned-dirs", VENDOR_DIR])
-        .current_dir(&root);
+        .current_dir(root);
     eprintln!("$ cargo vendor --locked --versioned-dirs {VENDOR_DIR}");
     let output = cmd.output()?;
     if !output.status.success() {
@@ -193,6 +220,7 @@ fn sbom() -> Result<()> {
     if count == 0 {
         return Err("cargo cyclonedx produced no SBOM".into());
     }
+    count += portal::sbom(&root, &out_dir)?;
     eprintln!("{count} SBOM(s) written to {}", out_dir.display());
     Ok(())
 }
