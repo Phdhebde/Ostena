@@ -1,10 +1,11 @@
 # ADR-0020 : Portail web et passerelle navigateur
 
-- **Statut** : Accepté pour les sections 2 (serveur web du core ; la WebSocket `ostena-ws` avec la PR 8b) et 3 (session navigateur), livrées par les PR 8a et 8b, et pour les trois arbitrages rendus par le responsable du projet le 2026-11-26 (amendement de l'ADR-0009). Proposé pour le reste (chaîne de build, passerelle, internationalisation, tests de bout en bout) : chaque partie passe à « Accepté » avec sa PR.
+- **Statut** : Accepté pour les sections 2 (serveur web du core ; la WebSocket `ostena-ws` avec la PR 8b), 3 (session navigateur) et 4 (passerelle navigateur : parcours, rôle du core dans le relais, contre-pression côté core et tunnel), livrées par les PR 8a et 8b, et pour les trois arbitrages rendus par le responsable du projet le 2026-11-26 (amendement de l'ADR-0009). Dans la section 4, le WebAssembly, l'ordonnanceur du navigateur et le SSH web restent proposés (PR 8c et 12). Proposé pour le reste (chaîne de build, internationalisation, tests de bout en bout dans un navigateur) : chaque partie passe à « Accepté » avec sa PR.
 - **Date** : 2026-11-26
 - **Révision** : 2026-11-26, PR 8a : arbitrages consignés, détails de mise en œuvre (« Mise en œuvre de la PR 8a »)
 - **Révision** : 2026-11-26, PR 8b (1/3) : crate `ostena-ws` et module `ostena-crypto::websocket` (« Mise en œuvre de la PR 8b »)
 - **Révision** : 2026-11-26, PR 8b (2/3) : `POST /api/v1/access`, flux navigateur du tunnel côté agent, code `GTW-E006`
+- **Révision** : 2026-11-27, PR 8b (3/3) : WebSocket `/api/v1/gateway`, relais du core, événements `gateway.*`, balayage des sessions inactives, latence mesurée ; section 4 acceptée ; le grant présenté est vérifié par sa signature ECDSA (arbitrage du 2026-11-27)
 
 ## Contexte
 
@@ -193,7 +194,7 @@ Aucun en-tête `Server`. Les journaux du core n'écrivent jamais `Cookie`, `Set-
    - `Origin` exactement égale à `core.web.origin` ;
    - le cookie de session : valide, et de la même source ;
    - la présence du sous-protocole `ostena-frame.v1` ;
-   - le grant : connu du registre, émis pour **cette** session de connexion, non expiré, jamais présenté. Les octets sont comparés en temps constant par `ostena-crypto`.
+   - le grant : sa signature ECDSA P-256 (ostena-grant, pour le groupe qu'il désigne), puis sa ligne du registre : émis pour **cette** session de connexion, non expiré, jamais présenté. La signature couvre tous les octets du grant : aucune comparaison d'octets n'est faite (arbitrage du 2026-11-27, qui remplace la comparaison en temps constant prévue ici).
 
    Le grant est alors marqué « présenté », de façon atomique : une seconde WebSocket avec le même grant est refusée (`GTW-E001`). La réponse `101` ne sélectionne que `ostena-frame.v1`, jamais le sous-protocole du grant.
 4. Le core ouvre un flux du tunnel vers un agent connecté du groupe d'audience et lui transmet le grant. L'agent suit alors le chemin commun (ADR-0008, ADR-0014) :
@@ -349,7 +350,7 @@ Les codes sont réservés ici ; leur texte exact est fixé par la PR qui les int
 **Décision sur une session.** Elle est une fonction pure (`web::session::decide`), dans cet ordre : révoquée ou compte inactif, échéance absolue, changement de source, inactivité.
 - L'échéance absolue répond `401` sans événement : la fin de la session de connexion est déjà portée par son échéance.
 - L'inactivité et le changement de source révoquent la session et écrivent `web_session.expired` ou `web_session.source_changed`, acteur `core`.
-- L'activité n'est enregistrée qu'à partir de 10 s après la précédente : l'échéance d'inactivité peut être atteinte jusqu'à 10 s plus tôt que l'inactivité réelle, jamais plus tard. Une session inactive n'est révoquée qu'à sa requête suivante ; un balayage périodique viendra avec la passerelle (PR 8b), pour couper aussi les sessions de passerelle.
+- L'activité n'est enregistrée qu'à partir de 10 s après la précédente : l'échéance d'inactivité peut être atteinte jusqu'à 10 s plus tôt que l'inactivité réelle, jamais plus tard. Une session inactive est révoquée à sa requête suivante, ou par le balayage périodique livré avec la passerelle (PR 8b), qui coupe aussi ses sessions de passerelle.
 
 **Écouteur.** Plafond global de connexions (`core.web.max_connections`, 256) et par source (`core.web.connections_per_source`, 16), connexions persistantes bornées à 300 s. L'origine (`core.web.origin`) est une URL `https://` sans chemin. Les groupes TLS actifs sont journalisés au démarrage (`web.tls_groups`). Codes de configuration : `CFG-V019` (section `[core.web]` invalide), `CFG-P018` (`bind_source = false`) et `CFG-P019` (`tls_classic_fallback = true`), ces deux derniers refusés en production.
 
@@ -388,6 +389,22 @@ La PR 8b est livrée en trois parties : le crate `ostena-ws` et le module `osten
 L'agent remet chaque session à un driver navigateur (trait `BrowserDriver`) puis rapporte sa fin au core (`session_closed`, octets dans chaque sens). Le binaire de la PR 8b n'a aucun driver navigateur (`NoDriver`) : chaque flux est refusé par `GTW-E006` après consommation du grant. Le terminal SSH arrive avec la PR 12, l'affichage RDP avec la PR 13. Le tunnel accepte désormais les canaux ouverts par le core (file de 16, puis la limite de flux du tunnel) ; seuls les canaux de classe interactive sont servis.
 
 Événements de l'agent (journal structuré) : `agent.browser_opened`, `agent.browser_refused` (code), `agent.browser_closed` (cause, octets dans chaque sens), `agent.channel_refused` (en-tête de canal invalide ou classe non servie).
+
+**WebSocket et relais (3/3).** `GET /api/v1/gateway` (session exigée) est vérifiée dans l'ordre du parcours : `Origin` (`WEB-E002`), cookie (`WEB-E001`), poignée de main et `ostena-frame.v1` (`GTW-E002`), puis le grant, présent exactement une fois dans `ostena-grant.<grant>` (`GTW-E001`).
+- **Grant** : signature ECDSA vérifiée par `ostena-grant` pour le groupe qu'il désigne, puis, dans une transaction, `UPDATE access_grant SET presented_at` sur la ligne `web` de cette session de connexion, non expirée, jamais présentée ni consommée. L'enregistrement **accordant** `gateway.opened` (jti, groupe, agent) est écrit dans la même transaction : une seconde WebSocket avec le même grant est refusée (`GTW-E001`). Côté agent, `session_request` refuse un grant `web` jamais présenté (`ACC-E008`) : un grant du portail n'ouvre de session que par sa WebSocket.
+- **Agent** : celui choisi à l'émission, sinon un autre agent connecté du groupe ; sans agent, `503` `GTW-E003`. Le core ouvre le flux navigateur et attend la réponse de l'agent **avant** le `101` : un refus de l'agent est rendu en HTTP (`GTW-E006`, ou `GTW-E001` pour les autres codes, le code de l'agent allant dans `gateway.refused`).
+- **Relais** : chaque message binaire du navigateur doit être une trame `ostena-frame` vers la passerelle, décodée et acceptée par un `Receiver` (version, séquence consécutive, fragmentation), puis écrite telle quelle dans le flux. La version négociée est apprise du `HelloAck` de l'agent. Vers le navigateur, les trames sont découpées par leur en-tête, vérifié (sens, type, longueur), et mises dans une file de 64 trames : pleine, le core cesse de lire le flux, et le contrôle de flux du tunnel ralentit l'agent. Une écriture vers le navigateur bloquée 30 s ferme la session (4003, `GTW-E004`).
+- **Fermetures** : 1000 (fin par l'agent ou le navigateur), 1002 (trame refusée, `GTW-E005`), 1003, 1007, 1009 (message WebSocket refusé, `GTW-E005`), 1008 (session de connexion révoquée), 1011 (trame de l'agent refusée), 4003 (navigateur trop lent).
+- **Révocation** : la révocation d'une session de connexion (déconnexion, administrateur, inactivité, changement de source) coupe à l'instant ses sessions de passerelle, à la réception de la notification de révocation par le core.
+- **Inactivité** : les trames du navigateur gardent la session active (enregistrée au plus toutes les 10 s). Toutes les 30 s, le core révoque les sessions du portail inactives (`web_session.expired`), ce qui coupe leurs sessions de passerelle sans attendre une requête.
+- **Connexions** : une WebSocket garde sa place dans le plafond global et dans celui de sa source jusqu'à sa fin.
+- **Événements** : `gateway.opened` (accordant), `gateway.refused` (au mieux : code, cause, dont le code de l'agent), `gateway.closed` (au mieux : session, jti, cause, octets reçus du navigateur et envoyés vers lui). Journal structuré : `gateway.cut`, `web.sessions_swept`.
+
+**Latence mesurée** (2026-11-27, machine de développement, boucle locale, build de test non optimisé) :
+- aller-retour complet navigateur → core → agent → core → navigateur, WebSocket sur TLS 1.3 hybride, trames `Ping`/`Pong` d'`ostena-frame`, 500 mesures (`tests/web_gateway.rs`) : p50 0,66 à 0,87 ms, p99 1,3 à 2,0 ms ;
+- le flux navigateur du tunnel seul, core → agent → core (`ostena-tunnel`, `tests/gateway.rs`) : p50 0,36 ms, p99 0,98 ms.
+
+La part du relais WebSocket (TLS, décodage, contrôle des trames, file) est donc d'environ 0,3 à 0,5 ms au p50 et 1 ms au p99, pour un aller-retour : bien sous l'objectif de 10 ms au p99 pour le navigateur.
 
 ## Conséquences
 
