@@ -61,6 +61,8 @@ ostena-crypto = { workspace = true, features = ["testing"] }
 [dev-dependencies]
 # The enrolment tests run the binary against the in-process test core.
 ostena-tunnel = { workspace = true, features = ["testing"] }
+# Paused Tokio time: the trust dates are reached without real delay.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "agent_ssh"

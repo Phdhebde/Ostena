@@ -237,6 +237,31 @@ fn listener_closes_when_the_token_expired_before_the_first_look() {
     });
 }
 
+/// The enrolment port stays held while the listener is closed: no other
+/// socket can take it before the first token, nor between two openings.
+#[test]
+fn enrolment_port_stays_reserved_while_the_listener_is_closed() {
+    run_paused(async {
+        let clock = Arc::new(ManualClock(AtomicU64::new(1_000)));
+        let core = TestCore::start_with_clock(fast(), Behaviour::default(), clock.clone()).unwrap();
+        let addr = core.enrollment_addr();
+        assert!(!core.enrollment_open());
+        assert!(std::net::UdpSocket::bind(addr).is_err(), "port released");
+        core.issue_token(group(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(core.enrollment_open());
+        clock.0.store(1_002, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!core.enrollment_open());
+        assert!(std::net::UdpSocket::bind(addr).is_err(), "port released");
+        // Opens again on the same address.
+        core.issue_token(group(), HOUR).await.unwrap();
+        assert!(core.enrollment_open());
+        assert_eq!(core.enrollment_addr(), addr);
+    });
+}
+
 #[test]
 fn listener_serves_the_enrolment_protocol_only() {
     run(async {

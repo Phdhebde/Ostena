@@ -469,9 +469,9 @@ impl IdentitySink {
 
 /// Sleeps until the wall clock reaches `at` (Unix seconds), in steps of an
 /// hour at most so that a clock change is caught up.
-async fn sleep_until_unix(at: u64) {
+async fn sleep_until_unix(at: u64, clock: &impl Fn() -> u64) {
     loop {
-        let now = ostena_grant::unix_now();
+        let now = clock();
         if now >= at {
             return;
         }
@@ -485,20 +485,30 @@ async fn sleep_until_unix(at: u64) {
 /// the start of validity of a certificate not valid yet, without waiting
 /// for the next push.
 fn follow_trust(
+    trust: watch::Receiver<Option<Arc<ostena_tunnel::ssh::SshTrust>>>,
+    sink: IdentitySink,
+) -> JoinHandle<()> {
+    follow_trust_on(trust, sink, ostena_grant::unix_now)
+}
+
+/// [`follow_trust`] on the wall clock `clock` (Unix seconds): the tests
+/// drive it from the Tokio clock, paused.
+fn follow_trust_on(
     mut trust: watch::Receiver<Option<Arc<ostena_tunnel::ssh::SshTrust>>>,
     sink: IdentitySink,
+    clock: impl Fn() -> u64 + Send + Sync + 'static,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let current = trust.borrow_and_update().clone();
-            let next = current.and_then(|trust| sink.apply(&trust, ostena_grant::unix_now()));
+            let next = current.and_then(|trust| sink.apply(&trust, clock()));
             tokio::select! {
                 changed = trust.changed() => {
                     if changed.is_err() {
                         return;
                     }
                 }
-                () = sleep_until_unix(next.unwrap_or_default()), if next.is_some() => {}
+                () = sleep_until_unix(next.unwrap_or_default(), &clock), if next.is_some() => {}
             }
         }
     })
@@ -957,6 +967,17 @@ mod tests {
             .block_on(f)
     }
 
+    /// [`block_on`], Tokio time paused: sleeps end as soon as everything
+    /// is idle.
+    fn block_on_paused<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
     #[test]
     fn lost_revocations_cut_every_session() {
         block_on(async {
@@ -1344,10 +1365,16 @@ mod tests {
 
     #[test]
     fn follow_trust_acts_at_the_dates_without_a_new_push() {
-        block_on(async {
+        // Tokio time paused, and the wall clock of the certificates driven
+        // by it: the dates are reached exactly, whatever the load of the
+        // machine (on the real clock, a slow start found the first
+        // certificate already expired).
+        block_on_paused(async {
             let t = Trusted::new("trust-timer");
             let ca = SigningKey::generate().unwrap().0;
             let now = ostena_grant::unix_now();
+            let started = tokio::time::Instant::now();
+            let clock = move || now + started.elapsed().as_secs();
             // Expires in 2 s; the next one is accepted in 5 s.
             let first = t.trust(
                 1,
@@ -1372,7 +1399,7 @@ mod tests {
                 }
             };
             let (tx, rx) = watch::channel(Some(Arc::new(first)));
-            let task = follow_trust(rx, t.sink);
+            let task = follow_trust_on(rx, t.sink, clock);
             assert!(wait(true).await, "ready");
             assert!(wait(false).await, "withdrawn at expiry");
             tx.send_replace(Some(Arc::new(second)));

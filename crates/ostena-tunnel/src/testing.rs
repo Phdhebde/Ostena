@@ -439,14 +439,14 @@ impl TestCore {
             )
             .map_err(config)?,
         );
-        // The enrolment listener is bound only while a token is valid: reserve
-        // a free port now, so that the agents know where to go.
-        let enroll_port = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .and_then(|s| s.local_addr())
-            .map_err(|e| TunnelError::Io(e.to_string()))?
-            .port();
+        // The enrolment listener opens only while a token is valid, but the
+        // agents must know where to go now: keep a free port bound for the
+        // life of the core. Releasing it until the first token let a parallel
+        // test take it (`os error 10048` on Windows).
+        let enroll_socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|e| TunnelError::Io(e.to_string()))?;
         let enrollment = EnrollmentService::new(
-            (Ipv4Addr::LOCALHOST, enroll_port).into(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
             &server,
             issuer.clone(),
             registry.clone(),
@@ -454,7 +454,8 @@ impl TestCore {
             DEFAULT_CERTIFICATE_LIFETIME,
             Duration::from_secs(5),
         )?
-        .with_clock(clock);
+        .with_clock(clock)
+        .with_socket(enroll_socket)?;
         let core = Self {
             pki,
             registry,
