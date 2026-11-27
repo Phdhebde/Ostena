@@ -26,14 +26,17 @@
       "get": {
         "operationId": "portal",
         "summary": "Racine du portail.",
-        "description": "Sert le portail (PR 8c). Sans portail embarqué dans le binaire : 503 WEB-E008.",
+        "description": "Sert index.html, puis les fichiers du portail embarqué à leur chemin (hors de cette table de routes, publics, GET seulement), en brotli si le navigateur l'accepte, avec un ETag. Sans portail embarqué dans le binaire : 503 WEB-E008.",
         "security": [],
         "responses": {
           "200": {
-            "description": "La page du portail.",
+            "description": "La page du portail (Cache-Control: no-store).",
             "content": {
               "text/html": {}
             }
+          },
+          "304": {
+            "description": "Non modifiée (If-None-Match égal à l'ETag)."
           },
           "503": {
             "$ref": "#/components/responses/NoPortal"
