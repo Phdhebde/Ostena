@@ -1,0 +1,24 @@
+{
+  "name": "ostena-portal",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "engines": {
+    "node": "22.23.5"
+  },
+  "scripts": {
+    "build": "vite build && node scripts/pack.mjs",
+    "check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "5.3.0",
+    "svelte": "5.57.3"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "7.3.1",
+    "svelte-check": "4.7.8",
+    "typescript": "6.0.3",
+    "vite": "8.3.8"
+  }
+}
