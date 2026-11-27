@@ -130,6 +130,7 @@ Le lien coûte environ 1,5 Mio sous Linux et 3,4 Mio sous Windows. **Presque tou
 | `AGT-E009` | accès au plan de contrôle refusé |
 | `AGT-E010` | adresse d'écoute du serveur SSH natif inutilisable (`agent.ssh.listen`) : l'agent refuse de démarrer |
 | `AGT-E013` | sessions Bureau à distance d'une cible impossibles à lister ou à fermer (API WTS, agent Windows seulement ; ADR-0026) |
+| `AGT-E014` | ticket Kerberos impossible pour le service de gestion des sessions d'une cible (`cifs/<nom>`, SSPI ; ADR-0026) |
 
 Événements : `agent.started`, `agent.stopping`, `agent.sessions_closed`, `agent.stopped`, `agent.idle_footprint`, `agent.config_refused`, `agent.replay_store_refused`, `agent.control_unavailable`, `agent.control_denied`, `agent.control_error` ; pour le serveur SSH natif (ADR-0010) : `agent.ssh_started`, `agent.ssh_unavailable`, `agent.ssh_key_created`, `agent.ssh_stopped`.
 

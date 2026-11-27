@@ -1,7 +1,7 @@
 # ADR-0026 : Fermeture des sessions Windows des cibles RDP
 
 - **Statut** : Proposé
-- **Date** : 2026-11-27
+- **Date** : 2026-11-27 ; révision du 2026-11-27 : points à trancher décidés (agent Debian, canal de gestion par nom DNS et Kerberos, signature SMB), section 7
 - **Complète** : ADR-0019 (driver RDP)
 
 ## Contexte
@@ -25,7 +25,7 @@ Agir sur la session par des frappes simulées (menu de fermeture) ou un shell de
 Après la fin de la boucle de session, quelle qu'en soit la cause (arrêt demandé, fin par la cible, erreur), l'agent :
 
 1. reprend l'identifiant de session lu dans la *Save Session Info PDU* ;
-2. ouvre une vue sur les sessions de la cible (adresse épinglée, identifiants du compte, section 4) ;
+2. ouvre une vue sur les sessions de la cible (nom DNS vérifié, identifiants du compte, sections 4 et 7) ;
 3. attend au plus 3 s que la cible voie cette session déconnectée, puis la ferme (`WTSLogoffSession`, en attendant la fin de la fermeture) ; si elle a déjà disparu (l'utilisateur s'est déconnecté lui-même), rien à faire ;
 4. sans identifiant (notification absente), ferme toutes les sessions **déconnectées** du compte.
 
@@ -55,9 +55,9 @@ disconnected_sessions = "logoff"   # défaut ; "keep" : CFG-P022, refusé en pro
 - `ostena-platform::wts` (seule crate où vit l'`unsafe`, chaque bloc commenté `SAFETY` et testé sous Windows) : `WTSOpenServerW`, `WTSEnumerateSessionsExW` (niveau 1 : identifiant, état, utilisateur, domaine), `WTSLogoffSession`, `WTSCloseServer`. Aucune nouvelle crate : `windows-sys`, déjà présente, avec la fonctionnalité `Win32_System_RemoteDesktop`.
 - **Identifiants** : le fil qui travaille emprunte un jeton `LOGON32_LOGON_NEW_CREDENTIALS` du compte cible (`LogonUserW`) ; ces identifiants ne servent qu'à l'authentification sortante, jamais à une ouverture de session locale sur l'agent. Le mot de passe est relu dans la source des secrets à chaque usage, converti dans un tampon effacé après l'appel. Le compte est celui de la session : un administrateur de la cible (exigé par le Restricted Admin) peut lister et fermer ses sessions ; un compte non administrateur doit en avoir reçu le droit sur l'écouteur RDP, sinon la session est refusée.
 - **Fil dédié** : l'emprunt d'identité est lié au fil. Chaque opération tourne sur un fil créé pour elle, qui se termine avec elle : un échec de `RevertToSelf` ne peut pas donner cette identité à une autre tâche.
-- **Périmètre** : la vue est ouverte sur l'**adresse épinglée** par le contrôle de périmètre (ADR-0005), jamais sur un nom que Windows résoudrait lui-même.
+- **Périmètre et authentification** : voir la section 7 (vue ouverte par le nom DNS de la cible, vérifié contre l'adresse épinglée ; Kerberos ; signature SMB).
 - **Domaine** : `DOMAINE\compte` tel quel ; `compte@royaume` en nom principal, sans domaine ; un compte local de la cible s'authentifie dans le domaine de la machine (premier label de son nom DNS dans l'inventaire).
-- **Agent Debian** : l'API WTS n'existe pas. Réimplémenter l'interface RPC de gestion des sessions ([MS-TSTS]) sur SMB 2 et DCE/RPC est hors de portée de ce correctif. La fermeture y est donc **impossible** : par défaut, la session est refusée (`RDP-E019`). En production, un agent Debian ne peut pas ouvrir de session RDP tant qu'un mécanisme n'existe pas.
+- **Agent Debian** : l'API WTS n'existe pas. Réimplémenter l'interface RPC de gestion des sessions ([MS-TSTS]) sur SMB 2 et DCE/RPC est hors de portée de ce correctif. La fermeture y est donc **impossible** : la session est refusée (`RDP-E019`). **Décision du 2026-11-27 : en M2, un agent Debian n'ouvre pas de session RDP** (comportement ci-dessus, sans option). Un client [MS-TSTS] sur SMB 2 est inscrit comme suite **après M2** ; il devra suivre les règles de la section 7 (nom vérifié, Kerberos, signature SMB).
 - **Côté driver** (`ostena-rdp::target_sessions`) : la règle (quelles sessions fermer, quand refuser) est indépendante du mécanisme (trait `SessionControl`), testée sous Linux avec une cible simulée.
 
 ### 5. Défense en profondeur : stratégie des cibles
@@ -71,7 +71,9 @@ La fermeture par l'agent ne couvre pas un agent arrêté brutalement ni une coup
 | *Connexions* : restreindre chaque utilisateur à une seule session | activé | `fSingleSessionPerUser` = 1 |
 | *Connexions* : autoriser la gestion à distance des sessions (RPC) | activé | `AllowRemoteRPC` = 1 (`HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server`) |
 
-La plus petite durée proposée par la stratégie est 1 minute : c'est une fenêtre de rattachement que seule la fermeture par l'agent supprime. `AllowRemoteRPC` et l'accès de l'agent au port 445 de la cible (canaux nommés de gestion des sessions) sont nécessaires au mécanisme de la section 4. La signature SMB exigée sur les cibles est recommandée (section « Limites »).
+| *Paramètres de sécurité > Options de sécurité* : serveur réseau Microsoft, signer numériquement les communications (toujours) | activé | `RequireSecuritySignature` = 1 (`HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters`) |
+
+La plus petite durée proposée par la stratégie est 1 minute : c'est une fenêtre de rattachement que seule la fermeture par l'agent supprime. `AllowRemoteRPC` et l'accès de l'agent au port 445 de la cible (canaux nommés de gestion des sessions) sont nécessaires au mécanisme de la section 4. La **signature SMB exigée** est un prérequis, contrôlé par l'agent (section 7).
 
 ### 6. Codes et événements
 
@@ -81,11 +83,33 @@ La plus petite durée proposée par la stratégie est 1 minute : c'est une fenê
 | `RDP-E019` | sessions du compte impossibles à lister ou à fermer, aucun mécanisme sur l'agent, ou `keep` en production | `rdp.session_cleanup_failed` |
 | `AGT-E013` | échec de l'API WTS (`ostena-platform`), repris dans le message de `RDP-E019` | — |
 | `CFG-P022` | `rdp.disconnected_sessions = "keep"` en production | `config.weakening` en développement |
+| `RDP-E021` | canal de gestion refusé : cible sans nom DNS, nom refusé par le contrôle de périmètre, ou nom qui ne résout pas vers l'adresse épinglée (section 7) | `rdp.session_channel_refused` |
+| `RDP-E022` | aucun ticket Kerberos pour `cifs/<nom>` et NTLM non admis sur le canal (production, ou `ntlm_fallback = false`) | `rdp.session_channel_ntlm_refused` |
+| `RDP-E023` | la cible n'exige pas la signature SMB, en production | `rdp.smb_signing_refused` |
+| `AGT-E014` | ticket Kerberos du canal impossible (`ostena-platform`), repris dans le message de `RDP-E022` | — |
 
 Événements de succès et d'avertissement :
 
 - `rdp.session_logged_off` (info) : `target`, `session` (identifiant sur la cible), `state` (état avant fermeture), `moment` (`before` ou `end`) ;
-- `rdp.session_cleanup_skipped` (warn, `code = CFG-P022`) : sessions laissées déconnectées en développement.
+- `rdp.session_cleanup_skipped` (warn, `code = CFG-P022`) : sessions laissées déconnectées en développement ;
+- `rdp.session_channel_ntlm` (warn) : `target`, `server`, `moment` ; canal ouvert sans ticket Kerberos, NTLM admis (développement avec `ntlm_fallback`) ;
+- `rdp.smb_signing_not_required` (warn) : `target`, `server` ; la cible n'exige pas la signature SMB (développement) ;
+- `rdp.session_closed` (debug) : `reason` ; raison d'une fermeture de la connexion vue par le transport.
+
+### 7. Canal de gestion des sessions : nom DNS vérifié, Kerberos, signature SMB
+
+Décision du 2026-11-27. Le canal de gestion (RPC sur les canaux nommés de la cible, donc SMB sur le port 445) suit les mêmes règles que la connexion RDP :
+
+1. **Nom DNS obligatoire** : la vue est ouverte par le nom DNS de la cible (celui de l'inventaire, sinon celui de l'épinglage). Sans nom, refus (`RDP-E021`) : une adresse n'a pas de nom principal de service, donc pas de Kerberos.
+2. **Nom vérifié par le contrôle de périmètre** : avant la première ouverture, l'agent résout ce nom par la portée du groupe de passerelles (`ostena-scope`, résolution unique, règles et plancher appliqués **pour le port 445**) et exige que l'adresse épinglée de la session figure parmi les adresses obtenues. Sinon, refus (`RDP-E021`). Les règles d'autorisation des cibles RDP doivent donc ouvrir le port 445 en plus du port RDP.
+3. **Kerberos exigé** : sur le fil qui emprunte l'identité du compte, l'agent demande d'abord par SSPI (paquet Kerberos seul) un ticket de service pour `cifs/<nom>` ; le ticket reste dans le cache de cette session d'ouverture, où le client SMB de Windows le prend pour authentifier le canal. Sans ticket, la vue n'est pas ouverte (`AGT-E014`, `RDP-E022`) : NTLM n'est jamais laissé à la négociation de Windows. NTLM n'est admis sur ce canal qu'en développement avec `rdp.ntlm_fallback = true` (événement `rdp.session_channel_ntlm`) : la règle suit `ntlm_fallback = false` et le refus en production, sans nouvelle option.
+4. **Signature SMB contrôlée** : avant la première ouverture, l'agent envoie à l'adresse épinglée, port 445, une seule requête SMB 2 NEGOTIATE ([MS-SMB2] 2.2.3, dialectes 2.0.2 à 3.0.2, sans session ni authentification) et lit dans la réponse le drapeau `SMB2_NEGOTIATE_SIGNING_REQUIRED` (2.2.4). Une cible qui n'exige pas la signature est refusée en production (`RDP-E023`), signalée en développement (`rdp.smb_signing_not_required`). L'analyseur de la réponse a sa cible de fuzz (`rdp_smb_negotiate`).
+
+**Pourquoi le nom et l'adresse** : Windows résout le nom une seconde fois pour ouvrir le canal ; l'agent ne peut pas lui imposer l'adresse. La vérification par le contrôle de périmètre garantit que le nom désigne, au moment de la session, la cible épinglée et une adresse admise ; l'authentification mutuelle Kerberos lie ensuite le canal au compte de machine qui détient la clé de `cifs/<nom>` : un DNS falsifié entre les deux résolutions mène à un serveur qui ne peut pas répondre au ticket.
+
+**Conséquence** : en production, une cible RDP doit être membre d'un domaine joignable par l'agent (KDC), inscrite par son nom DNS, et exiger la signature SMB. Une cible hors domaine (compte local seul) ne peut plus être ouverte en production.
+
+**CI** : le runner Windows n'appartient à aucun domaine. La cible y est connue par un nom du laboratoire, `target.ostena.test`, que le script de la CI associe à `127.0.0.1` dans le fichier hosts : l'épinglage, la vérification du nom par la portée et l'ouverture de la vue par ce nom passent par le code de production, sans dérogation. `localhost` ne convient pas : le contrôle de périmètre le refuse toujours (nom réservé). Le nom de la machine ne convient pas non plus : il résout vers les adresses des interfaces, pas vers l'adresse épinglée de la boucle locale. Kerberos y étant impossible, la CI prouve le refus en production (`RDP-E022`, avec `AGT-E014`) et ouvre les sessions en développement, NTLM admis ; le script déclare le nom du laboratoire comme nom de la machine pour NTLM (`BackConnectionHostNames`) et exige la signature SMB, que l'agent lit sur la vraie cible. Le chemin Kerberos complet (ticket obtenu, canal authentifié) relève du laboratoire (ADR-0025), sur une cible membre d'un domaine.
 
 ## Conséquences
 
@@ -93,18 +117,19 @@ La plus petite durée proposée par la stratégie est 1 minute : c'est une fenê
 - Une session ouverte sur le même compte en dehors d'Ostena (console, autre poste) bloque l'accès par le bastion (`RDP-E018`) au lieu d'être reprise. C'est voulu : la reprise déconnecterait cet utilisateur et donnerait sa session à un autre.
 - Ce que l'utilisateur laisse ouvert dans sa session est perdu à la fin : il n'y a plus de reprise d'une session interrompue. Une reconnexion après une coupure du navigateur ouvre une session neuve.
 - La connexion ajoute une liste des sessions par RPC (quelques allers-retours vers la cible) ; la fermeture d'une session laissée, rare, prend une à quelques secondes.
-- **Agent Debian : plus de RDP en production** tant qu'un mécanisme de fermeture n'existe pas pour lui (point à trancher ci-dessous).
-- L'agent Windows a besoin d'un flux vers le port 445 des cibles, en plus de 3389.
+- **Agent Debian : pas de RDP en M2** (section 4, décidé) ; le client [MS-TSTS] sur SMB 2 vient après M2.
+- L'agent Windows a besoin d'un flux vers le port 445 des cibles, en plus de 3389, admis par les règles du contrôle de périmètre.
+- **En production, les cibles RDP sont membres d'un domaine**, inscrites par leur nom DNS, et exigent la signature SMB (section 7).
 - Le test sur un seul compte a révélé un défaut du transport, corrigé avec cette décision : les octets clairs de TLS n'étaient vidés qu'après toute une lecture TCP ; au-delà de 16 Kio retenus, la lecture suivante échouait et la boucle prenait l'erreur pour une fin de session par la cible. La rafale graphique qui suit l'ouverture de session fermait ainsi des sessions de la CI par intermittence. Ils sont désormais vidés après chaque lot d'enregistrements (test unitaire du transport).
 
 ### Limites connues
 
-- **Authentification de la vue** : ouverte sur une adresse, la connexion RPC ne peut pas obtenir de ticket Kerberos (pas de SPN pour une adresse) et Windows négocie NTLM. Aucun mot de passe n'est transmis à la cible (défi-réponse seulement), mais un relais NTLM reste possible sans signature SMB exigée par la cible. Cela contredit `rdp.ntlm_fallback = false` pour ce seul canal de gestion : point à trancher.
-- En CI, la cible est la machine de l'agent (boucle locale) : l'emprunt d'identité et la liste par RPC sont exercés sur `127.0.0.1`, pas au travers d'un réseau ni avec un compte de domaine. Le laboratoire (ADR-0025) doit couvrir une cible distante membre d'un domaine.
+- **Kerberos du canal** : l'agent prouve qu'un ticket pour `cifs/<nom>` est obtenu, dans la session d'ouverture qui sert au canal, avant de l'ouvrir ; il n'observe pas le paquet que le client SMB de Windows négocie ensuite. Avec un ticket en cache, Windows choisit Kerberos ; la signature SMB exigée par la cible ferme le relais restant. La stratégie « restreindre NTLM : trafic sortant » sur l'agent Windows est recommandée en complément.
+- En CI, la cible est la machine de l'agent (boucle locale), hors domaine : le chemin Kerberos n'y est prouvé que par son refus. Le laboratoire (ADR-0025) doit couvrir une cible distante membre d'un domaine (ticket obtenu, canal ouvert, signature exigée).
 - La correspondance entre une session et le compte se fait sur les noms : sans domaine dans le compte, un homonyme d'un autre domaine est traité comme le compte (une fermeture de trop d'une session déconnectée, ou un refus de trop), jamais l'inverse.
 - Les sessions ouvertes par un agent arrêté brutalement restent déconnectées jusqu'à la limite de la stratégie de la cible (section 5), ou jusqu'à la connexion suivante sur le compte, qui les ferme.
 
-### Points à trancher (responsable du projet)
+### Points tranchés (2026-11-27)
 
-1. **Agent Debian** : accepter qu'il n'ouvre pas de session RDP en production, ou financer un client de l'interface de gestion des sessions ([MS-TSTS] sur SMB 2), ou admettre une option distincte qui s'en remet à la stratégie de la cible (fenêtre de rattachement d'au moins 1 minute).
-2. **NTLM sur le canal de gestion** (limite ci-dessus) : l'admettre en exigeant la signature SMB des cibles, ou ouvrir la vue par le nom DNS de la cible (Kerberos) après avoir vérifié qu'il se résout en l'adresse épinglée.
+1. **Agent Debian** : RDP refusé en M2 ; client [MS-TSTS] sur SMB 2 après M2 (section 4).
+2. **Canal de gestion** : nom DNS vérifié par le contrôle de périmètre, Kerberos exigé (NTLM refusé en production), signature SMB exigée et contrôlée (section 7).

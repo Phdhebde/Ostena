@@ -74,3 +74,8 @@ pub fn session(data: &[u8]) {
     let mut demux = Demux::new(io, message, 1002);
     let _ = demux.feed(frames);
 }
+
+/// The SMB 2 NEGOTIATE response read by the signing probe (ADR-0026).
+pub fn smb_negotiate(data: &[u8]) {
+    let _ = crate::smb::signing_required(data);
+}

@@ -3,7 +3,12 @@
 # NLA required, Restricted Admin allowed, remote session management (WTS
 # API) allowed, one local administrator for every mode of the tests
 # (delegation, Restricted Admin: the agent logs its sessions off, ADR-0026)
-# with a random password and its profile already created. Writes the
+# with a random password and its profile already created, SMB signing
+# required, and the target known by a DNS name of the lab mapped to
+# 127.0.0.1 in the hosts file (the agent opens the management channel by
+# that name once the scope control resolved it to the pinned address,
+# ADR-0026; other.ostena.test maps to another loopback address, for the
+# refusal). Writes the
 # OSTENA_RDP_TARGET_* variables to $env:GITHUB_ENV, the password masked in
 # the logs.
 #
@@ -79,6 +84,21 @@ Set-ItemProperty -Path $Ts -Name AllowRemoteRPC -Value 1 -Type DWord
 Set-Service -Name TermService -StartupType Manual
 Restart-Service -Name TermService -Force
 
+Write-Host '=== name of the target, SMB signing required'
+$Name = 'target.ostena.test'
+$Hosts = "$env:SystemRoot\System32\drivers\etc\hosts"
+Add-Content -Path $Hosts -Value "`n127.0.0.1 $Name`n127.0.0.2 other.ostena.test" -Encoding ascii
+# The NTLM loopback check refuses an authentication to this machine by
+# another name than its own: the name of the lab is declared as one of
+# its names (the same applies to an alias of a real target).
+$Msv = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
+New-ItemProperty -Path $Msv -Name BackConnectionHostNames -Value @($Name) -PropertyType MultiString -Force | Out-Null
+Set-SmbServerConfiguration -RequireSecuritySignature $true -EnableSecuritySignature $true -Force
+Clear-DnsClientCache
+$Resolved = (Resolve-DnsName -Name $Name -Type A -ErrorAction SilentlyContinue).IPAddress
+if ($Resolved -ne '127.0.0.1') { Fail "$Name resolves to '$Resolved', not 127.0.0.1" }
+Write-Host "$Name -> $Resolved, SMB signing required: $((Get-SmbServerConfiguration).RequireSecuritySignature)"
+
 Write-Host '=== listener and certificate'
 $Hash = $null
 for ($i = 0; $i -lt 60 -and -not $Hash; $i++) {
@@ -95,11 +115,13 @@ for ($i = 0; $i -lt 60 -and -not $Hash; $i++) {
 }
 if (-not $Hash) { Fail 'RDP listener or certificate missing after 60 s' }
 
-$Name = $env:COMPUTERNAME.ToLowerInvariant()
 @(
     "OSTENA_RDP_TARGET_PORT=3389"
     "OSTENA_RDP_TARGET_NAME=$Name"
-    "OSTENA_RDP_TARGET_USER=$User"
+    # Qualified by the computer: the name of the lab is not the computer
+    # name, from which the agent would otherwise take the domain of a
+    # local account.
+    "OSTENA_RDP_TARGET_USER=$($env:COMPUTERNAME)\$User"
     "OSTENA_RDP_TARGET_PASSWORD=$Password"
     "OSTENA_RDP_TARGET_SHA256=$Hash"
 ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

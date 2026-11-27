@@ -5,6 +5,9 @@
 
 mod support;
 
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,17 +20,40 @@ use ostena_rdp::driver::{
 };
 use ostena_rdp::profile::to_hex;
 use ostena_rdp::target_sessions::{
-    SessionControl, SessionState, SessionView, TargetSession, Unsupported, ViewRequest,
+    OpenError, Opened, SessionControl, SessionState, SessionView, TargetNames, TargetSession,
+    Unsupported, ViewRequest,
 };
 use ostena_session::{Driver, DriverConnection};
 use support::{LOGON_SESSION, Options, PASSWORD, Script, Target, USER, loopback};
 
+/// The DNS name of the test target.
+const NAME: &str = "target.example.test";
+
 /// The sessions of a fake target, shared by the views.
-#[derive(Default)]
 struct Sessions {
     list: Vec<TargetSession>,
     logged_off: Vec<u32>,
-    opened_with: Vec<(String, String)>,
+    /// Server name, Kerberos required, password of each view.
+    opened_with: Vec<(String, bool, String)>,
+    /// Addresses asked for SMB signing.
+    probed: Vec<SocketAddr>,
+    /// A Kerberos ticket can be had for the target.
+    kerberos: bool,
+    /// The target requires SMB signing.
+    signing: bool,
+}
+
+impl Default for Sessions {
+    fn default() -> Self {
+        Self {
+            list: Vec::new(),
+            logged_off: Vec::new(),
+            opened_with: Vec::new(),
+            probed: Vec::new(),
+            kerberos: true,
+            signing: true,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -37,6 +63,14 @@ impl FakeControl {
     fn with(list: Vec<TargetSession>) -> Self {
         Self(Arc::new(Mutex::new(Sessions {
             list,
+            ..Sessions::default()
+        })))
+    }
+
+    fn channel(kerberos: bool, signing: bool) -> Self {
+        Self(Arc::new(Mutex::new(Sessions {
+            kerberos,
+            signing,
             ..Sessions::default()
         })))
     }
@@ -62,16 +96,59 @@ impl SessionView for FakeView {
 }
 
 impl SessionControl for FakeControl {
-    fn open(&self, request: &ViewRequest) -> Result<Box<dyn SessionView>, String> {
+    fn open(&self, request: &ViewRequest) -> Result<Opened, OpenError> {
         // SECRET-EXPOSURE: test checks the password given to the view.
         #[expect(clippy::disallowed_methods)]
         let password = request.password.expose_secret().to_owned();
-        self.0
-            .lock()
-            .unwrap()
+        let mut state = self.0.lock().unwrap();
+        state
             .opened_with
-            .push((request.address.to_string(), password));
-        Ok(Box::new(FakeView(self.0.clone())))
+            .push((request.server.clone(), request.kerberos_required, password));
+        if !state.kerberos && request.kerberos_required {
+            return Err(OpenError::Kerberos(format!(
+                "pas de KDC pour cifs/{}",
+                request.server
+            )));
+        }
+        Ok(Opened {
+            view: Box::new(FakeView(self.0.clone())),
+            kerberos: state.kerberos,
+        })
+    }
+
+    fn smb_signing(&self, addr: SocketAddr) -> Result<bool, String> {
+        let mut state = self.0.lock().unwrap();
+        state.probed.push(addr);
+        Ok(state.signing)
+    }
+}
+
+/// The scope control of the tests: each name resolves to its addresses.
+struct Names(Vec<(&'static str, Vec<IpAddr>)>);
+
+impl Names {
+    fn standard() -> Self {
+        Self(vec![
+            (NAME, vec![IpAddr::from([127, 0, 0, 1])]),
+            ("elsewhere.example.test", vec![IpAddr::from([192, 0, 2, 7])]),
+        ])
+    }
+}
+
+impl TargetNames for Names {
+    fn resolve<'a>(
+        &'a self,
+        name: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            assert_eq!(port, 445);
+            self.0
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, a)| a.clone())
+                .ok_or_else(|| "[SCOPE-E00x] résolution impossible".to_owned())
+        })
     }
 }
 
@@ -114,6 +191,7 @@ fn driver_with(production: bool, ntlm_fallback: bool, sessions: DisconnectedSess
             disconnected_sessions: sessions,
         }),
         Arc::new(Secrets),
+        Arc::new(Names::standard()),
     )
 }
 
@@ -121,7 +199,7 @@ fn params(target: &Target, account: &str) -> TargetParams {
     TargetParams {
         session: RdpSessionParams {
             account: account.into(),
-            target_name: Some("target.example.test".into()),
+            target_name: Some(NAME.into()),
             certificate_sha256: Some(to_hex(&target.fingerprint())),
             mode: RdpMode::RestrictedAdmin,
             width: 1280,
@@ -199,10 +277,14 @@ async fn sessions_of_the_account_are_logged_off_before_and_after() {
     assert_eq!(control.logged_off(), vec![2]);
     {
         let state = control.0.lock().unwrap();
-        // The view goes to the pinned address, with the secret of the
-        // account.
-        assert_eq!(state.opened_with[0].0, "127.0.0.1");
-        assert_eq!(state.opened_with[0].1, PASSWORD);
+        // The view goes by the verified name, Kerberos only in
+        // production, with the secret of the account; signing was asked
+        // on the pinned address.
+        assert_eq!(
+            state.opened_with[0],
+            (NAME.to_owned(), true, PASSWORD.to_owned())
+        );
+        assert_eq!(state.probed, vec![SocketAddr::from(([127, 0, 0, 1], 445))]);
     }
     // The target opened session LOGON_SESSION; the agent disconnects, the
     // target sees it disconnected, the agent logs it off.
@@ -283,6 +365,107 @@ async fn no_mechanism_refuses_and_keep_is_development_only() {
             .iter()
             .all(|p| p.phase != "sessions")
     );
+    connection.close().await;
+    assert!(target.join().accepted);
+}
+
+fn params_named(target: &Target, name: Option<&str>) -> TargetParams {
+    let mut p = params(target, USER);
+    p.session.target_name = name.map(Into::into);
+    p
+}
+
+/// ADR-0026: the management channel goes by the DNS name of the target
+/// only once the scope control resolves it to the pinned address; no name,
+/// a name elsewhere or a name the scope refuses refuses the session before
+/// any connection.
+#[tokio::test]
+async fn the_channel_needs_a_name_resolving_to_the_pinned_address() {
+    let target = Target::start(Options {
+        restricted_admin: true,
+        script: Script::WaitClient,
+        ..Options::default()
+    });
+    let pinned = loopback(target.addr.port()).await;
+    for name in [
+        None,
+        Some("elsewhere.example.test"),
+        Some("unknown.example.test"),
+    ] {
+        let control = FakeControl::default();
+        let error = driver_with(true, true, DisconnectedSessions::Logoff)
+            .with_session_control(Arc::new(control.clone()))
+            .connect(&pinned, params_named(&target, name), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "RDP-E021", "{name:?}: {error}");
+        assert_eq!(error.event(), "rdp.session_channel_refused");
+        let state = control.0.lock().unwrap();
+        assert_eq!(state.probed, Vec::new());
+        assert_eq!(state.opened_with, Vec::new());
+    }
+    drop(target);
+}
+
+/// ADR-0026: without a Kerberos ticket for the target, NTLM is refused on
+/// the channel in production (even with `ntlm_fallback`, which admits it
+/// for RDP itself); development with `ntlm_fallback` admits it (logged).
+/// Without `ntlm_fallback`, the RDP connection itself needs Kerberos and
+/// the plan refuses first (`RDP-E011`).
+#[tokio::test]
+async fn ntlm_on_the_channel_is_development_only() {
+    let target = Target::start(Options {
+        restricted_admin: true,
+        script: Script::LogonThenWait,
+        ..Options::default()
+    });
+    let pinned = loopback(target.addr.port()).await;
+    {
+        let control = FakeControl::channel(false, true);
+        let error = driver_with(true, true, DisconnectedSessions::Logoff)
+            .with_session_control(Arc::new(control.clone()))
+            .connect(&pinned, params(&target, USER), Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "RDP-E022", "{error}");
+        assert_eq!(error.event(), "rdp.session_channel_ntlm_refused");
+        assert!(control.0.lock().unwrap().opened_with[0].1);
+    }
+    let control = FakeControl::channel(false, true);
+    let connection = driver_with(false, true, DisconnectedSessions::Logoff)
+        .with_session_control(Arc::new(control.clone()))
+        .connect(&pinned, params(&target, USER), Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert!(!control.0.lock().unwrap().opened_with[0].1);
+    connection.close().await;
+    assert!(target.join().accepted);
+}
+
+/// ADR-0026: a target that does not require SMB signing is refused in
+/// production, admitted (logged) in development.
+#[tokio::test]
+async fn smb_signing_is_required_in_production() {
+    let target = Target::start(Options {
+        restricted_admin: true,
+        script: Script::LogonThenWait,
+        ..Options::default()
+    });
+    let pinned = loopback(target.addr.port()).await;
+    let control = FakeControl::channel(true, false);
+    let error = driver_with(true, true, DisconnectedSessions::Logoff)
+        .with_session_control(Arc::new(control.clone()))
+        .connect(&pinned, params(&target, USER), Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert_eq!(error, RdpError::SmbSigning);
+    assert_eq!(error.code(), "RDP-E023");
+    assert_eq!(control.0.lock().unwrap().opened_with, Vec::new());
+    let connection = driver_with(false, true, DisconnectedSessions::Logoff)
+        .with_session_control(Arc::new(FakeControl::channel(true, false)))
+        .connect(&pinned, params(&target, USER), Duration::from_secs(20))
+        .await
+        .unwrap();
     connection.close().await;
     assert!(target.join().accepted);
 }

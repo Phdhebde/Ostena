@@ -19,8 +19,17 @@
 //! The work is blocking (RPC to the target) and runs on a thread of its own
 //! ([`run`]): the Windows implementation impersonates the account on that
 //! thread, which ends with the work.
+//!
+//! The channel that carries this management (RPC over the named pipes of
+//! the target, that is SMB) is opened by the **DNS name** of the target,
+//! for Kerberos, once [`verify_name`] has checked through the scope
+//! control that the name resolves to the pinned address; NTLM is refused
+//! on it unless the development mode and `ntlm_fallback` admit it, and the
+//! target must require SMB signing ([`SessionControl::smb_signing`]).
 
-use std::net::IpAddr;
+use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,6 +42,8 @@ use crate::error::RdpError;
 pub const DISCONNECT_WAIT: Duration = Duration::from_secs(3);
 /// Polling interval while waiting.
 const POLL: Duration = Duration::from_millis(200);
+/// Bound of each step of the SMB signing probe.
+pub const SMB_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The state of a session on the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,8 +107,11 @@ pub trait SessionView {
 pub struct ViewRequest {
     /// The pinned address of the target (scope control, ADR-0005).
     pub address: IpAddr,
-    /// DNS name of the target in the inventory, if any.
-    pub target_name: Option<String>,
+    /// The DNS name the view is opened by, checked by [`verify_name`] to
+    /// resolve to `address`.
+    pub server: String,
+    /// Kerberos only: no view without a service ticket for the target.
+    pub kerberos_required: bool,
     /// The account, as in `session_params`.
     pub account: String,
     /// Its password, for the network authentication of the view.
@@ -108,11 +122,30 @@ impl std::fmt::Debug for ViewRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ViewRequest")
             .field("address", &self.address)
-            .field("target_name", &self.target_name)
+            .field("server", &self.server)
+            .field("kerberos_required", &self.kerberos_required)
             .field("account", &self.account)
             .field("password", &self.password.redacted())
             .finish()
     }
+}
+
+/// An open view, and how it authenticated.
+pub struct Opened {
+    /// The view.
+    pub view: Box<dyn SessionView>,
+    /// A Kerberos service ticket was obtained for the target before the
+    /// view was opened; `false`: Windows may have negotiated NTLM.
+    pub kerberos: bool,
+}
+
+/// Why a view cannot be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    /// Kerberos is required and impossible towards the target.
+    Kerberos(String),
+    /// Anything else (no mechanism, credentials, target unreachable).
+    Failed(String),
 }
 
 /// Opens views on targets: the WTS API on a Windows agent.
@@ -121,9 +154,18 @@ pub trait SessionControl: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Why it cannot be opened (no mechanism on this platform, credentials,
-    /// target unreachable).
-    fn open(&self, request: &ViewRequest) -> Result<Box<dyn SessionView>, String>;
+    /// [`OpenError`].
+    fn open(&self, request: &ViewRequest) -> Result<Opened, OpenError>;
+
+    /// Whether the target at `addr` (pinned address, port 445) requires SMB
+    /// signing. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// Why the answer could not be had.
+    fn smb_signing(&self, addr: SocketAddr) -> Result<bool, String> {
+        crate::smb::probe(addr, SMB_TIMEOUT)
+    }
 }
 
 /// The control of a platform without a mechanism: always refuses.
@@ -131,13 +173,102 @@ pub trait SessionControl: Send + Sync + 'static {
 pub struct Unsupported;
 
 impl SessionControl for Unsupported {
-    fn open(&self, _: &ViewRequest) -> Result<Box<dyn SessionView>, String> {
-        Err(
+    fn open(&self, _: &ViewRequest) -> Result<Opened, OpenError> {
+        Err(OpenError::Failed(
             "aucun mécanisme de fermeture des sessions Windows sur cet agent \
              (API WTS : agent Windows seulement)"
                 .into(),
-        )
+        ))
     }
+
+    fn smb_signing(&self, _: SocketAddr) -> Result<bool, String> {
+        Err("aucun mécanisme de fermeture des sessions Windows sur cet agent".into())
+    }
+}
+
+/// Resolves the DNS name of a target through the scope control: the
+/// agent gives its [`ostena_scope::Scope`].
+pub trait TargetNames: Send + Sync + 'static {
+    /// The addresses `name` resolves to, every one admitted by the scope
+    /// for `port`.
+    ///
+    /// # Errors
+    ///
+    /// The refusal of the scope (resolution, rule, floor).
+    fn resolve<'a>(
+        &'a self,
+        name: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>>;
+}
+
+impl<R: ostena_scope::Resolver + Send + Sync + 'static> TargetNames for ostena_scope::Scope<R> {
+    fn resolve<'a>(
+        &'a self,
+        name: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.pin(name, port)
+                .await
+                .map(|pinned| pinned.addrs().iter().map(SocketAddr::ip).collect())
+                .map_err(|e| e.to_string())
+        })
+    }
+}
+
+/// Checks that `name` (the DNS name of the target, `None` when it has
+/// none) resolves through the scope control, for the SMB port, to the
+/// pinned `address`; gives the name the view is opened by.
+///
+/// # Errors
+///
+/// [`RdpError::SessionChannel`] when the name is missing, the scope
+/// refuses it, or `address` is not among its addresses.
+pub async fn verify_name(
+    names: &dyn TargetNames,
+    name: Option<&str>,
+    address: IpAddr,
+) -> Result<String, RdpError> {
+    let name = name.ok_or_else(|| {
+        RdpError::SessionChannel(
+            "cible sans nom DNS : la vue de ses sessions passe par Kerberos, \
+             qui demande le nom"
+                .into(),
+        )
+    })?;
+    let addresses = names
+        .resolve(name, crate::smb::PORT)
+        .await
+        .map_err(|e| RdpError::SessionChannel(format!("{name} : {e}")))?;
+    if !addresses.contains(&address) {
+        return Err(RdpError::SessionChannel(format!(
+            "{name} résout vers {addresses:?}, pas vers l'adresse épinglée {address}"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+/// Whether the target at `address` requires SMB signing, asked on a thread
+/// of its own.
+///
+/// # Errors
+///
+/// [`RdpError::SessionCleanup`] when the answer could not be had.
+pub async fn smb_signing(
+    control: Arc<dyn SessionControl>,
+    address: IpAddr,
+) -> Result<bool, RdpError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("ostena-rdp-smb".into())
+        .spawn(move || {
+            let _ = tx.send(control.smb_signing(SocketAddr::new(address, crate::smb::PORT)));
+        })
+        .map_err(|e| RdpError::SessionCleanup(format!("fil de travail : {e}")))?;
+    rx.await
+        .unwrap_or_else(|_| Err("fil de travail interrompu".into()))
+        .map_err(RdpError::SessionCleanup)
 }
 
 /// The control of this platform: `WtsControl` on Windows, [`Unsupported`]
@@ -278,26 +409,33 @@ pub fn after_session(
 }
 
 /// Runs `work` on a view of the target of `request`, on a thread of its
-/// own, and gives its result.
+/// own, and gives its result and whether the view authenticated with
+/// Kerberos.
 ///
 /// # Errors
 ///
-/// [`RdpError::SessionCleanup`] when the view cannot be opened or the
-/// thread cannot start; [`RdpError::Internal`] when it panicked; what
-/// `work` returned.
+/// [`RdpError::SessionChannelNtlm`] when Kerberos is required and
+/// impossible; [`RdpError::SessionCleanup`] when the view cannot be opened
+/// or the thread cannot start; [`RdpError::Internal`] when it panicked;
+/// what `work` returned.
 pub async fn run<T: Send + 'static>(
     control: Arc<dyn SessionControl>,
     request: ViewRequest,
     work: impl FnOnce(&mut dyn SessionView, &str) -> Result<T, RdpError> + Send + 'static,
-) -> Result<T, RdpError> {
+) -> Result<(T, bool), RdpError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("ostena-rdp-sessions".into())
         .spawn(move || {
             let result = control
                 .open(&request)
-                .map_err(RdpError::SessionCleanup)
-                .and_then(|mut view| work(view.as_mut(), &request.account));
+                .map_err(|e| match e {
+                    OpenError::Kerberos(m) => RdpError::SessionChannelNtlm(m),
+                    OpenError::Failed(m) => RdpError::SessionCleanup(m),
+                })
+                .and_then(|mut opened| {
+                    work(opened.view.as_mut(), &request.account).map(|t| (t, opened.kerberos))
+                });
             let _ = tx.send(result);
         })
         .map_err(|e| RdpError::SessionCleanup(format!("fil de travail : {e}")))?;
@@ -305,18 +443,21 @@ pub async fn run<T: Send + 'static>(
 }
 
 /// The WTS API of a Windows agent (`ostena-platform`): the view is opened
-/// on the pinned address of the target, the thread impersonating the
-/// network credentials of the account.
+/// by the verified DNS name of the target, the thread impersonating the
+/// network credentials of the account, after a Kerberos service ticket
+/// for the target was obtained (or attempted, when NTLM is admitted).
 #[cfg(windows)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WtsControl;
 
 #[cfg(windows)]
 mod wts {
-    use ostena_platform::wts::{self, NetworkCredentials, RemoteServer};
+    use ostena_platform::Code;
+    use ostena_platform::wts::{self, Authentication, NetworkCredentials, RemoteServer};
 
     use super::{
-        SessionControl, SessionState, SessionView, TargetSession, ViewRequest, WtsControl,
+        OpenError, Opened, SessionControl, SessionState, SessionView, TargetSession, ViewRequest,
+        WtsControl,
     };
 
     struct View(RemoteServer);
@@ -350,7 +491,7 @@ mod wts {
     }
 
     impl SessionControl for WtsControl {
-        fn open(&self, request: &ViewRequest) -> Result<Box<dyn SessionView>, String> {
+        fn open(&self, request: &ViewRequest) -> Result<Opened, OpenError> {
             let (domain, _) = super::split_account(&request.account);
             let upn = request.account.contains('@') && domain.is_none();
             let user = if upn {
@@ -361,9 +502,9 @@ mod wts {
             // A local account of the target authenticates in the domain of
             // the target computer: the first label of its name.
             let local = request
-                .target_name
-                .as_deref()
-                .and_then(|n| n.split('.').next())
+                .server
+                .split('.')
+                .next()
                 .map(str::to_ascii_uppercase);
             let domain = if upn {
                 None
@@ -378,10 +519,20 @@ mod wts {
                 domain: domain.as_deref(),
                 password: &request.password,
             };
-            let server = request.address.to_string();
-            RemoteServer::open(Some(&server), Some(&credentials))
-                .map(|s| Box::new(View(s)) as Box<dyn SessionView>)
-                .map_err(|e| e.to_string())
+            let authentication = if request.kerberos_required {
+                Authentication::Kerberos
+            } else {
+                Authentication::KerberosOrNtlm
+            };
+            RemoteServer::open(Some(&request.server), Some(&credentials), authentication)
+                .map(|s| Opened {
+                    kerberos: s.kerberos(),
+                    view: Box::new(View(s)),
+                })
+                .map_err(|e| match e.code {
+                    Code::Kerberos => OpenError::Kerberos(e.to_string()),
+                    _ => OpenError::Failed(e.to_string()),
+                })
         }
     }
 }
@@ -602,7 +753,8 @@ mod tests {
     async fn run_reports_an_unsupported_platform() {
         let request = ViewRequest {
             address: IpAddr::from([192, 0, 2, 1]),
-            target_name: None,
+            server: "srv.corp.example".into(),
+            kerberos_required: true,
             account: "admin".into(),
             password: SecretString::from("x".to_owned()),
         };
