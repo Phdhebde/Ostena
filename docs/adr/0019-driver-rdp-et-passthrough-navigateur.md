@@ -304,9 +304,12 @@ Comme russh pour SSH, IronRDP et `sspi` apportent leur propre cryptographie, et 
 | `RDP-E017` | `session_params` invalides | `rdp.params_refused` |
 | `RDP-E018` | session du même compte tenue par une autre connexion (ADR-0026) | `rdp.session_in_use` |
 | `RDP-E019` | sessions Windows du compte impossibles à fermer (ADR-0026) | `rdp.session_cleanup_failed` |
+| `RDP-E021` | canal de gestion des sessions refusé : nom DNS absent ou qui ne résout pas vers l'adresse épinglée (ADR-0026) | `rdp.session_channel_refused` |
+| `RDP-E022` | Kerberos impossible sur le canal de gestion, NTLM refusé (ADR-0026) | `rdp.session_channel_ntlm_refused` |
+| `RDP-E023` | la cible n'exige pas la signature SMB, en production (ADR-0026) | `rdp.smb_signing_refused` |
 | `RDP-E099` | panique d'une dépendance, session coupée | `rdp.internal_error` |
 
-Événements de succès : `rdp.connect_phases` (durée et allers-retours par phase : `tcp`, `x224`, `tls`, `credssp`, `mcs`, `licensing`, `activation`), `rdp.ntlm_used`, `rdp.profile_changed`, et depuis l'ADR-0026 `rdp.session_logged_off` et `rdp.session_cleanup_skipped`.
+Événements de succès : `rdp.connect_phases` (durée et allers-retours par phase : `tcp`, `x224`, `tls`, `credssp`, `mcs`, `licensing`, `activation`), `rdp.ntlm_used`, `rdp.profile_changed`, et depuis l'ADR-0026 `rdp.session_logged_off`, `rdp.session_cleanup_skipped`, `rdp.session_channel_ntlm` et `rdp.smb_signing_not_required` (avertissements du développement), `rdp.session_closed` (debug, raison d'une fermeture vue par le transport).
 
 **Fin de session (ADR-0026)** : la session Windows est fermée par l'agent (API WTS), jamais laissée déconnectée ; les sessions du compte laissées sur la cible sont fermées avant une nouvelle session, ou la session est refusée.
 
