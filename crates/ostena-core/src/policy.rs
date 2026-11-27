@@ -228,7 +228,7 @@ impl Policies {
 /// Whether the configuration lets one account hold incompatible
 /// administration roles (`core.admin.allow_role_cumulation`, ADR-0022).
 /// In production the option only passes the validation with its
-/// justification (`CFG-P022`).
+/// justification (`CFG-P023`).
 pub fn separation(admin: &ostena_common::config::CoreAdminConfig) -> Separation {
     if admin.allow_role_cumulation {
         Separation::CumulationAllowed

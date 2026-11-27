@@ -2,6 +2,7 @@
 
 - **Statut** : Accepté. Implémenté dans le lot M1, PR 5b.
 - **Date** : 2026-11-25
+- **Révision** : 2026-11-27, le droit retenu est choisi par le point de décision des accès, chargé depuis les droits et confirmé dans la transaction (ADR-0022, jalon M2, PR 10b)
 - **Révision** : 2026-11-26, fonctions d'un droit SSH (`--allow`, migration `0008_ssh_functions`, réversible), portées par le grant, `ACC-E010` (jalon M2, PR 4a)
 
 ## Contexte

@@ -1,6 +1,9 @@
 # ADR-0022 : PDP compilé en mémoire et rôles d'administration séparés
 
-- **Statut** : Accepté en partie. Jalon M2, PR 10a : crate `ostena-policy` (modèle, compilation, décision, installation, rôles), banc. L'intégration au core (chargement depuis PostgreSQL, migration propre, événements d'audit, rôles en base, option de cumul) est la PR 10b.
+- **Statut** : Accepté en partie.
+  - PR 10a : crate `ostena-policy` (modèle, compilation, décision, installation, rôles), banc.
+  - PR 10b : le core décide des accès SSH par le PDP, chargé depuis les droits, avec le rechargement, l'invalidation et les événements d'audit. S'y ajoutent l'option de cumul des rôles (`CFG-P023`) et les contrôles de séparation, au démarrage et à l'attribution d'un rôle.
+  - Reste pour la PR 10c : les groupes de comptes, les règles sur des groupes, les interdictions et les rôles `policy` et `audit` en base (une migration).
 - **Date** : 2026-11-26
 
 ## Contexte
@@ -87,12 +90,28 @@ Un `Pdp` tient la politique en place derrière un verrou en lecture-écriture. U
 - **Installation** (`install`) : remplace la politique **en entier**. La version ne recule jamais : une version plus ancienne que la plus haute déjà installée est refusée (`POL-E005`), si bien qu'un rechargement lent qui finit après un plus récent ne ramène pas une ancienne politique. La même version est acceptée de nouveau (rechargement après une invalidation).
 - **Invalidation** (`invalidate`) : retire la politique ; tout est refusé (`POL-E003`) jusqu'à la prochaine installation. **Échec fermé.**
 
-Intégration au core (PR 10b) :
+### Intégration au core
 
-- la version est tirée d'une séquence propre aux politiques, incrémentée par chaque changement (règle, droit, groupe, appartenance, utilisateur désactivé) dans la transaction qui le fait ;
-- le changement est notifié sur le canal `ostena_registry` (`policy:<version>`, ADR-0014) ; le core relit tout, compile hors du verrou et installe. **Pendant le rechargement, la politique précédente reste en place** : refuser tout pendant chaque rechargement couperait le service à chaque changement ;
-- si le rechargement échoue (base injoignable, politique invalide), le core **invalide** et réessaie toutes les 5 s, comme le rejeu des notifications perdues (ADR-0014). Une notification perdue est rattrapée de la même façon : au retour de l'écoute, le core recharge ;
-- à la demande de grant, la décision du PDP remplace la recherche du droit en SQL ; la transaction garde ses verrous (ADR-0014). À `session_request`, la décision est **reprise** avec les fonctions signées dans le grant comme fonctions voulues : une autorisation retirée entre-temps donne un refus, des fonctions manquantes `ACC-E010`.
+**PR 10b (sans migration).** Les règles sont pour l'instant les droits de l'ADR-0014 :
+
+- **Chargement.** Le core lit en une requête les droits non révoqués et non échus (`access_right`) ; chacun devient une règle « utilisateur × compte » qui autorise ses fonctions (PR 4a) pour son protocole, sur sa fenêtre. Le core compile la politique hors du verrou, puis l'installe. Il la charge **avant d'accepter le premier agent** : un échec arrête le démarrage.
+- **Version.** Chaque rechargement reçoit un numéro, propre au processus et croissant. Les rechargements sont **sérialisés et fusionnés** : une demande arrivée pendant une lecture de la base relance une seule lecture après celle-ci, jamais en parallèle. Une lecture lente ne peut donc pas installer des règles plus anciennes.
+- **Rechargement.** `right grant` et `right revoke` notifient `policy` sur le canal `ostena_registry` (ADR-0014), dans la transaction du changement ; le core relit tout. **Pendant le rechargement, la politique précédente reste en place** : refuser tout à chaque rechargement couperait le service à chaque changement. Le rejeu des notifications perdues recharge aussi.
+- **Échec.** Si le rechargement échoue (base injoignable, politique invalide), la politique est **invalidée** et tout est refusé (`POL-E003`), jusqu'au prochain rechargement réussi ; le rejeu réessaie toutes les 5 s (ADR-0014). Chaque installation est consignée (`policy.installed`), chaque échec aussi (`policy.invalidated`).
+- **Décision d'un accès SSH.** À la demande de grant et à l'ouverture de session (avec, comme fonctions voulues, celles signées dans le grant), la décision du PDP remplace la recherche du droit en SQL. La transaction garde ses verrous (ADR-0014) et **confirme** la décision dans la base :
+  - autorisation : le droit retenu est relu avec `FOR SHARE` (non révoqué, valide, mêmes utilisateur, compte et protocole, avec toutes les fonctions accordées). Une révocation concurrente attend donc le grant et le trouve, comme avant ;
+  - droit introuvable ou révoqué, ou refus par défaut alors qu'un droit valide existe dans la base : la politique est **en retard**. Le core la recharge une fois et décide de nouveau. S'il est encore en retard après ce rechargement, il refuse (`POL-E003`) ;
+  - refus par défaut confirmé : `ACC-E006`, comme avant, avec `POL-E001` dans la raison.
+
+  Une autorisation n'est donc jamais plus large que les droits que voit la transaction. Un droit **ajouté** alors qu'un autre droit valide sur le même compte est déjà connu ne sert qu'après le rechargement qui suit sa notification, de l'ordre de la milliseconde.
+- **Essai à blanc** (`access check`) : la commande, hors du core, charge la politique depuis la base et décide de la même façon.
+
+**PR 10c (migration à la suite de celles de la PR 9c et de la PR 8b).**
+
+- Tables des groupes de comptes, de leurs membres et des règles. Les règles portent sur des groupes d'utilisateurs (`user_group`, PR 9c) et sur les interdictions.
+- Rôles `policy` et `audit` dans `user_role`.
+- Commandes d'administration des règles et des groupes de comptes.
+- Une **ligne de version** de la politique, relue par la transaction du grant. Elle remplace la détection du retard ci-dessus, qui ne vaut que pour les droits.
 
 ### Codes
 
@@ -107,27 +126,26 @@ Intégration au core (PR 10b) :
 
 Comme pour l'ADR-0014, l'utilisateur refusé ne reçoit que le libellé générique ; le code et la règle vont dans la chaîne d'audit.
 
-### Événements d'audit (PR 10b)
+### Événements d'audit
 
-Les décisions sont consignées par les événements d'accès existants (`access.ssh_granted`, `access.ssh_refused`, `access.session_opened`, `access.session_refused` ; ceux du RDP et du navigateur à leur arrivée), avec de nouveaux champs : `pdp_version` (version qui a décidé), `rule_id` (autorisation retenue ou interdiction en cause), `restricted_by`, `functions` et `code` (`POL-E001` à `POL-E003`). Le champ `right_id` reste pour une règle issue d'un droit.
+**PR 10b.** Les décisions sont consignées par les événements d'accès existants, avec de nouveaux champs :
 
-Nouveaux événements :
+- `access.ssh_granted`, `access.web_granted` (portail, ADR-0020) et `access.session_opened` portent `pdp_version` (la version qui a décidé) et `rule_id` (la règle retenue, aujourd'hui le droit, aussi nommé par `right_id`) ;
+- `access.ssh_refused` et `access.web_refused` portent `pdp_version` quand le PDP a décidé, et le code (`ACC-E006` avec `POL-E001` dans la raison, `POL-E002`, `POL-E003`) ;
+- RDP fera de même à son arrivée.
 
 | Événement | Classe (ADR-0012) | Contenu |
 |---|---|---|
-| `access_rule.created` | accordant | règle : sujet, cible, protocoles, effet, fenêtre ; une interdiction est **protectrice** |
-| `access_rule.revoked` | protecteur | règle |
-| `account_group.created`, `account_group.member_added` | accordant | groupe, compte |
-| `account_group.member_removed` | protecteur | groupe, compte |
-| `policy.installed` | au mieux | version, version remplacée, nombre de règles, d'utilisateurs, de groupes, de comptes, durée de compilation |
-| `policy.invalidated` | au mieux | version retirée, raison (`code`) |
-| `policy.reload_failed` | au mieux | raison ; agrégé, une fois par minute au plus |
+| `policy.installed` | au mieux | `pdp_version`, `previous_version`, `rules`, `compile_micros` |
+| `policy.invalidated` | au mieux | `code`, `reason` |
+
+**PR 10c.** `access_rule.created` (accordant ; une interdiction est protectrice), `access_rule.revoked` (protecteur), `account_group.created` et `account_group.member_added` (accordants), `account_group.member_removed` (protecteur), `admin.role_cumulation_used` (au mieux), et le champ `restricted_by`.
 
 Une décision du portail qui ne fait que lister le catalogue n'est pas auditée une par une (elle n'ouvre rien) ; l'ouverture qui suit l'est.
 
 ### Rôles d'administration séparés
 
-Trois rôles (la PR 10b étend la contrainte de `user_role`) :
+Trois rôles (la PR 10c étend la contrainte de `user_role` ; aujourd'hui seul `admin` existe en base) :
 
 | Rôle | Pouvoirs |
 |---|---|
@@ -139,13 +157,19 @@ Trois rôles (la PR 10b étend la contrainte de `user_role`) :
 
 - À l'attribution d'un rôle, le cumul est refusé (`POL-E006`, au même titre que `CORE-E012`).
 - Au démarrage, les rôles déjà donnés sont vérifiés : un cumul **arrête le core en production** (`POL-E006`), et n'est qu'averti en développement.
-- **Option explicite** (décision du mainteneur du 2026-11-27), pour les petites équipes qui ne peuvent pas séparer : `[core.admin] allow_role_cumulation = true`, avec `role_cumulation_justification`, **obligatoire en production** (20 caractères au moins, espaces de début et de fin non comptés ; sinon la configuration est refusée par un code `CFG-V…`, attribué par la PR 10b). Sans l'option, le cumul est refusé en production. Avec elle :
-  - elle est journalisée **à chaque démarrage**, avec sa justification (`config.waiver`) ;
-  - elle est journalisée **à chaque usage** : chaque attribution d'un rôle cumulé (`user.role_granted`, champ `cumulation`) et chaque action d'administration faite par un compte qui cumule (`admin.role_cumulation_used`, au mieux).
+- **Option explicite** (décision du mainteneur du 2026-11-27), pour les petites équipes qui ne peuvent pas séparer : `[core.admin] allow_role_cumulation = true`, avec `role_cumulation_justification`, **obligatoire en production** (20 caractères au moins, espaces de début et de fin non comptés ; sinon la configuration est refusée en production par `CFG-P023`, et l'option est journalisée comme affaiblissement en développement). Sans l'option, le cumul est refusé en production. Avec elle :
+  - elle est journalisée **à chaque démarrage**, avec sa justification : `CFG-P023` en avertissement et dans l'audit (`config.waiver`), comme les autres affaiblissements tolérés (ADR-0003). Chaque compte qui cumule est aussi journalisé au démarrage (`admin.role_cumulation`) ;
+  - elle est journalisée **à chaque usage** : chaque attribution d'un rôle cumulé (`user.role_granted`) et chaque action d'administration faite par un compte qui cumule (`admin.role_cumulation_used`, au mieux ; PR 10c, avec les rôles).
 
   Justification : la règle générale refuse en production toute option qui affaiblit ; ici, l'interdire sans recours pousserait ces équipes à partager un compte, ce qui détruit l'imputabilité, pire que le cumul. La dérogation est motivée et visible dans l'audit.
 
-La règle d'incompatibilité est dans la crate (`roles`), testée seule ; l'option, la vérification au démarrage et la base sont dans la PR 10b.
+La règle d'incompatibilité est dans la crate (`roles`), testée seule. La PR 10b y ajoute :
+
+- l'option `[core.admin]` et son code `CFG-P023` ;
+- la vérification au démarrage (`ostena core run`), qui arrête le core en production sur `POL-E006` ;
+- le refus à l'attribution d'un rôle (`ostena core user role-grant`, `POL-E006`).
+
+Ces contrôles s'appliqueront dès que les rôles `policy` et `audit` existeront en base (PR 10c).
 
 ### Hors du périmètre v0
 
