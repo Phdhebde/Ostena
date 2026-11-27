@@ -41,6 +41,12 @@ event_kinds! {
     AuditBreakAcknowledged => "audit.break_acknowledged",
     /// An export was produced (first and last seq).
     AuditExported => "audit.exported",
+    /// A head was time-stamped by an RFC 3161 authority: head number and
+    /// hash, `genTime`, policy and the token (ADR-0012).
+    AuditHeadTimestamped => "audit.head_timestamped",
+    /// A head could not be time-stamped (code, reason); written once per
+    /// run of failures.
+    AuditTimestampFailed => "audit.timestamp_failed",
     /// The core started.
     CoreStarted => "core.started",
     /// The core stopped.
@@ -229,6 +235,12 @@ pub mod field {
     pub const LAST_SEQ: &str = "last_seq";
     /// Head number.
     pub const HEAD_NO: &str = "head_no";
+    /// Hash of a head (`audit.head_timestamped`).
+    pub const HEAD_HASH: &str = "head_hash";
+    /// `genTime` of a time-stamp token, Unix milliseconds.
+    pub const STAMPED_AT: &str = "stamped_at";
+    /// Policy of a time-stamping authority (dotted OID).
+    pub const POLICY: &str = "policy";
     /// Heartbeat of the head signer, in seconds.
     pub const HEARTBEAT_SECS: &str = "heartbeat_secs";
     /// Schema version after migration.
@@ -363,6 +375,9 @@ pub mod field {
 
     /// Every name above.
     pub const ALL: &[&str] = &[
+        HEAD_HASH,
+        STAMPED_AT,
+        POLICY,
         AGENT_ID,
         GROUP_ID,
         ENROLLMENT_ID,
@@ -611,7 +626,7 @@ mod tests {
     #[test]
     fn event_names_are_unique_and_well_formed() {
         let mut names: Vec<&str> = EventKind::ALL.iter().map(|k| k.name()).collect();
-        assert_eq!(names.len(), 71);
+        assert_eq!(names.len(), 73);
         for name in &names {
             assert!(
                 (3..=64).contains(&name.len())
@@ -630,6 +645,7 @@ mod tests {
     #[test]
     fn field_names_are_valid_unique_and_never_redacted() {
         let mut names = field::ALL.to_vec();
+        names.extend(crate::timestamp::TOKEN_FIELDS);
         for name in &names {
             assert!(crate::record::is_field_name(name.as_bytes()), "{name}");
             assert!(
@@ -639,7 +655,10 @@ mod tests {
         }
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), field::ALL.len());
+        assert_eq!(
+            names.len(),
+            field::ALL.len() + crate::timestamp::TOKEN_FIELDS.len()
+        );
     }
 
     #[test]

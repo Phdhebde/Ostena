@@ -588,6 +588,10 @@ enum CoreAuditCommand {
         /// Public key file of the head signer, once per trusted key.
         #[arg(long = "key", required = true)]
         keys: Vec<PathBuf>,
+        /// PEM file of the trusted certificates of the time-stamping
+        /// authority: the time-stamps of the heads are verified. Repeatable.
+        #[arg(long = "tsa-ca")]
+        tsa_ca: Vec<PathBuf>,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -625,6 +629,11 @@ enum AuditCommand {
         /// the export must be there and match its seal (ADR-0016).
         #[arg(long)]
         transcripts: Option<PathBuf>,
+        /// PEM file of the trusted certificates of the time-stamping
+        /// authority (RFC 3161): every time-stamp of a head in the export is
+        /// then verified (ADR-0012). Repeatable.
+        #[arg(long = "tsa-ca")]
+        tsa_ca: Vec<PathBuf>,
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
@@ -1135,6 +1144,7 @@ fn run_audit(command: AuditCommand) -> ExitCode {
             keys,
             heads,
             transcripts,
+            tsa_ca,
             json,
             clock_tolerance_ms,
             head_gap_tolerance_secs,
@@ -1143,6 +1153,7 @@ fn run_audit(command: AuditCommand) -> ExitCode {
             keys: &keys,
             heads: &heads,
             transcripts: transcripts.as_deref(),
+            tsa_ca: &tsa_ca,
             json,
             clock_tolerance_ms,
             head_gap_tolerance_secs,
@@ -1179,9 +1190,12 @@ fn run_core(command: CoreCommand) -> ExitCode {
                 from_head,
             } => core::audit_export(&config, &out, from_head),
             CoreAuditCommand::Head { config } => core::audit_head(&config),
-            CoreAuditCommand::Verify { config, keys, json } => {
-                core::audit_verify(&config, &keys, json)
-            }
+            CoreAuditCommand::Verify {
+                config,
+                keys,
+                tsa_ca,
+                json,
+            } => core::audit_verify(&config, &keys, &tsa_ca, json),
             CoreAuditCommand::AcknowledgeBreak { config, seq } => {
                 core::audit_acknowledge_break(&config, seq)
             }

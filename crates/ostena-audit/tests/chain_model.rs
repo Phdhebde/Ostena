@@ -36,7 +36,11 @@ struct Model {
 
 fn event(seq: u64) -> Event {
     let kinds = EventKind::ALL;
-    let kind = kinds[usize::try_from(seq).unwrap() % kinds.len()];
+    let mut kind = kinds[usize::try_from(seq).unwrap() % kinds.len()];
+    // A time-stamp names a real head (tests of the verifier cover it).
+    if kind == EventKind::AuditHeadTimestamped {
+        kind = EventKind::AuditExported;
+    }
     let event = Event::new(kind, Outcome::Success, ActorKind::Admin, "alice")
         .u64(field::FIRST_SEQ, seq)
         .text(field::REASON, "modèle");
